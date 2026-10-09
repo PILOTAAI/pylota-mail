@@ -6,6 +6,7 @@ The landing page and the docs, served together by one assets-only Cloudflare Wor
 ```
 site/
   wrangler.jsonc     Worker config: name, compatibility date, assets directory
+  check-live.sh      after a deploy: both hostnames over HTTPS, and HTTP redirects to HTTPS
   public/            everything that is served
     index.html       landing page
     404.html         served for unknown paths (assets.not_found_handling = "404-page")
@@ -31,6 +32,16 @@ environment. It needs two secrets on that environment:
 | `CLOUDFLARE_API_TOKEN` | A token with **Account › Workers Scripts › Edit**, and **Zone (pylotamail.com) › Workers Routes › Edit** and **DNS › Edit** |
 | `CLOUDFLARE_ACCOUNT_ID` | The Cloudflare account that holds the `pylotamail.com` zone |
 
+Secrets belong to one repository. Secrets that another repository uses for the same Cloudflare
+account are not visible here; add them to this repository's `production` environment.
+
+After deploying, the job runs `site/check-live.sh`. It checks that both hostnames serve the landing
+page and the docs over HTTPS, and that plain HTTP redirects to HTTPS. Run it by hand the same way:
+
+```bash
+bash site/check-live.sh pylotamail.com www.pylotamail.com
+```
+
 **By hand**, from the repository root:
 
 ```bash
@@ -49,8 +60,31 @@ The workflow pins mdBook 0.5.4 and Wrangler 4.139.0; change both there and here 
   created by `pmail setup` and are unaffected. Do not add a `CNAME` at the apex or at `www`: a Custom
   Domain cannot be created on a hostname that already has one ([Custom Domains](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/),
   read 2026-10-09).
+- Turn on **Always Use HTTPS** for the zone: **SSL/TLS › Edge Certificates › Always Use HTTPS**
+  in the dashboard, or set the zone setting `always_use_https` to `"on"` through the API. The
+  Worker serves every request it gets, plain HTTP included, and nothing in this repository can
+  redirect by scheme: `_redirects` matches paths only. The HSTS header in `_headers` does not fill
+  the gap either. Browsers ignore it on HTTP responses, so it only takes effect after a first HTTPS
+  visit. The setting applies to every hostname in the zone, so it will cover `app.` and `api.` too
+  ([Always Use HTTPS](https://developers.cloudflare.com/ssl/edge-certificates/additional-options/always-use-https/),
+  read 2026-10-09). Until it is on, the deploy job's last step fails.
 - The console (`app.pylotamail.com`) and the API (`api.pylotamail.com`) are served by the main
   `pylota-mail` Worker, not by this site.
+
+### When a hostname does not resolve
+
+If one browser or network reports `NXDOMAIN` (for example `DNS_PROBE_FINISHED_NXDOMAIN`) for a
+hostname that works elsewhere, that browser or network looked the name up before the deploy created
+its record and kept the "no such name" answer. The zone's SOA allows such an answer to be kept for
+up to 30 minutes (minimum TTL 1800 seconds). Check the public view first:
+
+```bash
+dig +short @1.1.1.1 pylotamail.com A
+```
+
+If that returns addresses, the site is fine. Clear the browser's DNS cache
+(`chrome://net-internals/#dns`, or `edge://net-internals/#dns` in Edge, then **Clear host cache**),
+or wait for the cached answer to expire.
 
 ### Self-hosting the site
 
