@@ -1,0 +1,28 @@
+[book]
+title = "Pylota Mail"
+authors = ["Pylota"]
+description = "Email and identity for AI agents. Source available under FSL-1.1-ALv2, written in Rust, runs on your own Cloudflare account."
+language = "en"
+src = "src"
+
+[build]
+# The landing page Worker serves the built docs at /docs/.
+build-dir = "../site/public/docs"
+create-missing = false
+
+[output.html]
+site-url = "/docs/"
+default-theme = "light"
+preferred-dark-theme = "navy"
+additional-css = ["theme/pylota.css"]
+git-repository-url = "https://github.com/PILOTAAI/pylota-mail"
+edit-url-template = "https://github.com/PILOTAAI/pylota-mail/edit/main/docs/{path}"
+no-section-label = true
+
+[output.html.search]
+enable = true
+
+# Without this, book.js fetches play.rust-lang.org on pages with Rust code blocks:
+# a third-party request the site CSP blocks and the docs promise not to make.
+[output.html.playground]
+runnable = false
