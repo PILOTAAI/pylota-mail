@@ -165,7 +165,7 @@ design adds the `allowances` and `holds` tables from the
 [data model](data-model.md#3-other-durable-objects) and these requests:
 
 ```rust
-// crates/worker/src/billing/quota.rs (variants added to QuotaRequest)
+// crates/worker/src/billing/quota.rs (QuotaRequest variants declared by the M5 stub, implemented here in M22)
 pub enum Feature { Inboxes, Sends, Triage, CustomDomains, StorageGb, Seats }
 
 Hold     { feature: Feature, units: u32, r#ref: String, gates: Vec<Feature> },

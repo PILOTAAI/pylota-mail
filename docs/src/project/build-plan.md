@@ -168,7 +168,7 @@ environment named in brackets. Nothing in this table is ever committed.
 | Gmail (Google Workspace) and Microsoft 365 test mailboxes holding only synthetic mail, with API access for the harness | Owner | M20 (the live suite) | Actions: `STAGING_GMAIL_CLIENT_ID`, `STAGING_GMAIL_CLIENT_SECRET`, `STAGING_GMAIL_REFRESH_TOKEN`, `STAGING_M365_TENANT_ID`, `STAGING_M365_CLIENT_ID`, `STAGING_M365_CLIENT_SECRET` [`staging`] |
 | A domain at an external DNS provider (not Cloudflare) and that provider's API token | Owner | M20 step 5 (`live::domains::dns_records_external_host`) | Actions: `STAGING_EXTERNAL_DNS_TOKEN`, `STAGING_EXTERNAL_DOMAIN` [`staging`] |
 | A staging platform key (90-day expiry) | Created by the agent with `pmail keys create` on staging; stored by a person | M20 | Actions: `STAGING_PLATFORM_KEY` [`staging`] |
-| A Stripe account in test mode | Owner | M22 (recorded fixtures), M20 step 11 | `PM_STRIPE_SECRET_KEY` (a `sk_test_` restricted key) and `PM_STRIPE_WEBHOOK_SECRET` (Worker secrets on staging); Actions: `STAGING_STRIPE_SECRET_KEY`, `STAGING_STRIPE_WEBHOOK_SECRET` [`staging`] |
+| A Stripe account in test mode | Owner | M22 (recorded fixtures), M20 step 11 | `PM_STRIPE_SECRET_KEY` (a restricted key, `rk_test_…`) and `PM_STRIPE_WEBHOOK_SECRET` (Worker secrets on staging); Actions: `STAGING_STRIPE_SECRET_KEY`, `STAGING_STRIPE_WEBHOOK_SECRET` [`staging`] |
 | A Google OAuth client and a GitHub OAuth app, with redirect URLs on the staging and production console hosts | Owner | M24 (its gate re-reads both providers' documentation), M20 step 10 | `PM_OAUTH_GOOGLE_CLIENT_ID`, `PM_OAUTH_GITHUB_CLIENT_ID` (variables); `PM_OAUTH_GOOGLE_CLIENT_SECRET`, `PM_OAUTH_GITHUB_CLIENT_SECRET` (Worker secrets) |
 | The minisign release key pair, generated offline by a person (`minisign -G`) | Owner | M19 | Secret key: Actions `MINISIGN_SECRET_KEY` and `MINISIGN_PASSWORD` [`release`]. Public key: compiled into `pmail` as the `current` key ([CLI and setup §8.2](design/cli.md#82-signature-and-checksums)); a second key pair becomes `next` before the first rotation |
 | Optional: registration of the production deployment's Web Bot Auth key directory (`https://{PM_API_HOST}/.well-known/http-message-signatures-directory`) with Cloudflare's verified-bot programme (dashboard, "Bot Submission Form", verification method "Request Signature"; [Deploy › Signed HTTP requests](../self-hosting.md#signed-http-requests-web-bot-auth)) | Owner, after M25 ships with S13 passed and `PM_WEB_BOT_AUTH=on` | No milestone or test: signatures verify for any Web Bot Auth verifier without it, and S13 expects the unregistered `401` | None (a dashboard form; nothing to store) |
@@ -826,7 +826,7 @@ and the cross-tenant suite's new routes (NFR-SEC-1).
 3. The JWKS endpoint, with the pause and suspension kill switch.
 4. Assertions (`identities:sign`, `RL_SIGN`), never stored or logged; `Idempotency-Key` ignored. Each
    signature is counted through `QuotaRequest::RecordUsage` (`usage:assertions`, `usage:http_signatures`,
-   flushed to `usage_daily`); if M25 lands before M9 adds that request, M9 wires the two calls.
+   flushed to `usage_daily`; the M5 stub has recorded `RecordUsage` since M5, so the calls work whatever lands first).
 5. Signed HTTP requests and the signed directory behind `PM_WEB_BOT_AUTH` and tenant policy
    `web_bot_auth.allowed`; the `web_bot_auth` purpose of `POST /v1/platform/keys/{purpose}/rotate`.
 6. The SDK verifier and the CLI commands; the two MCP tools are added to M15's table.

@@ -223,6 +223,7 @@ GROUP BY domain_id
 | `agentic_ms`, `agentic_first_evidence_ms` | observation | – | `fetch` |
 | `ai_calls_total` | counter | purpose (`embed`, `rerank`, `triage`, `planner`, `markdown`), result | worker |
 | `index_jobs_total` | counter | kind, result | `pm-index` |
+| `vector_count_drift` | observation | – (the value is `index_count − Σ embedded_rows`) | Nightly reconciliation cron ([Search › Nightly reconciliation](search.md#66-nightly-reconciliation)) |
 | `triage_total` | counter | status | `pm-index` |
 | `job_steps_total` | counter | kind, step, result | JobRunner |
 | `erasure_ms` | observation | scope | JobRunner: `created_at` → completion |
@@ -298,6 +299,7 @@ the window (the Custom Alert "minimum event count").
 | Alert | Class | Condition | Severity | Runbook |
 |---|---|---|---|---|
 | `dlq:{queue}` | B | The oldest open `dlq_items` row of a queue is older than 15 minutes ([J8](../edge-cases.md)) | page | [DLQ growth](#dlq-growth) |
+| `vector_drift` | B | Tonight's and the previous night's reconciliation both put `drift_pct` more than 1 away from zero ([Search › Nightly reconciliation](search.md#66-nightly-reconciliation)) | ticket | Re-run the reconciliation; if the drift persists, start a `reindex` job for the affected identities (`POST /v1/jobs`) |
 | `bounce_rate:{domain_id}` | A | `bounces_total / recipients_submitted_total` > 2% over 1 h for a domain with ≥ 50 recipients | page | [Bounce spike](#bounce-spike) |
 | `complaint_rate:{domain_id}` | A | `complaints_total / recipients_submitted_total` > 0.1% over 24 h for a domain with ≥ 200 recipients | page | [Complaint spike](#complaint-spike) |
 | `inbound_reject_spike` | A | Anomaly detection on `inbound_received_total{result=rejected_unknown}`: spike, 15-minute evaluation window, 24 h baseline, minimum 50 events | ticket | [Domain failing](#domain-failing) (routing checks) |

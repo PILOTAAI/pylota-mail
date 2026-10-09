@@ -618,7 +618,7 @@ adds the security and traceability jobs:
 |---|---|---|
 | `ci.yml` | `fmt`, `clippy`, `test` (with coverage), `layering`, `wasm`, `itest` (`cargo xtask itest --suite it`; includes the attack suite and the deterministic keyword recall), `browser` (`cargo xtask itest --suite browser`: the console without JavaScript and the axe scan, section 6.8), `fuzz-smoke`, `deny`, `audit` (`cargo audit`), `openapi`, `docs`, `trace` (`cargo xtask trace`) | Every pull request and push to `main` |
 | `codeql.yml` | CodeQL for Rust | Every pull request, weekly |
-| `nightly.yml` | All fuzz targets for 10 minutes each; property tests at 65,536 cases; `eval-search`, `eval-agentic`, `eval-triage`; `live::` suite; `cargo audit` on `main` | Nightly |
+| `nightly.yml` | All fuzz targets for 10 minutes each; property tests at 65,536 cases; `eval-search`, `eval-agentic`, `eval-triage`; the large benchmarks (`it::bench::*`, section 6.9); `live::` suite; `cargo audit` on `main` | Nightly |
 | `release.yml` | The full `ci.yml` gate; the three evaluations; CLI binaries; `cargo xtask release`; SBOM (`cargo cyclonedx --format json` for the Worker and the CLI); signed `SHA256SUMS`; build provenance (`actions/attest@v4`); deploy to staging; the `live::` suite; then the GitHub Release, `cargo publish`, and the production rollout (10% → 50% → 100%, [Architecture](../architecture.md)) | Tag `v*` |
 
 **Required checks to merge into `main`:** `fmt`, `clippy`, `test`, `layering`, `wasm`, `itest`,

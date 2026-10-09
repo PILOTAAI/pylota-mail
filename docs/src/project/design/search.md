@@ -930,7 +930,7 @@ written in the message transaction.
    the index's vector count with `VectorIndex::describe()` on `VECTORS` (spike S6 confirms that the V2
    binding returns it), emits `vector_count_drift = index_count − Σ embedded_rows`, and writes
    `index_count`, `embedded_rows` and `drift_pct` on the summary row. The "two nights" state is the
-   previous run's summary row: the alert fires when this run's `drift_pct` and the previous day's are both
+   previous run's summary row: the `vector_drift` alert ([Observability](observability.md)) fires when this run's `drift_pct` and the previous day's are both
    more than 1 away from zero (too many vectors or too few). The same tick deletes `index_reconcile` rows
    older than 7 days.
 
