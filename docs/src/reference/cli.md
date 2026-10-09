@@ -2,8 +2,8 @@
 
 `pmail` is the command-line client for Pylota Mail. It sets up and deploys a deployment on your
 Cloudflare account, checks its health, administers tenants, identities, domains, members, keys and
-webhooks, and sends, reads and searches mail. Every command can print JSON (`--json`), so scripts and agents can use
-it as well as people.
+webhooks, sends, reads and searches mail, and signs as an identity. Every command can print JSON
+(`--json`), so scripts and agents can use it as well as people.
 
 The behaviour behind each command is specified in the [CLI and setup design](../project/design/cli.md).
 
@@ -52,34 +52,63 @@ key_env = "PYLOTA_MAIL_STAGING_KEY"
 | `key_env` | The name of an environment variable that holds the key |
 | `key_command` | A command whose output is the key, for example `op read op://vault/pylota-mail/key`. It runs once per invocation, with a 10-second timeout |
 | `identity` | The default identity for mail commands (an ID or an address) |
-| `tenant` | The default tenant for platform keys (an ID or a slug) |
+| `tenant` | The default tenant for platform keys (an ID or a slug). `jobs start` ignores it and needs `--tenant` |
+| `account_id` | Your Cloudflare account ID, written by `pmail setup`. Not a secret; the Cloudflare API token is never stored |
 
 Use only one of `key`, `key_env` and `key_command` in a profile. Unknown keys are an error.
 
-**Precedence**, highest first: command-line flags (`--url`, `--key`, `--profile`), then the
-environment (`PYLOTA_MAIL_URL`, `PYLOTA_MAIL_KEY`, `PYLOTA_MAIL_PROFILE`), then the profile. Without
-`--profile` or `PYLOTA_MAIL_PROFILE`, the profile is `default_profile`, else one named `default`.
+**Precedence**, highest first: command-line flags (`--url`, `--key`, `--profile`, `--account-id`), then
+the environment (`PYLOTA_MAIL_URL`, `PYLOTA_MAIL_KEY`, `PYLOTA_MAIL_PROFILE`, `CLOUDFLARE_ACCOUNT_ID`),
+then the profile. Without `--profile` or `PYLOTA_MAIL_PROFILE`, the profile read is `default_profile`,
+else one named `default`. A key in `PYLOTA_MAIL_KEY` therefore overrides the key saved in any profile.
+
+**Which profile setup and login write.** `pmail setup` and `pmail login` store a key, so they write the
+profile named by `--profile`, default `default`; `PYLOTA_MAIL_PROFILE` and `default_profile` do not
+change it.
 
 **File permissions.** `pmail` creates the file with mode `0600` (its directory `0700`) and refuses to
-read it if other users can read it or if another user owns it. Fix that with `chmod 600` on the file.
+read it (exit 3) if its group or other users have any access to it, or if another user owns it. Fix
+that with `chmod 600` on the file.
 
 **Keys on the command line.** `--key` works, but other users of the machine can see command lines.
 Prefer `PYLOTA_MAIL_KEY` or a profile; `pmail` prints a warning when you use `--key`.
 
-**Cloudflare credentials.** `setup`, `setup ses`, `deploy`, `upgrade`, `doctor`, `destroy` and
-`secrets` use `CLOUDFLARE_API_TOKEN` from the environment (there is no flag for it) and the account ID
-from `--account-id` or `CLOUDFLARE_ACCOUNT_ID`; so does `domains add` when it falls back to your local
-token. They are never written to the config file. The token's permissions are listed in
-[Self-hosting](../self-hosting.md#2-create-a-cloudflare-api-token). The platform operations (`dlq`,
-`keys rotate thread|link|cursor`, `jobs`, `waitlist invite`) need only an API key.
+**Cloudflare credentials.** Some commands use your Cloudflare API token; they are listed in
+[Commands that use your Cloudflare token](#commands-that-use-your-cloudflare-token).
 
-**AWS credentials.** `setup ses`, and the doctor's `ses` check, use your local AWS credentials from the
-standard AWS sources: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN` in the
-environment, or the profile named by `AWS_PROFILE` in `~/.aws/credentials` and `~/.aws/config` (which
-other sources are supported, and in what order: verify at build time). They are never stored by
-`pmail` or uploaded to the Worker.
+**AWS credentials.** `setup ses`, `destroy --include-ses` and the doctor's `ses` check use your local AWS
+credentials from the standard AWS sources: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and
+`AWS_SESSION_TOKEN` in the environment, else the profile named by `AWS_PROFILE` (else `default`) in
+`~/.aws/credentials` and `~/.aws/config` (which other sources are supported, and in what order: verify
+at build time). They are never stored by `pmail` or uploaded to the Worker.
 
 The settings are also listed in [Configuration › CLI configuration](configuration.md#cli-configuration).
+
+### Commands that use your Cloudflare token
+
+These commands call the Cloudflare API or Wrangler with `CLOUDFLARE_API_TOKEN`. This is the one list;
+other pages link here.
+
+| Command | What it does with the token |
+|---|---|
+| [`setup`](#setup) | Creates and reads every Cloudflare resource, deploys the Worker, uploads its secrets, and runs the D1 queries of setup (migrations, the bootstrap key, the platform domain row, the system identity) |
+| [`setup ses`](#setup-ses) | Uploads the Worker's SES key as Worker secrets, deploys, and writes the platform domain's SES DKIM records into its zone |
+| [`deploy`](#deploy), [`upgrade`](#upgrade) | Applies D1 migrations, deploys with Wrangler, and manages Vectorize index generations |
+| [`doctor`](#doctor) | The Cloudflare checks: DNS, routing, sending, event subscriptions, bindings, secret names, dead-letter items, quota and the zone count |
+| [`destroy`](#destroy) | Disables routing, tears down the platform domain, deletes the Worker, the storage and the D1 database |
+| [`secrets rotate-master`](#secrets-rotate-master) | Uploads the new master key and follows the re-seal through D1 |
+| [`domains add --local-token`](#domains-add) | Onboards a zone apex itself, when the deployment has no `PM_CF_API_TOKEN`, and registers it in D1 |
+| [`domains subscribe`](#domains-subscribe) | Creates a domain's Email Sending event subscription and records it in D1 |
+
+- The token comes from the environment only. There is no flag for it, so it never appears in the
+  process list, and `pmail` never writes it to the config file.
+- They also need the account ID: `--account-id`, else `CLOUDFLARE_ACCOUNT_ID`, else the profile's
+  `account_id` (which `setup` stores), else `PM_CF_ACCOUNT_ID` in `deploy/wrangler.toml`.
+- The permissions the token needs, and those of the Worker's own `PM_CF_API_TOKEN`, are in one table:
+  [Deploy to Cloudflare › Create a Cloudflare API token](../self-hosting.md#2-create-a-cloudflare-api-token).
+- Every other command needs only an API key, including the platform operations (`dlq`,
+  `keys rotate thread|link|cursor|web_bot_auth`, `jobs`, `waitlist invite`). `assertions verify` and
+  `webhooks verify` need neither a key nor a token.
 
 ## Global flags
 
@@ -87,24 +116,26 @@ These work with every command.
 
 | Flag | Environment | Meaning |
 |---|---|---|
-| `--url <url>` | `PYLOTA_MAIL_URL` | API host. `https://` is required except for `localhost` |
+| `--url <url>` | `PYLOTA_MAIL_URL` | API host. `https://` is required except for `localhost`, `127.0.0.1` and `[::1]` |
 | `--key <key>` | `PYLOTA_MAIL_KEY` | API key |
 | `--profile <name>` | `PYLOTA_MAIL_PROFILE` | Profile in the config file |
-| `--json` | – | Print exactly one JSON document on stdout: the API response, or the command's result, or the error envelope. Turns off every prompt |
+| `--account-id <id>` | `CLOUDFLARE_ACCOUNT_ID` | Cloudflare account ID, for the [commands that use your Cloudflare token](#commands-that-use-your-cloudflare-token). Falls back to the profile's `account_id` |
+| `--json` | – | Print exactly one JSON document on stdout: the API response, or the command's result, or the error envelope. The one exception is `--stream` (`ask --json --stream`), which prints NDJSON, one JSON document per line. Turns off every prompt |
 | `--quiet` | – | Print only the essential value (a new ID, a secret, hit IDs) and errors |
 | `--yes` | – | Answer yes to confirmations (not to `destroy`'s typed confirmation) |
 | `--verbose` | – | Log each HTTP request's method, path, status and duration to stderr (never bodies or keys) |
 | `--help` | – | Help for any command |
 | `--version` | – | The CLI's version (at the top level only; `deploy --version` is a different flag) |
 
-Colour is used only on a terminal, and never when `NO_COLOR` is set.
+Colour is used only when stdout is a terminal, and never when `NO_COLOR` is set.
 
 ## Output
 
 - **Human** (the default): single objects print as indented JSON; lists print as tables; operator
   commands print one line per step.
-- **`--json`**: the API's response body, unchanged. Lists print `{ "data": [ … ], "next_cursor": … }`;
-  add `--all` to follow every page into one document.
+- **`--json`**: exactly one JSON document, the API's response body unchanged. Lists print
+  `{ "data": [ … ], "next_cursor": … }`; add `--all` to follow every page into one document. The one
+  exception is `--stream`, which prints NDJSON ([`ask`](#ask)).
 - **`--quiet`**: one value per line, for scripts.
 
 Text that comes from email (subjects, names, snippets, bodies, filenames, answers) is untrusted. In
@@ -121,19 +152,19 @@ Errors print the API's error envelope: in human mode as `error: <code> (<status>
 |---|---|
 | 0 | Success (also `doctor` with only warnings) |
 | 1 | Internal error in the CLI |
-| 2 | Invalid flags or arguments, or a required answer missing in non-interactive mode |
-| 3 | Configuration: no URL or key, an unreadable or insecure config file, a failing `key_env` or `key_command`, missing Cloudflare credentials, no AWS credentials for `setup ses` |
+| 2 | Invalid flags or arguments, or a required answer missing in non-interactive mode (also `keys create --level platform` without `--permissions`) |
+| 3 | Configuration: no URL or key, an unreadable or insecure config file, a failing `key_env` or `key_command`, missing Cloudflare credentials, no AWS credentials for `setup ses` or `destroy --include-ses`, or a deployment not set up for a domain method (`422 transport_unavailable` or `422 cf_token_required` from `domains add` without `--local-token`) |
 | 4 | The API refused the key: `401` or `403` |
 | 5 | Not found: `404` with a Pylota Mail error code |
 | 6 | Conflict or state: `409`, `410`, `423` |
 | 7 | Invalid request: `400`, `413`, `422` |
 | 8 | Limit: `402 billing_limit` or `429` |
 | 9 | Service unavailable: `5xx`, a network error, or a `404` that did not come from Pylota Mail |
-| 10 | A Cloudflare API call or Wrangler failed, or a prerequisite (Node.js 22+, Wrangler) is missing |
-| 11 | Verification failed: a release signature or checksum, or `webhooks verify` |
+| 10 | A Cloudflare API call or Wrangler failed, or a prerequisite is missing (Node.js 22+, Wrangler) or not met (the mail domain already has another provider's MX records), during `setup`, `setup ses`, `deploy`, `upgrade`, `destroy`, `secrets rotate-master`, `domains add --local-token` or `domains subscribe`. `doctor` reports such failures as failing checks (exit 12) |
+| 11 | Verification failed: a release signature or checksum, `webhooks verify`, or `assertions verify` |
 | 12 | `doctor` found at least one failure |
 | 13 | Timed out: `wait` returned nothing, or a polling step passed its deadline |
-| 14 | `setup ses`: an AWS API call failed, or the AWS account has no SES production access |
+| 14 | `setup ses` or `destroy --include-ses`: an AWS API call failed, or the AWS account has no SES production access |
 | 130 | Interrupted (Ctrl-C) |
 
 ## Naming identities and tenants
@@ -143,7 +174,9 @@ Errors print the API's error envelope: in human mode as `error: <code> (<status>
   profile's `identity`, or the key's own identity for an identity key.
 - `--tenant` takes a tenant ID (`ten_…`) or a slug (`acme`). Without it, a tenant or identity key uses
   its own tenant, and a platform key uses the profile's `tenant`, else the **default tenant** created by
-  `pmail setup` (the one whose addresses have no suffix).
+  `pmail setup` (the one whose addresses have no suffix). Three commands never use the default tenant:
+  [`jobs start`](#jobs-start) needs `--tenant`, and [`usage`](#usage) and [`usage daily`](#usage-daily)
+  with a platform key need `--tenant` or the profile's `tenant`.
 - Domain arguments take a domain ID (`dom_…`) or a domain name.
 - Times take RFC 3339 (`2026-10-09T10:00:00Z`) or a date (`2026-10-09`, midnight UTC).
 
@@ -151,8 +184,9 @@ Errors print the API's error envelope: in human mode as `error: <code> (<status>
 
 `send`, `reply`, `reply-all` and `forward` need an idempotency key. Pass one with `--idempotency-key`;
 derive it from your task (`bk-2291-confirm`) and reuse it if you run the command again for the same
-message. If you leave it out, `pmail` generates one (`pmail-<id>`), prints it to stderr, and reuses it
-for its own retries. See [Sending › Safe retries](../guides/sending.md#safe-retries).
+message. If you leave it out, `pmail` generates one (`pmail-<id>`) and reuses it for its own retries. In
+human mode it prints the key to stderr; with `--json` the key appears only in the error document, if the
+command fails. See [Sending › Safe retries](../guides/sending.md#safe-retries).
 
 ---
 
@@ -168,14 +202,14 @@ creates only what is missing.
 pmail setup --domain <api-host> [--mail-domain <apex>] [--account-id <id>] [--jurisdiction eu|default]
             [--console-host <host>] [--owner-email <email>] [--owner-name <name>]
             [--tenant-name <name>] [--no-console] [--replace-mx] [--daily-send-quota <n>]
-            [--backup-bucket <name>] [--version <v>] [--from-source] [--print-secrets]
-            [--rotate-pepper] [--profile <name>] [--dir <path>]
+            [--backup-bucket <name>] [--version <v>] [--from-source [--source-dir <path>]]
+            [--print-secrets] [--rotate-pepper] [--profile <name>] [--dir <path>]
 ```
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--account-id` | `CLOUDFLARE_ACCOUNT_ID` | Cloudflare account ID |
-| `--domain` | required | The API host, where the Worker serves `/v1`, `/mcp` and `/health` (`PM_API_HOST`) |
+| `--account-id` | `CLOUDFLARE_ACCOUNT_ID` | Cloudflare account ID (a global flag). Setup stores it in the profile as `account_id` |
+| `--domain` | required | The API host (`PM_API_HOST`). The Worker serves the REST API (`/v1/*`, including signed links `/v1/links/*`), MCP (`/mcp`), `/openapi.json`, `/health`, `/.well-known/*`, the provider hooks (`/hooks/*`) and `/billing/stripe/webhook` there, and the console too unless `--console-host` names another host |
 | `--console-host` | the API host | The host that serves the console (`PM_CONSOLE_HOST`). A different host becomes a second custom domain on the same Worker |
 | `--mail-domain` | asked for | The platform mail domain (`PM_PLATFORM_DOMAIN`). It must be a zone apex in the account. Required with `--json` or `--yes` |
 | `--jurisdiction` | `eu` | `eu` or `default`, for D1, R2 and Durable Objects. It cannot be changed later |
@@ -187,20 +221,25 @@ pmail setup --domain <api-host> [--mail-domain <apex>] [--account-id <id>] [--ju
 | `--daily-send-quota` | unset | Your account's Email Sending daily quota, copied from the Cloudflare dashboard (`PM_DAILY_SEND_QUOTA`). An alert fires at 80% of it. Without it, `doctor` warns |
 | `--backup-bucket` | unset | Create a second R2 bucket with this name in the same jurisdiction, bind it as `BACKUP`, and copy new mail objects into it nightly (`PM_BACKUP_BUCKET`) |
 | `--version` | the CLI's | Worker release to deploy |
-| `--from-source` | off | Build the Worker locally (needs Rust, the `wasm32-unknown-unknown` target and `worker-build` 0.8.7) |
-| `--print-secrets` | off | Print the generated Worker secrets once. Without it they are never written anywhere |
+| `--from-source` | off | Build the Worker locally from a checkout of the repository (needs Rust, the `wasm32-unknown-unknown` target and `worker-build` 0.8.7). It skips the GitHub Releases download but still needs crates.io (or vendored crates) and npm for Wrangler |
+| `--source-dir` | `.` | The checkout that `--from-source` builds |
+| `--print-secrets` | off | Print the generated secrets once, to stdout, at the end. Without it they go only to the Worker (through Wrangler, on stdin) and are never printed or written to a file or a log |
 | `--rotate-pepper` | off | Break-glass: replace `PM_KEY_PEPPER` and create a new platform key. **Every existing API key stops working** |
-| `--profile` | `default` | Profile that receives the URL and the temporary key |
+| `--profile` | `default` | Profile that receives the URL, the account ID and the temporary key. `default_profile` and `PYLOTA_MAIL_PROFILE` do not change it |
 | `--dir` | `./deploy` | Where `wrangler.toml` and downloaded releases are kept |
 
 What it does, in order: checks Node.js and Wrangler; checks that the mail domain is a zone apex
-without another mail provider's MX records; creates D1, R2 (with its lifecycle rule, plus the backup
-bucket if you asked for one), the queues and the Vectorize index; enables Email Routing and Email
-Sending on the mail domain; writes `deploy/wrangler.toml`; applies D1 migrations; deploys the Worker;
-uploads the generated secrets; waits for `/health`; creates the delivery-event subscription; points the
-catch-all at the Worker; creates a platform key that expires in 24 hours and saves it in the profile;
-and creates the default tenant with its owner. Mail to the platform domain is refused until the Worker
-can store it, then accepted. If a step fails, fix the cause and run the same command again.
+without another mail provider's MX records; downloads and verifies the release bundle; creates D1, R2
+(with its lifecycle rule, plus the backup bucket if you asked for one), the queues and the Vectorize
+index; enables Email Routing on the mail domain and writes the ownership record
+(`_pylota-mail.<mail domain>`); onboards the mail domain for Email Sending; picks IDs for the six
+rate-limit bindings; writes `deploy/wrangler.toml`; applies D1 migrations; deploys the Worker; uploads
+the generated secrets; waits for `/health`; creates the delivery-event subscription; points the catch-all
+at the Worker; creates a platform key that expires in 24 hours and saves it in the profile; records the
+platform domain; creates the default tenant with its owner and the system identity; and runs a mail test
+to set `PM_TRUSTED_AUTHSERV_ID`. Mail to the platform domain is refused until the Worker can store it,
+then accepted. If a step fails, fix the cause and run the same command again. The full list is in the
+[CLI and setup design](../project/design/cli.md#63-steps).
 
 Setup performs the first deploy itself, so `pmail deploy` run straight after it finds nothing to change
 and exits 0.
@@ -234,7 +273,7 @@ pmail setup ses --region <aws-region> [--allow-non-eu] [--prefix <prefix>] [--di
 | Flag | Default | Meaning |
 |---|---|---|
 | `--region` | required | The SES region (`PM_SES_REGION`). It must be a region where SES receives mail |
-| `--allow-non-eu` | off | Accept a region outside the EU on a deployment with `PM_JURISDICTION = "eu"`. Without it such a region is refused |
+| `--allow-non-eu` | off | Accept a region outside the EU and the UK on a deployment with `PM_JURISDICTION = "eu"`. Without it such a region is refused. For the SES region, `eu` means "EU or UK" (the UK has an EU GDPR adequacy decision), so `eu-west-2` (London) needs no flag; Cloudflare's own `eu` jurisdiction for D1, R2 and Durable Objects means the EU only |
 | `--prefix` | `pylota-mail-` + your AWS account ID | Prefix of the S3 bucket that holds incoming mail until it is ingested (`{prefix}-inbound`) |
 | `--yes` | off | Apply the IAM policy without asking. Without it, the policy is printed and you are asked first |
 
@@ -251,11 +290,12 @@ disk or printed); writes `PM_SES_REGION`, `PM_SES_INBOUND_BUCKET`, `PM_SES_INBOU
 deploys; and subscribes the Worker to both topics. Safe to run again. The full list is in
 [Domains on any DNS host](../project/design/domain-connections.md#42-deployment-set-up-for-ses).
 
-Exit codes: 2 for a region that cannot receive mail, a non-EU region on an EU deployment without
+Exit codes: 2 for a region that cannot receive mail, a region outside the EU and the UK on an EU deployment without
 `--allow-non-eu`, a deployment on another version than the CLI (run `pmail upgrade` first), or a policy
-review you declined; 3 without AWS or Cloudflare credentials; 10 when Wrangler or the Cloudflare API
-fails; 13 when the subscriptions are not confirmed within 5 minutes; 14 when an AWS call fails or the
-account has no production access.
+review you declined or (without `--yes`) could not be asked; 3 without AWS or Cloudflare credentials, or
+without `deploy/wrangler.toml` (run `pmail setup` first); 9 when the Worker's `/health` does not answer;
+10 when Wrangler or the Cloudflare API fails; 13 when the subscriptions are not confirmed within 5
+minutes; 14 when an AWS call fails or the account has no production access.
 
 ```bash
 pmail setup ses --region eu-west-2
@@ -268,14 +308,15 @@ checksum, renders `deploy/wrangler.toml`, applies D1 migrations, and deploys wit
 `npx --yes wrangler@4.139.0`. Needs Node.js 22 or later.
 
 ```text
-pmail deploy [--version <v>] [--from-source] [--gradual] [--stages <list>] [--stage-wait <duration>]
-             [--force] [--account-id <id>] [--dir <path>]
+pmail deploy [--version <v>] [--from-source [--source-dir <path>]] [--gradual] [--stages <list>]
+             [--stage-wait <duration>] [--force] [--dir <path>]
 ```
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--version` | the CLI's | Deploy this release, for example to roll back. It cannot be newer than the CLI |
-| `--from-source` | off | Build from the repository checkout instead of downloading |
+| `--from-source` | off | Build from a repository checkout instead of downloading. It still needs crates.io (or vendored crates) and npm for Wrangler |
+| `--source-dir` | `.` | The checkout that `--from-source` builds |
 | `--gradual` | off | Shift traffic in stages, checking health and alerts at each, and roll back on failure |
 | `--stages` | `10,50,100` | Percentages for `--gradual` |
 | `--stage-wait` | `10m` | Time at each stage |
@@ -314,7 +355,8 @@ To roll back, deploy the previous version with `pmail deploy --version <previous
 ### `doctor`
 
 Checks DNS, routing, sending, event subscriptions, bindings, secrets, alerts, dead-letter queues,
-quota, SES (when configured) and the account's zone count, and prints a fix for each failure.
+quota, SES (when configured), the Web Bot Auth key directory (when it is on) and the account's zone
+count, and prints a fix for each failure.
 
 ```text
 pmail doctor [--mail-test] [--check <name>]… [--dir <path>]
@@ -322,8 +364,8 @@ pmail doctor [--mail-test] [--check <name>]… [--dir <path>]
 
 | Flag | Meaning |
 |---|---|
-| `--mail-test` | Also send a message from the platform domain to itself and check it arrives with `verdict: pass`. Prints the `Authentication-Results` authserv-id to set as `PM_TRUSTED_AUTHSERV_ID`. The test messages are erased afterwards |
-| `--check` | Run only the named checks: `dns.platform`, `routing.catch_all`, `sending.domains`, `sending.event_subscriptions`, `bindings`, `secrets`, `observability`, `worker.version`, `health`, `alerts`, `dlq`, `quota`, `ses`, `cloudflare.zones`, `security_txt`, `mail_test` |
+| `--mail-test` | Also send a message from the platform domain to itself and check it arrives with `verdict: pass`. Prints the `Authentication-Results` authserv-id to set as `PM_TRUSTED_AUTHSERV_ID`. The test messages are erased afterwards. Needs a key with `identities:read`, `identities:write`, `messages:send`, `messages:read`, `search:read` and `erasure:manage` in the default tenant (the platform key from setup has them) |
+| `--check` | Run only the named checks: `dns.platform`, `routing.catch_all`, `sending.domains`, `sending.event_subscriptions`, `bindings`, `secrets`, `observability`, `worker.version`, `health`, `alerts`, `dlq`, `quota`, `ses`, `cloudflare.zones`, `security_txt`, `web_bot_auth`, `mail_test` |
 
 ```bash
 pmail doctor --mail-test
@@ -342,26 +384,34 @@ Some checks only warn:
 
 - `secrets` warns while `PM_MASTER_KEY_NEXT` is set, which means a `secrets rotate-master` did not
   finish.
-- `quota` warns when `PM_DAILY_SEND_QUOTA` is not set.
+- `quota` warns when `PM_DAILY_SEND_QUOTA` is not set, and when your Cloudflare token lacks Account
+  Analytics · Read, which it needs to read the quota errors
+  ([Self-hosting › step 2](../self-hosting.md#2-create-a-cloudflare-api-token)).
 - `ses` runs only when `PM_SES_REGION` is set and AWS credentials are available. It fails without SES
-  production access, when sending is paused, when the active receipt rule set lacks `pm-deliver`, when
-  the region cannot receive mail, or at 10,000 SES identities in the region (the SES limit). It warns
-  (`ses_identities_90pct`) from 9,000, and when the region is outside the EU on an EU deployment.
+  production access, when sending is paused, when inbound mail goes through SES and the active receipt
+  rule set is not the one `setup ses` configured (`PM_SES_RULE_SET`) or lacks `pm-deliver`, when the
+  region cannot receive mail, or at 10,000 SES identities in the region (the SES limit). It warns
+  (`ses_identities_90pct`) from 9,000, and when the region is outside the EU and the UK on an EU deployment.
 - `cloudflare.zones` prints how many zones the Cloudflare account holds and warns above 1,000: ask
   Cloudflare then to confirm the account's limit, because it is not published.
 
-Exit 12 when any check fails. The checks are listed in
+`web_bot_auth` runs only when `PM_WEB_BOT_AUTH = "on"`: it fetches the key directory and fails unless it
+is served with the right content type, lists one to three keys and carries a valid signature for each
+([Self-hosting › Signed HTTP requests](../self-hosting.md#signed-http-requests-web-bot-auth)).
+
+Exit 12 when any check fails. A Cloudflare API error inside a check is reported as that check failing,
+so `doctor` never exits 10. The checks are listed in
 [Observability › pmail doctor](../project/design/observability.md#72-pmail-doctor).
 
 ### `destroy`
 
 Deletes the deployment: every tenant's data (through erasure), the Worker, the mail domain's routing
 and sending set-up, the Vectorize index, the queues, the R2 buckets (including the backup bucket) and
-the D1 database. **This deletes
-all mail, keys and configuration permanently.**
+the D1 database. **This deletes all mail, keys and configuration permanently.**
 
 ```text
-pmail destroy [--dry-run] [--confirm <platform-domain>] [--skip-erasure] [--keep-dns] [--dir <path>]
+pmail destroy [--dry-run] [--confirm <platform-domain>] [--skip-erasure] [--keep-dns] [--include-ses]
+              [--dir <path>]
 ```
 
 | Flag | Meaning |
@@ -370,8 +420,19 @@ pmail destroy [--dry-run] [--confirm <platform-domain>] [--skip-erasure] [--keep
 | `--confirm` | The platform domain, to confirm without a prompt. Required in non-interactive runs; `--yes` does not replace it |
 | `--skip-erasure` | Do not erase tenants through the API first (use only when the Worker no longer answers) |
 | `--keep-dns` | Leave the mail domain's Email Routing DNS records in place |
+| `--include-ses` | Also delete the AWS resources that [`setup ses`](#setup-ses) created, with your local AWS credentials, in the reverse order of setup |
 
-Threads under a legal hold stop the erasure step until a person releases the hold. The R2 bucket can
+If you ran `setup ses`, the plan lists its AWS resources (the S3 bucket, SNS topic, SQS queue, receipt
+rule, configuration set, the platform domain's SES identity, and the IAM user `pylota-mail-worker` with
+its access key). Without `--include-ses` they are left in place and listed again at the end: delete them
+in the AWS console, because the IAM user's access key stays valid until you do. With `--include-ses`,
+`destroy` deletes them itself; an active receipt rule set that was yours before `setup ses` is kept,
+without the `pm-deliver` rule. It needs AWS credentials (exit 3 without them, before anything is deleted),
+and an AWS failure is exit 14.
+
+Tenant erasure skips threads under a legal hold. If any tenant has held threads, `destroy` lists them and
+stops with exit 6 before it deletes anything else, because deleting the storage would destroy held mail.
+Release the holds (export the mail first if you must keep it) and run `destroy` again. The R2 bucket can
 only be deleted when it is empty; if staging objects remain, run `destroy` again a day later.
 
 ```bash
@@ -388,8 +449,10 @@ Worker has re-sealed every stored secret with it, then makes it `PM_MASTER_KEY`.
 pmail secrets rotate-master [--resume] [--dir <path>]
 ```
 
-`--resume` continues an interrupted rotation. The thread, link and cursor signing keys are rotated with
-[`keys rotate thread|link|cursor`](#keys-rotate-threadlinkcursor). `PM_CF_API_TOKEN` and the SES keys are
+`--resume` continues an interrupted rotation. Identity signing keys and the Web Bot Auth key are re-sealed
+with everything else; their public keys do not change. The thread, link, cursor and Web Bot Auth signing
+keys are rotated with
+[`keys rotate thread|link|cursor|web_bot_auth`](#keys-rotate-threadlinkcursorweb_bot_auth). `PM_CF_API_TOKEN` and the SES keys are
 rotated with `wrangler secret put`, as described in
 [Security](../project/design/security.md#62-rotation-procedures).
 
@@ -435,13 +498,14 @@ pmail dlq redrive dlq_01JA9P2T8CW7X2M5N6P8R0T1YZ
 pmail dlq redrive --queue pm-inbound --yes
 ```
 
-### `keys rotate thread|link|cursor`
+### `keys rotate thread|link|cursor|web_bot_auth`
 
 Rotates one of the keys the Worker uses to sign thread tokens (`thread`), download links, console
-tokens and OAuth state (`link`), or search cursors (`cursor`). The Worker generates the new key; no key is ever shown.
+tokens and OAuth state (`link`), search cursors (`cursor`), or Web Bot Auth HTTP signatures and their
+key directory (`web_bot_auth`). The Worker generates the new key; no key is ever shown.
 
 ```text
-pmail keys rotate thread|link|cursor [--revoke-previous] [--yes]
+pmail keys rotate thread|link|cursor|web_bot_auth [--revoke-previous] [--yes]
 ```
 
 | Purpose | The previous key keeps verifying for |
@@ -449,11 +513,18 @@ pmail keys rotate thread|link|cursor [--revoke-previous] [--yes]
 | `thread` | 90 days |
 | `link` | 7 days |
 | `cursor` | 24 hours |
+| `web_bot_auth` | 7 days, listed in the key directory |
 
 `--revoke-previous` deletes the previous key at once instead. Use it after a suspected leak, then run
 `pmail secrets rotate-master`. Tokens the old key signed stop working: replies to old thread tokens fall
 back to header threading; open download and sign-in links, invitations, console sessions and Google or
-GitHub sign-ins in progress fail; and open search cursors fail. You are asked to confirm unless `--yes`.
+GitHub sign-ins in progress fail; open search cursors fail; and HTTP signatures made with the old
+`web_bot_auth` key fail once verifiers fetch the directory again (they may cache it for up to 24 hours).
+You are asked to confirm unless `--yes`.
+
+`web_bot_auth` works only while `PM_WEB_BOT_AUTH` is `on`; otherwise the API answers
+`422 web_bot_auth_disabled` (exit 7). Its key IDs are 43-character JWK thumbprints. See
+[Self-hosting › Signed HTTP requests](../self-hosting.md#signed-http-requests-web-bot-auth).
 
 The output shows the purpose, the new key ID (kid), and the previous kid with the time it stops
 verifying, or `revoked`:
@@ -467,6 +538,7 @@ An argument that starts with `key_` rotates an API key instead ([`keys rotate`](
 
 ```bash
 pmail keys rotate link --yes
+pmail keys rotate web_bot_auth
 ```
 
 ### `jobs start`
@@ -480,7 +552,9 @@ pmail jobs start reparse|reembed|reindex --tenant <tenant> [--identity <identity
                  [--before <time>]
 ```
 
-Without `--identity`, the job covers every identity of the tenant. It prints the job with its ID.
+`--tenant` is required: neither the profile's `tenant` nor the default tenant stands in for it, because a
+job over the wrong tenant is costly to undo. Without `--identity`, the job covers every identity of the
+tenant. It prints the job with its ID.
 
 ```bash
 pmail jobs start reparse --tenant brightwell --after 2026-09-01
@@ -518,11 +592,16 @@ Invited 50; 262 still waiting.
 
 ### `login`
 
-Asks for the API URL and a key, checks the key with `GET /v1/me`, and saves both in a profile.
+Asks for the API URL and a key, checks the key with `GET /v1/me`, and saves both in the profile named
+by `--profile` (default `default`, whatever `default_profile` or `PYLOTA_MAIL_PROFILE` say). Without a
+terminal, pass `--url` and put the key in `PYLOTA_MAIL_KEY`.
 
 ```text
 pmail login [--profile <name>] [--url <url>] [--key-env <NAME> | --key-command <cmd>]
 ```
+
+A key in `PYLOTA_MAIL_KEY` outranks the one saved in a profile, so while that variable is set the CLI
+keeps using it; `login` warns when it differs from the key you saved. Unset it to use the profile.
 
 ```bash
 pmail login
@@ -539,8 +618,8 @@ pmail config show
 
 ### `config set`
 
-Sets `url`, `identity`, `tenant`, `key_env`, `key_command` or `default_profile`. To store a key, use
-`pmail login`.
+Sets `url`, `identity`, `tenant`, `account_id`, `key_env`, `key_command` or `default_profile`. To store
+a key, use `pmail login`.
 
 ```text
 pmail config set <setting> <value> [--profile <name>]
@@ -650,7 +729,8 @@ pmail identities create --username <name> --display-name <name> [--purpose <tag>
 | `--domain` | Create the primary address on a healthy tenant domain instead of the platform domain |
 | `--client-id` | Makes the create idempotent for your own provisioning |
 
-With a platform key and no `--tenant`, the identity is created in the default tenant.
+With a platform key and no `--tenant`, the identity is created in the profile's `tenant`, else in the
+default tenant.
 
 ```bash
 pmail identities create --username bookings --display-name "Acme Car Hire"
@@ -805,11 +885,12 @@ pmail domains add <name> --method <method> [--tenant <tenant>] [--no-receiving] 
                   [--replace-mx] [--confirm-dedicated]
                   [--inbound forward|ses] [--smtp-host <host>] [--smtp-port 465|587]
                   [--smtp-username <name>] [--smtp-password-stdin] [--probe-from <address>]
+                  [--local-token]
 ```
 
 | `--method` | Use it for | You change at your DNS host | Needs on the deployment |
 |---|---|---|---|
-| `cloudflare_zone` | A domain already on Cloudflare in the deployment's account | Nothing | `PM_CF_API_TOKEN` (an apex works without it, see below) |
+| `cloudflare_zone` | A domain already on Cloudflare in the deployment's account | Nothing | `PM_CF_API_TOKEN` (an apex works without it with `--local-token`, see below) |
 | `nameservers` | A new domain used only for mail | Two NS records at your registrar | `PM_CF_API_TOKEN`; a platform key, or a tenant whose policy allows zone creation |
 | `dns_records` | A subdomain (or domain) whose DNS stays where it is, both directions | One MX, three DKIM CNAMEs, a MAIL FROM MX and TXT, an ownership TXT | [`setup ses`](#setup-ses) |
 | `send_only` | Sending as your existing addresses; your mailbox forwards to the agent | Three DKIM CNAMEs, a MAIL FROM MX and TXT, an ownership TXT | [`setup ses`](#setup-ses) |
@@ -825,12 +906,23 @@ pmail domains add <name> --method <method> [--tenant <tenant>] [--no-receiving] 
 | `--smtp-password-stdin` | `smtp_relay` (required) | Read the SMTP password from stdin. **The password is never accepted on the command line.** On a terminal, `pmail` asks for it with hidden input |
 | `--probe-from` | `smtp_relay` | The sender address of the alignment probe. Defaults to `postmaster@{domain}` |
 | `--no-receiving`, `--no-sending` | all | Onboard only one direction |
+| `--local-token` | `cloudflare_zone` (apex) | If the deployment has no `PM_CF_API_TOKEN`, onboard the zone apex with your own `CLOUDFLARE_API_TOKEN` (below) |
 
 A flag that the method does not use is refused (exit 2). Needs `domains:write`.
 
-When the deployment has no `PM_CF_API_TOKEN`, `domains add --method cloudflare_zone` onboards a zone
-**apex** with your local `CLOUDFLARE_API_TOKEN` instead (catch-all routing, no per-address rules). A zone
-subdomain, `nameservers` and `delegated_subdomain` then need `PM_CF_API_TOKEN` on the deployment.
+**A deployment not set up for the method.** Without `--local-token`, `pmail` checks nothing locally and
+calls the API. When the deployment or the tenant's policy lacks what the method needs (for example SES
+for `dns_records`, or `domains.allow_create_zone` for `nameservers`), the API answers
+`422 transport_unavailable` and `pmail` exits 3, printing `details.reason` and its fix. Without
+`PM_CF_API_TOKEN` on the deployment, `cloudflare_zone`, `nameservers` and `delegated_subdomain` fail with
+`422 cf_token_required`, also exit 3 with the fix. For a zone **apex**,
+add `--local-token`: `pmail` checks first that the method is `cloudflare_zone`, the domain is a zone apex
+in your account (exit 2 otherwise) and your token and account ID are set (exit 3 otherwise); it then
+calls the API as usual and, when the API answers `cf_token_required`, onboards the apex with your local
+token (catch-all routing, no per-address rules) and registers it in the deployment's D1 database through
+the D1 query API, using the account ID ([`--account-id`](#global-flags)). A zone subdomain, `nameservers`
+and `delegated_subdomain` always need `PM_CF_API_TOKEN` on the deployment, because the Worker keeps
+calling Cloudflare over the domain's life.
 
 The result is the domain in `pending`, followed by the records to publish. Each record has a `name`
 (the full name) and a `host` (the name relative to your registered domain). Enter `host` if your DNS
@@ -944,6 +1036,18 @@ Issues a new ownership record for a `suspended` domain.
 
 ```bash
 pmail domains reprove acme.example.com
+```
+
+### `domains subscribe`
+
+Creates the Email Sending event subscription of a domain that reports `delivery_events: "manual"`, using
+your local `CLOUDFLARE_API_TOKEN`, and records it on the deployment. The API returns that state, with
+`details.action = "run pmail domains subscribe <domain>"`, only when the Worker could not create the
+subscription itself (the spike S9 fallback). Delivery events for the domain start once this has run;
+until then statuses stop at `sent`. Running it again is a no-op. Needs `domains:read`.
+
+```bash
+pmail domains subscribe acme.example.com
 ```
 
 ### `domains remove`
@@ -1203,15 +1307,16 @@ pmail search "damage to the rear bumper" --tenant acme --group-by thread
 ### `ask`
 
 Asks a question and prints an answer in which every sentence cites messages, streaming the progress as
-it searches. Needs `search:agentic`.
+it searches. Needs `search:read` and `search:agentic`.
 
 ```text
-pmail ask "<question>" --identity <identity> [--max-steps <2-10>] [--max-seconds <3-30>]
+pmail ask "<question>" (--identity <identity> | --tenant <tenant>) [--max-steps <2-10>] [--max-seconds <3-30>]
           [--include-quarantined] [--no-stream] [--show-trace] [--stream]
 ```
 
 | Flag | Meaning |
 |---|---|
+| `--tenant` | Ask across every identity of a tenant (tenant and platform keys) |
 | `--max-steps`, `--max-seconds` | The search budget (defaults 6 steps and 8 seconds, or the tenant's policy) |
 | `--no-stream` | Wait for the whole answer instead of showing progress |
 | `--show-trace` | Print every step, even when stderr is not a terminal |
@@ -1364,7 +1469,7 @@ pmail webhooks deliveries whk_01JA9J8P4YW7X2M5N6P8R0T1YT --status dead
 
 ### `webhooks replay`
 
-Delivers past events again (up to 30 days old).
+Delivers past events again (up to the tenant's `events_days` old, by default 30 days).
 
 ```text
 pmail webhooks replay <webhook-id> (--event-id <evt_…>… | --since <time> [--until <time>] [--status dead])
@@ -1408,17 +1513,27 @@ pmail keys create --level platform|tenant|identity --name <name> [--tenant <tena
 | Flag | Meaning |
 |---|---|
 | `--level` | `platform` reaches every tenant; `tenant` one tenant; `identity` one identity |
-| `--permissions` | Comma-separated ([API › Permissions](api.md#permissions)). Required for tenant and identity keys. A platform key without it gets every permission |
+| `--permissions` | Comma-separated ([API › Permissions](api.md#permissions)). Required at every level: a platform key has no implicit full set, and `--level platform` without it is refused (exit 2) with the list of permissions a platform key may hold |
 | `--expires-in` | For example `90d` |
 | `--save-profile` | Also store the new key in this CLI profile |
 
-The new key cannot exceed your own key's level, tenant, identity or permissions. The secret
-(`pmk_live_…` or `pmk_test_…`) is printed **once**. Run interactively with the temporary key that
-`setup` stored, `pmail` offers to save the new platform key in that profile and revoke the temporary
-one.
+The new key cannot exceed your own key's level, tenant, identity or permissions. Some permissions are
+refused at some levels (`400 invalid_request`, `permission_not_allowed_for_level`, exit 7):
+`identities:sign` on a platform key; `tenants:manage` and `platform:ops` below platform level; and
+`members:read`, `members:manage`, `suppressions:manage`, `audit:read` and `usage:read` on an identity
+key. The secret (`pmk_live_…` or `pmk_test_…`) is printed **once**. Run interactively with the temporary
+key that `setup` stored, `pmail` offers to save the new platform key in that profile and revoke the
+temporary one.
+
+The first platform key of a deployment usually holds every permission a platform key may hold, so it
+can create every other key (`setup` prints this command for you):
 
 ```bash
-pmail keys create --level platform --name first-key
+pmail keys create --level platform --name first-key --permissions \
+tenants:manage,platform:ops,keys:manage,identities:read,identities:write,domains:read,domains:write,\
+messages:read,messages:send,messages:write,attachments:read,search:read,search:agentic,\
+quarantine:review,webhooks:read,webhooks:manage,erasure:manage,suppressions:manage,usage:read,\
+audit:read,members:read,members:manage
 ```
 
 ```bash
@@ -1454,9 +1569,176 @@ pmail keys rotate <key-id> [--overlap-hours <0-168>]
 pmail keys rotate key_01JA9K9Q5ZW7X2M5N6P8R0T1YV --overlap-hours 24
 ```
 
-The first argument decides what is rotated: a `key_…` ID rotates that API key, and `thread`, `link` or
-`cursor` rotates a signing key ([`keys rotate thread|link|cursor`](#keys-rotate-threadlinkcursor)).
+The first argument decides what is rotated: a `key_…` ID rotates that API key, and `thread`, `link`,
+`cursor` or `web_bot_auth` rotates a signing key
+([`keys rotate thread|link|cursor|web_bot_auth`](#keys-rotate-threadlinkcursorweb_bot_auth)).
 `--overlap-hours` with a signing key, or `--revoke-previous` with an API key, is refused (exit 2).
+
+---
+
+## Identity keys and signing
+
+An identity can prove who it is outside email: with an **agent assertion**, a short-lived signed token a
+service checks against the identity's published keys, or with **signed HTTP requests** (Web Bot Auth).
+See [Using it from an agent › Agent assertions](../guides/agents.md#agent-assertions) and the
+[design](../project/design/agent-keys.md). Private keys never leave the Worker.
+
+### `identity-keys list`
+
+Lists the identity's signing keys, newest first, including `retired` ones: key ID (kid), status
+(`active`, `retiring` or `retired`), when it was created, and until when a retiring key still verifies.
+`--json` adds each public key. Needs `identities:read`.
+
+```text
+pmail identity-keys list --identity <identity> [--status active|retiring|retired] [--limit <n>] [--all]
+```
+
+```bash
+pmail identity-keys list --identity bookings@acme.example.com
+```
+
+### `identity-keys create`
+
+Creates the identity's first key. If it already has an active key, that key is shown and nothing
+changes. Optional: the first signing request creates a key too. Needs `identities:write`.
+
+```bash
+pmail identity-keys create --identity bookings@acme.example.com
+```
+
+### `identity-keys rotate`
+
+Makes a new key active. The previous key becomes `retiring` and stays published, so assertions it signed
+keep verifying, for `PM_IDENTITY_KEY_OVERLAP_DAYS` (7 days by default). Needs `identities:write`.
+
+```bash
+pmail identity-keys rotate --identity bookings@acme.example.com
+```
+
+```text
+Rotated key for bookings@acme.example.com: new kid kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k
+Previous kid 9fT2Lw0…: retiring, verifies until 2026-10-16T09:00:00Z
+```
+
+### `identity-keys revoke`
+
+Retires a key at once, for a suspected leak: it leaves the identity's published key set, so assertions it
+signed stop verifying as soon as verifiers fetch the key set again (they cache it for up to 5 minutes).
+You are asked to confirm unless `--yes`. An unknown kid is exit 5. Needs `identities:write`.
+
+```text
+pmail identity-keys revoke <kid> --identity <identity> [--yes]
+```
+
+```bash
+pmail identity-keys revoke kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k --identity bookings@acme.example.com --yes
+```
+
+Keys can be managed while the identity is paused. A paused identity cannot sign, and its key set is not
+published until it resumes.
+
+### `assertions create`
+
+Mints an agent assertion: a JWT signed with the identity's key, naming the identity's address, display
+name and workspace, for one audience. Needs `identities:sign` on a tenant or identity key (platform keys
+cannot hold it).
+
+```text
+pmail assertions create --identity <identity> --audience <audience> [--expires-in <60-600>]
+                        [--nonce <nonce>] [--ext <json> | --ext-file <file>]
+```
+
+| Flag | Meaning |
+|---|---|
+| `--audience` | Required. The URL or identifier the service expects, 1–256 printable ASCII characters |
+| `--expires-in` | Seconds, 60–600, default 300 |
+| `--nonce` | The service's challenge, copied into the token (1–128 printable ASCII characters) |
+| `--ext`, `--ext-file` | A JSON object of extra claims, at most 2 KB, placed under `ext` |
+
+The result has `assertion` (the token), `kid`, `expires_at` and `jwks_uri`. `--quiet` prints only the
+token. Each call mints a new token; nothing is stored, and no idempotency key is needed.
+
+```bash
+pmail assertions create --identity bookings@acme.example.com --audience https://portal.supplier.example --quiet
+```
+
+### `assertions verify`
+
+Checks an assertion the way a service should, with the Rust SDK's `verify_assertion`. It needs no API
+key: it fetches the identity's public keys from `{issuer}/.well-known/jwks/{identity}.json`.
+
+```text
+pmail assertions verify <token> --audience <audience> [--issuer <url>] [--now <unix-seconds>]
+```
+
+| Flag | Meaning |
+|---|---|
+| `<token>` | The assertion, or `-` to read it from stdin (other users of the machine can see command lines) |
+| `--audience` | Required. Your own audience: the token's `aud` must equal it |
+| `--issuer` | The deployment you trust, for example `https://mail.example.com`. Defaults to the API URL (`--url`, `PYLOTA_MAIL_URL` or the profile's `url`). Keys are never fetched from a URL inside the token |
+| `--now` | Check the times against this moment instead of the clock |
+
+It checks the algorithm (`EdDSA`) and type, the issuer, the signature against the published key with the
+token's `kid`, the audience, and the expiry (with 60 seconds of clock skew). It prints `valid` and the
+claims (exit 0), or `invalid: <reason>` (exit 11), where the reason is `malformed`,
+`unsupported_algorithm`, `issuer_mismatch`, `identity_not_found` (the identity is unknown, paused,
+suspended or deleted), `unknown_kid`, `bad_signature`, `audience_mismatch`, `expired` or
+`not_yet_valid`. A network failure while fetching the keys is exit 9. It does not keep a replay cache:
+a service should remember each `jti` until `exp` ([Verifying an assertion](../guides/agents.md#verifying-an-assertion)).
+
+```bash
+pmail assertions create --identity bookings@acme.example.com --audience https://portal.supplier.example --quiet \
+  | pmail assertions verify - --audience https://portal.supplier.example --issuer https://mail.example.com
+```
+
+```text
+valid
+sub    idn_01J9Z3K8V4QW7X2M5N6P8R0T1Y
+email  bookings@acme.example.com
+name   Acme Car Hire
+org    Acme Car Hire
+aud    https://portal.supplier.example
+exp    2026-10-09T12:05:00Z
+```
+
+### `http-sign`
+
+Signs an HTTP request as the identity with Web Bot Auth, so a website can tell which agent made it. It
+returns the headers to attach; the Worker never makes the request. Needs `identities:sign` on a tenant or
+identity key, `PM_WEB_BOT_AUTH = "on"` on the deployment (otherwise `422 web_bot_auth_disabled`, exit 7)
+and the tenant policy `web_bot_auth.allowed: true` (otherwise `403 policy_denied`, exit 4); see
+[Self-hosting › Signed HTTP requests](../self-hosting.md#signed-http-requests-web-bot-auth).
+
+```text
+pmail http-sign --identity <identity> --url <https-url> [--method <METHOD>] [--expires-in <30-300>]
+                [--component @method|@path|@query]…
+```
+
+| Flag | Meaning |
+|---|---|
+| `--url` | Required. The `https` URL of the request, at most 2,048 characters |
+| `--method` | The request method, in upper case. Signed only with `--component @method` |
+| `--expires-in` | Seconds, 30–300, default 60. Sign just before you send |
+| `--component` | Also sign `@method`, `@path` or `@query` (repeatable). `@authority`, `signature-agent` and `from` are always signed |
+
+It prints the four headers, one `Name: value` line each; `--json` prints the response
+(`headers`, `expires_at`).
+
+```bash
+pmail http-sign --identity bookings@acme.example.com \
+  --url "https://www.brightwell.example/fleet/availability?from=2026-10-12" > signature-headers.txt
+curl -H @signature-headers.txt "https://www.brightwell.example/fleet/availability?from=2026-10-12"
+```
+
+```text
+Signature-Agent: "https://mail.example.com"
+From: bookings@acme.example.com
+Signature-Input: sig1=("@authority" "signature-agent" "from");created=1791547200;expires=1791547260;keyid="poqkLGiymh_W0uP6PZFw-dvez3QJT5SolqXBCW38r0U";alg="ed25519";nonce="e8N7S2MF…";tag="web-bot-auth"
+Signature: sig1=:jdq0SqOwHdyHr9+r5jw3iYZH6aNGKijYp/EstF4RQTQdi5N5YYKrD+mCT1HA1nZDsi6nJKuHxUi/5Syp3rLWBA==:
+```
+
+Assertions and HTTP signatures together are limited to 600 a minute per identity (`429 rate_limited`,
+exit 8). They are counted in `pmail usage daily` but use no plan allowance.
 
 ---
 
@@ -1561,7 +1843,8 @@ pmail export get exp_01JA9N1S7BW7X2M5N6P8R0T1YX --download dsr-1182.zip
 ## Members
 
 Console users of a workspace. The console is the main place to manage them; these commands let you
-provision people from a script. Need `members:manage` (tenant or platform keys).
+provision people from a script. `members list` needs `members:read`; the others need `members:manage`
+(tenant or platform keys).
 
 ### `members list`
 
@@ -1646,8 +1929,10 @@ pmail billing set --tenant brightwell --mode exempt
 ### `usage`
 
 Shows the workspace's billing mode, plan and every allowance (granted, used, remaining, reset time),
-from `GET /v1/usage`. Any key can read its own workspace's usage; another workspace's needs
-`usage:read` (platform keys pass `--tenant`).
+from `GET /v1/usage`. A tenant or identity key reads its own workspace's usage and needs no permission.
+A platform key needs `usage:read` and must name the workspace with `--tenant` (or the profile's
+`tenant`); it never falls back to the default tenant, and without a tenant the API answers
+`400 invalid_request` (exit 7).
 
 ```text
 pmail usage [--tenant <tenant>]
@@ -1659,8 +1944,9 @@ pmail usage
 
 ### `usage daily`
 
-Prints per-day counts (inbound, outbound, sends, triage, search, agentic, AI neurons, storage), at most
-92 days at a time, from `GET /v1/usage/daily`. Needs `usage:read` on a platform or tenant key.
+Prints per-day counts (inbound, outbound, sends, triage, search, agentic, assertions, HTTP signatures,
+AI neurons, storage), at most 92 days at a time, from `GET /v1/usage/daily`. Needs `usage:read` on a
+platform or tenant key; a platform key names the tenant as for [`usage`](#usage).
 
 ```text
 pmail usage daily [--tenant <tenant>] [--from <date>] [--to <date>]
@@ -1688,17 +1974,18 @@ pmail audit --tenant acme --action quarantine.release
 
 ```text
 Deployment   setup · setup ses · deploy · upgrade · doctor · destroy · secrets rotate-master
-Platform     dlq list|redrive · keys rotate thread|link|cursor · jobs start|get · waitlist invite
+Platform     dlq list|redrive · keys rotate thread|link|cursor|web_bot_auth · jobs start|get · waitlist invite
 Profiles     login · config show|set · mcp config
 Tenants      tenants create|list|get|update|suspend|resume
 Identities   identities create|list|get|update|pause|resume|delete|lookup
 Addresses    addresses list|add|promote|retire|delete|test-forwarding
-Domains      domains add|list|get|update|records|verify|probe|health|reprove|remove
+Domains      domains add|list|get|update|records|verify|probe|health|reprove|subscribe|remove
 Sending      send · reply · reply-all · forward · cancel · resolve
 Reading      threads list|get|label|hold|unhold · messages list|get|raw|attachment|attachment-text|label
 Search       search · ask · wait · triage list|rerun · quarantine list|release
 Webhooks     webhooks create|list|get|update|delete|rotate|test|deliveries|replay|verify
 Keys         keys create|list|get|revoke|rotate
+Signing      identity-keys list|create|rotate|revoke · assertions create|verify · http-sign
 Lists        suppressions list|add|remove · lists list|add|remove
 Privacy      erasure create|get|list · export create|get
 Members      members list|invite|remove · invitations revoke
@@ -1706,4 +1993,7 @@ Billing      plans list · billing get|set
 Usage        usage · usage daily · audit
 ```
 
-Members, invitations, plans and billing can also be managed in the console.
+Members, invitations, plans and billing can also be managed in the console. Notification preferences
+(new-mail emails, usage alerts, the daily "needs a person" email) are only in the console, under
+**Settings › Notifications**: they belong to people, not API keys, so there is no command or API
+endpoint for them ([Notifications design](../project/design/notifications.md#2-preferences)).

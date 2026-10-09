@@ -9,7 +9,9 @@ coding agent (or a team) working through it in one pass. Each milestone lists:
 - the gate that must be green before the next milestone starts.
 
 Design documents are binding. When a milestone shows a design is wrong, stop, write an ADR, update the
-design, then continue. Never let code and docs drift.
+design, then continue. Never let code and docs drift. When two pages disagree, `openapi.yaml` wins for
+wire behaviour and the design page wins for internal behaviour
+([Design › Precedence](design/index.md#precedence)).
 
 ## How to work through it
 
@@ -37,7 +39,7 @@ design, then continue. Never let code and docs drift.
 | Phase | What | Elapsed time with AI coding agents |
 |---|---|---|
 | A. Foundation and spikes | M0–M1 | 0.5–1 day. Spikes need a real Cloudflare account and DNS |
-| B. Build | M2–M19, M21–M24, run as parallel tracks after M5 | 3–5 days of agent time, depending on parallelism and review speed |
+| B. Build | M2–M19, M21–M26, run as parallel tracks after M5 | 3–5 days of agent time, depending on parallelism and review speed |
 | C. Live proof | M20: staging deploy, live end-to-end suite, deliverability checks | 2–5 days. DNS propagation, Email Sending onboarding and real-mailbox tests are wall-clock bound |
 | D. Hardening before production traffic | DMARC ramp (`p=none` → `quarantine` → `reject`), Postmaster Tools enrolment, external review | 4–6 weeks of calendar time, mostly waiting, run in parallel with early use |
 
@@ -55,49 +57,64 @@ production with the previous provider.
 
 ## Dependency graph
 
+An arrow means "must be done before".
+
 ```text
 M0 skeleton ─▶ M1 spikes ─▶ M2 core ─▶ M3 api-types ─▶ M4 platform ─▶ M5 worker base
                                                                          │
             ┌──────────────┬──────────────┬──────────────┬──────────────┼──────────────┐
             ▼              ▼              ▼              ▼              ▼              ▼
      M6 identities   M8 webhooks    M16 SDK/CLI    M17 observability  M19 site/release  │
+     and outbox            │                                                          │
             │              │                                                          │
             ▼              │                                                          │
      M7 inbound ◀──────────┘                                                          │
+     and wait                                                                         │
             │                                                                         │
-     ┌──────┴───────┬───────────────┬──────────────┐                                  │
-     ▼              ▼               ▼              ▼                                  │
- M9 outbound   M10 search      M12 triage     M13 domains                            │
-     │              │                              │                                  │
-     │              ▼                              │                                  │
-     │         M11 agentic                         │                                  │
-     └──────┬───────┴──────────────┬───────────────┘                                  │
-            ▼                      ▼                                                  │
-     M14 privacy             M15 MCP ◀────────────────────────────────────────────────┘
-            │                      │
-            └──────────┬───────────┘
-                       ▼
-               M18 quality gates ─▶ M20 staging + live proof ─▶ v1.0
+     ┌──────┴───────┬───────────────┐                                                 │
+     ▼              ▼               ▼                                                 │
+ M9 outbound   M10 search      M12 triage                                             │
+     │              │               │                                                 │
+     ▼              ▼               │                                                 │
+ M13 domains   M11 agentic          │                                                 │
+     │              │               │                                                 │
+     └──────┬───────┴───────┬───────┘                                                 │
+            ▼               ▼                                                         │
+     M14 privacy      M15 MCP ◀───────────────────────────────────────────────────────┘
+            │               │
+            └───────┬───────┘
+                    ▼
+            M18 quality gates ─▶ M20 staging + live proof ─▶ v1.0
 ```
 
-The console, billing and domain-method milestones join the graph like this. Each also feeds M20:
+The console, billing, domain-method, agent-key and notification milestones join the graph like this.
+Each also feeds M20:
 
 ```text
-M6 identities ─▶ M21 console ─▶ M22 billing ─▶ M24 cloud sign-up and sign-in
-                 (M22 also needs M9 and M12)
-M13 domains (and M9 outbound) ─▶ M23 domains on any DNS host   (S10, S11, S12 gate its methods)
+M7, M8, M9, M10, M11, M12, M13, M14 ─▶ M21 console ─▶ M22 billing ─▶ M24 cloud sign-up and sign-in
+   (the console's pages show what these build)        (M22 also needs M9 and M12)
+M9 outbound ─▶ M13 domains ─▶ M23 domains on any DNS host   (S10, S11, S12 gate its methods)
+M5, M6 ─▶ M25 agent signing keys, assertions and signed requests ─▶ M15 MCP (two signing tools)
+                                                                  ─▶ M21 console (keys on the identity page)
+   (S13 gates signed HTTP requests only)
+M9, M10, M21, M22 (and M6's system identity) ─▶ M26 notifications and usage alerts
 ```
 
 After M5, these tracks can run in parallel, each in its own branch and worktree:
 
-- **Track 1:** M6 → M7 → M9;
+- **Track 1:** M6 → M7 → M9 → M13 (domains need the send path for fallback sends and `transport/ses.rs`);
 - **Track 2:** M8;
 - **Track 3:** M16 + M17;
-- **Track 4:** M19.
+- **Track 4:** M19;
+- **Track 5:** M25, once M6 lands (it needs only M5 and M6).
 
-Once M7 lands, M10, M12 and M13 also run in parallel. M23 follows M13 (and M9) on the domains track.
-M21 starts after M6, M22 after M9, M12 and M21, and M24 after M21 and M22. Tracks never edit the same files. Shared files
-(`router.rs`, `wrangler.toml` template, migrations) are changed only by the track that owns them, as
+Once M7 lands, M10 and M12 also run in parallel with M9. M23 follows M13 on the domains track. M21
+starts only after M7–M14 and M25, because its screens (inboxes, search, quarantine, triage, domains,
+webhooks, erasure, identity keys) call their services; M22 starts after M9, M12 and M21, M24 after M21 and
+M22, and M26 after M9, M10, M21 and M22 (it sends through M6's system identity and is fed by M8's
+webhook dispatcher and M12's triage, which come before M21). M15 also waits for M25, whose two signing
+tools it registers. No milestone depends on one that comes later in this graph. Tracks never edit the same files. Shared files
+(`router.rs`, `wrangler.toml` template, `0001_init.sql`) are changed only by the track that owns them, as
 listed per milestone.
 
 ---
@@ -109,12 +126,42 @@ listed per milestone.
 `xtask/`, `.github/workflows/ci.yml`, `deny.toml`, `.cargo/config.toml`, `migrations/d1/`,
 `deploy/wrangler.toml.tmpl`.
 
-**Implements:** the workspace and dependency rules in `AGENTS.md`.
+**Implements:** the workspace and dependency rules in `AGENTS.md`, and the size check of NFR-SEC-2.
+
+### Human prerequisites
+
+A coding agent cannot create these. A person provides each one before the milestone or spike that
+needs it, and stores the credential under the name in the last column. Local values go in the shell or in
+`spikes/.env` (git-ignored); CI values are GitHub Actions secrets on `PILOTAAI/pylota-mail`, in the
+environment named in brackets. Nothing in this table is ever committed.
+
+| Item | Who provides it | Needed by | Secret or config name |
+|---|---|---|---|
+| A Cloudflare account on the Workers Paid plan | Owner (TREFT LTD) | M1 (every spike except S10 and S13), M18 nightly evaluations, M20 | `CLOUDFLARE_ACCOUNT_ID` (local); `PM_CF_ACCOUNT_ID` (written by `pmail setup`); Actions: `PM_EVAL_CF_ACCOUNT_ID`, `STAGING_CLOUDFLARE_ACCOUNT_ID` [`staging`] |
+| The `pylotamail.com` zone in that account (bought 2026-10-09, [Cloud sign-up §2](design/cloud-signup.md#2-hostnames)), plus a separate staging zone apex | Owner | M1 (S2, S7, S9 use a scratch zone or the staging zone), M20 | `PM_PLATFORM_DOMAIN`, `PM_API_HOST`, `PM_CONSOLE_HOST` in `deploy/wrangler.toml` |
+| The setup API token, with the permissions in [Deploy › step 2](../self-hosting.md#2-create-a-cloudflare-api-token) | Owner | M1, M20 | `CLOUDFLARE_API_TOKEN` (local, used by `pmail` and Wrangler); `PM_CF_API_TOKEN` (Worker secret, a separate token with the "Worker token" permissions of that table, stored by the operator with `wrangler secret put`, [Deploy › Domains on Cloudflare](../self-hosting.md)); Actions: `STAGING_CLOUDFLARE_API_TOKEN` [`staging`] |
+| A Workers AI API token for the nightly evaluations | Owner | M18 | Actions: `PM_EVAL_CF_API_TOKEN` (repository secret, Workers AI read only) |
+| A Cloudflare Enterprise account (optional) | Owner, through Cloudflare sales | S10 only | `S10_CLOUDFLARE_ACCOUNT_ID`, `S10_CLOUDFLARE_API_TOKEN` in `spikes/.env`. **S10 may be skipped:** without it `delegated_subdomain` stays off (`PM_CF_SUBDOMAIN_SETUP=off`) and the spike result says "skipped, no Enterprise account" |
+| An AWS account with SES production access in `eu-west-2` (London, decided 2026-10-09), on the à la carte plan | Owner; production access is requested in the AWS console and approved by AWS, which can take a day | S8, S11, then M23 and M20 step 5 | `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, or `AWS_PROFILE` (local); `PM_SES_ACCESS_KEY_ID` and `PM_SES_SECRET_ACCESS_KEY` (Worker secrets, written by `pmail setup ses`); Actions: `STAGING_AWS_ACCESS_KEY_ID`, `STAGING_AWS_SECRET_ACCESS_KEY` [`staging`] |
+| Two real SMTP submission providers (for example a Google Workspace mailbox and a Microsoft 365 mailbox), each with a sending account on a test domain | Owner | S12 | `S12_SMTP_A_HOST`, `S12_SMTP_A_USERNAME`, `S12_SMTP_A_PASSWORD`, and the same for `S12_SMTP_B_*`, in `spikes/.env` |
+| Gmail (Google Workspace) and Microsoft 365 test mailboxes holding only synthetic mail, with API access for the harness | Owner | M20 (the live suite) | Actions: `STAGING_GMAIL_CLIENT_ID`, `STAGING_GMAIL_CLIENT_SECRET`, `STAGING_GMAIL_REFRESH_TOKEN`, `STAGING_M365_TENANT_ID`, `STAGING_M365_CLIENT_ID`, `STAGING_M365_CLIENT_SECRET` [`staging`] |
+| A domain at an external DNS provider (not Cloudflare) and that provider's API token | Owner | M20 step 5 (`live::domains::dns_records_external_host`) | Actions: `STAGING_EXTERNAL_DNS_TOKEN`, `STAGING_EXTERNAL_DOMAIN` [`staging`] |
+| A staging platform key (90-day expiry) | Created by the agent with `pmail keys create` on staging; stored by a person | M20 | Actions: `STAGING_PLATFORM_KEY` [`staging`] |
+| A Stripe account in test mode | Owner | M22 (recorded fixtures), M20 step 11 | `PM_STRIPE_SECRET_KEY` (a `sk_test_` restricted key) and `PM_STRIPE_WEBHOOK_SECRET` (Worker secrets on staging); Actions: `STAGING_STRIPE_SECRET_KEY`, `STAGING_STRIPE_WEBHOOK_SECRET` [`staging`] |
+| A Google OAuth client and a GitHub OAuth app, with redirect URLs on the staging and production console hosts | Owner | M24 (its gate re-reads both providers' documentation), M20 step 10 | `PM_OAUTH_GOOGLE_CLIENT_ID`, `PM_OAUTH_GITHUB_CLIENT_ID` (variables); `PM_OAUTH_GOOGLE_CLIENT_SECRET`, `PM_OAUTH_GITHUB_CLIENT_SECRET` (Worker secrets) |
+| The minisign release key pair, generated offline by a person (`minisign -G`) | Owner | M19 | Secret key: Actions `MINISIGN_SECRET_KEY` and `MINISIGN_PASSWORD` [`release`]. Public key: compiled into `pmail` as the `current` key ([CLI and setup §8.2](design/cli.md#82-signature-and-checksums)); a second key pair becomes `next` before the first rotation |
+| Optional: registration of the production deployment's Web Bot Auth key directory (`https://{PM_API_HOST}/.well-known/http-message-signatures-directory`) with Cloudflare's verified-bot programme (dashboard, "Bot Submission Form", verification method "Request Signature"; [Deploy › Signed HTTP requests](../self-hosting.md#signed-http-requests-web-bot-auth)) | Owner, after M25 ships with S13 passed and `PM_WEB_BOT_AUTH=on` | No milestone or test: signatures verify for any Web Bot Auth verifier without it, and S13 expects the unregistered `401` | None (a dashboard form; nothing to store) |
+| The GitHub repository `PILOTAAI/pylota-mail` (created 2026-10-09), with Actions enabled, the environments `staging` (one required reviewer, `main` and `v*` tags only) and `release` (`v*` tags only), and branch protection on `main` | Owner | M0 | Actions: `CARGO_REGISTRY_TOKEN` [`release`], for `cargo publish`; every other secret above |
+
+A milestone whose prerequisite is missing stops and reports which row is missing. It never substitutes a
+fake for a spike's real provider.
 
 **Acceptance:**
 
 - `cargo test --workspace` passes on an empty test per crate.
-- `cargo xtask build-worker` builds a "hello" Worker to wasm. The size check runs and passes.
+- `cargo xtask build-worker` builds a "hello" Worker to wasm. The size check runs and passes, and from
+  here on enforces NFR-SEC-2 on every pull request: the compressed bundle stays ≤ 10 MiB
+  (`xtask::size_budget`).
 - CI runs these jobs: fmt, clippy, native tests, wasm build, `cargo deny check`, `mdbook build docs`.
 - A CI check fails if any crate other than `platform` depends on `worker`
   (`cargo xtask check-layering`).
@@ -128,18 +175,19 @@ shipped), plus a written result.
 
 | Spike | Prove | Pass criteria | If it fails |
 |---|---|---|---|
-| S1 Bindings smoke | `workers-rs` 0.8.7 can: receive in `#[event(email)]`; send structured mail with `replyTo`, `headers` (In-Reply-To, References, Auto-Submitted, X-*) and attachments (attachment and inline); produce and consume Queues; use DO SQLite with transactions and alarms; query D1 | All calls work from Rust. Returned `messageId` captured | Use raw MIME send (`EmailMessage`) built with `mail-builder` for whichever field is missing |
-| S2 Inbound failure semantics | What the sending MTA sees when `email()` throws, versus `set_reject` | Throwing gives a 4xx temporary failure (sender retries) | Write raw to an in-isolate retry, then fall back to `forward()` to a backup address on the same account. Document in [Inbound](design/inbound.md) |
-| S3 FTS5 in DO SQLite | `contentless_delete=1`, the `trigram` tokenizer, `bm25()` with column weights | All available | Use an external-content table (`fts_docs`). Disable trigram and rely on reference normalisation plus semantic fallback |
-| S4 Wasm budget | Bundle size, cold start, CPU and peak memory parsing a 25 MiB message, `mail-auth` verdicts on the corpus | Compressed bundle ≤ 10 MiB. Cold start under 1 s. A 25 MiB parse under 128 MB peak and inside the CPU limit. DKIM/DMARC verdicts match the reference on the corpus | Stream attachments to R2 before parsing bodies. Split heavy features behind cargo features |
-| S5 MCP over rmcp | Serve MCP Streamable HTTP from the fetch handler using `rmcp` 3.5.1 protocol types (no tokio) | MCP Inspector and Claude Code connect, list tools and call one | Implement the JSON-RPC types locally from the spec (they are small) and keep `rmcp` for tests |
-| S6 Externs and jurisdiction | Vectorize (`upsert`, `query` with metadata filter and namespace, `deleteByIds`) and `AI.toMarkdown` through `wasm-bindgen` externs. DO IDs from `unique_id_with_jurisdiction("eu")` stored and re-addressed with `id_from_string` | Every call works. An EU DO reports EU location | REST fallback for Vectorize (`/vectorize/v2/...`) and `toMarkdown` (`/ai/tomarkdown`) using `PM_CF_API_TOKEN` |
-| S7 Outbound Message-ID | The relationship between the `messageId` that `send()` returns and the `Message-ID` header recipients see | Either a deterministic mapping, or the header learned from a journal copy | Strategy B: hidden journal BCC to `journal+{msg}@{platform}`. The email handler records the header and drops the copy. See [Outbound](design/outbound.md) |
-| S8 SES in wasm | SigV4 signing for SES v2 `SendEmail` (raw) and SNS message signature verification (`SignatureVersion` 2 only; version 1 refused), from Rust in wasm | A real send through SES. A real SNS notification verified, a tampered one refused | SES leaves v1.0: an ADR moves `send_only`, `dns_records` and the SES failover to v1.1 |
-| S9 Event subscriptions | Create an Email Sending event subscription to a queue through the API for one domain. Receive all six event types | Payload fields match the brief. Subscriptions can be created per domain at runtime | Create subscriptions at setup or domain-add time through the CLI only |
-| S10 Child zones | On an Enterprise account, a subdomain-setup child zone accepts Email Routing catch-all to the Worker and Email Sending onboarding, and both work end to end ([Domains on any DNS host §12](design/domain-connections.md#12-spikes)) | Mail to any address at the child apex reaches `email()`; a send is DKIM-aligned | `delegated_subdomain` stays off; `dns_records` covers the case |
-| S11 SES receiving | Rule set, S3 action and topic as specified. The notification shape (including the `objectKey` form) matches the design. S3 `GetObject` with SigV4 from a Worker. A 30 MB message. `user+tag@` routing. The retired-address bounce. The backstop picks up a message whose push failed | All pass in `eu-west-2` | `dns_records` does not ship in v1.0; `send_only` still does |
-| S12 SMTP from a Worker | Ports 465 and 587 with `StartTls` against two real providers. The certificate host name is checked (a wrong-name certificate is refused). Timeouts and the uncertain window behave as designed | All pass | `smtp_relay` does not ship in v1.0 |
+| S1 Bindings smoke | From Rust with `worker` 0.8.7, through the `platform::export_worker!` entry glue (which replaces `#[event]` and `#[durable_object]`, see [Rust workspace](design/rust-workspace.md#2-crate-responsibilities-and-allowed-dependencies)): receive an email event and read `from`, `to`, headers and the raw stream; send with the `send_email` binding's structured `send()` including `replyTo`, `headers` (`In-Reply-To`, `References`, `Auto-Submitted`, `X-*`) and attachments (`attachment` and `inline` with `contentId`); produce and consume Queues with `delay_seconds` and `retry_with_options`, and confirm that `Message::timestamp()` is unchanged across retries; DO SQLite with the `transactionSync` extern (a thrown error rolls back) and alarms; D1 `batch`; a multi-statement request to the D1 query API (`POST /accounts/{a}/d1/database/{id}/query`); and the response of the local `wrangler dev` email endpoint to a `setReject` ([Testing §6.4](design/testing.md#64-injecting-inbound-mail)) | Every call works from Rust. The returned `messageId` is captured. A rolled-back transaction leaves no rows. A multi-statement D1 query-API request is atomic: when its last statement fails, none of the earlier statements' rows remain | Raw MIME send (`EmailMessage`) built with `mail-builder` for any missing structured field. If the entry glue cannot replace the macros: an ADR allowing exactly one file, `crates/worker/src/entry.rs`, to use them ([Rust workspace §2](design/rust-workspace.md#2-crate-responsibilities-and-allowed-dependencies)). If the D1 query API is not atomic: every migration file is made re-runnable and a CI lint enforces it ([CLI and setup §8.5](design/cli.md#85-d1-migrations)). **`transactionSync` has no fallback; this is an accepted risk.** The planned path is a `wasm-bindgen` call to `ctx.storage.transactionSync`, which Cloudflare documents with no restriction on the calling method beyond a SQLite-backed object ([SQLite storage API](https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/), read 2026-10-09), so any JS method of the class, including the glue's, may call it. If S1 shows otherwise, the build stops and an ADR is written before M4 continues. The owner accepted this risk on 2026-10-09 |
+| S2 Inbound failure semantics | What the sending MTA sees when `email()` throws, versus `setReject` (documented as a permanent error); which `Authentication-Results` headers reach the handler | Throwing yields a 4xx temporary failure and the sender retries. The exact SMTP reply text for both cases is recorded. Record which `Authentication-Results` authserv-id Cloudflare stamps on delivered mail (setup later writes it to `PM_TRUSTED_AUTHSERV_ID`, [Inbound › Authentication verdict](design/inbound.md#authentication-verdict)) | **Throw only.** The handler keeps its in-handler R2 retries (three attempts) and then throws, as designed, whatever the sender is shown; the spike result records the observed reply in [Inbound](design/inbound.md#interface). There is no `forward()` to a backup address: setup registers no Email Routing destination address ([Identities and domains › Cloudflare API token](design/identity-domains.md#cloudflare-api-token-permissions)), so none exists to forward to |
+| S3 FTS5 in DO SQLite | `content='', contentless_delete=1`, the `trigram` tokenizer, `bm25()` with six column weights, `DELETE FROM fts WHERE rowid = ?`, and renaming an FTS5 table (for the index swap in [Search](design/search.md)) | All work on the deployed runtime, not only on local workerd | External-content table `fts_docs` ([Data model](design/data-model.md)); disable trigram and rely on reference normalisation plus semantic fallback; without rename, the swap rebuilds `fts` in place |
+| S4 Wasm budget | Bundle size, cold start, CPU time and peak memory when parsing and verifying a 25 MiB message and a 40 MB message from the SES source ([N5](edge-cases.md)), and `mail-auth` verdict parity on the corpus | Compressed bundle ≤ 10 MiB (NFR-SEC-2), cold start under 1 s, both messages parsed under 128 MB peak and inside the CPU limit, DKIM and DMARC verdicts equal the reference implementation on every corpus message | Write attachments to R2 before parsing bodies; move heavy features behind cargo features; switch the release profile to `opt-level = "z"` |
+| S5 MCP over rmcp | Streamable HTTP served from `fetch` using `rmcp` 3.5.1 protocol types, without a tokio runtime. Note: `rmcp` 3.5.1 declares `tokio` (features `sync`, `macros`, `rt`, `time`) as a non-optional dependency (crates.io metadata, read 2026-10-09) | MCP Inspector and Claude Code connect, list tools and call one; the wasm build never starts a tokio runtime or timer, and the bundle stays inside the S4 budget | Implement the JSON-RPC types locally in `worker`; keep `rmcp` as a native dev-dependency for client tests. **Taken in advance** ([ADR 0009](adr/0009-local-mcp-protocol-types.md)): M1 still runs S5 against the local types to record the Inspector and Claude Code result |
+| S6 Externs and jurisdiction | Vectorize `upsert`, `query` (namespace and metadata filter), `deleteByIds`, `getByIds` and `describe()` (the vector count); `AI.run` with the `gateway` option, including the `bge-m3` output shape, the reranker's score form and the agent model's chat-completions schema ([Search](design/search.md)); `AI.toMarkdown` (including whether PDF output marks page boundaries) — all through `wasm-bindgen` externs; DO IDs from `unique_id_with_jurisdiction("eu")` stored as strings and re-addressed with `id_from_string` | Every call works and each recorded shape matches the design, or the design is updated with the observed one. An EU object reports the EU jurisdiction (`ctx.id.jurisdiction`) | REST fallbacks (`/vectorize/v2/…`, `/ai/run`, `/ai/tomarkdown`) using `PM_CF_API_TOKEN`, which then becomes required ([Rust workspace §7](design/rust-workspace.md#7-wasm-bindgen-externs)); one page per document when `toMarkdown` does not mark pages. If an EU object does not report the EU jurisdiction, the build stops for an owner decision, because FR-PRV-1 depends on it |
+| S7 Outbound Message-ID | The relationship between the `messageId` that `send()` returns and the `Message-ID` header recipients see | Either a deterministic mapping (strategy A), or the header learned from a journal copy (strategy B) | Strategy B: a hidden journal BCC to `journal+{message ulid}.{identity ulid}@{PM_PLATFORM_DOMAIN}`; the email handler records the header and drops the copy ([Outbound](design/outbound.md#message-id-of-outbound-mail-spike-s7)). If a journal copy never arrives, that message matches replies by thread token and provider ID only |
+| S8 SES in wasm | SigV4 signing for SES v2 `SendEmail` with raw content, and SNS message signature verification (`SignatureVersion` 2; version 1 is refused), from Rust in wasm | A real send through SES in `eu-west-2`; a real SNS notification verified, and a tampered one rejected | SES leaves v1.0: an ADR moves `send_only`, `dns_records`, `smtp_relay` with `inbound: ses` and the SES failover to v1.1 |
+| S9 Event subscriptions and onboarding APIs | Create an Email Sending event subscription to `pm-delivery-events` through the API for one domain (source type `email.sending` with `zone_id` and `domain`; this source shape appears in Wrangler's source, not yet in the API reference), receive all six event types, delete it. Onboard a zone **apex** and a subdomain through `POST /zones/{zone_id}/email/sending/subdomains`, and enable routing on a subdomain through `POST /zones/{zone_id}/email/routing/dns` with `name`. A literal routing rule whose `worker` action value is the script name `pylota-mail` delivers to the Worker | Payload fields match [Outbound › Delivery events](design/outbound.md#delivery-events); subscriptions can be created per domain at runtime with `PM_CF_API_TOKEN`; apex and subdomain onboarding both work through the API | For `cloudflare_zone` and `nameservers`, the API creates the domain without a subscription, marks it `delivery_events: "manual"`, and returns its records with `details.action = "run pmail domains subscribe <domain>"`; delivery events start once that command has run ([Identities and domains › Kind `zone`](design/identity-domains.md#kind-zone), test `it::domains::s9_manual_delivery_events`). Any onboarding step the API cannot do is listed by `pmail domains add` as a dashboard step and checked by `pmail doctor` |
+| S10 Child zones | On an Enterprise account, a subdomain-setup child zone accepts Email Routing catch-all to the Worker and Email Sending onboarding, and both work end to end. Optional: skipped when no Enterprise account is available ([Build plan › Human prerequisites](#human-prerequisites)) | Mail to any address at the child apex reaches `email()`; a send is DKIM-aligned | `delegated_subdomain` stays off; `dns_records` covers the case |
+| S11 SES receiving | Rule set, S3 action and topic as specified; the notification shape, including the `objectKey` form; S3 `GetObject` with SigV4 from a Worker; a 39 MB message ([N5](edge-cases.md)); `user+tag@` routing; the retired-address bounce; the backstop picks up a message whose push failed | All pass in `eu-west-2` | `dns_records` and `smtp_relay` with `inbound: ses` do not ship in v1.0; `send_only` still does |
+| S12 SMTP from a Worker | Ports 465 and 587 with `StartTls` against two real providers; the certificate host name is checked (a wrong-name certificate is refused); timeouts and the uncertain window behave as designed | All pass | `smtp_relay` does not ship in v1.0 |
+| S13 Web Bot Auth format | A request signed by `core::httpsig` with the deployment key (`Signature-Agent` as a quoted structured-field string; `Signature-Input` covering `@authority`, `signature-agent` and `from`, with `tag="web-bot-auth"`, `keyid` = the JWK thumbprint, `created`, `expires` and a 64-byte nonce), sent to `https://crawltest.com/cdn-cgi/web-bot-auth`, which answers `401` for a well-formed message with an unknown key, `200` for a known key that verifies and `400` otherwise ([Web Bot Auth](https://developers.cloudflare.com/bots/reference/bot-verification/web-bot-auth/), read 2026-10-09). Needs no Cloudflare account | `401` before the key directory is registered (well-formed, unknown key), never `400` | Signed HTTP requests stay off in v1.0: `PM_WEB_BOT_AUTH` cannot be turned on ([Agent signing keys](design/agent-keys.md#5-signed-http-requests-web-bot-auth)). Agent assertions are unaffected |
 
 **Gate:** every spike has a written result. Design documents are updated where a fallback was taken.
 
@@ -147,7 +195,7 @@ shipped), plus a written result.
 
 ## M2 · Core logic (`crates/core`, no I/O)
 
-**Files:** `crates/core/src/{ids.rs, address.rs, thread_token.rs, mime/, sanitize.rs, text.rs, quote.rs, refs/, classify.rs, auth.rs, trust.rs, attach.rs, query/, fusion.rs, citations.rs, triage_rules.rs, policy.rs, dns.rs, domain_fsm.rs, injection.rs}`,
+**Files:** `crates/core/src/{ids.rs, address.rs, thread_token.rs, thread.rs, reply.rs, mime/, sanitize.rs, text.rs, quote.rs, refs/, classify.rs, auth.rs, trust.rs, attach.rs, query/, fusion.rs, citations.rs, triage_rules.rs, policy.rs, dns.rs, domain_fsm.rs, injection.rs}`,
 `crates/conformance/corpus/`, `fuzz/`.
 
 **Implements:** the parsing and decision logic behind FR-ADR-6/7, FR-IN-3, 6, 7 and 9, FR-THR-1,
@@ -157,7 +205,8 @@ FR-SRCH-3/4/8 (verifier), FR-TRI-2, FR-DOM-4/5 (the pure state machine).
 
 - Unit tests for every `core::` row in sections A–H of the edge-case register (section N's are in M23):
   A1–A4, A12, B2, B4–B11, B13, C1, C2,
-  C8, D1–D3, D6, D8–D10, E1, F1, F5, F9, F11, H2, H3, H7.
+  C8, D1–D3, D6, D8, D9, E1, F1, F5, F9, F11, H2, H3, H7. (D10's test is `it::inbound::d10_token_bruteforce`,
+  which needs the mailbox's `rate_windows`, so it belongs to M7.)
 - A property test for the query parser: every input parses or returns `invalid_query`, and every
   compiled FTS expression contains only quoted terms.
 - A property test for thread tokens: round-trip works, and any bit flip fails verification.
@@ -206,13 +255,22 @@ Cloudflare implementations and in-memory fakes for native tests.
 
 ## M5 · Worker base: routing, auth, tenants, keys
 
-**Files:** `crates/worker/src/{lib.rs, router.rs, auth.rs, errors.rs, ratelimit.rs, request_id.rs, keyring.rs, handlers/{meta.rs, tenants.rs, keys.rs, audit.rs, usage.rs}, db/{mod.rs, tenants.rs, keys.rs, audit.rs, idempotency.rs, signing_keys.rs}}`,
-`migrations/d1/0001_init.sql` (all tables from [Data model](design/data-model.md)),
+**Files:** `crates/worker/src/{lib.rs, router.rs, auth.rs, errors.rs, ratelimit.rs, request_id.rs, keyring.rs, handlers/{meta.rs, tenants.rs, keys.rs, audit.rs}, db/{mod.rs, tenants.rs, keys.rs, audit.rs, idempotency.rs, signing_keys.rs}, quota/mod.rs}`,
+`crates/core/src/{keys.rs, crypto.rs}` (key format and the sealing envelope, pure)
+(`TenantQuota` as a stub class: `Init`, the owner check and `schema_version` only; later milestones add its requests),
+`migrations/d1/0001_init.sql` (every D1 table and index in [Data model](design/data-model.md), including those that
+later milestones use: the console, billing, sign-up and domain-method tables and columns),
 `crates/worker/tests/` harness (`cargo xtask itest`).
 
-**Implements:** FR-TEN-1/2/3, FR-KEY-1/2/3, the error envelope, rate limits, request IDs,
+**Implements:** FR-TEN-1/2/3, FR-KEY-1/2/3, NFR-SEC-1 (the cross-tenant suite), the error envelope, rate limits, request IDs,
 idempotency for non-mail POSTs, and the thread and link keyring (`signing_keys`, created on first use;
 [Security](design/security.md#62-rotation-procedures)).
+
+**Tenants without owner or billing behaviour.** `POST /v1/tenants` accepts `owner` and `billing` as
+[REST API](../reference/api.md) specifies, validates them, and stores them: the owner's `users` and
+`members` rows and the `billing_accounts` row. Nothing acts on them yet. The owner's sign-in link is sent
+once M21 lands, and plan checks run once M22 lands; until then holds always succeed, as in billing mode
+`disabled`. Each tenant gets its `TenantQuota` object (`quota_do_id`, then `QuotaRequest::Init`).
 
 **Acceptance:**
 
@@ -220,11 +278,23 @@ idempotency for non-mail POSTs, and the thread and link keyring (`signing_keys`,
 - A cross-tenant suite skeleton: for every registered route, a key from another tenant gets an
   indistinguishable `404`. The suite enumerates the router table, so a new route without a test fails.
 - `it::keys::j6_revoke_rotate`, with `GET /v1/audit-events?actor_key_id=`.
-- The keyring creates one key per purpose under concurrency and opens it with `PM_MASTER_KEY`.
-- Idempotent `POST /v1/tenants` replays and conflicts.
-- `/health`, `/v1/me` and `/openapi.json` are served.
+- The keyring creates one key per purpose under concurrency and opens it with `PM_MASTER_KEY`
+  (`core::keys::format_round_trip`, `core::crypto::envelope_round_trip`).
+- Idempotent `POST /v1/tenants` replays and conflicts; `owner` and `billing` are stored but send no mail
+  and change no limit; the tenant's `TenantQuota` answers `Init` and refuses a mismatched owner.
+- `/health`, `/v1/me`, `/openapi.json` and `/.well-known/security.txt` are served (the last as
+  [Security](design/security.md) specifies, from `PM_SECURITY_CONTACT`).
+- J6 (`it::keys::j6_revoke_rotate`, above).
+- NFR-SEC-1: the cross-tenant suite (`it::security::cross_tenant_matrix`) finds 0 cross-tenant reads or
+  writes. Every later milestone extends it with its routes, and it must stay at 0.
 
-**Owner of shared files from here:** Track 1 owns `router.rs` and migrations. Other tracks add routes
+**One migration until v1.0.** `0001_init.sql` holds every table until v1.0 is released. No later
+milestone adds a D1 migration: M6–M26 change code only. A milestone that finds a missing column or table
+fixes `0001_init.sql` itself (no deployed database exists before M20) and updates
+[Data model](design/data-model.md) in the same pull request. Migrations `0002_…` onwards start after v1.0,
+under the expand-then-contract rule ([CLI and setup §8.5](design/cli.md#85-d1-migrations)).
+
+**Owner of shared files from here:** Track 1 owns `router.rs` and `0001_init.sql`. Other tracks add routes
 through `handlers/<area>.rs` plus one registration line, reviewed by Track 1.
 
 ---
@@ -233,71 +303,93 @@ through `handlers/<area>.rs` plus one registration line, reviewed by Track 1.
 
 **Files:** `handlers/{identities.rs, addresses.rs, domains.rs (platform domain read only)}`,
 `db/{identities.rs, addresses.rs, domains.rs}`, `mailbox/mod.rs` (IdentityMailbox shell with
-schema-on-wake), `crons/retire.rs`.
+schema-on-wake), `mailbox/outbox.rs` (the transactional outbox, its dispatch alarm, the `event_index`
+writes and the `pm-webhooks` producer; [Webhooks and events](design/webhooks.md#transactional-outbox)),
+`crons/retire.rs`, and the system identity's mailbox minting in the every-minute cron.
 
-**Implements:** FR-IDN-1–4, FR-ADR-1–7, FR-DOM-1 (platform).
+**Implements:** FR-IDN-1–4, FR-ADR-1–7, FR-DOM-1 (platform), the outbox and event index, and the system
+identity ([Identities and domains](design/identity-domains.md#the-system-identity)).
 
-**Acceptance:** A5, A7 (pause part), A8, A11, A12, A13, J9, plus promote, retire and rollback flows
-with `identity.address_*` events (to outbox).
+**Acceptance:** A5, A7 (pause part), A8, A11, A12, A13, A14, J9, plus promote, retire and rollback
+flows whose `identity.*` events reach the outbox, `event_index` and a `pm-webhooks` message (consumed
+once M8 lands); a crash between commit and dispatch repeats the dispatch, never loses it. The system
+identity is never listed and refuses tenant keys.
 
 ---
 
 ## M7 · Inbound (Track 1)
 
-**Files:** `email.rs` (handler), `consumers/inbound.rs`, `mailbox/{ingest.rs, threads.rs, messages.rs, attachments.rs, outbox.rs, schema/v1.sql}`,
-`handlers/{threads.rs, messages.rs, quarantine.rs}`, `consumers/index.rs` (attachment text only at
+**Files:** `email.rs` (handler), `consumers/inbound.rs`, `mailbox/{ingest.rs, threads.rs, messages.rs, attachments.rs, schema/v1.sql}`,
+`handlers/{threads.rs, messages.rs, quarantine.rs, wait.rs}`, `consumers/index.rs` (attachment text only at
 this stage).
 
-**Implements:** FR-IN-1–9, FR-THR-1/2, read APIs, quarantine and release, outbox and event index.
+**Implements:** FR-IN-1–9, FR-THR-1/2, NFR-REL-1/2, read APIs, quarantine and release, and `wait`
+([Inbound › The `wait` handler](design/inbound.md#the-wait-handler-e4)), which is P0 because quarantine
+rule 5 (E5) depends on its registrations.
 
 **Acceptance:** A2, A6, A9, A10 (inbound part), B1 (documented), B3, B12, B14, C1, C3, C7 (inbound
-matching), D4, D5, D7, D9, D10, E5, J1, J2, J7, plus loopback L3, and every `conf::` corpus case
-ingested end to end through workerd.
+matching), D4, D5, D7, D9, D10, E4 (`it::wait::e4_*`), E5, J1, J2, J7, plus loopback L3, and every
+`conf::` corpus case ingested end to end through workerd. NFR-REL-1: under the J1, J2 and J7 fault
+injections `inbound_lost_total` and `inbound_raw_missing_total` stay 0. NFR-REL-2: the inbound SLI
+counters of [Observability §4](design/observability.md#4-service-level-objectives) are emitted for accepted, staged and
+temporarily failed mail.
 
 ---
 
 ## M8 · Webhooks (Track 2)
 
-**Files:** `handlers/webhooks.rs`, `consumers/webhooks.rs`, `webhooks/{sign.rs, ssrf.rs, client.rs, replay.rs}`, `crons/outbox_sweep.rs`.
+**Files:** `handlers/webhooks.rs`, `consumers/webhooks.rs`, `webhooks/{sign.rs, client.rs, replay.rs, payloads.rs}`,
+`crons/outbox_sweep.rs`, the SSRF guard `crates/core/src/ssrf.rs` (pure) and `crates/worker/src/net.rs` (guarded HTTP)
+([Webhooks](design/webhooks.md), [Security § 9](design/security.md#9-ssrf-controls)).
 
-**Implements:** FR-WH-1–5.
+**Implements:** FR-WH-1–5, NFR-REL-4.
 
 **Acceptance:**
 
 - Signature vectors from the Standard Webhooks spec verify.
 - Rotation sends two signatures.
 - The SSRF table refuses loopback, RFC 1918, link-local, CGNAT, `::1`, `fc00::/7` and
-  `169.254.169.254`, and does not follow redirects.
+  `169.254.169.254`, and does not follow redirects (`core::ssrf::refuses_private_ranges`).
 - J4: a time-controlled harness checks the retry schedule.
 - Replay.
 - Auto-disable on `410` and on 100 consecutive failures.
+- NFR-REL-4: the retry schedule reaches 24 hours within its 13 attempts, and `webhook_delivery_latency_ms`
+  and `webhook_dead_total` are emitted for the SLI.
 
 ---
 
 ## M9 · Outbound and delivery (Track 1, after M7)
 
 **Files:** `handlers/send.rs`, `mailbox/{submit.rs, compose.rs, locks.rs, deliveries.rs, idempotency.rs}`,
+`crates/core/src/compose.rs` (MIME composition, pure),
 `transport/{mod.rs, cloudflare.rs, simulator.rs, loopback.rs}`, `consumers/{outbound.rs, delivery.rs}`,
-`quota/mod.rs` (TenantQuota DO), `handlers/suppressions.rs`, `db/suppressions.rs`, `mailbox/alarms.rs`
-(the claim, dispatch, lock and reconciliation purposes; no cron is involved).
+`quota/mod.rs` (extends the M5 stub with `Reserve`, `Release`, `RecordOutcome` and `RecordUsage`),
+`handlers/{suppressions.rs, links.rs}` (signed links, `GET /v1/links/{token}`, with kid verification),
+`db/suppressions.rs`, `mailbox/alarms.rs` (the claim, dispatch, lock and reconciliation purposes; no cron
+is involved).
 
-**Implements:** FR-OUT-1–12, FR-DLV-1–5.
+**Implements:** FR-OUT-1–12, FR-DLV-1–5, NFR-PERF-1/2.
 
-**Acceptance:** A7, A8, A10, C2, C4, C6, D6 (exchange cap), E2, E3, E8, G1–G4, G6–G11, K3,
-L1, L2, L4. Also: the simulator matrix drives every status, an uncertain send is reconciled by a
-later provider event, and `?dry_run=true` returns the recipient plan without storing anything.
+**Acceptance:** A7, A8, A10, C2, C4, C6, D6 (exchange cap), E2, E3, E8, G1–G11 (G5 with signed links),
+K3, L1, L2, L4. Also: the simulator matrix drives every status, an uncertain send is reconciled by a
+later provider event, `?dry_run=true` returns the recipient plan without storing anything, and cancel
+works only while a message is `queued` and unclaimed (`it::send::cancel_queued`, FR-OUT-11).
+NFR-PERF-1 (`it::bench::send_api_p95`) and NFR-PERF-2 (`it::bench::queue_to_transport_p95`) report their
+figures; CI warns above the targets.
 
 ---
 
 ## M10 · Search (after M7)
 
 **Files:** `search/{mod.rs, keyword.rs, semantic.rs, hybrid.rs, rerank.rs, facets.rs, cursor.rs, tenant.rs, contacts.rs, related.rs}`,
-`mailbox/search.rs`, `consumers/index.rs` (chunk, embed, upsert), `handlers/{search.rs, contacts.rs, wait.rs}`, `crons/index_reconcile.rs`.
+`mailbox/search.rs`, `consumers/index.rs` (chunk, embed, upsert), `handlers/{search.rs, contacts.rs}`, `crons/index_reconcile.rs`.
 
-**Implements:** FR-SRCH-1–7, 10 and 11 (index side), plus contacts, related and `wait`.
+**Implements:** FR-SRCH-1–7, 10 and 11 (index side), plus contacts and related; NFR-PERF-3/4/5.
 
-**Acceptance:** E4, F3–F8, F14, F15. Keyword p95 ≤ 200 ms on a 50,000-message synthetic mailbox in
-workerd (a benchmark test that reports the figure, with a CI warning threshold).
+**Acceptance:** F2 (`it::auth::f2_permission`, now that search exists), F3–F8, F14, F15. NFR-PERF-3:
+keyword p95 ≤ 200 ms on a 50,000-message synthetic mailbox in workerd (`it::bench::keyword_p95`, which
+reports the figure, with a CI warning threshold). NFR-PERF-4 (`it::bench::hybrid_p95`) and NFR-PERF-5
+(`it::bench::tenant_fanout_p95`) report theirs the same way.
 
 ---
 
@@ -305,7 +397,7 @@ workerd (a benchmark test that reports the figure, with a CI warning threshold).
 
 **Files:** `search/agentic/{mod.rs, planner.rs, tools.rs, judge.rs, answer.rs, sse.rs, prompts.rs}`.
 
-**Implements:** FR-SRCH-8/9.
+**Implements:** FR-SRCH-8/9, NFR-PERF-6.
 
 **Acceptance:**
 
@@ -313,7 +405,8 @@ workerd (a benchmark test that reports the figure, with a CI warning threshold).
 - Deterministic tests with a scripted fake model: plan, two searches, refine, answer, then a
   verifier removal.
 - An SSE stream test.
-- Budget enforcement by steps and by time.
+- Budget enforcement by steps and by time, and the tenant daily cap through `QuotaRequest::CountAgentic`.
+- NFR-PERF-6: `it::bench::agentic_p95` reports p95 and first-evidence time against 8 s and 1.5 s.
 
 ---
 
@@ -332,17 +425,21 @@ workerd (a benchmark test that reports the figure, with a CI warning threshold).
 
 ---
 
-## M13 · Domains (after M7; SES depends on S8)
+## M13 · Domains (after M7 and M9; SES depends on S8)
 
-**Files:** `domains/{mod.rs, cloudflare_api.rs, ses_api.rs, records.rs, monitor.rs (DomainMonitor DO), fallback.rs}`,
+**Files:** `domains/{mod.rs, cloudflare_api.rs, ses_api.rs, ses_control.rs (SesControl DO, the SES
+token bucket), records.rs, monitor.rs (DomainMonitor DO), fallback.rs}`,
 `handlers/domains.rs` (full, including `PATCH /v1/domains/{domain_id}` for the transport), `transport/ses.rs`,
-`consumers/ses_events.rs` (the `POST /hooks/ses` SNS endpoint).
+`consumers/ses_events.rs` (the `POST /hooks/ses` SNS endpoint), and CLI `pmail domains subscribe`.
 
 **Implements:** FR-DOM-2–6.
 
 **Acceptance:**
 
-- H1–H7, G7, J5 (`it::domains::transport_patch`).
+- H1–H7, G7, and the API part of J5 (`it::domains::transport_patch`). J5's live part,
+  `live::transport::j5_ses_failover`, runs in M20.
+- The spike S9 fallback path, whatever S9's result (`it::domains::s9_manual_delivery_events`,
+  `cli::domains::subscribe_manual`), and the SES control-plane budget (`it::ses::control_plane_rate`).
 - `it::domains::*` with a DNS fake that can remove a record, add a conflicting record, or move the NS.
 - The fallback send carries `sent_via_fallback` and keeps the thread token.
 - Recovery leaves fallback threads pinned.
@@ -355,9 +452,9 @@ workerd (a benchmark test that reports the figure, with a CI warning threshold).
 `handlers/domains.rs` (methods, `PATCH` with `smtp`, `probe`), `handlers/addresses.rs`
 (`test-forwarding`), `handlers/hooks_ses.rs` (`POST /hooks/ses/inbound`), `transport/smtp.rs`,
 `inbound/sources/{routing.rs, ses.rs}`, `consumers/inbound.rs` (the SES source), `crons/ses_backstop.rs`,
-`domains/monitor.rs` (method health rows, retired-address rules, probe and forwarding tokens), a
-migration for the new `domains` columns, `ses_ingest`, `addresses.ses_bounce_rule` and
-`addresses.forwarding`; CLI `pmail setup ses`, `pmail domains add --method`, `pmail domains update
+`domains/monitor.rs` (method health rows, retired-address rules, probe and forwarding tokens); no
+migration (the `domains` method columns, `ses_ingest`, `addresses.ses_bounce_rule` and
+`addresses.forwarding` are already in `0001_init.sql`); CLI `pmail setup ses`, `pmail domains add --method`, `pmail domains update
 --smtp-…`, `pmail domains probe` and `pmail addresses test-forwarding`.
 
 **Implements:** FR-DOM-7–12, [Domains on any DNS host](design/domain-connections.md).
@@ -384,22 +481,25 @@ for `delegated_subdomain` (which also stays behind `PM_CF_SUBDOMAIN_SETUP`). `cl
 ## M14 · Privacy (after M9, M10)
 
 **Files:** `jobs/{mod.rs (JobRunner DO), erasure.rs, retention.rs, export.rs, reembed.rs, reparse.rs, reindex.rs, backup.rs}`,
-`handlers/{erasure.rs, exports.rs, holds.rs, links.rs}`, `crons/retention.rs`.
+`handlers/{erasure.rs, exports.rs, holds.rs}`, `crons/retention.rs`.
 
-**Implements:** FR-PRV-1–6, FR-IDN-4.
+**Implements:** FR-PRV-1–6, FR-IDN-4, NFR-PRV-1.
 
-**Acceptance:** F6, I1–I7, J3, plus every erasure scope with receipt counts and empty probes, signed
-links (`GET /v1/links/{token}`) with kid verification, the optional backup copy
-(`it::retention::backup_copy`), and `it::logs::i5_no_content_in_logs`, which greps captured Worker logs
-for any test-message body string and any test address.
+**Acceptance:** F6, I1–I7, J3, plus every erasure scope with receipt counts and empty probes (identity and
+tenant scope also delete `identity_keys` and write `key_tombstones`; with M25 this is O7), the
+optional backup copy (`it::retention::backup_copy`), and `it::logs::i5_no_content_in_logs`, which greps
+captured Worker logs for any test-message body string and any test address. NFR-PRV-1: in a
+time-controlled harness every erasure scope completes within 24 hours, and a step that keeps failing
+still produces a receipt (`it::erasure::step_retry_and_fail`).
 
 ---
 
-## M15 · MCP server (after M10, M11)
+## M15 · MCP server (after M10, M11, M25)
 
 **Files:** `mcp/{mod.rs, transport.rs, tools.rs, schemas.rs, prompts.rs}`.
 
-**Implements:** FR-MCP-1 and the tool list in [MCP reference](../reference/mcp.md).
+**Implements:** FR-MCP-1 and the tool list in [MCP reference](../reference/mcp.md), including the two
+signing tools of M25 (`mail_sign_assertion`, `mail_sign_http_request`).
 
 **Acceptance:**
 
@@ -416,11 +516,14 @@ for any test-message body string and any test address.
 
 **Files:** `crates/sdk/src/*`, `crates/cli/src/{main.rs, config.rs, output.rs, cloudflare/, commands/*}`.
 
-**Implements:** FR-SDK-1, FR-CLI-1, FR-OPS-1–3.
+**Implements:** FR-SDK-1, FR-CLI-1, FR-OPS-1–3. The SDK's `verify_assertion` and the CLI commands
+`identity-keys`, `assertions` and `http-sign` land with M25's endpoints.
 
 **Acceptance:**
 
-- SDK integration tests run against the workerd harness for every endpoint.
+- SDK integration tests run against the workerd harness for every endpoint, and
+  `sdk::coverage::every_operation` proves the SDK has one method per `openapi.yaml` operation (FR-SDK-1,
+  [Rust workspace §11](design/rust-workspace.md#11-the-rust-sdk-fr-sdk-1)).
 - `pmail setup` is idempotent: it runs twice against a recorded Cloudflare API fake with no
   duplicate resources.
 - `pmail deploy` verifies checksums and refuses a tampered bundle.
@@ -431,18 +534,27 @@ for any test-message body string and any test address.
 
 ## M17 · Observability and operations (Track 3)
 
-**Files:** `obs/{log.rs, metrics.rs}`, `ops/alerts.rs`, `consumers/dlq.rs`, `handlers/platform.rs`
+**Files:** `crates/worker/src/{log.rs, metrics.rs}`, `ops/alerts.rs`, `consumers/dlq.rs`, `crates/core/src/slo.rs`
+(alert rules, pure), `handlers/platform.rs`
 (the platform API: `GET /v1/platform/dlq`, `POST /v1/platform/dlq/{dlq_id}/redrive`,
-`POST|GET /v1/platform/jobs`, `POST /v1/platform/keys/{purpose}/rotate`, all `platform:ops`), CLI
+`POST /v1/platform/jobs`, `GET /v1/platform/jobs/{job_id}`, `POST /v1/platform/keys/{purpose}/rotate`, all
+`platform:ops`), CLI
 `dlq list|redrive`. There is no internal-only handler: the CLI uses the public platform API.
 
-**Implements:** FR-OPS-4 and [Observability](design/observability.md).
+**Implements:** FR-OPS-4, NFR-OPS-2, NFR-COST-1 and [Observability](design/observability.md).
 
 **Acceptance:**
 
 - J8, J3 (job start through the API), `it::secrets::signing_key_rotation`, `it::ops::provider_quota_80`.
 - Log scrubbing (part of I5).
 - Every metric in the design is emitted by at least one test path.
+- Every SLO of [Observability §4](design/observability.md#4-service-level-objectives) is computed from emitted metrics
+  (`it::ops::slo_from_metrics`): NFR-REL-1–4, NFR-PERF-1–6 and NFR-PRV-1.
+- NFR-OPS-2: `it::ops::restore_rebuilds_ledger`, and the restore runbook that `live::ops::restore_drill`
+  runs in M20.
+- NFR-COST-1: the generated `wrangler.toml` declares no always-on compute (no Containers, no binding
+  that bills while idle beyond storage), checked by `xtask::template_no_idle_compute`; the idle-cost
+  review runs in M20.
 
 ---
 
@@ -474,54 +586,62 @@ regression of more than 1 point.
 
 ---
 
-## M21 · Console and workspaces (after M6; uses M8–M14 services)
+## M21 · Console and workspaces (after M7–M14 and M25, whose services its pages use)
 
 **Files:** `crates/worker/src/console/{mod.rs, router.rs, session.rs, signin.rs, csrf.rs, layout.rs (maud), pages/*.rs}`,
-`crates/worker/src/members/{mod.rs, invitations.rs, roles.rs}`, `handlers/members.rs`, migrations for
-`users`, `members`, `invitations`, `login_tokens`, `sessions`.
+`crates/worker/src/members/{mod.rs, invitations.rs, roles.rs}`, `handlers/members.rs`. No migration:
+`users`, `members`, `invitations`, `login_tokens` and `sessions` are in `0001_init.sql`.
 
-**Implements:** FR-CON-1–7, the console screens in [Console design](design/console.md).
+**Implements:** FR-CON-1–7, NFR-CON-1, the console screens in [Console design](design/console.md),
+including identity-key management on the identity page ([Agent signing keys §6](design/agent-keys.md#6-permissions-limits-and-plans)).
 
 **Acceptance:**
 
-- M9, M10, M15–M18.
+- Edge rows W9, W10, W15–W18.
 - Every console route works with JavaScript disabled, checked by a Playwright run with `javaScriptEnabled: false`.
 - An axe accessibility scan with no serious violations on every page.
-- Sign-in emails are sent through the deployment's own platform identity, using the simulator in tests.
+- NFR-CON-1: `it::console::render_budget` keeps server render time p95 ≤ 300 ms on every page.
+- Sign-in and invitation emails are sent through the system identity that setup creates
+  ([Identities and domains › The system identity](design/identity-domains.md#the-system-identity)), using the
+  simulator in tests; invitations also work with `PM_CONSOLE=off`.
 
 ---
 
 ## M22 · Plans, metering and billing (after M9, M12, M21)
 
 **Files:** `crates/worker/src/billing/{mod.rs, catalog.rs, quota.rs (TenantQuota allowances and holds), stripe.rs, webhook.rs, usage.rs}`,
-`handlers/{usage.rs, plans.rs, billing.rs}`, console pages `plan.rs`, migration for `billing_accounts` and
-`billing_events`.
+`handlers/{usage.rs, plans.rs, billing.rs}` (`GET /v1/usage` and `GET /v1/usage/daily`),
+console pages `plan.rs`. No migration: `billing_accounts` and `billing_events` are in `0001_init.sql`.
 
-**Implements:** FR-BILL-1–12, the metering points in [Billing design](design/billing.md).
+**Implements:** FR-BILL-1–12, NFR-BILL-1/2, the metering points in [Billing design](design/billing.md).
 
 **Acceptance:**
 
-- M1–M8, M11–M14, M19.
+- Edge rows W1–W8, W11–W14, W19.
 - Every metered action is wired to a hold and a settlement, checked by a table test that lists each metering
   point. A new metered action without a row fails.
 - A Stripe test-mode run (CLI `stripe trigger` fixtures recorded as JSON) covers checkout completed,
   subscription updated, payment failed, and canceled.
 - `GET /v1/usage` matches the catalog and the `TenantQuota` state in property tests.
+- NFR-BILL-1: `it::billing::w1_last_unit_race` and the hold property tests allow 0 actions beyond a
+  granted allowance. NFR-BILL-2: `it::billing::w2_stripe_down_sends_ok` fails no metered action while
+  Stripe is unreachable.
 
 ---
 
 ## M24 · Cloud sign-up and sign-in (after M21, M22)
 
 **Files:** `crates/worker/src/console/{signup.rs, oauth.rs, totp.rs, landing.rs, onboarding.rs, pages/overview.rs}`,
-`handlers/platform.rs` (`POST /v1/platform/waitlist/invite`), a migration for the new `users` columns,
-`oauth_identities`, `oauth_states`, `waitlist` and `tenants.{require_two_factor, onboarding_dismissed_at}`,
-the host split for `PM_CONSOLE_HOST` in `router.rs`, and CLI `pmail waitlist invite`.
+`crates/core/src/totp.rs` (RFC 6238 codes, pure; the console module only stores and checks them),
+`handlers/platform.rs` (`POST /v1/platform/waitlist/invite`), no migration (the `users` sign-in
+columns, `oauth_identities`, `oauth_states`, `waitlist` and `tenants.{require_two_factor,
+onboarding_dismissed_at}` are in `0001_init.sql`), the host split for `PM_CONSOLE_HOST` in `router.rs`, and CLI `pmail waitlist invite`.
 
 **Implements:** FR-CON-8–13, [Cloud sign-up, sign-in and first run](design/cloud-signup.md).
 
 **Acceptance:**
 
-- M20–M34, with the tests named in the register (`it::oauth::*`, `it::signup::*`, `it::totp::*`,
+- Edge rows W20–W34, with the tests named in the register (`it::oauth::*`, `it::signup::*`, `it::totp::*`,
   `it::landing::routing_table`, `it::checkout::*`, `it::abuse::free_ramp`,
   `it::console::delete_account_owner_required`).
 - `core::totp::rfc6238_vectors`, `it::signup::email_creates_account_only_on_use`,
@@ -535,7 +655,107 @@ and recorded in the design before the OAuth code is written ([Cloud sign-up §4]
 
 ---
 
+## M25 · Agent signing keys, assertions and signed requests (after M5 and M6; S13 gates signed requests)
+
+**Files:** `crates/core/src/{jwk.rs, jwt.rs, httpsig.rs}` (RFC 7638 and RFC 8037 thumbprints and JWS,
+RFC 9421 signature bases, pure), `handlers/{identity_keys.rs, assertions.rs, http_signatures.rs,
+well_known.rs}`, `db/identity_keys.rs`, `keyring.rs` (the `web_bot_auth` purpose: a 43-character
+thumbprint kid, `public_jwk`, the 7-day directory overlap), the `RL_SIGN` binding in the `wrangler.toml`
+template, `crates/sdk/src/assertions.rs` (`verify_assertion`), CLI `pmail identity-keys
+list|create|rotate|revoke`, `pmail assertions create|verify` and `pmail http-sign`; no migration
+(`identity_keys`, `key_tombstones` and the `signing_keys` columns are in `0001_init.sql`). Route
+registrations go through Track 1 as usual.
+
+**Implements:** FR-IDN-6–9 and edge rows O1–O13 ([Agent signing keys and signed requests](design/agent-keys.md)),
+and the cross-tenant suite's new routes (NFR-SEC-1).
+
+**Tasks:**
+
+1. Write the RFC vector tests first (`core::jwk`, `core::jwt`, `core::httpsig`), then the pure code.
+2. Identity keys: lazy creation on first sign, `POST …/keys`, rotation with the
+   `PM_IDENTITY_KEY_OVERLAP_DAYS` overlap, revocation, the `key_tombstones` check at generation, and the
+   three `identity.key_*` events through the identity's mailbox (`MailboxRequest::EmitEvent`).
+3. The JWKS endpoint, with the pause and suspension kill switch.
+4. Assertions (`identities:sign`, `RL_SIGN`), never stored or logged; `Idempotency-Key` ignored. Each
+   signature is counted through `QuotaRequest::RecordUsage` (`usage:assertions`, `usage:http_signatures`,
+   flushed to `usage_daily`); if M25 lands before M9 adds that request, M9 wires the two calls.
+5. Signed HTTP requests and the signed directory behind `PM_WEB_BOT_AUTH` and tenant policy
+   `web_bot_auth.allowed`; the `web_bot_auth` purpose of `POST /v1/platform/keys/{purpose}/rotate`.
+6. The SDK verifier and the CLI commands; the two MCP tools are added to M15's table.
+
+**Acceptance:**
+
+- Edge rows O1–O13, with the tests named in the register: `core::httpsig::signature_base_rfc9421` (O10),
+  `it::identity_keys::{lazy_create_and_rotate, revoke_removes_from_jwks, paused_withdraws_jwks}` (O2, O3,
+  O1), `it::assertions::claims_and_limits` (O4–O6), `it::secrets::rotate_master_reseals_identity_keys`
+  (O8: the existing re-seal sweep already covers `identity_keys.private_enc` and `signing_keys.ciphertext`),
+  `it::http_signatures::{disabled_and_policy, expiry_bounds}` (O9, O13, O11) and
+  `it::well_known::directory_signed_per_key` (O12). O7 (`it::assertions::erasure_tombstones_kid`) runs
+  once M14 has landed too: M14's identity- and tenant-scope erasure deletes the keys and writes
+  `key_tombstones`.
+- `core::jwk::thumbprint_rfc8037_vector`, `core::jwt::eddsa_rfc8037_vector` and
+  `it::assertions::sdk_verifies` (the SDK verifier accepts a fresh token and rejects a wrong audience, an
+  expired token, an unknown kid and `alg: none`).
+- The cross-tenant suite covers the six new `/v1` routes; another tenant's key gets the same `404` as a
+  missing identity, and the two `/.well-known` routes give the same `404 identity_not_found` for unknown,
+  paused and deleted identities.
+- No response, log line, event or idempotency record contains a private key, a seed, an assertion or a
+  signature (`it::logs::i5_no_content_in_logs` is extended with them).
+
+**Gate:** signed HTTP requests ship only when spike S13 passed. Otherwise `PM_WEB_BOT_AUTH` cannot be
+turned on (`422 web_bot_auth_disabled`, the directory `404`), FR-IDN-8 moves to v1.1 by ADR, and the
+assertion half of the milestone ships unchanged.
+
+---
+
+## M26 · Notifications and usage alerts (after M9, M10, M21 and M22; the system identity from M6)
+
+**Files:** `crates/worker/src/notify/{mod.rs, notifier.rs (the Notifier Durable Object), compose.rs,
+prefs.rs, unsubscribe.rs}`, `crates/core/src/notify.rs` (windows, caps, schedules across time zones, and
+rendering that takes no mail content, pure), `crates/worker/src/console/pages/notifications.rs`
+(`/console/settings/notifications` and the unsubscribe pair), one hook each in `consumers/webhooks.rs`
+(M8's dispatcher: `NotifierRequest::Event`) and `quota/mod.rs` (M22's `TenantQuota`:
+`NotifierRequest::UsageThreshold`), the `NOTIFY` binding and the `Notifier` class in the `wrangler.toml`
+template and `export_worker!`, and `tenants.notify_do_id` minted with the tenant row; no migration
+(`notification_prefs` and the column are in `0001_init.sql`). The hooks in other tracks' files are
+reviewed by their owners.
+
+**Implements:** FR-CON-14, FR-CON-15, FR-BILL-13 and edge rows O14–O26
+([Notifications and usage alerts](design/notifications.md)).
+
+**Tasks:**
+
+1. `core::notify` first: coalescing windows, caps, the 09:00 schedule per time zone, and the
+   content-free renderer, each unit-tested.
+2. The `Notifier` object (`Init`, `pending`, `windows`, `sent`, `meta`, one alarm) and its three inputs:
+   the dispatcher hook for `new_mail`, `UsageThreshold` from `TenantQuota` (with the
+   `alerted:{feature}:{threshold}:{period}` keys), and `Account` from the handlers that change security or
+   billing state.
+3. Sending through the system identity with the `notify:` idempotency key; bounces and complaints set
+   `paused_reason`; the platform-domain retry loop.
+4. The console settings page, the bounce banner and its confirmation, and the unsubscribe pair (no
+   session, CSRF-exempt, served with `PM_CONSOLE=off`).
+5. Member removal and person and tenant erasure delete preferences and pending items.
+
+**Acceptance:**
+
+- Edge rows O14–O26, with the tests named in the register (`it::notify::*`).
+- `core::notify::no_content_in_body`: a rendered notification contains no subject, sender, snippet or
+  attachment name from the source message.
+- Notification emails go out through the system identity with the simulator in tests, as
+  `transactional` sends carrying `List-Unsubscribe` and `List-Unsubscribe-Post`; a retried alarm never
+  sends twice (the `notify:` idempotency key).
+- The new pages pass the M21 checks: they work with JavaScript disabled and have no serious axe
+  violations. The unsubscribe pair works without a session and with `PM_CONSOLE=off`.
+- The cross-tenant suite covers the unsubscribe route: a token never changes another person's or
+  workspace's preferences (O18).
+
+---
+
 ## M20 · Staging deploy and live proof
+
+**Implements:** NFR-OPS-1 (the timed rehearsal, step 12) and the live measurements of NFR-REL-3,
+NFR-PERF-4, NFR-OPS-2 and NFR-COST-1 (step 13).
 
 Deploy to staging with `pmail setup` and `pmail deploy` from the docs alone, as if you were a new
 self-hoster. Then run `live::*`:
@@ -559,7 +779,18 @@ self-hoster. Then run `live::*`:
     first-run checklist, and Checkout from `?plan=developer`.
 11. Billing in Stripe test mode: upgrade Free to Developer through Checkout, spend the send allowance to a
     `402`, buy a top-up, and retry the same send successfully.
-12. A fresh-account rehearsal: a person who did not build it deploys from `self-hosting.md` in under
-    15 minutes (NFR-OPS-1).
+12. NFR-OPS-1, a fresh-account rehearsal (`live::ops::fresh_deploy_rehearsal`): a person who did not
+    build it deploys from `self-hosting.md` in under 15 minutes of hands-on time, timed and recorded.
+13. Measured on staging: NFR-REL-3 (`live::slo::inbound_to_webhook`), NFR-PERF-4 with the real models
+    (the hybrid figure of `it::bench::hybrid_p95` repeated against staging), NFR-OPS-2
+    (`live::ops::restore_drill`) and NFR-COST-1 (`live::ops::idle_cost_review` after a week of idling).
+    NFR-REL-2 and NFR-REL-4 are read from the SLO dashboard over the live run.
+14. Agent keys: an assertion minted on staging verifies with `pmail assertions verify` against staging's
+    JWKS, and stops verifying within 5 minutes of pausing the identity. With S13 passed and
+    `PM_WEB_BOT_AUTH=on`, a signed request to `https://crawltest.com/cdn-cgi/web-bot-auth` returns `401`
+    (the directory is not registered on staging).
+15. Notifications: in Stripe test mode, sends cross 80% and an alert arrives once; a `new_mail`
+    notification reaches the Gmail test mailbox with no content from the mail; Gmail's one-click
+    unsubscribe turns that kind off.
 
 **v1.0 release criteria:** [PRD §9](prd.md#9-release-criteria-v10).

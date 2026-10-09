@@ -47,18 +47,19 @@ needs these permissions: `identities:read`, `identities:write`, `messages:read`,
 `keys:manage`.
 
 **If you deployed it yourself**, you have a platform key from
-[`pmail keys create --level platform`](self-hosting.md#5-create-the-first-api-key). Use it to create
-the tenant and a tenant key, so day-to-day work does not use the platform key:
+[`pmail keys create --level platform`](self-hosting.md#5-create-the-first-api-key), saved in your CLI's
+`default` profile. Use it to create the tenant and a tenant key, so day-to-day work does not use the
+platform key:
 
 ```bash
-export PYLOTA_MAIL_URL=https://mail.example.com
-export PYLOTA_MAIL_KEY=pmk_live_…            # the platform key
-
 pmail tenants create --slug acme --name "Acme Car Hire"
 
 pmail keys create --level tenant --tenant acme --name acme-quickstart \
   --permissions identities:read,identities:write,messages:read,messages:send,messages:write,attachments:read,search:read,search:agentic,webhooks:manage,keys:manage
 ```
+
+If you keep the platform key somewhere else, set `PYLOTA_MAIL_URL` and `PYLOTA_MAIL_KEY` for these two
+commands, then unset `PYLOTA_MAIL_KEY`: a key in the environment outranks every profile.
 
 The key's secret (`pmk_live_…`) is printed **once**. It is stored only as a keyed hash, so it
 cannot be shown again. If you lose it, create a new key and revoke the old one.
@@ -66,16 +67,23 @@ cannot be shown again. If you lose it, create a new key and revoke the old one.
 ## 2. Log in
 
 ```bash
-pmail login
+pmail login --profile acme
+pmail config set default_profile acme
 ```
 
-`pmail login` asks for the API URL (`https://mail.example.com`) and the key, and saves them as a
-profile in `~/.config/pylota-mail/config.toml`. The file is created with mode `0600`, and `pmail`
-refuses to read it if other users can. You can also skip the file and set `PYLOTA_MAIL_URL` and
-`PYLOTA_MAIL_KEY` in your environment. See
-[Configuration › CLI configuration](reference/configuration.md#cli-configuration).
+`pmail login` asks for the API URL (`https://mail.example.com`) and the tenant key, checks the key, and
+saves both as the profile `acme` in `~/.config/pylota-mail/config.toml`; `config set default_profile`
+makes `pmail` read that profile when you name none. Name the profile: without `--profile`, `login` writes
+the profile `default`, which holds your platform key if you deployed Pylota Mail yourself. The file is
+created with mode `0600`, and `pmail` refuses to read it if its group or other users have any access to
+it.
 
-Check the key with the API:
+You can also skip the file and set `PYLOTA_MAIL_URL` and `PYLOTA_MAIL_KEY` in your environment. Flags
+come first, then the environment, then the profile, so a `PYLOTA_MAIL_KEY` in the environment is the key
+`pmail` uses. See [CLI › Configuration](reference/cli.md#configuration).
+
+Check the key with the API. The `curl` examples on this page read the tenant key from
+`PYLOTA_MAIL_KEY`; with it exported, the CLI uses the same key:
 
 ```bash
 export PYLOTA_MAIL_KEY=pmk_live_…            # the tenant key
@@ -261,7 +269,7 @@ Each message carries:
 
 - `extracted_text`: the new content, with quoted history and signatures removed. Read this first;
   it is what fits in a model's context;
-- `trust`: the authentication verdict (`pass`, `fail`, `softfail`, `none` or `unaligned`),
+- `trust`: the authentication verdict (`pass`, `fail`, `softfail`, `none`, `unaligned` or `unverified`),
   `known_sender`, `spam_score` and flags such as `display_name_spoof`;
 - `triage`: category, needs-reply score, urgency, summary and risk flags.
 
@@ -326,16 +334,23 @@ Agentic search plans the searches for you and answers with citations:
 pmail ask "Did the insurer accept the Golf claim?" --identity compliance@acme.example.com
 ```
 
-The CLI streams progress (each search step and the evidence found), then prints the answer:
+The CLI streams progress (each search step and the evidence found), then prints the answer with
+numbered citations, the cited messages, and the status:
 
 ```text
-Yes. Admiral accepted claim 7781 on 2 October, after the photos sent on 28 September
-[msg_01JA…][msg_01JB…].
-status: answered · confidence 0.86 · 3 steps · 2.8 s
+⋯ step 1  search "claim Golf photos" (hybrid) · 7 hits · 412 ms
+⋯ step 2  read thread thr_01JA… · 38 ms
+
+Yes. Admiral accepted claim 7781 on 2 October, after the photos sent on 28 September [1][2].
+
+[1] msg_01JA…  2026-10-02  Admiral Claims <claims@admiral.example>  "Claim 7781 – decision"
+[2] msg_01JB…  2026-09-28  Acme Car Hire <compliance@acme.example.com>  "Photos for claim 7781"
+
+answered · confidence 0.86 · 3 steps · 2.8 s
 ```
 
-Every sentence cites message IDs, and code checks each citation against the evidence before the
-answer is returned. If the mail does not answer the question, the status is `insufficient_evidence`,
+Every sentence cites message IDs (the API returns them as `[msg_…]` markers; the CLI numbers them), and
+code checks each citation against the evidence before the answer is returned. If the mail does not answer the question, the status is `insufficient_evidence`,
 never a guess. Agentic search needs the `search:agentic` permission. See
 [Search › Agentic search](guides/search.md#agentic-search).
 
@@ -393,11 +408,14 @@ that teaches the model how to search. See [MCP server](reference/mcp.md) and
 
 A **test tenant** never sends mail outside the deployment
 ([FR-TEN-2](project/prd.md#61-tenancy-and-access)). Its keys start with `pmk_test_`, and its sends
-go to a simulator instead of the internet. Create one with a platform key:
+go to a simulator instead of the internet. Create one with a platform key. If `PYLOTA_MAIL_KEY` still
+holds the tenant key, unset it first, because it would outrank the platform key in your `default`
+profile:
 
 ```bash
-pmail tenants create --slug acme-test --name "Acme Car Hire (test)" --mode test
-pmail keys create --level tenant --tenant acme-test --name acme-test-key \
+unset PYLOTA_MAIL_KEY
+pmail --profile default tenants create --slug acme-test --name "Acme Car Hire (test)" --mode test
+pmail --profile default keys create --level tenant --tenant acme-test --name acme-test-key \
   --permissions identities:read,identities:write,messages:read,messages:send,messages:write,search:read
 ```
 

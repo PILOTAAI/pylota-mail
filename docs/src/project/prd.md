@@ -16,7 +16,7 @@ The words **must**, **should** and **may** are used as in RFC 2119.
 
 Pylota Mail is an email and identity service for AI agents. Each agent gets an **identity**: a mailbox
 with one or more addresses, authenticated sending, verified inbound mail, threads, attachments with
-extracted text, triage and search. Applications and agents use it through a REST API, an MCP server and
+extracted text, triage and search, plus signing keys that let it prove who it is to other services. Applications and agents use it through a REST API, an MCP server and
 a CLI. It reports what happened through signed webhooks.
 
 It is source available under the Functional Source License (FSL-1.1-ALv2), written entirely in Rust, and
@@ -59,7 +59,9 @@ Pylota's own experience showed the cost of these gaps:
 
 ### Goals (v1.0)
 
-1. Agent identities with addresses that can change domain without losing history or breaking threads.
+1. Agent identities with addresses that can change domain without losing history or breaking threads,
+   and that can prove who they are to other services with short-lived signed assertions, verifiable
+   against a published key set.
 2. Reliable inbound mail: no acknowledged message is ever lost, and every message carries an
    authentication verdict and trust metadata.
 3. Safe outbound mail. A retry never produces a second email. An outcome that cannot be known is
@@ -73,8 +75,9 @@ Pylota's own experience showed the cost of these gaps:
    subject-access export.
 9. A console for the people who run the agents: passwordless sign-in (email, Google or GitHub, with
    optional two-step verification), self-serve sign-up on Pylota Mail Cloud, workspaces with members,
-   roles and enforced seats, inbox views, quarantine review, keys, domains, plan and usage. It works with
-   no JavaScript.
+   roles and enforced seats, inbox views, quarantine review, keys, domains, plan and usage, and email
+   notifications (usage alerts, new mail, and a daily list of what needs a person). It works with no
+   JavaScript.
 10. Plans that are enforced exactly: atomic holds so two requests can never both pass on the last unit, a
     `402 billing_limit` that is safe to retry with the same idempotency key after an upgrade, and metering
     that never depends on a billing provider being reachable.
@@ -101,14 +104,15 @@ copy (README, landing page) may only claim what this table lists.
 | # | Proposition | Guaranteed by | Proved by |
 |---|---|---|---|
 | U1 | **Answers you can check.** Agentic search cites message IDs, and a deterministic verifier removes any sentence the evidence does not support | FR-SRCH-8, FR-SRCH-9 | F10–F13, NFR-QUAL-2 |
-| U2 | **One email per intent.** Idempotency is required; an unknown outcome becomes `uncertain` and is never resent; plan limits never break a retry | FR-OUT-1, FR-OUT-2, FR-BILL-6 | G1, G2, L2, M3 |
+| U2 | **One email per intent.** Idempotency is required; an unknown outcome becomes `uncertain` and is never resent; plan limits never break a retry | FR-OUT-1, FR-OUT-2, FR-BILL-6 | G1, G2, L2, W3 |
 | U3 | **Identities outlive domains.** Addresses move between domains with history and threads intact, with rollback and a clean `550 5.1.6` after retirement | FR-ADR-1–5 | A11, C3, live domain-change test |
 | U4 | **Never sends mail that fails authentication.** Two-resolver health checks, aligned fallback in the same thread, suspension when ownership changes, and, for a relay we do not control, an alignment probe before the first send and every day | FR-DOM-4–6, FR-DOM-11 | H1, H4, H7, N18 |
 | U5 | **Built for untrusted input.** Verdicts and trust flags on every message, hidden text stripped, fenced model input, human-only quarantine release | FR-IN-4–9, FR-CON-6 | B10, B11, D2, D9, E1 |
 | U6 | **Your account, your receipts.** Runs in the deployer's Cloudflare account (EU optional); erasure returns per-store counts and empty probe queries | FR-PRV-1–6 | I1–I7 |
-| U7 | **Real team seats.** Members, roles and seat limits are enforced, with an audit log of every privileged action and two-step verification that a workspace can require | FR-CON-2–5, FR-CON-10 | M8–M10, M27 |
+| U7 | **Real team seats.** Members, roles and seat limits are enforced, with an audit log of every privileged action and two-step verification that a workspace can require | FR-CON-2–5, FR-CON-10 | W8–W10, W27 |
 | U8 | **Tested against the edge cases.** A public edge-case register where every row names its test, a MIME conformance corpus, and quality gates in CI | Release criteria §9 | the register itself |
-| U9 | **Nothing to keep running.** One Rust Worker on Cloudflare primitives: no servers, no external database, no billing vendor in the request path | NFR-COST-1, NFR-BILL-2 | M2 |
+| U9 | **Nothing to keep running.** One Rust Worker on Cloudflare primitives: no servers, no external database, no billing vendor in the request path | NFR-COST-1, NFR-BILL-2 | W2 |
+| U10 | **Agents that can prove who they are.** Each identity signs short-lived assertions with its own Ed25519 key, which any service verifies against the identity's published key set; the private key never leaves the Worker, and pausing the identity withdraws its keys at once | FR-IDN-6, FR-IDN-7, FR-IDN-9 | O1–O8, `it::assertions::sdk_verifies` |
 
 ### Competitive landscape
 
@@ -138,7 +142,7 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
 
 | Area | P0 | P1 | P2 |
 |---|---|---|---|
-| Identities | CRUD, idempotent create, pause, accountable human | Agent signing keys (JWKS) | – |
+| Identities | CRUD, idempotent create, pause, accountable human; agent signing keys and assertions (JWKS) | Signed HTTP requests (Web Bot Auth, spike S13) | – |
 | Addresses | Platform domain, aliases, promote, retire, rollback | – | – |
 | Domains | Platform domain; `cloudflare_zone`; `nameservers` | `dns_records` (spike S11); `send_only` (S8); `smtp_relay` (S12); `delegated_subdomain` behind `PM_CF_SUBDOMAIN_SETUP` (S10) | Mailgun and SendGrid inbound sources |
 | Inbound | Parse, verdicts, quarantine, loops, attachments, extracted text | Malware scanner hook | – |
@@ -146,11 +150,11 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
 | Delivery | All six provider event types, per-recipient status | Uncertain-send reconciliation | – |
 | Search | Keyword, semantic, hybrid, agentic; facets; tenant scope | Contacts, find-related | – |
 | Triage | Category, needs-reply, urgency, summary, risk flags; rules | Custom categories | – |
-| Integrations | REST, OpenAPI, MCP (API key), CLI, Rust SDK, webhooks | `wait` long-poll and verification extraction | MCP OAuth 2.1, WebSocket push |
+| Integrations | REST, OpenAPI, MCP (API key), CLI, Rust SDK, webhooks; `wait` long-poll and verification extraction (quarantine rule 5, unsolicited OTP, depends on it: E4, E5) | – | MCP OAuth 2.1, WebSocket push |
 | Privacy | Retention, erasure with receipts, legal hold | Subject-access export | – |
 | Operations | Setup, deploy, doctor, metrics, DLQ consumers, test mode | Restore drill tooling | – |
-| Console | Sign-in, workspaces, members, roles, seats, inboxes, quarantine release, keys, domains, plan and usage; Cloud sign-up (waitlist and open); Google and GitHub sign-in; two-step verification (TOTP); the Overview | Notifications | Passkeys; SSO (SAML/OIDC) |
-| Plans and billing | Plan catalog, metering with holds, `402 billing_limit`, usage API, Stripe checkout and portal, top-ups | Usage alerts | Annual billing, invoicing |
+| Console | Sign-in, workspaces, members, roles, seats, inboxes, quarantine release, keys, domains, plan and usage; Cloud sign-up (waitlist and open); Google and GitHub sign-in; two-step verification (TOTP); the Overview; notifications | – | Passkeys; SSO (SAML/OIDC) |
+| Plans and billing | Plan catalog, metering with holds, `402 billing_limit`, usage API, Stripe checkout and portal, top-ups; usage alerts | – | Annual billing, invoicing |
 
 ## 6. Functional requirements
 
@@ -181,6 +185,27 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
   with `identity_paused`.
 - **FR-IDN-4** Deleting an identity **must** run an identity-scope erasure and tombstone all of its
   addresses permanently.
+- **FR-IDN-5** Not assigned. IDs are never reused, so the gap stays.
+- **FR-IDN-6** Each identity **must** have Ed25519 signing keys that are generated, sealed and used only
+  inside the Worker and are never exported or imported. An identity has one `active` key, created on its
+  first signing request or on request, and **must** support rotation with an overlap
+  (`PM_IDENTITY_KEY_OVERLAP_DAYS`, default 7 days) during which the previous key stays published, and
+  revocation that removes a key from publication at once. Key IDs are RFC 7638 thumbprints
+  ([Agent signing keys](design/agent-keys.md)).
+- **FR-IDN-7** An identity **must** be able to mint short-lived agent assertions (JWT signed with
+  `EdDSA`, 60–600 seconds) for an audience it names. An assertion carries the identity's address,
+  display name and workspace name and whether it has an accountable human, and **must never** carry the
+  owner's personal data. Each identity's public keys **must** be published as a JWKS at
+  `/.well-known/jwks/{identity_id}.json`, so any service can verify an assertion; the Rust SDK and the
+  CLI **must** include a verifier.
+- **FR-IDN-8** An identity **should** be able to obtain Web Bot Auth signature headers (RFC 9421, signed
+  with the deployment key, with its address in a signed `From` header) for HTTP requests its agent makes,
+  with the deployment's key directory published at `/.well-known/http-message-signatures-directory`. It is
+  off unless the operator sets `PM_WEB_BOT_AUTH=on` (allowed only once spike S13 has passed) and the
+  tenant's policy has `web_bot_auth.allowed: true`.
+- **FR-IDN-9** Pausing an identity, or suspending its tenant, **must** stop new signatures at once and
+  withdraw the identity's JWKS (`404`). Deleting or erasing an identity **must** delete its keys and
+  tombstone their key IDs, so a deleted key ID is never published again.
 - **FR-ADR-1** An identity **must** support several addresses over time. Each address has a role
   (`primary` or `alias`) and a status (`pending`, `active`, `retiring` or `retired`).
 - **FR-ADR-2** Promoting an address **must**:
@@ -196,7 +221,8 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
   erased address **must** get `550 5.1.1`, with no hint that the address existed.
 - **FR-ADR-6** Reserved and confusable local parts **must** be refused:
   - on the shared platform domain, every RFC 2142 role name (including `info`, `marketing`, `sales` and
-    `support`), whose mail goes to the operator rather than an agent;
+    `support`) where it would stand alone as the local part (usernames of the default tenant, whose
+    address suffix is empty); mail to the operational names goes to the operator rather than an agent;
   - on a tenant's own domain, only `postmaster` and `abuse`, which route to the tenant's owner contact;
     the other role names are allowed there, because the tenant owns the domain;
   - everywhere, `noreply`, `mailer-daemon` and similar names, and names the service uses itself;
@@ -249,7 +275,7 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
   sealed and never returned. An alignment probe **must** pass before the first send and again every day; a
   failing probe moves the domain to `failing`, and sends fall back to the platform address (FR-DOM-6).
 - **FR-DOM-12** `nameservers` **must** create a Cloudflare zone for a domain used only for mail. It
-  **must** refuse a name that has A, AAAA or MX records, or a `www` record, with
+  **must** refuse a name that has A, AAAA or MX records, or a CNAME, A or AAAA record at `www`, with
   `409 domain_not_dedicated` unless the request carries `"confirm_dedicated": true`. A tenant key **may**
   use it only when its policy has `domains.allow_create_zone: true`. `delegated_subdomain` **must** stay
   off unless `PM_CF_SUBDOMAIN_SETUP=on`, the Cloudflare account is Enterprise, and spike S10 has passed.
@@ -424,7 +450,7 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
 - **FR-PRV-2** Retention **must** be configurable per tenant:
   - raw MIME: 90 days by default;
   - parsed messages: kept by default;
-  - events and delivery logs: 30 days.
+  - events and delivery logs: 30 days by default (`retention.events_days`, 1–365).
 
   Every purge **must** write an audit event.
 - **FR-PRV-3** Erasure **must** be supported per message, thread, counterparty, identity and tenant. It
@@ -492,6 +518,16 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
   Cloud **must** apply abuse controls: `RL_SIGNIN`, a new-workspace send ramp (`tenant_daily_send_cap` 50
   for the first 7 days on Free), refusal of disposable addresses (`PM_SIGNUP_BLOCKED_DOMAINS`), and system
   mail sent from `PM_SYSTEM_FROM`.
+- **FR-CON-14** A person **may** opt in, per workspace, to email notifications of new mail in the inboxes
+  they choose (`instant`, `hourly` or `daily`). Notifications **must** be coalesced (one email per person
+  and inbox per window), **must** count only mail that becomes visible in the inbox, and **must never**
+  include content from the mail: no subject, sender, snippet or attachment name
+  ([Notifications](design/notifications.md)).
+- **FR-CON-15** Owners and admins **must** receive a daily "needs a person" email by default
+  (quarantined mail, uncertain sends, failing domains and failing webhooks), and the person concerned
+  **must** receive `account` emails for security and billing events, which cannot be turned off. Every
+  other notification **must** carry RFC 8058 one-click unsubscribe. Notification email is capped at 50 per
+  person and 200 per workspace a day, beyond which items wait for the next daily digest.
 
 ### 6.15 Plans, metering and billing
 
@@ -526,6 +562,11 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
   remaining and reset time, and the plan catalog, so agents can read their own limits.
 - **FR-BILL-12** A self-hosted deployment **must** run with billing off by default and **must not** need a
   Stripe account. Turning billing on (`PM_BILLING=stripe`) is an operator choice.
+- **FR-BILL-13** Owners and admins **must** be emailed when an allowance reaches 80% and 100% of its
+  limit (top-ups included), unless they turn it off. Each threshold alerts at most once per billing period
+  for allowances that reset, and at most once a day per feature and threshold for counts that do not.
+  With billing off, alerts follow the operator quotas in tenant policy, and a feature with no quota sends
+  none. Webhook events (`quota.warning`, `billing.limit_reached`) are unchanged.
 
 ## 7. Non-functional requirements
 
@@ -582,6 +623,7 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
 | Vectorize has no documented jurisdiction option | Vectors hold IDs and filter fields only, never text. Documented in privacy notes |
 | A shared platform domain means shared reputation | Per-identity caps, complaint and bounce auto-pause, DMARC ramp, custom domains encouraged |
 | An LLM fabricates in agentic search or triage | Deterministic citation check, schema validation, untrusted-content fencing, read-only tools |
+| Web Bot Auth is still an IETF draft, and Cloudflare's verifier can change | Spike S13 checks the format against Cloudflare's test endpoint. Signed HTTP requests are P1 and stay off (`PM_WEB_BOT_AUTH=off`) unless S13 passes; agent assertions rely only on published RFCs (7517, 7519, 7638, 8037) |
 | SES receiving, SMTP from a Worker and child zones are unproven from a Worker | Spikes S11, S12 and S10 gate `dns_records`, `smtp_relay` and `delegated_subdomain`. A method whose spike fails moves to v1.1 by ADR; `cloudflare_zone`, `nameservers` and `send_only` do not depend on them |
 
 ## 11. Open questions

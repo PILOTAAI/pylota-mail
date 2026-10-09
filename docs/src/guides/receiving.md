@@ -1,8 +1,9 @@
 # Receiving, webhooks and quarantine
 
 This guide explains how inbound mail reaches an identity, what a received message contains, how
-quarantine and sender controls work, and how to receive events on a webhook endpoint safely. It ends
-with `wait`, for agents that need a verification code.
+quarantine and sender controls work, how to receive events on a webhook endpoint safely, and which
+notification emails the people behind your agents get. It ends with `wait`, for agents that need a
+verification code.
 
 ## How inbound mail arrives
 
@@ -54,7 +55,7 @@ places:
 | Connection method | How mail arrives | What is different |
 |---|---|---|
 | `dns_records`, and `smtp_relay` with `inbound: ses` | Amazon SES receives the message, keeps it in S3 until the Worker has stored it, and notifies the Worker, which runs the same pipeline from parsing onwards | Mail to an address that does not exist is accepted by SES and then dropped without a bounce, instead of `550 5.1.1`. Mail to a retired address gets a `550 5.1.6` bounce from SES. Messages up to 40 MB are accepted, instead of 25 MiB |
-| `send_only`, and `smtp_relay` with `inbound: forward` | The tenant's own mailbox forwards the message to the identity's platform address | `delivered_to` is the address on the tenant's domain when it appears in `To` or `Cc`, so replies come from it. A forwarder that changes the message breaks the sender's DKIM signature, and the message is quarantined as `unauthenticated` |
+| `send_only`, and `smtp_relay` with `inbound: forward` | The tenant's own mailbox forwards the message to the identity's platform address | `delivered_to` is the address on the tenant's domain when it appears in `To` or `Cc`, so replies come from it. A forwarder that changes the message breaks the sender's DKIM signature, and the message is quarantined (`auth_failed`) |
 
 Mail to a domain that is `failing` or `suspended` is still accepted, whatever the method.
 
@@ -91,13 +92,13 @@ Every inbound message carries an authentication verdict and trust metadata
 
 | Field | Meaning |
 |---|---|
-| `verdict` | `pass`, `fail`, `softfail`, `none` or `unaligned`. Computed by Pylota Mail's own DKIM, ARC and DMARC verification, plus Cloudflare's `Authentication-Results` header when its authserv-id is trusted ([D9](../project/edge-cases.md)) |
+| `verdict` | `pass`, `fail`, `softfail`, `none`, `unaligned` or `unverified` (SPF alignment could not be checked yet, because the deployment's `PM_TRUSTED_AUTHSERV_ID` is not set). Computed by Pylota Mail's own DKIM, ARC and DMARC verification, plus Cloudflare's `Authentication-Results` header when its authserv-id is trusted ([D9](../project/edge-cases.md)) |
 | `known_sender` | The identity has exchanged mail with this address before |
 | `spam_score` | 0 to 1. Above the tenant's `quarantine.spam_threshold` (default 0.8) the message is quarantined |
 | `automated` | Auto-reply, mailing list, bounce or read receipt |
 | `flags` | `hidden_text`, `display_name_spoof`, `lookalike_domain`, `reply_to_mismatch`, `thread_join_unverified` |
 
-A sender whose domain has no DMARC policy, or `p=none`, gets `none` or `unaligned`. That alone never
+A sender whose domain has no DMARC record gets `none` (alignment is still recorded), and one with `p=none` that fails alignment gets `unaligned`. That alone never
 quarantines a message, because much legitimate mail looks like that. But it is not proof of who sent
 it: require `verdict: pass` before an automation that acts on authenticity, such as paying an invoice
 or contesting a PCN ([D1](../project/edge-cases.md)).
@@ -147,13 +148,16 @@ refused ([D6](../project/edge-cases.md)).
 
 ## Quarantine
 
-Quarantined mail is stored, but hidden from every key that lacks `quarantine:review`: it does not
-appear in thread lists, search results or MCP tools ([FR-IN-5](../project/prd.md#64-inbound)). Its
-`message.quarantined` event carries no `extracted_text`.
+Quarantined mail is stored, but kept away from agents ([FR-IN-5](../project/prd.md#64-inbound)).
+Lists, search results and MCP tools leave it out by default. It appears in a message list only when
+the request filters on `status=quarantined` **and** the key holds `quarantine:review`, and in search
+only with `include_quarantined` and that permission. A key without `quarantine:review` never sees it.
+Its `message.quarantined` event carries no `extracted_text`.
 
 | `quarantine_reason` | Cause | Policy |
 |---|---|---|
 | `auth_failed` | The message failed authentication | `quarantine.on_auth_fail` (default `true`) |
+| `auth_unverified` | The sender's DMARC policy is `quarantine` or `reject`, DKIM did not align, and SPF could not be checked because the deployment has not yet learned Cloudflare's `Authentication-Results` authserv-id (`PM_TRUSTED_AUTHSERV_ID`; `pmail setup` sets it) | `quarantine.on_auth_fail` (default `true`) |
 | `spam` | `spam_score` above the threshold | `quarantine.spam_threshold` (default 0.8) |
 | `risky_attachment` | An attachment has a `risk` | Always |
 | `blocked_sender` | The sender is suppressed or matched a receive-block rule (see [Blocked senders and throttling](#blocked-senders-and-throttling)). These messages get status `hidden`, not `quarantined`: they are never evented, never shown in the quarantine and cannot be released | Tenant lists |
@@ -196,6 +200,9 @@ curl -X PUT https://mail.example.com/v1/tenants/ten_01J9…/lists/receive/block/
 | Receive-allow | Mail skips spam quarantine. It does **not** skip authentication quarantine |
 | Suppressed sender | Treated like receive-block: stored `hidden` |
 | Per-sender throttle | More than `inbound.per_sender_per_hour` messages (default 60) from one sender to one identity in an hour: the excess is stored `throttled`, hidden from agents, counted and alerted ([D5](../project/edge-cases.md)) |
+
+`hidden` and `throttled` mail follows the same rule as quarantined mail: lists leave it out unless the
+request filters on that `status` and the key holds `quarantine:review`.
 
 ## Set up a webhook endpoint
 
@@ -337,7 +344,9 @@ so you can deploy the new secret without dropping events. CLI: `pmail webhooks r
 
 - Failed deliveries are retried at about **30 s, 2 min, 10 min, 30 min, 1 h, 2 h, 4 h, 8 h, 12 h,
   12 h, 12 h and 19 h** (about 72 hours in total), each with ±10% jitter.
-- After the last attempt the delivery is `dead`. Dead deliveries can be replayed for 30 days.
+- After the last attempt the delivery is `dead`. A dead delivery can be replayed for 30 days from its
+  event's `occurred_at` (or `retention.events_days`, if shorter, because the payloads are then gone).
+  The window counts from the event, not from when the delivery went dead.
 - After 100 consecutive failures spread over at least 24 hours, the endpoint is disabled
   (`disabled_reason: failing`) and a `webhook.disabled` event goes to the platform's other endpoints.
   A `410 Gone` response disables the endpoint immediately. Re-enable it with
@@ -380,6 +389,39 @@ Payloads are thin: IDs, a summary, verdicts, triage and up to `policy.webhook_te
 `extracted_text` (default 16 KB, maximum 64 KB), with `extracted_text_truncated` when cut. Fetch the
 rest through the API. Lowering `webhook_text_bytes` keeps less mail content in your own logs and
 queues. The envelope and every event type are in [Webhook events](../reference/events.md).
+
+## Notifications by email
+
+Webhooks are for your software. The people behind the agents can also get email from the deployment
+about their workspace ([Notifications design](../project/design/notifications.md)). Agents keep using
+webhooks and the API: notifications change nothing that your endpoints receive.
+
+| Kind | What it says | Default |
+|---|---|---|
+| `usage` | An allowance reached 80% or 100% of its limit ([Plans › Usage alerts](plans.md#usage-alerts)) | On for the owner and admins |
+| `new_mail` | New mail arrived in inboxes the person follows | Off for everyone: opt in |
+| `needs_person` | Once a day, what needs a person: quarantined mail, uncertain sends, failing domains and failing webhooks | Daily for the owner and admins |
+| `account` | Security and billing events, such as two-step verification turned off or a failed payment | Always sent to the person concerned (the owner, for billing). Cannot be turned off |
+
+- **Settings.** Each person chooses their own, per workspace, at **Settings › Notifications**
+  (`/console/settings/notifications`). There is no API for them: API keys are not people.
+- **New-mail notifications** are `instant`, `hourly` or `daily`, for every inbox or chosen ones, and
+  optionally only for mail that needs a reply. `instant` waits 2 minutes and sends one email for
+  everything that arrived, then at most one per inbox every 10 minutes. Daily emails, including the
+  "needs a person" email, arrive at 09:00 in the workspace's time zone. Only mail that becomes visible in
+  the inbox counts: quarantined, hidden and spam mail never does.
+- **Counts only, never content.** A notification names the inbox and counts messages ("3 new messages
+  in bookings.acme@agents.example, 2 waiting for a reply"). It never includes a subject, a sender, a
+  snippet or an attachment name, so it is safe to read on a lock screen.
+- **One-click unsubscribe.** Every `usage`, `new_mail` and `needs_person` email carries
+  `List-Unsubscribe` and `List-Unsubscribe-Post` (RFC 8058), so a mail app's unsubscribe button turns
+  that kind off for that person and workspace, without sign-in. `account` emails link to settings
+  instead.
+- **Caps.** At most 50 notification emails per person and 200 per workspace a day, not counting
+  `account` emails. Past a cap, the day's remaining items go into the next daily digest, and the
+  settings page says so.
+- If a notification hard-bounces or draws a complaint, that person's notifications pause (only
+  `account` emails still go out) until they confirm their address in the console.
 
 ## Waiting for a verification code
 

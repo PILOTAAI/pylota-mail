@@ -3,7 +3,8 @@
 There are two ways to run Pylota Mail. You can host it yourself on your own Cloudflare account, free and
 with no plan limits. Or you can use Pylota Mail Cloud, Pylota's hosted deployment of the same code, on the
 Free, Developer or Team plan. This guide covers both: what each plan includes, what counts against it,
-what happens at a limit, how to change plans, and how an agent reads its own limits.
+what happens at a limit, who is told by email before it, how to change plans, and how an agent reads its
+own limits.
 
 ## Self-hosting
 
@@ -19,6 +20,7 @@ Self-hosting is free under FSL-1.1-ALv2. You pay only your own Cloudflare usage
   ([Configuration › Tenant policy](../reference/configuration.md#tenant-policy)).
 - `GET /v1/usage` still reports what each workspace uses, with `"billing": "disabled"`, no plan limits,
   and any operator quota from tenant policy.
+- [Usage alerts](#usage-alerts) go out only for features that have an operator quota in tenant policy.
 
 Turning billing on (`PM_BILLING=stripe`, with a plan catalog and Stripe keys) is an operator choice,
 described in the [billing design](../project/design/billing.md#self-host-mode). FSL-1.1-ALv2 does not
@@ -143,6 +145,29 @@ attachments, each with `402 billing_limit` and `feature: "storage_gb"`. Mail kee
 without attachments keep working. Delete or erase mail, shorten retention, or upgrade to bring it back
 under the limit.
 
+## Usage alerts
+
+People in the workspace get an email when an allowance reaches **80%** and **100%** of its limit
+(`granted`, top-ups included). These emails are for the people behind the agents; agents keep reading
+limits from the API and webhooks ([Notifications design](../project/design/notifications.md#4-usage-alerts)).
+
+- **Who gets them.** The owner and admins, by default. Members and viewers get none unless they turn
+  them on. Each person turns them on or off for themselves at **Settings › Notifications**
+  (`/console/settings/notifications`), or with the one-click unsubscribe link in the email
+  ([Receiving › Notifications by email](receiving.md#notifications-by-email)).
+- **How often.** For allowances that reset (sends, triage analyses), each threshold alerts at most once
+  per billing period, even if usage drops back and crosses it again. For counts that do not reset
+  (inboxes, custom domains, seats, storage), an alert goes out when the count crosses a threshold
+  upwards, then not again for 24 hours for that allowance and threshold.
+- **What the email says.** The allowance in plain words, used and granted, when it resets (or that it
+  does not), and what happens at 100%, for example "sends return `402 billing_limit` until 1 November".
+  It links to **Plan and usage**, and for the owner to buying a top-up. The subject reads like
+  `[Pylota Mail] Sends at 80% for Brightwell`.
+- **Webhooks are unchanged.** `quota.warning` and `billing.limit_reached` events still go to your
+  endpoints, so agents and your backend learn about limits the same way as before.
+- **Self-hosted with billing off.** There are no plan limits, so alerts follow the operator quotas in
+  tenant policy, and a feature with no quota sends none.
+
 ## Upgrade, downgrade and cancel
 
 Plans are managed on the console's **Plan and usage** page (`/console/plan`). Every member can see it.
@@ -185,8 +210,9 @@ Paying later restores the plan, with a `billing.plan_changed` event whose reason
 
 Agents can read their own limits before they hit one ([REST API › Usage](../reference/api.md#usage-and-audit)).
 
-**`GET /v1/usage`** works with any key for its own workspace (other workspaces need `usage:read`;
-platform keys pass `tenant_id`):
+**`GET /v1/usage`** works with every tenant and identity key for its own workspace: they hold
+`usage:read` there implicitly. A platform key needs `usage:read` and must pass `tenant_id` (a request
+without `tenant_id` gets `400 invalid_request`).
 
 ```bash
 curl https://mail.example.com/v1/usage -H "Authorization: Bearer $PYLOTA_MAIL_KEY"
@@ -216,8 +242,10 @@ curl https://mail.example.com/v1/usage -H "Authorization: Bearer $PYLOTA_MAIL_KE
 - `granted` includes top-ups. `remaining` also allows for actions in flight, so it is what you can use now.
 - `plans` is the full plan catalog.
 
-**`GET /v1/usage/daily`** (`usage:read`) gives per-day figures: inbound, outbound, sends, triage, search,
-agentic searches, AI usage and storage, for up to 92 days per request.
+**`GET /v1/usage/daily`** (`usage:read`, tenant or platform key) gives per-day figures: inbound,
+outbound, sends, triage, search, agentic searches, AI usage, storage, and the agent assertions and
+signed HTTP requests minted (`assertions`, `http_signatures`), for up to 92 days per request. Signing is
+counted but not limited by any plan.
 
 **`GET /v1/plans`** needs no key. It returns the plan catalog, or `{ "billing_enabled": false, "data": [] }`
 on a deployment without billing.
@@ -226,8 +254,9 @@ on a deployment without billing.
 `--json` for the raw response.
 
 **MCP.** [`mail_get_usage`](../reference/mcp.md#mail_get_usage) returns the same object. It is read-only
-and takes no input; every tenant and identity key sees it for its own workspace. A `billing_limit` tool
-error also carries the feature, the numbers and `resets_at` in its `details`.
+and takes no input; every tenant and identity key sees it for its own workspace, and platform keys do
+not (they use REST with `tenant_id`). A `billing_limit` tool error also carries the feature, the numbers
+and `resets_at` in its `details`.
 
 ## Tax
 
@@ -253,5 +282,6 @@ never to a public issue.
 - [Limits › Plans](../reference/limits.md#plans) and [Limits › Console](../reference/limits.md#console)
 - [Errors › Policy and limits](../reference/errors.md#policy-and-limits)
 - [Webhook events › Workspaces, members and billing](../reference/events.md#workspaces-members-and-billing)
-- [Billing design](../project/design/billing.md) and [Console design](../project/design/console.md)
+- [Billing design](../project/design/billing.md), [Console design](../project/design/console.md) and
+  [Notifications design](../project/design/notifications.md)
 - [PRD §13, business model and pricing](../project/prd.md#13-business-model-and-pricing)

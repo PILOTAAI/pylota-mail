@@ -17,6 +17,7 @@ ADR supersedes it (AGENTS.md).
 | [0006](0006-vectorize.md) | Vectorize for semantic search | Accepted | 2026-10-09 |
 | [0007](0007-agentic-search.md) | Agentic search with verified citations | Accepted | 2026-10-09 |
 | [0008](0008-domains-on-any-dns-host.md) | Domains on any DNS host | Accepted | 2026-10-09 |
+| [0009](0009-local-mcp-protocol-types.md) | Local MCP protocol types | Accepted | 2026-10-09 |
 
 ## When to write one
 

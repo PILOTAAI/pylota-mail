@@ -18,8 +18,8 @@ propagation can add a few minutes of waiting. You do not need a Rust toolchain u
 source.
 
 The rest of the page covers tenant domains and Amazon SES, DNS authentication and the DMARC ramp,
-postmaster mail, staging, upgrades, backups, costs, uninstalling, troubleshooting and deploying the docs
-site.
+postmaster mail, signed HTTP requests, staging, upgrades, backups, costs, uninstalling, troubleshooting
+and deploying the docs site.
 
 ## Before you start
 
@@ -27,7 +27,7 @@ site.
 |---|---|
 | A Cloudflare account on the **Workers Paid** plan | Email Sending to arbitrary recipients needs Workers Paid. Email Sending is in public beta |
 | A **platform mail domain**: a zone apex on Cloudflare DNS in that account, that does not receive mail anywhere else. Examples use `agents.example` | Every identity gets an address on it, such as `bookings.acme@agents.example`. Only this domain must be on Cloudflare: tenants' own domains can be on any DNS host ([Custom domains](guides/custom-domains.md)) |
-| An **API host**: any hostname on a zone in the account, with no existing CNAME record. Examples use `mail.example.com` | The Worker serves the REST API, the MCP server, `/openapi.json` and `/health` there, as a Worker Custom Domain |
+| An **API host**: any hostname on a zone in the account, with no existing CNAME record. Examples use `mail.example.com` | The Worker serves there, as a Worker Custom Domain: the REST API (`/v1/*`, including signed links `/v1/links/*`), the MCP server (`/mcp`), `/openapi.json`, `/health`, `/.well-known/*`, the provider hooks (`/hooks/*`) and `/billing/stripe/webhook`; and the console, unless you give it its own host with `--console-host` |
 | Node.js 22 or later | `pmail setup` and `pmail deploy` run Cloudflare's `wrangler` CLI (version `4.139.0`, through `npx --yes wrangler@4.139.0`) |
 | The `pmail` binary | It runs setup, deploy, the doctor and every admin and mail command |
 
@@ -64,7 +64,7 @@ cargo install pylota-mail-cli --locked
 
 ```bash
 pmail --version
-node --version     # must be v20 or later
+node --version     # must be v22 or later (wrangler 4.139.0 declares node >=22.0.0)
 ```
 
 The CLI's version decides which Worker release `pmail setup` and `pmail deploy` install, so keep the
@@ -72,47 +72,66 @@ CLI and the deployment on the same version.
 
 ## 2. Create a Cloudflare API token
 
-`pmail setup`, `pmail setup ses`, `pmail deploy` and `pmail doctor` use a Cloudflare API token from the
-`CLOUDFLARE_API_TOKEN` environment variable, and so does `pmail domains add` when it adds a zone apex
-for a deployment without `PM_CF_API_TOKEN` ([Tenant domains](#tenant-domains)). It is never written to
-the CLI's config file.
+`pmail` uses a Cloudflare API token from the `CLOUDFLARE_API_TOKEN` environment variable for the commands
+listed in [CLI › Commands that use your Cloudflare token](reference/cli.md#commands-that-use-your-cloudflare-token):
+`setup`, `deploy` and `doctor` among them. It is never written to the CLI's config file. The Worker can
+hold a second token, the secret `PM_CF_API_TOKEN`, so that tenants can add domains on Cloudflare through
+the API ([Domains on Cloudflare](#domains-on-cloudflare)). This table is the one list of what each token
+needs; other pages link here.
 
 Create the token in the Cloudflare dashboard, either as an account token (**Manage account** >
-**Account API tokens**) or as a user token (**My Profile** > **API Tokens**), with these
-permissions:
+**Account API tokens**) or as a user token (**My Profile** > **API Tokens**), with these permissions.
+Names are as the dashboard shows them; the API tab of Cloudflare's
+[permissions reference](https://developers.cloudflare.com/fundamentals/api/reference/permissions/)
+shows *Write* where the dashboard shows *Edit* (for example "DNS Write"), and they are the same
+permission.
 
-| Scope | Permission (as named on Cloudflare's permissions page) | Used for |
-|---|---|---|
-| Account | Workers Scripts · Edit | Uploading the Worker, its secrets, cron triggers and Durable Object migrations |
-| Account | D1 · Edit | Creating the `pylota-mail` database and applying migrations |
-| Account | Workers R2 Storage · Edit | Creating the `pylota-mail-blobs` bucket and its lifecycle rule |
-| Account | Queues · Edit | Creating the five work queues and their dead-letter queues, and the Email Sending event subscription that feeds `pm-delivery-events` |
-| Account | Vectorize · Edit | Creating the `pm-mail-chunks` index and its metadata indexes |
-| Account | Workers AI · Read | Checking that the configured models are available |
-| Account | Email Sending · Edit | Onboarding the platform domain for sending |
-| Account | Account Settings · Read | Used by `wrangler` to read the account |
-| Zone (the mail domain's zone and the API host's zone) | Zone · Read | Finding the zones and checking the mail domain is an apex |
-| Zone (same) | DNS · Edit | Reading and writing mail DNS records |
-| Zone (same) | Zone Settings · Edit | Enabling Email Routing on the mail domain (`POST /zones/{zone_id}/email/routing/dns` accepts Zone Settings Write, [API reference](https://developers.cloudflare.com/api/resources/email_routing/subresources/dns/methods/create/), read 2026-10-09) |
-| Zone (same) | Email Routing Rules · Edit | Creating the catch-all rule to the Worker |
-| Zone (same) | Workers Routes · Edit | Attaching the API host to the Worker as a Custom Domain |
-| User (user tokens only) | User Details · Read, Memberships · Read | Used by `wrangler` with user tokens |
+| Scope | Permission | Your token (`CLOUDFLARE_API_TOKEN`) | Worker token (`PM_CF_API_TOKEN`) | Used for |
+|---|---|---|---|---|
+| Account | Workers Scripts · Edit | Yes | – | Uploading the Worker, its secrets, cron triggers and Durable Object migrations; reading secret names (`doctor`); deleting the Worker (`destroy`) |
+| Account | D1 · Edit | Yes | – | Creating the `pylota-mail` database, applying migrations, and the CLI's D1 queries (setup, `doctor`, `secrets rotate-master`, `domains add --local-token`, `domains subscribe`) |
+| Account | Workers R2 Storage · Edit | Yes | – | Creating the `pylota-mail-blobs` bucket (and the backup bucket) and its lifecycle rule |
+| Account | Queues · Edit | Yes | Yes | Creating the five work queues and their dead-letter queues (your token); listing queues and creating each domain's Email Sending event subscription to `pm-delivery-events` (both) |
+| Account | Vectorize · Edit | Yes | Only if spike S6 fails | Creating the `pm-mail-chunks` index, its metadata indexes and later index generations; the Worker's REST fallback |
+| Account | Workers AI · Read and Workers AI · Edit | Yes | Only if spike S6 fails | Checking that the configured models exist, and the embedding probe when you change `PM_EMBED_MODEL`; the Worker's REST fallback. Cloudflare's Workers AI REST page asks a custom token for both to run a model (read 2026-10-09) |
+| Account | Email Sending · Edit | Yes | Yes | Onboarding domains for sending and reading their DNS records |
+| Account | Account Settings · Read | Yes | – | Used by `wrangler` to read the account |
+| Account | Account Analytics · Read | Yes | – | The doctor's `quota` check (Workers Analytics Engine SQL API). Without it that check warns instead of reading the quota errors |
+| Zone | Zone · Read | Yes | Yes | Finding zones, checking the mail domain is an apex, reading zone status, counting zones (`doctor`) |
+| Zone | Zone · Edit | Only for `destroy` when `nameservers` or `delegated_subdomain` domains still exist | Yes, for `nameservers` and `delegated_subdomain` | Creating a zone for a domain used only for mail, and deleting it when the domain is removed (by the Worker, or by `pmail destroy --skip-erasure`, which deletes the zones this deployment created) |
+| Zone | DNS · Edit | Yes | Yes | Mail DNS records: the ownership TXT, removing MX records with `--replace-mx`, the platform domain's SES DKIM records (`setup ses`) |
+| Zone | Zone Settings · Edit | Yes | Yes | Enabling Email Routing and sub-addressing, reading the routing DNS records, and turning routing off when a domain is removed (`POST /zones/{zone_id}/email/routing/dns` accepts Zone Settings Write, [API reference](https://developers.cloudflare.com/api/resources/email_routing/subresources/dns/methods/create/), read 2026-10-09) |
+| Zone | Email Routing Rules · Edit | Yes | Yes | The catch-all rule to the Worker, and the per-address rules on subdomains |
+| Zone | Workers Routes · Edit | Yes | – | Attaching the API host, and the console host if it differs, to the Worker as Custom Domains |
+| User (user tokens only) | User Details · Read, Memberships · Read | Yes | – | Token verification and account lookup by `wrangler` with a user token |
+
+**Which zones.** Choose **All zones** in the account for the zone permissions; this is the
+recommended setting, because the CLI writes to several zones: the platform mail domain's zone, the zones
+of the API host and the console host, and the zone of every tenant domain you add with
+`pmail domains add --local-token`. The Worker's token likewise needs every zone that tenants add with
+`cloudflare_zone`, and a zone it creates for `nameservers` or `delegated_subdomain` exists in no list of
+specific zones. For least privilege, give your own token **specific zones** instead: the mail domain's
+zone, the API host's zone, the console host's zone, and each tenant zone you will add with
+`--local-token` (add a zone to the token before you add its domain).
 
 Notes:
 
-- Cloudflare's permissions page lists some groups as *Edit* in one table and *Write* in another
-  (for example "DNS Write"). They are the same permission.
 - If your account uses **Workers roles**, creating a Worker needs the *Admin* role at the Workers
   product scope (later deploys need only *Editor*), and changing Routes or Custom Domains needs
   *Workers Routes Write* on each affected zone.
-- Cloudflare's documentation names the permission for sending (**Email Sending: Edit**) and for enabling
-  Email Routing (**Zone Settings Write**), but not the one for creating Queues event subscriptions.
-  `Queues · Edit` is assumed to cover it. `pmail doctor` checks that the event subscription and the
-  catch-all rule exist and tells you if either is missing
+- Cloudflare's documentation names the permission for sending (**Email Sending: Edit**, which is not on
+  the permissions page; its scope is verified at build time) and for enabling Email Routing
+  (**Zone Settings Write**), but not the one for creating Queues event subscriptions. `Queues · Edit` is
+  assumed to cover it. `pmail doctor` checks that the event subscription and the catch-all rule exist
+  and tells you if either is missing
   (spike [S9](project/build-plan.md#m1--spikes-each-one-gates-design-choices)).
-- Pylota Mail does not need permission to manage tokens, billing or members. Do not add them.
+- Whether a zone-scoped grant can create new zones (Zone · Edit for `nameservers`) is not stated by
+  Cloudflare; it is verified at build time.
+- Neither token needs permission to manage tokens, billing, members or Email Routing destination
+  addresses (setup registers none). Do not add them.
 
-Export the token, and the account ID if you prefer it to the `--account-id` flag:
+Export the token, and the account ID if you prefer it to the `--account-id` flag. Setup also stores the
+account ID (not the token) in your CLI profile, so later commands find it:
 
 ```bash
 export CLOUDFLARE_API_TOKEN=…
@@ -122,23 +141,31 @@ export CLOUDFLARE_ACCOUNT_ID=…        # optional; same as --account-id
 ## 3. Run setup
 
 ```bash
-pmail setup --account-id <account-id> --domain mail.example.com --mail-domain agents.example --jurisdiction eu
+pmail setup --account-id <account-id> --domain mail.example.com --mail-domain agents.example \
+  --jurisdiction eu --owner-email sam@acmecarhire.example
 ```
 
 | Flag | Meaning |
 |---|---|
-| `--account-id` | Your Cloudflare account ID (or set `CLOUDFLARE_ACCOUNT_ID`) |
-| `--domain` | The **API host**: where the Worker serves `/v1`, `/mcp`, `/openapi.json` and `/health`. Becomes `PM_API_HOST` |
+| `--account-id` | Your Cloudflare account ID (or set `CLOUDFLARE_ACCOUNT_ID`). Setup stores it in your CLI profile |
+| `--domain` | The **API host**, where the Worker serves the API, MCP, `/openapi.json`, `/health`, `/.well-known/*`, `/hooks/*` and the console ([Before you start](#before-you-start)). Becomes `PM_API_HOST` |
 | `--mail-domain` | The **platform mail domain**. It must be a zone apex in this account. Becomes `PM_PLATFORM_DOMAIN`. If you leave it out, setup asks for it |
 | `--jurisdiction` | `eu` (the default) or `default`. Applied when D1, R2 and every Durable Object are created. **It cannot be changed later.** Becomes `PM_JURISDICTION`. See [Privacy](guides/privacy.md#choosing-a-jurisdiction) |
-| `--print-secrets` | Optional. Prints the generated secrets once. Without it they are never written to disk |
+| `--owner-email` | The first console owner of the default tenant, who receives a sign-in link. Setup asks for it unless you pass `--no-console` |
+| `--console-host` | Optional. Serve the console on its own host instead of the API host (`PM_CONSOLE_HOST`) |
+| `--profile` | Optional. The CLI profile that receives the URL, the account ID and the temporary key; `default` unless you name another |
+| `--print-secrets` | Optional. Prints the generated secrets once, to stdout. Without it they go only to the Worker (through Wrangler, on stdin) and are never printed or written to a file or a log |
+
+Every flag is in the [CLI reference](reference/cli.md#setup).
 
 Setup also deploys the Worker. It downloads the release for the CLI's version
 (`pylota-mail-worker-<version>.tar.gz`) and the release's signed `SHA256SUMS` from GitHub Releases,
 refuses to continue if the checksum does not match, renders `deploy/wrangler.toml`, applies the D1
 migrations and runs `npx --yes wrangler@4.139.0 deploy`. `--version <v>` picks another release, and
-`--from-source` builds the Worker locally instead; it needs the Rust toolchain, the
-`wasm32-unknown-unknown` target and `worker-build` 0.8.7.
+`--from-source` builds the Worker locally from a checkout of the repository (`--source-dir <path>`,
+default the current directory) instead; it needs the Rust toolchain, the `wasm32-unknown-unknown` target
+and `worker-build` 0.8.7, and it still downloads crates from crates.io (unless you vendor them) and
+Wrangler from npm.
 
 Setup is idempotent: if it stops half-way (a missing permission, a network error), fix the cause
 and run the same command again. It finds what already exists and creates only what is missing
@@ -148,17 +175,22 @@ and run the same command again. It finds what already exists and creates only wh
 
 | Resource | Name | Notes |
 |---|---|---|
+| Release bundle | `deploy/.bundle/<version>/` | The verified Worker release that setup deploys |
 | D1 database | `pylota-mail` | In the chosen jurisdiction. Migrations applied. Holds the control plane: tenants, identities, the address directory, domains, hashed API keys, webhooks, suppressions, jobs, audit log |
 | R2 bucket | `pylota-mail-blobs` | Same jurisdiction. Lifecycle rule deletes `inbound-staging/` after one day |
 | Queues | `pm-inbound`, `pm-outbound`, `pm-delivery-events`, `pm-webhooks`, `pm-index` | Each with a dead-letter queue (`pm-inbound-dlq` and so on) |
 | Vectorize index | `pm-mail-chunks` | 1,024 dimensions, cosine, eight metadata indexes. Holds no message text |
 | Email Routing | On the platform domain | Enabled, with a catch-all rule that sends every address to the Worker |
+| Ownership record | TXT `_pylota-mail.agents.example` | `pm-verify=…`, the proof that this deployment controls the domain |
 | Email Sending | On the platform domain | Onboarded. Cloudflare adds MX and SPF records on `cf-bounce.agents.example`, DKIM at `cf-bounce._domainkey.agents.example` and DMARC at `_dmarc.agents.example` |
 | Event subscription | Platform domain → `pm-delivery-events` | Delivery, bounce, complaint and other Email Sending events |
-| Worker secrets | `PM_MASTER_KEY`, `PM_KEY_PEPPER`, `PM_HASH_KEY` | 32 random bytes each, one purpose each. The keys that sign thread tokens, links and search cursors are generated later by the Worker itself and kept sealed in D1. See [Configuration › Secrets](reference/configuration.md#secrets) |
-| Default tenant | – | The one tenant whose address suffix is empty, so its identities get `name@agents.example` |
-| Worker | `pylota-mail` | Its four Durable Object classes (`IdentityMailbox`, `DomainMonitor`, `JobRunner`, `TenantQuota`), its cron triggers and the API host's Custom Domain |
+| Rate-limit namespaces | `RL_API`, `RL_SEARCH`, `RL_AGENTIC`, `RL_SEND`, `RL_SIGNIN`, `RL_SIGN` | Six bindings, with namespace IDs from 1001 that no other Worker in the account uses |
+| Worker secrets | `PM_MASTER_KEY`, `PM_KEY_PEPPER`, `PM_HASH_KEY` | 32 random bytes each, one purpose each. The keys that sign thread tokens, links, search cursors and Web Bot Auth requests, and each identity's signing keys, are generated later by the Worker itself and kept sealed in D1. See [Configuration › Secrets](reference/configuration.md#secrets) |
+| Worker | `pylota-mail` | Its six Durable Object classes (`IdentityMailbox`, `DomainMonitor`, `JobRunner`, `TenantQuota`, `SesControl`, `Notifier`), its cron triggers and the API host's Custom Domain (two, with `--console-host`) |
+| Temporary platform key | `setup-bootstrap`, in your CLI profile | Expires after 24 hours. Replace it in [step 5](#5-create-the-first-api-key) |
 | Platform domain record | `dom_…` with `tenant_id: null` | Visible to every key. Its health is monitored like any other domain, from the Worker's first cron run |
+| Default tenant | – | The one tenant whose address suffix is empty, so its identities get `name@agents.example`. Its console owner is the `--owner-email` person |
+| System identity | `PM_SYSTEM_FROM` on the platform domain | Sends sign-in links, invitations and notification emails |
 | `deploy/wrangler.toml` | – | Bindings, variables, cron triggers and Durable Object migrations for `pmail deploy`. It holds no secrets |
 
 The bindings and variables are listed in [Configuration](reference/configuration.md#bindings).
@@ -186,8 +218,17 @@ setup, it finds nothing to change and exits without deploying.
 ## 5. Create the first API key
 
 ```bash
-pmail keys create --level platform --name first-key
+pmail keys create --level platform --name first-key --permissions \
+tenants:manage,platform:ops,keys:manage,identities:read,identities:write,domains:read,domains:write,\
+messages:read,messages:send,messages:write,attachments:read,search:read,search:agentic,\
+quarantine:review,webhooks:read,webhooks:manage,erasure:manage,suppressions:manage,usage:read,\
+audit:read,members:read,members:manage
 ```
+
+A platform key must list its permissions; there is no implicit full set. This one holds every permission
+a platform key may hold, so it can create every other key and run `pmail doctor --mail-test`. Setup's
+summary prints this command for you. (`identities:sign` is not in it: platform keys cannot sign as an
+identity.)
 
 This call authenticates with the short-lived **bootstrap key** that `pmail setup` stored in your CLI
 profile. Setup is the only moment the CLI knows `PM_KEY_PEPPER` (it generated it), so it mints that one
@@ -197,11 +238,10 @@ The secret (`pmk_live_…`) is printed **once**. Store it in a password manager.
 it reaches every tenant, so use it for administration only, and create tenant and identity keys for
 applications and agents ([Security](guides/security.md#keys-and-permissions)).
 
-Save it in a CLI profile:
-
-```bash
-pmail login          # API URL https://mail.example.com, then the key
-```
+Because the call used the bootstrap profile, `pmail` then asks whether to save the new key in that
+profile and revoke the bootstrap key. Answer yes. In a non-interactive run, add `--save-profile default`
+to the command instead: the new key is stored in the profile, and the bootstrap key expires on its own
+within 24 hours (or revoke it at once with `pmail keys revoke <key-id>`).
 
 ## 6. Run the doctor with a mail test
 
@@ -214,9 +254,11 @@ prints a fix for every failure ([FR-OPS-3](project/prd.md#613-operations)). With
 also sends a message out through the deployment and receives it back through Email Routing, then
 prints the `Authentication-Results` authserv-id that Cloudflare's MX stamped on it.
 
-Set that value as `PM_TRUSTED_AUTHSERV_ID` (see
-[Configuration › Variables](reference/configuration.md#variables)) and run `pmail deploy`.
-Until it is set, only Pylota Mail's own DKIM, ARC and DMARC verification counts. Headers from any
+`pmail setup` already ran this test as its last step and set that value as `PM_TRUSTED_AUTHSERV_ID`
+(see [Configuration › Variables](reference/configuration.md#variables)). If setup's mail test failed,
+the doctor says so; fix the cause and run `pmail setup` again, which sets it. Until it is set, SPF
+cannot be checked: mail from a sender whose DMARC policy is `quarantine` or `reject` and whose DKIM does
+not align is quarantined as `auth_unverified`. Headers from any
 other authserv-id are always ignored, because senders can forge them
 ([D9](project/edge-cases.md)).
 
@@ -241,17 +283,20 @@ something from the deployment:
 
 Without `PM_CF_API_TOKEN`, adding a `cloudflare_zone`, `nameservers` or `delegated_subdomain` domain
 fails with `422 cf_token_required`. You can still add a zone **apex** yourself with
-`pmail domains add <domain> --method cloudflare_zone --tenant <tenant>`, which uses your local
-`CLOUDFLARE_API_TOKEN`. A zone subdomain, `nameservers` and `delegated_subdomain` need the token on the
-Worker, because the Worker keeps calling Cloudflare over the domain's life (a routing rule per address,
-onboarding once a new zone is active). To let tenants add these domains through the API, create a token
-with the permissions in
-[Identities, addresses and domains › Cloudflare API token permissions](project/design/identity-domains.md#cloudflare-api-token-permissions)
-and store it as a Worker secret:
+`pmail domains add <domain> --method cloudflare_zone --tenant <tenant> --local-token`, which uses your
+local `CLOUDFLARE_API_TOKEN` (its zone permissions must cover that zone, [step 2](#2-create-a-cloudflare-api-token)).
+A zone subdomain, `nameservers` and `delegated_subdomain` need the token on the Worker, because the Worker
+keeps calling Cloudflare over the domain's life (a routing rule per address, onboarding once a new zone is
+active). To let tenants add these domains through the API, create a second token with the permissions
+marked for the Worker token in [step 2](#2-create-a-cloudflare-api-token) and store it as a Worker
+secret:
 
 ```bash
 npx --yes wrangler@4.139.0 secret put PM_CF_API_TOKEN --name pylota-mail
 ```
+
+What the Worker does with it is in
+[Identities, addresses and domains › Cloudflare API token permissions](project/design/identity-domains.md#cloudflare-api-token-permissions).
 
 ### Connect Amazon SES (optional)
 
@@ -269,8 +314,8 @@ Before you run it:
 | An AWS account | The resources below are created in it. Amazon Web Services then processes the mail of SES domains, so list it as a sub-processor ([Privacy](guides/privacy.md)) |
 | SES production access in the chosen region | The SES sandbox sends only to verified addresses, at most 200 messages a day ([SES quotas](https://docs.aws.amazon.com/ses/latest/dg/quotas.html), read 2026-10-09). Without production access, the command prints the AWS console steps to request it and stops before creating anything |
 | The SES à la carte plan, not Essentials | Sending costs $0.10 per 1,000 messages à la carte against $0.16 on Essentials ([SES pricing](https://aws.amazon.com/ses/pricing/), read 2026-10-09). The command warns on Essentials |
-| A region that receives mail | Not every SES region receives mail; the command refuses one that does not. With `PM_JURISDICTION` `eu`, the region must also be in the EU (`eu-central-1`, `eu-west-1`, `eu-west-2`, `eu-south-1`, `eu-west-3` or `eu-north-1`) unless you pass `--allow-non-eu` |
-| AWS credentials on your machine that can create the resources below (SES, S3, SNS, SQS and IAM) | Read from `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN`, or from the profile named by `AWS_PROFILE` in `~/.aws/credentials`. They are never stored, uploaded or printed |
+| A region that receives mail | Not every SES region receives mail; the command refuses one that does not. With `PM_JURISDICTION` `eu`, the region must also be in the EU or the UK (`eu-central-1`, `eu-west-1`, `eu-west-2` (London), `eu-south-1`, `eu-west-3` or `eu-north-1`) unless you pass `--allow-non-eu`. For the SES region, `eu` means "EU or UK": the UK has an EU adequacy decision under the GDPR (European Commission [adequacy decisions](https://commission.europa.eu/law/law-topic/data-protection/international-dimension-data-protection/adequacy-decisions_en), renewed 19 December 2025, read 2026-10-09). Cloudflare's own `eu` jurisdiction for D1, R2 and Durable Objects means the EU only |
+| AWS credentials on your machine that can create the resources below (SES, S3, SNS, SQS and IAM) | Read from `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN`, else from the profile named by `AWS_PROFILE` (else `default`) in `~/.aws/credentials` and `~/.aws/config`. They are never stored, uploaded or printed |
 | `CLOUDFLARE_API_TOKEN`, as in [step 2](#2-create-a-cloudflare-api-token) | To store the Worker's own SES key as Worker secrets, redeploy, and publish the platform domain's SES DKIM records in its zone |
 
 What it creates in the region:
@@ -348,6 +393,59 @@ names are allowed, except `postmaster` and `abuse`, whose mail goes to the tenan
 - Spam complaints from recipients do not arrive as mail. They arrive as `message.complained` events,
   suppress the recipient permanently, and count towards automatic pausing
   ([Sending › Bounces, complaints and suppressions](guides/sending.md#bounces-complaints-and-suppressions)).
+- The system identity also sends people's notification emails from the platform domain: new-mail
+  counts, usage alerts and the daily "needs a person" email, as each person chooses in the console
+  ([Notifications](project/design/notifications.md)). `PM_NOTIFICATIONS = "on"` is the default; set it
+  to `"off"` in `deploy/wrangler.toml` and run `pmail deploy` to send only `account` notifications
+  (security and billing events, which cannot be turned off).
+
+## Signed HTTP requests (Web Bot Auth)
+
+Identities can sign the HTTP requests their agents make, so that a website can tell which agent made a
+request and that it came through your deployment: `pmail http-sign` and the MCP tool
+`mail_sign_http_request` return `Signature-Agent`, `From`, `Signature-Input` and `Signature` headers,
+signed with a key that belongs to the deployment ([Web Bot Auth](https://developers.cloudflare.com/bots/reference/bot-verification/web-bot-auth/),
+read 2026-10-09). Agent assertions are separate and need nothing from you
+([Using it from an agent](guides/agents.md#agent-assertions)).
+
+**It is off by default.** `PM_WEB_BOT_AUTH = "off"` is written into `deploy/wrangler.toml`; while it is
+off, signing requests fail with `422 web_bot_auth_disabled` and the key directory answers
+`404 key_not_found`. Turn it
+on only if spike S13 passed (the [build plan](project/build-plan.md) records the result): S13 checks the
+signature format against Cloudflare's test endpoint before release. If it did not pass, signed HTTP
+requests stay off in this release and the setting cannot be turned on.
+
+To turn it on:
+
+1. Set `PM_WEB_BOT_AUTH = "on"` under `[vars]` in `deploy/wrangler.toml` and run `pmail deploy`. The
+   Worker creates the deployment's signing key the first time it is needed and publishes the key
+   directory at `https://mail.example.com/.well-known/http-message-signatures-directory` (your API
+   host). The directory is signed once per listed key and lists at most three keys.
+2. Run `pmail doctor --check web_bot_auth`, which fetches the directory and checks its signatures.
+3. Let each tenant that wants it opt in. Tenant policy `web_bot_auth.allowed` is `false` by default, and
+   until it is `true` that tenant's identities get `403 policy_denied`. With a platform key that holds
+   `tenants:manage`:
+
+   ```bash
+   pmail tenants update brightwell --policy '{"web_bot_auth":{"allowed":true}}'
+   ```
+
+Agents then sign with a tenant or identity key that holds `identities:sign`. Signing shares the
+`RL_SIGN` limit with assertions (600 calls a minute per identity) and uses no plan allowance.
+
+**Rotating the key.** `pmail keys rotate web_bot_auth` makes a new key active; the previous one stays
+listed in the directory for 7 days. After a suspected leak, add
+`--revoke-previous` to remove the old key from the directory at once, then run
+`pmail secrets rotate-master` ([CLI reference](reference/cli.md#keys-rotate-threadlinkcursorweb_bot_auth)).
+Verifiers may cache the directory for up to 24 hours.
+
+**Cloudflare's verified bots (optional).** Sites behind Cloudflare can treat your agents as a verified
+bot once you register the directory with Cloudflare. In the dashboard, go to **Manage Account** >
+**Configurations** > **Bot Submission Form**, choose the verification method **Request Signature**, and
+enter the directory URL from step 1 (Cloudflare's Web Bot Auth page, read 2026-10-09). You do not need
+this for any other verifier: any Web Bot Auth verifier can check the signatures against your directory
+without it. The design is in
+[Agent signing keys › Signed HTTP requests](project/design/agent-keys.md#5-signed-http-requests-web-bot-auth).
 
 ## A staging environment
 
@@ -356,30 +454,50 @@ Vectorize index and queues. Nothing is shared
 ([Architecture §7](project/architecture.md#7-deployment-topology)).
 
 The simplest way is a **separate Cloudflare account**, because setup uses fixed resource names
-(`pylota-mail`, `pylota-mail-blobs`, `pm-*`). For example:
+(`pylota-mail`, `pylota-mail-blobs`, `pm-*`). Give staging its own deployment directory and its own CLI
+profile, so it never touches production's `deploy/wrangler.toml` or production's key:
 
 ```bash
+export CLOUDFLARE_API_TOKEN=…        # a token for the staging account (step 2)
 pmail setup --account-id <staging-account-id> --domain mail-staging.example.com \
-  --mail-domain agents-staging.example --jurisdiction eu
+  --mail-domain agents-staging.example --jurisdiction eu \
+  --dir ./deploy-staging --profile staging
 ```
 
-Keep a CLI profile per environment:
+Pass `--profile staging` to every command for staging, and `--dir ./deploy-staging` to the commands that
+read the deployment directory (`setup ses`, `deploy`, `upgrade`, `doctor`, `destroy` and
+`secrets rotate-master`). Without them `pmail` uses `./deploy` and the `default` profile, which belong to
+production:
+
+```bash
+pmail keys create --level platform --name first-key --permissions … --profile staging
+pmail doctor --dir ./deploy-staging --profile staging
+pmail upgrade --dir ./deploy-staging --profile staging
+```
+
+(`…` is the list from [step 5](#5-create-the-first-api-key).)
+
+The profile holds staging's URL, its account ID and its key, so commands that use your Cloudflare token
+find the right account. After both setups, the config file looks like this:
 
 ```toml
 # ~/.config/pylota-mail/config.toml
-default_profile = "prod"
-
-[profiles.prod]
+[profiles.default]                    # production, written by pmail setup
 url = "https://mail.example.com"
-key_env = "PYLOTA_MAIL_KEY"
+account_id = "<production-account-id>"
+key = "pmk_live_…"
 
-[profiles.staging]
+[profiles.staging]                    # written by pmail setup --profile staging
 url = "https://mail-staging.example.com"
-key_env = "PYLOTA_MAIL_STAGING_KEY"
+account_id = "<staging-account-id>"
+key = "pmk_live_…"
 ```
 
-Then `pmail --profile staging doctor`. Before an upgrade reaches production, try it on staging:
-inbound from a real mailbox, outbound and a reply, a bounce, and a domain change.
+To keep a key out of the file, store an environment variable's name instead:
+`pmail login --profile staging --key-env PYLOTA_MAIL_STAGING_KEY`.
+
+Before an upgrade reaches production, try it on staging: inbound from a real mailbox, outbound and a
+reply, a bounce, and a domain change.
 
 ## Upgrades and rollbacks
 
@@ -388,12 +506,13 @@ inbound from a real mailbox, outbound and a reply, a bounce, and a domain change
 3. Upgrade staging, then production:
 
    ```bash
+   pmail upgrade --dir ./deploy-staging --profile staging
    pmail upgrade
    ```
 
    `pmail upgrade` deploys the new, checksum-verified release as a gradual deployment
-   (10% → 50% → 100% of traffic). See the [CLI reference](reference/cli.md) for its options.
-4. Run `pmail doctor`.
+   (10% → 50% → 100% of traffic). See the [CLI reference](reference/cli.md#upgrade) for its options.
+4. Run `pmail doctor` (for staging, with `--dir ./deploy-staging --profile staging`).
 
 What to expect during an upgrade:
 
@@ -465,17 +584,28 @@ keep raw mail (`retention.raw_days`). Watch usage per tenant with `pmail usage d
 pmail destroy
 ```
 
-`pmail destroy` removes the Worker and the resources setup created. **This deletes all mail, keys and
-configuration permanently.** Point-in-time recovery cannot bring back a deleted database or bucket.
+`pmail destroy` removes the Worker and the Cloudflare resources setup created. **This deletes all mail,
+keys and configuration permanently.** Point-in-time recovery cannot bring back a deleted database or
+bucket. It prints the plan first; `pmail destroy --dry-run` prints only the plan.
 
 Before you run it:
 
 1. Export anything you must keep (`pmail export create`, see
    [Privacy](guides/privacy.md#subject-access-export)).
 2. Tell integrators: their webhooks will stop and their keys will stop working.
+3. If you connected Amazon SES, decide what happens to its AWS resources. By default `destroy` leaves
+   them and lists them at the end, and the Worker's IAM access key stays valid until you delete it in the
+   AWS console. With `--include-ses`, `destroy` deletes them with your local AWS credentials, in the
+   reverse order of `setup ses`:
 
-Afterwards, check the platform domain's zone for leftover mail DNS records, and delete the Cloudflare
-API token if you no longer need it. See the [CLI reference](reference/cli.md) for `destroy`'s options.
+   ```bash
+   pmail destroy --include-ses
+   ```
+
+Threads under a legal hold stop `destroy` before it deletes anything else; release the holds (export
+the mail first if you must keep it) and run it again. Afterwards, check the platform domain's zone for
+leftover mail DNS records, and delete the Cloudflare API tokens if you no longer need them. See the
+[CLI reference](reference/cli.md#destroy) for `destroy`'s options.
 
 ## Troubleshooting
 
@@ -483,8 +613,9 @@ API token if you no longer need it. See the [CLI reference](reference/cli.md) fo
 |---|---|---|
 | Setup says the mail domain is not a zone apex | You gave a subdomain, or the zone is in another account | Use the zone's apex, in the account named by `--account-id` |
 | Setup refuses the mail domain because it has MX records | The domain already receives mail elsewhere | Use a dedicated domain. Replacing the MX records would stop that mail |
-| Setup stops with a Cloudflare permission error | The token lacks a permission from step 2 | Add it and re-run setup. It continues where it stopped |
-| `pmail setup` or `pmail deploy` fails before uploading | Node.js older than 22, or no network access to GitHub Releases | Install Node.js 22+. Behind a proxy, use `--from-source` |
+| Setup stops with a Cloudflare permission error | The token lacks a permission, or a zone, from step 2 | Add it and re-run setup. It continues where it stopped |
+| `pmail doctor` warns on `quota` that it cannot read the quota errors | The token lacks Account Analytics · Read | Add it ([step 2](#2-create-a-cloudflare-api-token)) |
+| `pmail setup` or `pmail deploy` fails before uploading | Node.js older than 22, or no network access to GitHub Releases | Install Node.js 22+. Behind a proxy, set `HTTPS_PROXY`, which `pmail` honours. `--from-source --source-dir <checkout>` avoids the GitHub Releases download only: it still needs crates.io (or vendored crates) and npm for Wrangler |
 | `pmail setup` or `pmail deploy` refuses the bundle | The checksum did not match | Do not override it. Download again, or report it ([SECURITY.md](https://github.com/PILOTAAI/pylota-mail/blob/main/SECURITY.md)) |
 | The Custom Domain cannot be created | The API host already has a CNAME record | Delete the record or choose another hostname |
 | `/health` does not answer | The Custom Domain or its certificate is still being created | Wait a few minutes, then run `pmail doctor` |
@@ -495,7 +626,8 @@ API token if you no longer need it. See the [CLI reference](reference/cli.md) fo
 | Delivery statuses never change after `submitted` | The Email Sending event subscription is missing | `pmail doctor` checks it. Re-run setup to create it |
 | Every verdict ignores Cloudflare's header | `PM_TRUSTED_AUTHSERV_ID` is not set | Run `pmail doctor --mail-test` and set the value it prints |
 | An alert says a dead-letter queue is not empty | A queue message failed every retry | `pmail dlq list` (`GET /v1/platform/dlq`), fix the cause, then `pmail dlq redrive` ([J8](project/edge-cases.md)) |
-| `401 unauthenticated` from every command | Wrong profile, URL or key | `pmail config show` |
+| `401 unauthenticated` from every command | Wrong profile, URL or key; a `PYLOTA_MAIL_KEY` in the environment overrides the profile's key | `pmail config show` shows where each setting came from |
+| `pmail http-sign` fails with `422 web_bot_auth_disabled` or `403 policy_denied` | Signed HTTP requests are off, or the tenant has not opted in | [Signed HTTP requests](#signed-http-requests-web-bot-auth) |
 
 ## Deploy the landing site and docs
 

@@ -34,8 +34,9 @@ request locally.
 - Anything else, including a timeout, TLS error, DNS error, redirect or `3xx`, is a failure. Failures
   retry at about **30 s, 2 min, 10 min, 30 min, 1 h, 2 h, 4 h, 8 h, 12 h, 12 h, 12 h, 19 h**, which
   adds up to about 72 hours. Each delay has ±10% jitter.
-- After the last attempt, the delivery is marked `dead`. It can be replayed for 30 days with
-  `POST /v1/webhooks/{id}/replay`.
+- After the last attempt, the delivery is marked `dead`. The event can be replayed with
+  `POST /v1/webhooks/{id}/replay` for 30 days from its `occurred_at` (or `retention.events_days`, if
+  shorter), counted from when the event happened, not from when the delivery went `dead`.
 - After 100 consecutive failures spread over at least 24 hours, the endpoint is disabled
   (`disabled_reason: failing`) and a `webhook.disabled` event goes to the platform's other endpoints.
 - `410 Gone` from an endpoint disables it immediately.
@@ -45,7 +46,8 @@ request locally.
 Events are not guaranteed to arrive in order. Each payload carries `occurred_at`, and a `sequence` that
 increases strictly per owner: per identity for mailbox events (`message.*`, `identity.*`,
 `verification.received`, `suppression.created`, `quota.warning`), per domain for `domain.*` events, and
-per job for `erasure.*` and `export.*` events. Use it to discard stale updates, for example a
+per job for `erasure.*` and `export.*` events, and for `identity.deleted`, which the erasure job emits
+after the mailbox is gone (it still carries `identity_id`, so identity-filtered endpoints receive it). Use it to discard stale updates, for example a
 `message.deferred` arriving after `message.delivered`. Platform events (`webhook.disabled`,
 `webhook.test`, `member.*` and `billing.*`) have `sequence: null`.
 
@@ -65,7 +67,7 @@ per job for `erasure.*` and `export.*` events. Use it to discard stale updates, 
 ```
 
 `identity_id` is `null` for events that do not belong to one identity (domain, job and platform
-events). `tenant_id` is `null` only for deployment-level platform events.
+events); `identity.deleted` is the one job event that sets it. `tenant_id` is `null` only for deployment-level platform events.
 
 Payloads are **thin**. They carry IDs, a summary, verdicts and up to `policy.webhook_text_bytes` of
 `extracted_text` (default 16 KB, maximum 64 KB). Fetch anything else through the API.
@@ -85,7 +87,7 @@ Payloads are **thin**. They carry IDs, a summary, verdicts and up to `policy.web
 | `message.deferred` | A temporary failure; the provider is retrying | `message_id`, `recipient`, `smtp_code`, `smtp_response` |
 | `message.bounced` | A permanent failure, or retries exhausted | `message_id`, `recipient`, `bounce_type` (`hard` or `soft`), `smtp_code`, `smtp_response`, `suppressed` |
 | `message.complained` | A recipient reported spam | `message_id`, `recipient`, `suppressed: true` |
-| `message.rejected` | The transport refused it before sending | `message_id`, `reason`, `detail` |
+| `message.rejected` | The transport refused it, at submission or, for some recipients, when the recipient's server rejected it after submission | `message_id`, `reason`, `detail` |
 | `message.failed` | It could not be sent | `message_id`, `reason` |
 | `message.uncertain` | The outcome is unknown; never resent automatically | `message_id`, `reason`, `fix` |
 | `message.reconciled` | An uncertain send was matched to a provider event | `message_id`, `status` |
@@ -114,18 +116,21 @@ The **message summary** used in `data.message` is:
 | `identity.updated` | `identity`, `changed` (list of field names) |
 | `identity.paused` | `identity_id`, `reason` (`manual`, `abuse_threshold` or `tenant_suspended`), `metrics` (for abuse) |
 | `identity.resumed` | `identity_id` |
-| `identity.deleted` | `identity_id`, `erasure_request_id` |
+| `identity.deleted` | `identity_id`, `erasure_request_id`. Emitted once, when the identity-scope erasure that deletes the identity completes and its status becomes `deleted` (after any legal holds end). It comes from the erasure job, so its `sequence` is the job's, and `identity_id` is set |
 | `identity.address_added` | `address` |
-| `identity.address_activated` | `address` (pending → active once its domain is healthy) |
+| `identity.address_activated` | `address` (pending → active once its domain is `healthy` or `degraded`) |
 | `identity.address_promoted` | `address`, `previous_primary` (with `retire_at`) |
 | `identity.address_retired` | `address` |
+| `identity.key_created` | `identity_id`, `kid`. A signing key was created for an identity that had no active key, lazily by a signing request or by `POST …/keys` ([Identity keys](api.md#identity-keys-and-signatures)). A rotation's new key emits `identity.key_rotated` instead |
+| `identity.key_rotated` | `identity_id`, `kid` (the new active key), `previous_kid` (the key now `retiring`, or `null` when the rotation created the first key) |
+| `identity.key_revoked` | `identity_id`, `kid`. The key is `retired` and has left the identity's JWK Set. Not sent when the key was already `retired` |
 
 ### Domains
 
 | Type | `data` |
 |---|---|
 | `domain.created` | `domain` |
-| `domain.verified` | `domain` (first time healthy) |
+| `domain.verified` | `domain` (verification passed: `verifying` → `healthy`, also after a re-proved suspension. A domain that reaches `degraded` first gets `domain.degraded`, then `domain.recovered` when it becomes `healthy`) |
 | `domain.degraded` | `domain_id`, `issues[]` (`code`, `record`, `fix`) |
 | `domain.failing` | `domain_id`, `issues[]`, `fallback_active` |
 | `domain.suspended` | `domain_id`, `reason` (`failing_14_days`, `nameservers_changed`, `ownership_record_missing` or `registration_changed`) |
@@ -141,7 +146,7 @@ The **message summary** used in `data.message` is:
 | `erasure.failed` | `erasure_request_id`, `step`, `error`. Retried by the job runner before this is sent |
 | `export.completed` | `export_id`, `expires_at` (fetch the download link from the API) |
 | `suppression.created` | `address_hint`, `reason`, `source_message_id` |
-| `quota.warning` | `metric`, `used`, `limit`, `scope` (tenant or identity). Sent at 80% and at 100% |
+| `quota.warning` | `metric` (`sends` in v1), `used`, `limit`, `scope` (tenant or identity). Sent at 80% and at 100% of a daily send cap |
 | `webhook.disabled` | `webhook_id`, `reason` (platform endpoints only) |
 | `webhook.test` | `message: "hello"` |
 
@@ -160,5 +165,6 @@ The **message summary** used in `data.message` is:
 ## Versioning
 
 `api_version` is the payload schema date. Additive changes, such as new fields or new event types, keep
-the version. A breaking change to a payload gets a new `api_version`, and endpoints can pin the old one
-for 12 months.
+the version. v1 has one version, `2026-10-01`, so there is nothing to pin and endpoints have no
+version field. A breaking change would get a new `api_version`, and the old one would stay available for
+12 months; the endpoint field that selects a version is added with that change, through an ADR.
