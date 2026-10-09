@@ -24,7 +24,8 @@ What `workers-rs` `worker` 0.8.7 provides (docs.rs item list and type pages, rea
   `delete_alarm`, `delete_all`; `ObjectNamespace::unique_id_with_jurisdiction`, whose documentation
   says jurisdiction constraints only apply to IDs created by `unique_id()`.
 - Queues: `Queue::send`, `send_batch`; `MessageBatch` and `Message` for consumers. Scheduled events.
-- Panic recovery since 0.6.5 (a panic fails only the in-flight request).
+- Panic recovery, implemented in 0.6.2 and on by default from 0.6.5 (a panic fails only the in-flight
+  request).
 
 Gaps found in the same reading, and the Rust answer to each:
 

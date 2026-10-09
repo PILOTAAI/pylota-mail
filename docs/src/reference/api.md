@@ -29,11 +29,13 @@ List endpoints take `limit` (default 25, max 100) and `cursor`. They return:
 - **Required** on `POST …/messages`, `…/reply`, `…/reply-all` and `…/forward`. A missing key returns
   `400 idempotency_key_required`. The one exception is a dry run (`?dry_run=true`), where the key is
   optional and never recorded ([Sending](#sending)).
-- **Optional** on every other `POST`, except the two signing endpoints
+- **Optional** on every other `POST`, except four that ignore the header and never record it
+  (`x-idempotency: none` in [`openapi.yaml`](openapi.yaml)): the two signing endpoints
   ([`…/assertions`](#post-v1identitiesidentity_idassertions--tenant-or-identity-key-identitiessign) and
   [`…/http-signatures`](#post-v1identitiesidentity_idhttp-signatures--tenant-or-identity-key-identitiessign)),
-  which ignore the header and never record it: each call signs anew, and a replay record would have to
-  store what was signed.
+  because each call signs anew and a replay record would have to store what was signed; and the two
+  Amazon SNS endpoints, `POST /hooks/ses` and `POST /hooks/ses/inbound`, which SNS calls without the
+  header.
 - The header is `Idempotency-Key: <1–255 printable ASCII characters>`. Keys are kept for 30 days, scoped
   per identity for mail and per tenant for everything else.
 - The same key with the same request returns the original response, with `"deduplicated": true` in
@@ -54,8 +56,11 @@ See [Sending and safe retries](../guides/sending.md#safe-retries).
 | Send (accepted into queue) | 120 per minute | per identity, plus daily caps from policy |
 | Signing (agent assertions and HTTP signatures together, binding `RL_SIGN`) | 600 per minute | per identity |
 
-Responses include `RateLimit-Limit`, `RateLimit-Remaining` and `RateLimit-Reset`. A `429` includes
-`Retry-After` (seconds) and `error.code = rate_limited`.
+Every authenticated response includes `RateLimit-Limit`, the limit of the bucket that applied, per period.
+A `429 rate_limited` also includes `Retry-After` and `RateLimit-Reset`, both the seconds to the end of the
+bucket's current period (other `429` codes, such as `daily_cap_reached`, set `Retry-After` to their own
+wait). There is no `RateLimit-Remaining`: Cloudflare's rate-limiting
+binding answers only allow or deny, so the service cannot tell how many requests are left.
 
 ### Permissions
 
@@ -254,7 +259,10 @@ Tenants are deleted through an erasure request with `scope: "tenant"`.
 }
 ```
 
-- `username`: `^[a-z0-9][a-z0-9._-]{0,23}$`. Reserved and confusable names are refused (`address_reserved`).
+- `username`: stored lower case as `^[a-z0-9][a-z0-9._-]{0,23}$`. The request value is checked by the
+  username rules, not by a schema pattern, so each failure has its own code: a reserved or confusable name
+  gets `address_reserved`, any other non-ASCII character `address_unsupported`, and anything else that
+  does not lower-case to the stored form `address_invalid`.
   `postmaster`, `abuse`, `noreply` and similar are reserved everywhere; the other RFC 2142 role names
   (`support`, `sales`, `info`, `marketing` and the rest) only where they would stand alone on the shared
   platform domain, that is, for the default tenant, whose suffix is empty
@@ -332,8 +340,9 @@ signing and its JWK Set return `404 identity_not_found`.
 { "local_part": "bookings", "domain_id": "dom_01JA…" }
 ```
 
-Creates an `alias`. `local_part` follows the username rules for a tenant domain: role names such as
-`support@` are allowed, `postmaster` and `abuse` are not. The status is `pending` until the domain is
+Creates an `alias`. `local_part` follows the username rules for a tenant domain, with a maximum of 40
+characters instead of 24 (stored as `^[a-z0-9][a-z0-9._-]{0,39}$`, with the same error codes): role names
+such as `support@` are allowed, `postmaster` and `abuse` are not. The status is `pending` until the domain is
 `healthy` or `degraded`, then `active`. Only one pending
 address per identity and domain is allowed; a newer request replaces an older pending one
 ([A11](../project/edge-cases.md)).
@@ -720,12 +729,16 @@ The body has `transport`, `smtp` or both. Returns `200` with the domain. Audit-l
 
 Switches the transport that sends as a domain on Cloudflare: `cloudflare` or `ses`. This is the Email
 Sending failover of [J5](../project/edge-cases.md). `ses` needs the SES transport configured
-(`422 transport_unavailable`, `details.reason: "ses_not_configured"`) and a verified SES identity for the
-domain. A transport the domain's method cannot use returns `422 transport_unavailable` with
-`details.reason: "method_not_supported"`: `dns_records` and `send_only` domains send only through `ses`,
-`smtp_relay` domains only through `smtp`, and the platform domain only through `cloudflare`. The change
-applies to sends that reach the transport after it and starts a health check at once (alignment differs
-per transport).
+(`422 transport_unavailable`, `details.reason: "ses_not_configured"`) and an SES identity for the domain
+(`ses_region` set). A `cloudflare_zone`, `nameservers` or `delegated_subdomain` domain gets one, with its
+three DKIM records, during onboarding when the SES transport is configured; without one the switch gets
+`422 transport_unavailable`. A transport the domain's method cannot use returns
+`422 transport_unavailable` with `details.reason: "method_not_supported"`: `dns_records` and `send_only`
+domains send only through `ses`, `smtp_relay` domains only through `smtp`, and the platform domain only
+through `cloudflare`. The change applies to sends that reach the transport after it and starts a health
+check at once (alignment differs per transport). A switch that must call SES waits up to 5 seconds for
+the deployment's SES control-plane budget (one call per second), then fails with
+`429 upstream_rate_limited` and `Retry-After`.
 
 **`smtp`**, tenant or platform keys, `smtp_relay` domains only (otherwise `method_not_supported`):
 
@@ -786,7 +799,9 @@ Issues a new ownership TXT value for a `suspended` domain. Returns the domain wi
 Fails with `409 domain_in_use` while any address on it is `active` or `retiring`. Otherwise it starts
 removal: routing rules, sending onboarding and the event subscription are deleted, and for a domain with
 an SES identity, the SES identity and the domain's addresses in the retired-address receipt rules
-(`pm-retired-{n}`). Returns `202`. `domain.removed` follows with `reason: "requested"`.
+(`pm-retired-{n}`). Returns `202`. `domain.removed` follows with `reason: "requested"`. A removal that
+must call SES first waits up to 5 seconds for the deployment's SES control-plane budget, then fails with
+`429 upstream_rate_limited` and `Retry-After`, as `PATCH` does.
 
 #### Domain object
 
@@ -811,12 +826,12 @@ an SES identity, the SES identity and the domain's addresses in the retired-addr
 | `inbound` | `routing` (Cloudflare Email Routing), `ses`, `forward` (the customer's mailbox forwards) or `none` |
 | `transport` | `cloudflare`, `ses` or `smtp` |
 | `routing_mode` | `catch_all`, `literal` (one routing rule per address, on a zone subdomain) or `forward` |
-| `ses_region` | The SES region when `inbound` or `transport` is `ses`, otherwise `null` |
+| `ses_region` | The region of the domain's SES identity: set when `inbound` or `transport` is `ses`, and on a `cloudflare_zone`, `nameservers` or `delegated_subdomain` domain that got an SES identity for the Email Sending failover ([J5](../project/edge-cases.md)) during onboarding; otherwise `null` |
 | `mail_from_domain` | `pm-bounce.{name}` when SES sends for the domain, otherwise `null`. The local part `pm-bounce` is reserved on such domains |
 | `smtp` | `smtp_relay` only, otherwise `null`: `{ "host", "port", "username", "probe_from" }`. Never the password |
 | `probe` | `smtp` transport only, otherwise `null`: `{ "last_at", "result" }`. `result` is `pass` or the issue code of the failure (`smtp_unaligned`, `smtp_from_rewritten`, `smtp_probe_timeout`, `smtp_auth_failed`, `smtp_tls_required`); both are `null` before the first probe |
 | `state_reason` | The first issue code, or `zone_expired` on a `nameservers` domain whose zone Cloudflare deleted |
-| `delivery_events` | `active` (provider delivery events reach the service), `manual` (a Cloudflare-transport domain created without an event subscription: run `pmail domains subscribe <domain>`; until then statuses stop at `sent`), or `none` (`sending: false`). See [Identities and domains › Kind `zone`](../project/design/identity-domains.md#kind-zone) |
+| `delivery_events` | `active` (provider delivery events reach the service), `manual` (a Cloudflare-transport domain created without an event subscription: run `pmail domains subscribe <domain>`; until then statuses stop at `submitted`), or `none` (`sending: false`). See [Identities and domains › Kind `zone`](../project/design/identity-domains.md#kind-zone) |
 | `details` | `null`, or `{ "action": "run pmail domains subscribe <domain>" }` while `delivery_events` is `manual`: the operator step that remains |
 
 ---
@@ -886,7 +901,8 @@ are listed only when the request filters on that status explicitly (`status=quar
 `include` takes `html`, `headers` and `quoted`. A `quarantined`, `hidden` or `throttled` message is
 returned only to a key that holds `quarantine:review`; any other key gets `404 message_not_found`, as for
 a message that does not exist ([Security](../project/design/security.md)). The same rule applies to its
-attachments and raw MIME.
+attachments, their extracted text, its raw MIME and re-running its triage. Reply, reply-all and forward
+need `quarantine:review` for a quarantined message and never accept a hidden or throttled one.
 
 #### Message object
 
@@ -963,7 +979,9 @@ model inside a clearly delimited block, never as instructions.
 ### `GET /v1/identities/{identity_id}/messages/{message_id}/attachments/{attachment_id}` — `attachments:read`
 
 Returns the bytes with `Content-Disposition: attachment`, `X-Content-Type-Options: nosniff` and
-`Content-Security-Policy: sandbox`. Attachments with a `risk` need `quarantine:review`.
+`Content-Security-Policy: sandbox`. The message's visibility is checked first: an attachment of a
+`quarantined`, `hidden` or `throttled` message is `404 message_not_found` without `quarantine:review`.
+Then attachments with a `risk` need `quarantine:review` too (`403 permission_denied`).
 
 ### `GET /v1/identities/{identity_id}/messages/{message_id}/attachments/{attachment_id}/text` — `attachments:read`
 
@@ -1059,8 +1077,12 @@ which only a dry run returns. A `200` always has `would_send: true`; each recipi
 - `from_address` must be an `active` address of the identity, or a `retiring` one on a thread that
   already uses it (G7; with `thread_id`). Otherwise `400 invalid_request` with
   `details.errors[0].path = "from_address"`. The default is the primary.
-- `headers` accepts only `X-` headers, plus the allow-listed `Importance`, `Priority`, `Sensitivity`,
-  `Keywords`, `Comments` and `Organization`. Everything else is set by the service.
+- `headers` accepts only `X-` names matching `^X-[A-Za-z0-9_-]+$` (at most 100 bytes), plus the
+  allow-listed `Importance`, `Priority`, `Sensitivity`, `Keywords`, `Comments` and `Organization`, spelled
+  exactly so; any other name gets `400 header_not_allowed`. `Importance` takes `high`, `normal` or `low`,
+  `Priority` `normal`, `non-urgent` or `urgent`, and `Sensitivity` `personal`, `private` or
+  `company-confidential`; another value gets `400 invalid_request`. These checks run when the request
+  arrives, so a bad header never becomes a later `rejected`. Everything else is set by the service.
 - Attachments: `content_base64`, `disposition` (`attachment` or `inline`) and `content_id` (for inline).
   The total encoded message must fit the transport limit (5 MiB with Cloudflare) or the request fails with
   `413 message_too_large`. When the tenant enables `large_attachments: "link"`, oversized attachments

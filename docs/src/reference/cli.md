@@ -1044,7 +1044,7 @@ Creates the Email Sending event subscription of a domain that reports `delivery_
 your local `CLOUDFLARE_API_TOKEN`, and records it on the deployment. The API returns that state, with
 `details.action = "run pmail domains subscribe <domain>"`, only when the Worker could not create the
 subscription itself (the spike S9 fallback). Delivery events for the domain start once this has run;
-until then statuses stop at `sent`. Running it again is a no-op. Needs `domains:read`.
+until then statuses stop at `submitted`. Running it again is a no-op. Needs `domains:read`.
 
 ```bash
 pmail domains subscribe acme.example.com
@@ -1081,7 +1081,7 @@ pmail send --identity <identity> --to <recipient>… --subject <text>
 | `--attach` | Attach a file (repeatable). `pmail` refuses before sending when the message would exceed 5 MiB, unless `--allow-large` (for tenants that turn large attachments into links) |
 | `--kind` | `marketing` needs `--unsubscribe-url` or `--unsubscribe-mailto` and the consent flags |
 | `--thread` | Continue an existing thread |
-| `--header` | Only `X-` headers and `Importance`, `Priority`, `Sensitivity`, `Keywords`, `Comments`, `Organization` |
+| `--header` | Only `X-` names matching `^X-[A-Za-z0-9_-]+$`, and `Importance` (`high`, `normal`, `low`), `Priority` (`normal`, `non-urgent`, `urgent`), `Sensitivity` (`personal`, `private`, `company-confidential`), `Keywords`, `Comments`, `Organization`, spelled exactly so; checked by the API (`400 header_not_allowed` for a name, `400 invalid_request` for a value) |
 | `--idempotency-key` | 1–255 printable ASCII characters. Generated and printed when omitted |
 
 ```bash

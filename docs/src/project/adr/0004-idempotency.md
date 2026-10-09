@@ -23,7 +23,8 @@ timeout or a dropped connection after the request was written leaves the outcome
 
 1. **`Idempotency-Key` is required** on `POST …/messages`, `…/reply`, `…/reply-all` and `…/forward`
    (1–255 printable ASCII characters). A missing key is `400 idempotency_key_required`. MCP send tools
-   require an `idempotency_key` argument. The key is optional on every other `POST`.
+   require an `idempotency_key` argument. The key is optional on every other `POST`. (Amended
+   2026-10-10 with the exceptions this item omitted; see [Amendments](#amendments).)
 2. **Reservation in the mailbox transaction.** The mailbox stores the key with a fingerprint
    (`sha256(operation, target, canonical body)`) in the same transaction that stores the message as
    `queued`. Keys are kept for 30 days, scoped per identity for mail and per tenant for other `POST`s.
@@ -62,3 +63,14 @@ timeout or a dropped connection after the request was written leaves the outcome
   would send twice.
 - **Deduplicating on `Message-ID` at the provider.** The usual SMTP-era answer. Not available: Email
   Sending sets `Message-ID` itself.
+
+## Amendments
+
+- **2026-10-10.** Decision 1 omitted exceptions that the API contract already had
+  ([`openapi.yaml`](../../reference/openapi.yaml), `x-idempotency`). A **dry run** (`?dry_run=true` on
+  send, reply, reply-all or forward) stores, reserves and sends nothing, so the key is optional there and
+  is never looked up or recorded. Four `POST` endpoints **ignore the header and never record it**
+  (`x-idempotency: none`): the two signing endpoints (`…/assertions` and `…/http-signatures`), because each
+  call signs anew and a replay record would have to store what was signed; and the two Amazon SNS
+  endpoints (`/hooks/ses` and `/hooks/ses/inbound`), which SNS calls without the header. The rest of the
+  decision is unchanged.

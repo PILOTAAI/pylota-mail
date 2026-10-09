@@ -12,7 +12,8 @@ Pylota Mail. Cloudflare's and Amazon's were read from their documentation on 202
 | Outbound message size, encoded, including attachments | 5 MiB | Cloudflare Email Sending | `413 message_too_large`, or a signed link if `large_attachments: link` |
 | Recipients per message (`to` + `cc` + `bcc`) | 49, default policy 10. Cloudflare allows 50; one is kept for the hidden journal copy of Message-ID strategy B | Cloudflare / Pylota Mail / policy | `400 too_many_recipients` |
 | Subject length | 998 characters | RFC 5322 / Cloudflare | `400 invalid_request` |
-| Custom headers on a send | 16 KB total; at most 20 non-`X-` headers, service-set ones included (only six non-`X-` names are allowed); values ≤ 2,048 bytes | Cloudflare | `400 header_not_allowed` / `invalid_request` |
+| Custom headers on a send | 16 KB total; at most 20 non-`X-` headers, service-set ones included; values ≤ 2,048 bytes. Names: `X-` names matching `^X-[A-Za-z0-9_-]+$` (≤ 100 bytes), or exactly `Importance`, `Priority`, `Sensitivity`, `Keywords`, `Comments`, `Organization`. Values of `Importance`: `high`, `normal`, `low`; `Priority`: `normal`, `non-urgent`, `urgent`; `Sensitivity`: `personal`, `private`, `company-confidential` | Cloudflare (Email headers reference, read 2026-10-10) | Checked when the request arrives: `400 header_not_allowed` for a name, `400 invalid_request` for a value |
+| Attachments per send | 32 (REST); 10 per call in the MCP tool `mail_send` | Pylota Mail | `400 invalid_request` |
 | Inbound MIME nesting depth | 32 | Pylota Mail | Deeper parts are kept raw; flag `parse_degraded` |
 | Inbound MIME parts | 500 | Pylota Mail | Further parts are kept raw; flag `parse_degraded` |
 | Attachment text extracted | 20 MB input, 200 pages, 2 MB text | Pylota Mail | `text_status: unavailable` beyond it |
@@ -72,6 +73,7 @@ Applies to domains connected with `smtp_relay`.
 | Agentic search per key | 20 per minute. Tenant daily cap 500 by default |
 | Sends per identity | 120 per minute. Daily caps from policy |
 | Signing per identity (`RL_SIGN`): agent assertions and signed HTTP requests together | 600 per minute. Not counted against any plan allowance |
+| Rate-limit headers | Every authenticated response carries `RateLimit-Limit` (the bucket's limit per period). A `429` also carries `Retry-After` and `RateLimit-Reset`, the seconds to the end of the bucket's current period (for `rate_limited` the two are equal; other `429` codes set `Retry-After` to their own wait). No `RateLimit-Remaining`: the rate-limiting binding answers only allow or deny |
 | Page size | 25 by default, 100 maximum |
 | Search `limit` | 10 by default, 50 maximum |
 | Search response size | 256 KB. Above it, results are cut and `truncated: true` |

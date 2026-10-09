@@ -61,26 +61,29 @@ An arrow means "must be done before".
 
 ```text
 M0 skeleton ─▶ M1 spikes ─▶ M2 core ─▶ M3 api-types ─▶ M4 platform ─▶ M5 worker base
-                                                                         │
-            ┌──────────────┬──────────────┬──────────────┬──────────────┼──────────────┐
-            ▼              ▼              ▼              ▼              ▼              ▼
-     M6 identities   M8 webhooks    M16 SDK/CLI    M17 observability  M19 site/release  │
-     and outbox            │                                                          │
-            │              │                                                          │
-            ▼              │                                                          │
-     M7 inbound ◀──────────┘                                                          │
-     and wait                                                                         │
-            │                                                                         │
-     ┌──────┴───────┬───────────────┐                                                 │
-     ▼              ▼               ▼                                                 │
- M9 outbound   M10 search      M12 triage                                             │
-     │              │               │                                                 │
-     ▼              ▼               │                                                 │
- M13 domains   M11 agentic          │                                                 │
-     │              │               │                                                 │
-     └──────┬───────┴───────┬───────┘                                                 │
-            ▼               ▼                                                         │
-     M14 privacy      M15 MCP ◀───────────────────────────────────────────────────────┘
+                                                                        │
+            ┌─────────────────────────────┬──────────────┬──────────────┼───────────────┐
+            ▼                             ▼              ▼              ▼               │
+     M6 identities                  M16 SDK/CLI    M17 observability  M19 site/release  │
+     and outbox                                                                         │
+            ├──────────────┐                                                            │
+            │              ▼                                                            │
+            │        M8 webhooks                                                        │
+            │              │                                                            │
+            ▼              │                                                            │
+     M7 inbound ◀──────────┘                                                            │
+     and wait                                                                           │
+            │                                                                           │
+     ┌──────┴───────┬───────────────┐                                                   │
+     ▼              ▼               ▼                                                   │
+ M9 outbound   M10 search      M12 triage                                               │
+     │              │               │                                                   │
+     ▼              ▼               │                                                   │
+ M13 domains   M11 agentic          │                                                   │
+     │              │               │                                                   │
+     └──────┬───────┴───────┬───────┘                                                   │
+            ▼               ▼                                                           │
+     M14 privacy      M15 MCP ◀─────────────────────────────────────────────────────────┘
             │               │
             └───────┬───────┘
                     ▼
@@ -103,7 +106,9 @@ M9, M10, M21, M22 (and M6's system identity) ─▶ M26 notifications and usage 
 After M5, these tracks can run in parallel, each in its own branch and worktree:
 
 - **Track 1:** M6 → M7 → M9 → M13 (domains need the send path for fallback sends and `transport/ses.rs`);
-- **Track 2:** M8;
+  M7 also waits for M8, whose `webhooks/payloads.rs` builds the `message.*` events that inbound mail emits;
+- **Track 2:** M8, once M6 lands (M8 imports M6's `webhooks/envelope.rs`: the event envelope, the
+  `WebhookJob` queue message and the identity payload builders that M6's outbox already needs);
 - **Track 3:** M16 + M17;
 - **Track 4:** M19;
 - **Track 5:** M25, once M6 lands (it needs only M5 and M6).
@@ -116,6 +121,22 @@ webhook dispatcher and M12's triage, which come before M21). M15 also waits for 
 tools it registers. No milestone depends on one that comes later in this graph. Tracks never edit the same files. Shared files
 (`router.rs`, `wrangler.toml` template, `0001_init.sql`) are changed only by the track that owns them, as
 listed per milestone.
+
+**Shared files.** Two files are changed by milestones that can run at the same time, so they have a
+rule of their own:
+
+- `quota/mod.rs`, the `TenantQuota` object. M5 creates it with every `QuotaRequest` variant already
+  answered by a stub (below), so later milestones replace the behaviour of the variants they own and
+  never change a signature: M9 (`Reserve`, `Release`, `RecordOutcome`), M11 (`CountAgentic`), M22 (the
+  allowance variants, through `billing/quota.rs`) and M26 (the `NotifierRequest::UsageThreshold` hook).
+- `consumers/index.rs`, the `pm-index` consumer. M7 creates it for attachment text, M10 adds chunking,
+  embedding and reconciliation, and M12 the triage job. M7 writes the whole `IndexJob` enum
+  ([Search § 6](design/search.md#6-indexing-pipeline-pm-index)), so each later milestone fills in only the
+  arm of its own job kind.
+
+Each change to one of these files has one owner, the milestone that needs it. When two tracks change the
+same file at once, the one that merges second rebases onto the other and re-runs the gate; neither edits
+the other's arm.
 
 ---
 
@@ -159,9 +180,12 @@ fake for a spike's real provider.
 **Acceptance:**
 
 - `cargo test --workspace` passes on an empty test per crate.
-- `cargo xtask build-worker` builds a "hello" Worker to wasm. The size check runs and passes, and from
-  here on enforces NFR-SEC-2 on every pull request: the compressed bundle stays ≤ 10 MiB
-  (`xtask::size_budget`).
+- `cargo xtask build-worker` builds a "hello" Worker to wasm. The `worker` attribute macros are never
+  used in `crates/worker` ([Rust workspace §2](design/rust-workspace.md#2-crate-responsibilities-and-allowed-dependencies)),
+  so M0 writes a minimal `platform::export_worker!` that exports only a `fetch` answering `200`; spike S1
+  validates its glue against the real runtime, and M4 extends it to the other handlers and the Durable
+  Object classes. The size check runs and passes, and from here on enforces NFR-SEC-2 on every pull
+  request: the compressed bundle stays ≤ 10 MiB (`xtask::size_budget`).
 - CI runs these jobs: fmt, clippy, native tests, wasm build, `cargo deny check`, `mdbook build docs`.
 - A CI check fails if any crate other than `platform` depends on `worker`
   (`cargo xtask check-layering`).
@@ -179,11 +203,11 @@ shipped), plus a written result.
 | S2 Inbound failure semantics | What the sending MTA sees when `email()` throws, versus `setReject` (documented as a permanent error); which `Authentication-Results` headers reach the handler | Throwing yields a 4xx temporary failure and the sender retries. The exact SMTP reply text for both cases is recorded. Record which `Authentication-Results` authserv-id Cloudflare stamps on delivered mail (setup later writes it to `PM_TRUSTED_AUTHSERV_ID`, [Inbound › Authentication verdict](design/inbound.md#authentication-verdict)) | **Throw only.** The handler keeps its in-handler R2 retries (three attempts) and then throws, as designed, whatever the sender is shown; the spike result records the observed reply in [Inbound](design/inbound.md#interface). There is no `forward()` to a backup address: setup registers no Email Routing destination address ([Identities and domains › Cloudflare API token](design/identity-domains.md#cloudflare-api-token-permissions)), so none exists to forward to |
 | S3 FTS5 in DO SQLite | `content='', contentless_delete=1`, the `trigram` tokenizer, `bm25()` with six column weights, `DELETE FROM fts WHERE rowid = ?`, and renaming an FTS5 table (for the index swap in [Search](design/search.md)) | All work on the deployed runtime, not only on local workerd | External-content table `fts_docs` ([Data model](design/data-model.md)); disable trigram and rely on reference normalisation plus semantic fallback; without rename, the swap rebuilds `fts` in place |
 | S4 Wasm budget | Bundle size, cold start, CPU time and peak memory when parsing and verifying a 25 MiB message and a 40 MB message from the SES source ([N5](edge-cases.md)), and `mail-auth` verdict parity on the corpus | Compressed bundle ≤ 10 MiB (NFR-SEC-2), cold start under 1 s, both messages parsed under 128 MB peak and inside the CPU limit, DKIM and DMARC verdicts equal the reference implementation on every corpus message | Write attachments to R2 before parsing bodies; move heavy features behind cargo features; switch the release profile to `opt-level = "z"` |
-| S5 MCP over rmcp | Streamable HTTP served from `fetch` using `rmcp` 3.5.1 protocol types, without a tokio runtime. Note: `rmcp` 3.5.1 declares `tokio` (features `sync`, `macros`, `rt`, `time`) as a non-optional dependency (crates.io metadata, read 2026-10-09) | MCP Inspector and Claude Code connect, list tools and call one; the wasm build never starts a tokio runtime or timer, and the bundle stays inside the S4 budget | Implement the JSON-RPC types locally in `worker`; keep `rmcp` as a native dev-dependency for client tests. **Taken in advance** ([ADR 0009](adr/0009-local-mcp-protocol-types.md)): M1 still runs S5 against the local types to record the Inspector and Claude Code result |
+| S5 MCP over rmcp | Streamable HTTP served from `fetch` using `rmcp` 3.4.1 protocol types, without a tokio runtime. Note: `rmcp` 3.4.1 (like 3.5.1) declares `tokio` (features `sync`, `macros`, `rt`, `time`) as a non-optional dependency (crates.io metadata, read 2026-10-10) | MCP Inspector and Claude Code connect, list tools and call one; the wasm build never starts a tokio runtime or timer, and the bundle stays inside the S4 budget | Implement the JSON-RPC types locally in `worker`; keep `rmcp` as a native dev-dependency for client tests. **Taken in advance** ([ADR 0009](adr/0009-local-mcp-protocol-types.md)): M1 still runs S5 against the local types to record the Inspector and Claude Code result |
 | S6 Externs and jurisdiction | Vectorize `upsert`, `query` (namespace and metadata filter), `deleteByIds`, `getByIds` and `describe()` (the vector count); `AI.run` with the `gateway` option, including the `bge-m3` output shape, the reranker's score form and the agent model's chat-completions schema ([Search](design/search.md)); `AI.toMarkdown` (including whether PDF output marks page boundaries) — all through `wasm-bindgen` externs; DO IDs from `unique_id_with_jurisdiction("eu")` stored as strings and re-addressed with `id_from_string` | Every call works and each recorded shape matches the design, or the design is updated with the observed one. An EU object reports the EU jurisdiction (`ctx.id.jurisdiction`) | REST fallbacks (`/vectorize/v2/…`, `/ai/run`, `/ai/tomarkdown`) using `PM_CF_API_TOKEN`, which then becomes required ([Rust workspace §7](design/rust-workspace.md#7-wasm-bindgen-externs)); one page per document when `toMarkdown` does not mark pages. If an EU object does not report the EU jurisdiction, the build stops for an owner decision, because FR-PRV-1 depends on it |
 | S7 Outbound Message-ID | The relationship between the `messageId` that `send()` returns and the `Message-ID` header recipients see | Either a deterministic mapping (strategy A), or the header learned from a journal copy (strategy B) | Strategy B: a hidden journal BCC to `journal+{message ulid}.{identity ulid}@{PM_PLATFORM_DOMAIN}`; the email handler records the header and drops the copy ([Outbound](design/outbound.md#message-id-of-outbound-mail-spike-s7)). If a journal copy never arrives, that message matches replies by thread token and provider ID only |
 | S8 SES in wasm | SigV4 signing for SES v2 `SendEmail` with raw content, and SNS message signature verification (`SignatureVersion` 2; version 1 is refused), from Rust in wasm | A real send through SES in `eu-west-2`; a real SNS notification verified, and a tampered one rejected | SES leaves v1.0: an ADR moves `send_only`, `dns_records`, `smtp_relay` with `inbound: ses` and the SES failover to v1.1 |
-| S9 Event subscriptions and onboarding APIs | Create an Email Sending event subscription to `pm-delivery-events` through the API for one domain (source type `email.sending` with `zone_id` and `domain`; this source shape appears in Wrangler's source, not yet in the API reference), receive all six event types, delete it. Onboard a zone **apex** and a subdomain through `POST /zones/{zone_id}/email/sending/subdomains`, and enable routing on a subdomain through `POST /zones/{zone_id}/email/routing/dns` with `name`. A literal routing rule whose `worker` action value is the script name `pylota-mail` delivers to the Worker | Payload fields match [Outbound › Delivery events](design/outbound.md#delivery-events); subscriptions can be created per domain at runtime with `PM_CF_API_TOKEN`; apex and subdomain onboarding both work through the API | For `cloudflare_zone` and `nameservers`, the API creates the domain without a subscription, marks it `delivery_events: "manual"`, and returns its records with `details.action = "run pmail domains subscribe <domain>"`; delivery events start once that command has run ([Identities and domains › Kind `zone`](design/identity-domains.md#kind-zone), test `it::domains::s9_manual_delivery_events`). Any onboarding step the API cannot do is listed by `pmail domains add` as a dashboard step and checked by `pmail doctor` |
+| S9 Event subscriptions and onboarding APIs | Create an Email Sending event subscription to `pm-delivery-events` through the API for one domain (source type `email.sending` with `zone_id` and `domain`; this source shape appears in Wrangler's source, not yet in the API reference), receive all six event types, delete it. Onboard a zone **apex** and a subdomain through `POST /zones/{zone_id}/email/sending/subdomains`, and enable routing on a subdomain through `POST /zones/{zone_id}/email/routing/dns` with `name`. A literal routing rule whose `worker` action value is the script name `pylota-mail` delivers to the Worker | Payload fields match [Outbound › Delivery events](design/outbound.md#delivery-events); subscriptions can be created per domain at runtime with `PM_CF_API_TOKEN`; apex and subdomain onboarding both work through the API | For `cloudflare_zone` and `nameservers`, the API creates the domain without a subscription, marks it `delivery_events: "manual"`, and returns its records with `details.action = "run pmail domains subscribe <domain>"`; delivery events start once that command has run ([Identities and domains › Kind `zone`](design/identity-domains.md#kind-zone), tests `it::domains::s9_manual_delivery_events` and, for `nameservers`, `it::domains::s9_manual_delivery_events_nameservers`). Any onboarding step the API cannot do is listed by `pmail domains add` as a dashboard step and checked by `pmail doctor` |
 | S10 Child zones | On an Enterprise account, a subdomain-setup child zone accepts Email Routing catch-all to the Worker and Email Sending onboarding, and both work end to end. Optional: skipped when no Enterprise account is available ([Build plan › Human prerequisites](#human-prerequisites)) | Mail to any address at the child apex reaches `email()`; a send is DKIM-aligned | `delegated_subdomain` stays off; `dns_records` covers the case |
 | S11 SES receiving | Rule set, S3 action and topic as specified; the notification shape, including the `objectKey` form; S3 `GetObject` with SigV4 from a Worker; a 39 MB message ([N5](edge-cases.md)); `user+tag@` routing; the retired-address bounce; the backstop picks up a message whose push failed | All pass in `eu-west-2` | `dns_records` and `smtp_relay` with `inbound: ses` do not ship in v1.0; `send_only` still does |
 | S12 SMTP from a Worker | Ports 465 and 587 with `StartTls` against two real providers; the certificate host name is checked (a wrong-name certificate is refused); timeouts and the uncertain window behave as designed | All pass | `smtp_relay` does not ship in v1.0 |
@@ -233,7 +257,8 @@ FR-SRCH-3/4/8 (verifier), FR-TRI-2, FR-DOM-4/5 (the pure state machine).
   Any difference fails.
 - Every error code in [Errors](../reference/errors.md) exists in the `ErrorCode` enum with its HTTP
   status and `retryable` flag, checked by a table test.
-- Serde round-trip tests for every object, using the examples from `api.md`.
+- Serde round-trip tests for every object, using the examples in `openapi.yaml`. The examples in `api.md`
+  are not used: they elide fields (`"…"`), so they are not complete objects.
 
 ---
 
@@ -257,7 +282,7 @@ Cloudflare implementations and in-memory fakes for native tests.
 
 **Files:** `crates/worker/src/{lib.rs, router.rs, auth.rs, errors.rs, ratelimit.rs, request_id.rs, keyring.rs, handlers/{meta.rs, tenants.rs, keys.rs, audit.rs}, db/{mod.rs, tenants.rs, keys.rs, audit.rs, idempotency.rs, signing_keys.rs}, quota/mod.rs}`,
 `crates/core/src/{keys.rs, crypto.rs}` (key format and the sealing envelope, pure)
-(`TenantQuota` as a stub class: `Init`, the owner check and `schema_version` only; later milestones add its requests),
+(`TenantQuota` as a stub class that answers every `QuotaRequest` variant, see below),
 `migrations/d1/0001_init.sql` (every D1 table and index in [Data model](design/data-model.md), including those that
 later milestones use: the console, billing, sign-up and domain-method tables and columns),
 `crates/worker/tests/` harness (`cargo xtask itest`).
@@ -271,6 +296,26 @@ idempotency for non-mail POSTs, and the thread and link keyring (`signing_keys`,
 `members` rows and the `billing_accounts` row. Nothing acts on them yet. The owner's sign-in link is sent
 once M21 lands, and plan checks run once M22 lands; until then holds always succeed, as in billing mode
 `disabled`. Each tenant gets its `TenantQuota` object (`quota_do_id`, then `QuotaRequest::Init`).
+`notify_do_id` is written as `''` until M26 mints a `Notifier` with the tenant row
+([Data model](design/data-model.md#1-d1-control-plane)).
+
+**The `TenantQuota` stub.** `quota/mod.rs` declares the whole `QuotaRequest` enum of
+[Outbound › TenantQuota](design/outbound.md#tenantquota) and
+[Plans, metering and billing](design/billing.md#tenantquota-allowances-and-holds) now, and the stub
+answers every variant, so a milestone that calls `TenantQuota` before the one that owns a variant gets a
+well-formed answer. Later milestones replace behaviour, never a signature:
+
+| Variants | Stub behaviour from M5 | Replaced by |
+|---|---|---|
+| `Init` | Stores the owner in `meta`; every other request checks it | final |
+| `Reserve`, `Release` | `Reserve` takes its `sends` hold as `Hold` does and counts the day's `sends:{identity_id}` and `sends` counters, without enforcing a cap; `Release` decrements them | M9: daily caps (`CapReached`) and `quota.warning` thresholds |
+| `RecordOutcome` | Records the outcome in `outcomes`; never pauses an identity | M9: abuse auto-pause (FR-DLV-3) |
+| `CountAgentic` | Counts `agentic` for the day and `usage:agentic`; always `Ok { used }` | M11: the tenant daily cap (`CapReached`) |
+| `RecordUsage` | Adds to `usage:{metric}` for the current UTC day | final |
+| `ForgetIdentity` | Deletes the identity's `outcomes` rows and `sends:{identity_id}` counters | final |
+| `Hold` | Always grants (`Held`), as in billing mode `disabled` | M22: allowances and holds |
+| `Settle`, `Extend`, `Adjust`, `SetPlan`, `SetMeasured`, `Reconcile` | No-ops that answer `Ok` | M22 |
+| `GetUsage` | The usage counters, with no allowances (`billing: disabled`) | M22 |
 
 **Acceptance:**
 
@@ -281,7 +326,8 @@ once M21 lands, and plan checks run once M22 lands; until then holds always succ
 - The keyring creates one key per purpose under concurrency and opens it with `PM_MASTER_KEY`
   (`core::keys::format_round_trip`, `core::crypto::envelope_round_trip`).
 - Idempotent `POST /v1/tenants` replays and conflicts; `owner` and `billing` are stored but send no mail
-  and change no limit; the tenant's `TenantQuota` answers `Init` and refuses a mismatched owner.
+  and change no limit; the tenant's `TenantQuota` answers `Init`, refuses a mismatched owner, and answers
+  every other variant as the stub table says (a worker-logic test sends each one).
 - `/health`, `/v1/me`, `/openapi.json` and `/.well-known/security.txt` are served (the last as
   [Security](design/security.md) specifies, from `PM_SECURITY_CONTACT`).
 - J6 (`it::keys::j6_revoke_rotate`, above).
@@ -301,19 +347,32 @@ through `handlers/<area>.rs` plus one registration line, reviewed by Track 1.
 
 ## M6 · Identities, addresses, platform domain (Track 1)
 
-**Files:** `handlers/{identities.rs, addresses.rs, domains.rs (platform domain read only)}`,
-`db/{identities.rs, addresses.rs, domains.rs}`, `mailbox/mod.rs` (IdentityMailbox shell with
-schema-on-wake), `mailbox/outbox.rs` (the transactional outbox, its dispatch alarm, the `event_index`
-writes and the `pm-webhooks` producer; [Webhooks and events](design/webhooks.md#transactional-outbox)),
-`crons/retire.rs`, and the system identity's mailbox minting in the every-minute cron.
+**Files:** `handlers/{identities.rs, addresses.rs (list and get; the platform address is created with
+the identity), domains.rs (platform domain read only)}`, `db/{identities.rs, addresses.rs, domains.rs}`,
+`mailbox/mod.rs` (IdentityMailbox shell with schema-on-wake), `mailbox/outbox.rs` (the transactional
+outbox, its dispatch alarm, the `event_index` writes and the `pm-webhooks` producer;
+[Webhooks and events](design/webhooks.md#transactional-outbox)), `webhooks/envelope.rs` (the event
+envelope builder, the `WebhookJob` queue message and the `identity_*` and `address_*` payload builders,
+which the outbox needs before M8 exists; M8 imports it), `jobs/mod.rs` as a `JobRunner` stub (below), and
+the system identity's mailbox minting in the every-minute cron.
 
-**Implements:** FR-IDN-1–4, FR-ADR-1–7, FR-DOM-1 (platform), the outbox and event index, and the system
-identity ([Identities and domains](design/identity-domains.md#the-system-identity)).
+**Implements:** FR-IDN-1–4, FR-ADR-5–7, FR-DOM-1 (platform), the outbox and event index, and the system
+identity ([Identities and domains](design/identity-domains.md#the-system-identity)). FR-ADR-1–4 (several
+addresses, promotion, retirement and rollback) need a tenant domain and land in M13.
 
-**Acceptance:** A5, A7 (pause part), A8, A11, A12, A13, A14, J9, plus promote, retire and rollback
-flows whose `identity.*` events reach the outbox, `event_index` and a `pm-webhooks` message (consumed
-once M8 lands); a crash between commit and dispatch repeats the dispatch, never loses it. The system
-identity is never listed and refuses tenant keys.
+**Identity deletion before M14.** `DELETE /v1/identities/{identity_id}` runs its whole D1 batch
+([Identities and domains › Delete](design/identity-domains.md#delete-fr-idn-4-a13)): tombstones, address
+removal, `status = 'deleting'`, and the `jobs` and `erasure_requests` rows. Until M14 the `JobRunner` is a
+stub that accepts `JobRequest::Start` and runs no step, so the job stays `queued` and the identity
+`deleting`. M14 replaces the stub with the real `JobRunner`, whose every-minute restart of jobs left
+`queued` picks these up.
+
+**Acceptance:** A5, A7 (pause part), A12, J9, plus `identity.created`, `identity.updated`,
+`identity.paused` and `identity.resumed` events that reach the outbox, `event_index` and a `pm-webhooks`
+message (consumed once M8 lands); a crash between commit and dispatch repeats the dispatch, never loses
+it. The system identity is never listed and refuses tenant keys. Rows that need a later milestone are
+accepted there: A13 in M7 (it needs `email()`), A8 in M9 (`it::send::a8_owner_required`), and A11, A14
+and the promote, retire and rollback flows in M13 (they need a tenant domain).
 
 ---
 
@@ -321,24 +380,31 @@ identity is never listed and refuses tenant keys.
 
 **Files:** `email.rs` (handler), `consumers/inbound.rs`, `mailbox/{ingest.rs, threads.rs, messages.rs, attachments.rs, schema/v1.sql}`,
 `handlers/{threads.rs, messages.rs, quarantine.rs, wait.rs}`, `consumers/index.rs` (attachment text only at
-this stage).
+this stage), `crates/api-types/src/internal/index_job.rs` (the whole `IndexJob` enum, so M10 and M12 only
+fill in their arms).
 
 **Implements:** FR-IN-1–9, FR-THR-1/2, NFR-REL-1/2, read APIs, quarantine and release, and `wait`
 ([Inbound › The `wait` handler](design/inbound.md#the-wait-handler-e4)), which is P0 because quarantine
 rule 5 (E5) depends on its registrations.
 
-**Acceptance:** A2, A6, A9, A10 (inbound part), B1 (documented), B3, B12, B14, C1, C3, C7 (inbound
-matching), D4, D5, D7, D9, D10, E4 (`it::wait::e4_*`), E5, J1, J2, J7, plus loopback L3, and every
-`conf::` corpus case ingested end to end through workerd. NFR-REL-1: under the J1, J2 and J7 fault
-injections `inbound_lost_total` and `inbound_raw_missing_total` stay 0. NFR-REL-2: the inbound SLI
+**Acceptance:** A2, A6, A9, A10 (inbound part), A13, B1 (documented), B3, B12, B14, C1, D4, D5, D9, D10,
+E4 (`it::wait::e4_*`), E5, J1, J2, J7, and every `conf::` corpus case ingested end to end through workerd.
+Rows whose inbound side needs a later milestone are accepted there: C7 (it matches replies to outbound
+mail), D7 (suppressions and lists) and loopback L3 in M9, and C3 (a retiring address) and A4's role-mail
+routing (it sends a new message and needs a tenant domain) in M13.
+NFR-REL-1 is checked with a canary, because the only emitter of `inbound_lost_total` is the global
+retention `staging` step, which comes with M14: under the J1, J2 and J7 fault injections, every message
+that `email()` accepted is found exactly once through the read API after the queues drain, and
+`inbound_raw_missing_total` stays 0 (`it::inbound::nfr_rel1_no_loss_canary`). NFR-REL-2: the inbound SLI
 counters of [Observability §4](design/observability.md#4-service-level-objectives) are emitted for accepted, staged and
 temporarily failed mail.
 
 ---
 
-## M8 · Webhooks (Track 2)
+## M8 · Webhooks (Track 2, after M6)
 
-**Files:** `handlers/webhooks.rs`, `consumers/webhooks.rs`, `webhooks/{sign.rs, client.rs, replay.rs, payloads.rs}`,
+**Files:** `handlers/webhooks.rs`, `consumers/webhooks.rs`, `webhooks/{sign.rs, client.rs, replay.rs, payloads.rs}`
+(it imports the envelope, `WebhookJob` and the identity payload builders from M6's `webhooks/envelope.rs`),
 `crons/outbox_sweep.rs`, the SSRF guard `crates/core/src/ssrf.rs` (pure) and `crates/worker/src/net.rs` (guarded HTTP)
 ([Webhooks](design/webhooks.md), [Security § 9](design/security.md#9-ssrf-controls)).
 
@@ -363,15 +429,21 @@ temporarily failed mail.
 **Files:** `handlers/send.rs`, `mailbox/{submit.rs, compose.rs, locks.rs, deliveries.rs, idempotency.rs}`,
 `crates/core/src/compose.rs` (MIME composition, pure),
 `transport/{mod.rs, cloudflare.rs, simulator.rs, loopback.rs}`, `consumers/{outbound.rs, delivery.rs}`,
-`quota/mod.rs` (extends the M5 stub with `Reserve`, `Release`, `RecordOutcome` and `RecordUsage`),
-`handlers/{suppressions.rs, links.rs}` (signed links, `GET /v1/links/{token}`, with kid verification),
-`db/suppressions.rs`, `mailbox/alarms.rs` (the claim, dispatch, lock and reconciliation purposes; no cron
-is involved).
+`quota/mod.rs` (replaces the M5 stub's `Reserve`, `Release` and `RecordOutcome` behaviour with the daily
+caps, quota warnings and abuse windows; `RecordUsage` has recorded since M5),
+`handlers/{suppressions.rs, lists.rs, links.rs}` (allow and block lists,
+`/v1/tenants/{tenant_id}/lists/{direction}/{kind}[/{entry}]`; signed links, `GET /v1/links/{token}`, with
+kid verification), `db/{suppressions.rs, lists.rs}`, `mailbox/alarms.rs` (the claim and dispatch purposes
+of [Data model §2](design/data-model.md#2-identitymailbox-durable-object-sqlite): thread locks expire
+lazily and reconciliation is event-driven, so neither has an alarm; no cron is involved).
 
 **Implements:** FR-OUT-1–12, FR-DLV-1–5, NFR-PERF-1/2.
 
-**Acceptance:** A7, A8, A10, C2, C4, C6, D6 (exchange cap), E2, E3, E8, G1–G11 (G5 with signed links),
-K3, L1, L2, L4. Also: the simulator matrix drives every status, an uncertain send is reconciled by a
+**Acceptance:** A7, A8, A10, C2, C4, C6, C7, D6 (exchange cap), D7, E2, E3, E8, G1–G6, G8–G11 (G5 with
+signed links), K3, L1–L4. G7 needs domain states and is accepted in M13. Also: the allow and block lists
+(`it::lists::entries_crud`) and their effect on sends and on inbound mail (`it::send::list_filters`,
+`it::inbound::receive_allow_skips_spam`; D7 covers receive-block), the custom-header rules checked at the
+API (`it::send::header_rules`), the simulator matrix drives every status, an uncertain send is reconciled by a
 later provider event, `?dry_run=true` returns the recipient plan without storing anything, and cancel
 works only while a message is `queued` and unclaimed (`it::send::cancel_queued`, FR-OUT-11).
 NFR-PERF-1 (`it::bench::send_api_p95`) and NFR-PERF-2 (`it::bench::queue_to_transport_p95`) report their
@@ -386,16 +458,21 @@ figures; CI warns above the targets.
 
 **Implements:** FR-SRCH-1–7, 10 and 11 (index side), plus contacts and related; NFR-PERF-3/4/5.
 
-**Acceptance:** F2 (`it::auth::f2_permission`, now that search exists), F3–F8, F14, F15. NFR-PERF-3:
-keyword p95 ≤ 200 ms on a 50,000-message synthetic mailbox in workerd (`it::bench::keyword_p95`, which
-reports the figure, with a CI warning threshold). NFR-PERF-4 (`it::bench::hybrid_p95`) and NFR-PERF-5
-(`it::bench::tenant_fanout_p95`) report theirs the same way.
+**Acceptance:** F2 (`it::auth::f2_permission`, now that search exists), F3–F5, F7, F8, F14, F15 (F6 needs
+erasure and is accepted in M14). The nightly reconciliation records its run in D1 `index_reconcile` and
+raises the drift alert only after two nights over 1% ([Search § 6.6](design/search.md#66-nightly-reconciliation)).
+NFR-PERF-3: keyword p95 ≤ 200 ms on a 50,000-message synthetic mailbox in workerd (`it::bench::keyword_p95`,
+which reports the figure, with a warning threshold). NFR-PERF-4 (`it::bench::hybrid_p95`) and NFR-PERF-5
+(`it::bench::tenant_fanout_p95`) report theirs the same way. The benchmarks fill their mailboxes through
+the `itest-hooks` bulk-seed hook and run in the nightly workflow, not as a required check on every pull
+request ([Testing § 6.9](design/testing.md#69-benchmarks)).
 
 ---
 
 ## M11 · Agentic search (after M10)
 
-**Files:** `search/agentic/{mod.rs, planner.rs, tools.rs, judge.rs, answer.rs, sse.rs, prompts.rs}`.
+**Files:** `search/agentic/{mod.rs, planner.rs, tools.rs, judge.rs, answer.rs, sse.rs, prompts.rs}`,
+`quota/mod.rs` (`QuotaRequest::CountAgentic`: the tenant daily cap replaces the M5 stub's plain count).
 
 **Implements:** FR-SRCH-8/9, NFR-PERF-6.
 
@@ -416,9 +493,12 @@ reports the figure, with a CI warning threshold). NFR-PERF-4 (`it::bench::hybrid
 
 **Implements:** FR-TRI-1–4.
 
+The `triage` hold of consumer step 2 ([Triage § 1.1](design/triage.md#11-consumer-steps)) goes to the M5
+`TenantQuota` stub, which grants every hold, so triage runs on every message until M22 adds allowances.
+
 **Acceptance:**
 
-- D8 and rule evaluation order.
+- D8 and rule evaluation order; E1 for triage input (`it::triage::e1_fenced`).
 - Invalid model output ends `failed` and is never guessed.
 - `message.triaged` events.
 - The thread roll-up.
@@ -429,18 +509,30 @@ reports the figure, with a CI warning threshold). NFR-PERF-4 (`it::bench::hybrid
 
 **Files:** `domains/{mod.rs, cloudflare_api.rs, ses_api.rs, ses_control.rs (SesControl DO, the SES
 token bucket), records.rs, monitor.rs (DomainMonitor DO), fallback.rs}`,
-`handlers/domains.rs` (full, including `PATCH /v1/domains/{domain_id}` for the transport), `transport/ses.rs`,
-`consumers/ses_events.rs` (the `POST /hooks/ses` SNS endpoint), and CLI `pmail domains subscribe`.
+`handlers/domains.rs` (full for `cloudflare_zone`, including `PATCH /v1/domains/{domain_id}` for the
+transport), `handlers/addresses.rs` (aliases on tenant domains, promote, retire and rollback),
+`crons/retire.rs`, `transport/ses.rs`, `consumers/ses_events.rs` (the `POST /hooks/ses` SNS endpoint), and
+CLI `pmail domains subscribe`. The other connection methods, `nameservers` included, are M23's.
 
-**Implements:** FR-DOM-2–6.
+**Implements:** FR-DOM-2–6 for `cloudflare_zone`, FR-ADR-1–4.
 
 **Acceptance:**
 
-- H1–H7, G7, and the API part of J5 (`it::domains::transport_patch`). J5's live part,
-  `live::transport::j5_ses_failover`, runs in M20.
-- The spike S9 fallback path, whatever S9's result (`it::domains::s9_manual_delivery_events`,
-  `cli::domains::subscribe_manual`), and the SES control-plane budget (`it::ses::control_plane_rate`).
-- `it::domains::*` with a DNS fake that can remove a record, add a conflicting record, or move the NS.
+- H1–H7, G7, C3, A11, A14, A4's role-mail routing (`it::inbound::a4_role_mail_routing`), the promote,
+  retire and rollback flows
+  (`it::addresses::promote_retire_rollback`, `it::addresses::retirement_cron`), and the API part of J5
+  (`it::domains::transport_patch`, including the SES identity that `cloudflare_zone` onboarding creates
+  for the failover when SES is configured). J5's live part, `live::transport::j5_ses_failover`, runs in
+  M20.
+- The spike S9 fallback path for `cloudflare_zone`, whatever S9's result
+  (`it::domains::s9_manual_delivery_events`, `cli::domains::subscribe_manual`), and the SES control-plane
+  budget (`it::ses::control_plane_rate`).
+- With a DNS fake that can remove a record, add a conflicting record, or move the NS, and the
+  `cloudflare_zone` method only: `it::domains::{h1_failing_fallback, h4_ownership_change, h5_existing_mx,
+  h6_rule_failure, onboarding_idempotent, records_from_api, cron_mints_missing_monitor,
+  cf_token_required_by_method}` and `it::send::g7_domain_states`. The `nameservers` and
+  `delegated_subdomain` parts of the onboarding, token and S9 fallback tests are separate tests, accepted
+  in M23.
 - The fallback send carries `sent_via_fallback` and keeps the thread token.
 - Recovery leaves fallback threads pinned.
 
@@ -461,11 +553,16 @@ migration (the `domains` method columns, `ses_ingest`, `addresses.ses_bounce_rul
 
 **Acceptance:**
 
-- N1–N30, with the tests named in the register (`core::connect::method_matrix`,
-  `core::sns::verify_v2_vectors`, `core::smtp::state_machine`, `core::dns::doubled_name_detected`,
+- N1–N30, with the tests named in the register (`core::sns::verify_v2_vectors`,
+  `core::smtp::state_machine`, `core::dns::doubled_name_detected`,
   `it::ses::*`, `it::smtp::*`, `it::forwarding::*`, `cli::setup::ses_region_check` and
   `it::domains::{existing_mx_external, nameservers_dedicated_check, zone_expired, mx_wrong_region,
   zone_create_rate_limited, zone_hold, delegation_removed, ses_identity_limit}`).
+- `core::connect::method_matrix`, which no register row names: every `method` maps to the documented
+  `kind`, `inbound` and `transport`, and invalid combinations are refused.
+- The `nameservers` and `delegated_subdomain` parts of M13's domain tests:
+  `it::domains::onboarding_idempotent_created_zones`, `it::domains::s9_manual_delivery_events_nameservers`
+  and `it::domains::cf_token_required_other_methods`.
 - `pmail setup ses` is idempotent: it runs twice against a recorded AWS API fake with no duplicate
   resources, never deactivates an existing active rule set, and prints the IAM policy before applying it.
 - Every new error code and `transport_unavailable` reason in the design is returned by at least one test.

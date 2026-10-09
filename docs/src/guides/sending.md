@@ -186,8 +186,12 @@ mode at `none`.
 
 ## Custom headers
 
-`headers` accepts `X-` headers plus `Importance`, `Priority`, `Sensitivity`, `Keywords`, `Comments`
-and `Organization`. Anything else fails with `400 header_not_allowed`. The service sets threading,
+`headers` accepts `X-` headers whose name uses only letters, digits, `-` and `_` (`X-Booking-Ref`), plus
+`Importance`, `Priority`, `Sensitivity`, `Keywords`, `Comments` and `Organization`, spelled exactly so.
+Anything else fails with `400 header_not_allowed`. `Importance` takes `high`, `normal` or `low`,
+`Priority` `normal`, `non-urgent` or `urgent`, and `Sensitivity` `personal`, `private` or
+`company-confidential`; another value fails with `400 invalid_request`. Both are checked when you send, so
+a bad header never turns into a rejected message later. The service sets threading,
 `Reply-To`, `Auto-Submitted` and unsubscribe headers itself, and Cloudflare sets `Message-ID`, `Date`
 and the DKIM signature. Custom headers can total 16 KB, with values of at most 2,048 bytes.
 

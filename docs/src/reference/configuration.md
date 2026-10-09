@@ -50,7 +50,11 @@ and email recipients ([Observability › Signals](../project/design/observabilit
 Cron triggers:
 
 - `* * * * *`: address retirement, the platform-event outbox sweep, restarting jobs left `queued`, the
-  state-alert evaluator, and the SES inbound backstop (draining `PM_SES_INBOUND_QUEUE_URL`, when set).
+  state-alert evaluator, the SES inbound backstop (draining `PM_SES_INBOUND_QUEUE_URL`, when set), and
+  minting the Durable Object IDs that only the Worker can mint for rows written outside it: the system
+  identity's mailbox, the `DomainMonitor` of a domain row with `monitor_do_id = ''` (the platform domain,
+  and domains added with `pmail domains add --local-token`), and the `SesControl` object when SES is
+  configured.
   Retrying stuck sends, transport claims and uncertain-send bookkeeping run in each mailbox's own alarms,
   not in the cron.
 - `*/15 * * * *`: domain health scheduling, retention, usage roll-up, the master-key re-seal sweep, the

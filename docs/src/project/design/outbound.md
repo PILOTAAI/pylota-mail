@@ -125,7 +125,7 @@ alarm; an expired key behaves as new.
 | 7 | Count across `to`, `cc`, `bcc` ≤ `policy.max_recipients` (default 10, at most 49: Cloudflare's limit is 50 and strategy B's journal copy takes one, so the limit is 49 on every transport) ([E3](../edge-cases.md)) | `400 too_many_recipients` |
 | 8 | Test tenant: every recipient is `*@simulator.invalid` or an `active`/`retiring` address on this deployment (FR-OUT-12, [L1](../edge-cases.md)) | `403 test_mode_recipient` |
 | 9 | `kind: marketing` has `unsubscribe.url` (HTTPS) and `consent` ([G9](../edge-cases.md), FR-OUT-8) | `400 marketing_requirements_missing` |
-| 10 | `kind: auto_reply` only for reply or reply-all, to a message whose `kind` is `normal` or `calendar`, with `policy.auto_reply.allowed`, identity `send_policy.auto_reply` not `"denied"`, and under the exchange cap ([D6](../edge-cases.md), FR-OUT-7) | `409 auto_reply_not_allowed` |
+| 10 | `kind: auto_reply` only for reply or reply-all, to a message whose `kind` is `normal` or `calendar`, with `policy.auto_reply.allowed`, identity `send_policy.auto_reply` not `"denied"` (the default is `"allowed"`), and under the exchange cap ([D6](../edge-cases.md), FR-OUT-7) | `409 auto_reply_not_allowed` |
 | 11 | Custom headers ([Headers](#headers)) | `400 header_not_allowed` / `400 invalid_request` |
 | 12 | Content: `text` or `html` present; subject ≤ 998 characters; ≤ 32 attachments, valid base64, `content_id` on inline parts; labels and metadata within limits | `400 invalid_request` |
 | 13 | From address ([From](#from-address-and-fallback)): an `active` address of the identity, or `retiring` on a thread that already uses it ([G7](../edge-cases.md)) | `400 invalid_request` (`details.errors[0].path = "from_address"`) |
@@ -226,6 +226,7 @@ after the restore point ([Observability › Restore from PITR](observability.md#
    | State | Behaviour |
    |---|---|
    | `healthy`, `degraded` | Send as composed |
+   | `pending`, `verifying` (the domain changed after submit, for example a reprove moved it from `suspended` to `verifying`) | **Hold and retry:** nothing is sent and the message stays `queued`. `BeginTransport` takes no claim and answers `DomainNotReady`; the consumer re-enqueues the message with the `Paused` back-off (as `Quota`), until 24 h after submit, then the queued deliveries are `failed` (`quota_exhausted`), as for every back-off ([Back-off bookkeeping](#transport-outcome-classification)) |
    | `failing`, `suspended`, or `transport = ses` while the platform check reports `ses_sending_paused`, with `policy.domain_fallback = true` | **Fallback:** From becomes the identity's platform-domain address with the same display name, Reply-To becomes that address with the thread token, the message gets flag `sent_via_fallback`, the transport is Cloudflare (the platform domain is always a Cloudflare zone), and the thread gets `fallback_pinned = 1` |
    | The same, with `policy.domain_fallback = false` | Status `failed`, reason `domain_failing_no_fallback`; nothing is sent |
    | `removing`, `removed` | Status `rejected`, reason `sender_domain_unavailable` |
@@ -311,13 +312,21 @@ In this order:
 | `X-Pylota-Mail-Hop: n` | Service | Always: `n` = 1 for a new send, else 1 + the hop of the message replied to or forwarded (stored as `automated_json.hop` on inbound messages, 0 when absent) |
 | `X-AI-Generated: true` | Service | `ai_disclosure.mode = "header"` |
 | `List-Unsubscribe`, `List-Unsubscribe-Post` | Service | `kind: marketing`; or a `kind: transactional` notification from the system identity whose internal submit input carries `list_unsubscribe` ([Body](#body-signature-disclosure-unsubscribe)). A caller can never set either name: it falls under "anything else" |
-| `X-*` | Caller | Any name except the reserved `X-Pylota-*` and `X-AI-Generated` |
-| `Importance`, `Priority`, `Sensitivity`, `Keywords`, `Comments`, `Organization` | Caller | Allowed |
+| `X-*` | Caller | A name matching `^X-[A-Za-z0-9_-]+$`, except the reserved `X-Pylota-*` and `X-AI-Generated` |
+| `Importance` | Caller | Value `high`, `normal` or `low` |
+| `Priority` | Caller | Value `normal`, `non-urgent` or `urgent` |
+| `Sensitivity` | Caller | Value `personal`, `private` or `company-confidential` |
+| `Keywords`, `Comments`, `Organization` | Caller | Any value within the limits below |
 | Anything else | – | `400 header_not_allowed` |
 
-Validation follows Cloudflare's limits (read 2026-10-09): names are printable ASCII without `:`, at most
-100 bytes; values are non-empty, contain no CR or LF, at most 2,048 bytes; at most 20 non-`X-` custom
-headers in total (service-set ones included); all custom headers together at most 16 KB. `From`, `To`,
+Validation follows Cloudflare's rules (Email headers reference, read 2026-10-10) and runs at policy step 11,
+when the request arrives, so a header Cloudflare would refuse is a `400` at the API, never a later
+`rejected` with `provider_validation`. Names: an `X-` name must match `^X-[A-Za-z0-9_-]+$` and be at most
+100 bytes; the six other names are matched exactly as spelled above; any other name, or an `X-` name with
+another character, is `400 header_not_allowed`. Values: non-empty, no CR or LF, at most 2,048 bytes, and
+for `Importance`, `Priority` and `Sensitivity` one of the values in the table; a value that breaks a rule
+is `400 invalid_request` (`details.errors[0].path = "headers.{name}"`). At most 20 non-`X-` custom headers
+in total (service-set ones included); all custom headers together at most 16 KB. `From`, `To`,
 `Cc`, `Bcc`, `Subject` and `Reply-To` are never custom headers; `Date`, `Message-ID`, `MIME-Version`,
 `Content-*`, `DKIM-Signature`, `Return-Path`, `Received` and the other platform-controlled headers are
 set by the transport.
@@ -481,6 +490,8 @@ For `Send`:
    `message.canceled`, audit entry `message.cancel` with the reason) and ack.
 2. **`BeginTransport { message_id, domain_state, fallback }`** in the mailbox:
    - status not `queued` → `NotQueued` → ack (a duplicate, or already handled);
+   - sending domain `pending` or `verifying` → `DomainNotReady` → no claim; re-enqueue with the `Paused`
+     back-off ([From address and fallback](#from-address-and-fallback));
    - a claim `meta` `claim:{msg}` younger than 5 minutes → `AlreadyClaimed` → ack;
    - a claim older than 5 minutes → the previous attempt died after claiming, so its outcome is unknown:
      record `uncertain` with `transport_connection_lost` and ack;
@@ -861,7 +872,11 @@ transport of domains with `transport = ses` (the methods `dns_records` and `send
 **Spike S8** must pass for it to ship in v1.0.
 
 **Identities.** Each such domain is an SES identity, created at onboarding with `CreateEmailIdentity` and
-`ConfigurationSetName` ([§ 4.3](domain-connections.md#43-dns_records)).
+`ConfigurationSetName` ([§ 4.3](domain-connections.md#43-dns_records)). When SES is configured, a
+`cloudflare_zone`, `nameservers` or `delegated_subdomain` domain also gets an SES identity at onboarding,
+with its DKIM CNAMEs published through the Cloudflare DNS API, so that the [J5](../edge-cases.md) failover
+needs no DNS change ([Identities and domains › Kind `zone`](identity-domains.md#kind-zone)). It has no
+custom MAIL FROM, so during a failover SPF does not align and DMARC passes on DKIM.
 
 - **DKIM.** Easy DKIM signs with `d=` the domain, so DKIM aligns even under `adkim=s`. The three CNAME
   targets are built from the returned `SigningHostedZone`, which differs by region
@@ -1154,6 +1169,8 @@ Agent        API handler      IdentityMailbox     pm-outbound consumer   Cloudfl
 | `core::reply::d3_reply_target` | Reply-To used only for known senders, same organisational domain or known contacts ([D3](../edge-cases.md)) |
 | `it::send::d6_exchange_cap` | The third consecutive auto-reply in a thread is refused ([D6](../edge-cases.md), FR-OUT-7) |
 | `it::send::e2_require_known_recipient` | Unknown recipients become `suppressed` deliveries ([E2](../edge-cases.md)) |
+| `it::lists::entries_crud` | `PUT`, `GET`, list and `DELETE` on `/v1/tenants/{tenant_id}/lists/{direction}/{kind}/{entry}` for both directions and kinds, an address and an `@domain` entry; entries are stored lower case with an A-label domain; `PUT` again updates only `note`; a key without `suppressions:manage` (every identity key, which can never hold it) gets `403 permission_denied`; another tenant's key gets `404 tenant_not_found` (build plan M9) |
+| `it::send::list_filters` | A send-block entry, and `policy.send_allowlist_only` without a send-allow entry, make that recipient's delivery `suppressed` with `policy: send_block` or `policy: not_on_allowlist`; a send-allow entry for the address or its `@domain` lets it through; a dry run reports the rule (build plan M9, FR-OUT-4) |
 | `it::send::e3_caps` | `max_recipients`, identity and tenant daily caps ([E3](../edge-cases.md)) |
 | `it::send::e8_disclosure_footer` | Footer and header modes ([E8](../edge-cases.md)) |
 | `it::send::c4_thread_lock` | Concurrent replies: the second waits, then `thread_busy` after 10 s ([C4](../edge-cases.md), FR-OUT-9) |
@@ -1168,6 +1185,7 @@ Agent        API handler      IdentityMailbox     pm-outbound consumer   Cloudfl
 | `it::delivery::g8_race` | An event before the provider ID is stored is retried every 30 s, then orphaned ([G8](../edge-cases.md)) |
 | `it::send::g9_marketing_requirements` | Marketing needs `unsubscribe` and `consent`; headers and visible link added ([G9](../edge-cases.md), FR-OUT-8) |
 | `it::send::notification_list_unsubscribe` | A `usage`, `new_mail` or `needs_person` notification from the system identity is `transactional` and carries `List-Unsubscribe` and `List-Unsubscribe-Post`; an `account` notification carries neither; a REST send naming either header gets `400 header_not_allowed`; `list_unsubscribe` on any other identity is refused |
+| `it::send::header_rules` | `X-Booking-Ref` and the six allowed names pass; `X-Bad Name`, `X-`, `Importance ` and `importance` get `400 header_not_allowed`; `Importance: urgent`, `Priority: high` and `Sensitivity: secret` get `400 invalid_request` with the header's path; nothing is stored, so no send ends `rejected` for a header |
 | `it::send::idempotency_key_pattern` | An empty key, a 256-byte key and a key with a byte outside 0x20–0x7E get `400 invalid_idempotency_key`; a 255-byte key with spaces is accepted |
 | `it::notify::bounce_pauses_prefs` ([Notifications §10](notifications.md#10-tests)) | A hard bounce on a notification suppresses the address on the default tenant and pauses every preference of the person ([O17](../edge-cases.md)) |
 | `it::send::g10_provider_validation` | Every validation code in the table → `rejected: provider_validation`, never retried ([G10](../edge-cases.md)) |

@@ -75,7 +75,7 @@ pipeline; this page adds what they must contain.
 | Test | Property |
 |---|---|
 | `core::query::f1_*` | For any input string: parsing never panics; it returns a typed tree or `invalid_query` with a position; the FTS5 expression built from any tree quotes every term, contains no bare FTS5 operator, column filter or `NEAR`, and never contains the raw input ([F1](../edge-cases.md)); `parse(print(tree)) == tree` |
-| `core::address::a1_case_and_dots` (property part) | Normalisation is idempotent, case-insensitive on the local part, keeps dots, converts the domain to an A-label; random Unicode local parts are refused with `address_unsupported` ([A1](../edge-cases.md), [A3](../edge-cases.md)) |
+| `core::address::a1_case_and_dots` (property part) | Normalisation is idempotent, case-insensitive on the local part, keeps dots, converts the domain to an A-label; random Unicode local parts are refused with `address_unsupported` or `address_reserved` ([A1](../edge-cases.md), [A3](../edge-cases.md)) |
 | `core::thread_token::a2_round_trip` | Mint then verify returns `Valid` for random identities and sequence numbers; every single-bit flip returns `Invalid` or `Absent`; a token for one identity never verifies for another ([Threading](threading.md)) |
 | `core::refs::f5_*` (property part) | Plate normalisation: `AB12CDE`, `ab12 cde` and `AB12  CDE` normalise equally; normalisation is idempotent ([F5](../edge-cases.md)) |
 | `core::ssrf::refuses_private_ranges` | Every address inside each blocked range, including IPv4-mapped, NAT64 and 6to4 embeddings, is refused; addresses outside them pass ([Security](security.md#9-ssrf-controls)) |
@@ -171,9 +171,22 @@ As defined in [Rust workspace](rust-workspace.md#9-xtask), plus the details belo
 4. Start `npx --yes wrangler@4.139.0 dev --local --port 8799 --persist-to target/itest/state
    --test-scheduled --config deploy/wrangler.itest.toml`, write its PID to `target/itest/wrangler.pid`, and
    capture stdout and stderr to `target/itest/worker.log`. Wait for `GET /health`.
-5. Seed: insert the platform domain row and one platform key directly with
-   `wrangler d1 execute --local` (the harness knows `PM_KEY_PEPPER` because it generated it). Every
-   other fixture (tenants, identities, domains, keys) is created through the public API.
+5. Seed exactly what `pmail setup` writes in steps 19–22 ([CLI and setup §6.3](cli.md#63-steps)), in the
+   same way:
+   - one platform key (step 19, the bootstrap key) with `wrangler d1 execute --local`; the harness knows
+     `PM_KEY_PEPPER` because it generated it;
+   - the platform domain row for `agents.example` (step 20) with `wrangler d1 execute --local`, with
+     `records_json` matching the DNS fake's zone for it and `monitor_do_id = ''`. Until M13 builds the
+     `DomainMonitor`, the row is written with `state = 'healthy'`. From M13 it is written `pending`, as
+     setup writes it, and the harness triggers the every-minute cron (section 6.5), then advances the fake
+     clock and runs the monitor's alarm through `/__test/alarm` until it has verified the domain `healthy`;
+   - the default tenant (step 21) through `POST /v1/tenants` with that key and `address_suffix: ""`,
+     because only the Worker can mint its `TenantQuota` ID;
+   - from M6, which builds the minting hook, the system identity (step 22): its `identities` row
+     (`is_system = 1`, `mailbox_do_id = ''`) and primary address with `wrangler d1 execute --local`, then
+     one every-minute cron run, after which its mailbox exists.
+
+   Every other fixture (tenants, identities, domains, keys) is created through the public API.
 6. Run `cargo test -p pylota-mail-worker --features itest-hooks --test it -- --test-threads=1` with
    `PM_ITEST_URL=http://127.0.0.1:8799`. The `it` test target declares
    `required-features = ["itest-hooks"]`, so `cargo test --workspace` never builds it.
@@ -194,6 +207,7 @@ the release bundle contains `/__test/`.
 | `POST /__test/rpc` | Sends a raw `RpcEnvelope` to an object, for owner-mismatch tests |
 | `POST /__test/delivery-event` | Publishes a provider event payload to `pm-delivery-events` through `Q_DELIVERY` |
 | `POST /__test/mailbox-schema` | Sets an object's `meta.schema_version` back by one, for [J9](../edge-cases.md) |
+| `POST /__test/bulk-seed` | `{ "identity_id", "count", "seed" }`: writes `count` synthetic messages (at most 50,000 per identity) from the seeded generator in `crates/conformance/src/gen/` straight into the identity's mailbox in batches of 500, with their FTS rows, refs and `chunks` rows as ingest would write them, and queues their `Embed` jobs; no `email()`, no events, no webhooks. For the benchmarks of section 6.9, which cannot inject 50,000 messages through the email endpoint in a reasonable time |
 
 ### 6.3 Fakes
 
@@ -210,7 +224,7 @@ traits that call it:
 | `Ai::run` (triage) | Schema-valid output looked up by `raw_sha256` from the labelled set, a default rule-based output otherwise; scriptable invalid JSON and timeouts (FR-TRI-4) |
 | `Ai::run` (planner) | Scripted tool-call sequences per question from `crates/conformance/golden/questions.toml`, including a hostile script that tries to widen scope ([F10](../edge-cases.md)) |
 | `Ai::to_markdown` | Text from a sidecar fixture, or a scripted failure or timeout ([B12](../edge-cases.md)) |
-| `VectorIndex` | In-memory namespaces with metadata filters (equality and `sent_at` ranges), mutation IDs, a configurable processing lag and `processedUpToDatetime`; scriptable failures ([F14](../edge-cases.md)) and a "keep one vector" mode for probe tests ([F6](../edge-cases.md)) |
+| `VectorIndex` | In-memory namespaces with metadata filters (equality and `sent_at` ranges), mutation IDs, a configurable processing lag and `processedUpToDatetime`; `describe()` with the vector count, which tests can offset for the drift check; scriptable failures ([F14](../edge-cases.md)) and a "keep one vector" mode for probe tests ([F6](../edge-cases.md)) |
 | `MailSender` (live tenants) | Records every `StructuredEmail`; scripted outcomes: accepted with a `messageId`, a coded error (`E_RATE_LIMIT_EXCEEDED`, `E_DAILY_LIMIT_EXCEEDED`, `E_HEADER_NOT_ALLOWED`, `E_RECIPIENT_SUPPRESSED`, …), an exception, or a timeout |
 | `HttpClient` | Routes requests by host to fake handlers: Cloudflare API (zones, including zone creation with scriptable error `1105` and zone-hold refusals; routing rules with the 200-rule limit; sending subdomains including `preview_enabled`; event subscriptions), SES (`SendEmail`, which checks the SigV4 signature against test credentials; email identities with scriptable DKIM and MAIL FROM status; the account's sending status; receipt rules with the 200-rule and 500-recipient caps), S3 (`GetObject` and `DeleteObject` on the inbound bucket, with SigV4 checks and scriptable `NoSuchKey`), SQS (`ReceiveMessage` and `DeleteMessage` on the backstop queue), SNS certificates, Google and GitHub OAuth (token, user and email endpoints with scriptable claims and unverified addresses), Stripe (creating and retrieving Checkout Sessions, the objects billing reads, and subscription cancellation, with scriptable failures), RDAP, the scanner, and webhook receivers. Any other host gets `HttpError::Connect`: integration tests never reach the internet |
 | SNS push | The fake server signs SES notifications with a test key (`SignatureVersion` 2, or 1 and tampered variants on request) and `POST`s them to the Worker's `/hooks/ses/inbound` and `/hooks/ses`. A test can skip the push and leave the notification only in the SQS fake, for the backstop cron ([N1](../edge-cases.md)–[N3](../edge-cases.md)) |
@@ -316,6 +330,15 @@ The test titles carry the `browser::` names, which `cargo xtask trace` collects 
 
 Pages added by M24 (sign-up, two-step verification, the Overview) and M26 (notification settings and the
 unsubscribe pair) join both tests when they land.
+
+### 6.9 Benchmarks
+
+The `it::bench::*` tests that need a large mailbox (`it::bench::keyword_p95` and `it::bench::hybrid_p95`
+on 50,000 messages, and `it::bench::tenant_fanout_p95` over 10 identities) fill it with
+`POST /__test/bulk-seed` and then measure through the public API. They are marked `#[ignore]`, so the
+pull-request `itest` run skips them, and the nightly workflow runs them by passing `--ignored` to the test
+binary. Each reports its figure and warns above its target. They are never a required check on a pull
+request: a 50,000-message seed takes minutes, and timings on shared CI runners are noisy.
 
 ## 7. Cross-tenant attack suite
 

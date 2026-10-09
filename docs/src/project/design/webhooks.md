@@ -7,7 +7,7 @@ signed HTTPS deliveries with retries, dead letters and replay.
 |---|---|
 | Requirements | FR-WH-1 … FR-WH-5, NFR-REL-3, NFR-REL-4, FR-PRV-6, FR-IDN-6 (key events), FR-CON-14 (the Notifier hand-off) |
 | Edge cases | [J4](../edge-cases.md), [I5](../edge-cases.md), [K1](../edge-cases.md) (integrator side), [C5](../edge-cases.md) (sequence), [O14](../edge-cases.md), [O16](../edge-cases.md) (Notifier hand-off) |
-| Code | `crates/worker/src/mailbox/outbox.rs` (and the outbox modules of `DomainMonitor` and `JobRunner`), `handlers/webhooks.rs`, `consumers/webhooks.rs`, `webhooks/{sign.rs, client.rs, replay.rs, payloads.rs}`, `crons/outbox_sweep.rs`; the SSRF guard is `crates/core/src/ssrf.rs` and `crates/worker/src/net.rs` ([Security](security.md#9-ssrf-controls)) |
+| Code | `crates/worker/src/mailbox/outbox.rs` (and the outbox modules of `DomainMonitor` and `JobRunner`), `webhooks/envelope.rs` (build plan M6: the envelope, `WebhookJob` and the identity payload builders), `handlers/webhooks.rs`, `consumers/webhooks.rs`, `webhooks/{sign.rs, client.rs, replay.rs, payloads.rs}` (build plan M8), `crons/outbox_sweep.rs`; the SSRF guard is `crates/core/src/ssrf.rs` and `crates/worker/src/net.rs` ([Security](security.md#9-ssrf-controls)) |
 | Contract | [Webhook events](../../reference/events.md) (envelope, types, signing, retry schedule), [REST API › Webhooks](../../reference/api.md#webhooks) |
 
 ```text
@@ -43,8 +43,8 @@ pub fn append(tx: &impl Sql, ids: &impl Ids, clock: &impl Clock, owner: &Owner,
    (initialised to `0` by `Init`). The counter never goes backwards, even when outbox rows are deleted.
 2. `event_id` = the given deterministic ID (used for `suppression.created`,
    [Outbound](outbound.md#suppressions)) or `ids.new_id(Evt)`.
-3. Build the envelope (below) with `sequence = seq` and serialise it once; these exact bytes are what is
-   signed and sent on every attempt.
+3. Build the envelope (below) with `sequence = seq` and serialise it once, with
+   `webhooks/envelope.rs`; these exact bytes are what is signed and sent on every attempt.
 4. `INSERT INTO outbox (seq, event_id, type, payload_json, occurred_at, dispatched_at) VALUES (?1, ?2, ?3, ?4, ?5, NULL) ON CONFLICT (event_id) DO NOTHING`.
    When the insert is ignored (a deterministic ID seen before), `meta.event_seq` is restored in the same
    transaction.
@@ -129,9 +129,12 @@ handler writes them after its D1 change through `MailboxRequest::EmitEvent` on t
 they carry the identity's `identity_id` and the next value of its `sequence`
 ([Agent signing keys §7](agent-keys.md#7-api-mcp-and-cli)).
 
-Payloads are built by `webhooks/payloads.rs` from rows already read in the transaction, and are **thin**
+Payloads are built from rows already read in the transaction, and are **thin**
 (FR-WH-4): IDs, a header summary, verdicts, triage and at most `policy.webhook_text_bytes` of
-`extracted_text` (default 16,384, maximum 65,536), cut at a UTF-8 character boundary.
+`extracted_text` (default 16,384, maximum 65,536), cut at a UTF-8 character boundary. The `identity_*`
+and `address_*` builders live in `webhooks/envelope.rs` with the envelope builder and the `WebhookJob`
+type, because M6's outbox emits identity events before M8 exists (build plan M6); every other builder is
+in `webhooks/payloads.rs` (M8), which imports them.
 
 | Builder | Event types | `data` (per [events](../../reference/events.md)) |
 |---|---|---|
@@ -398,7 +401,8 @@ retried.
 ## The pm-webhooks message
 
 ```rust
-// crates/worker/src/consumers/webhooks.rs — JSON, pointers only
+// crates/worker/src/webhooks/envelope.rs (build plan M6) — JSON, pointers only. The outbox produces
+// Fanout; consumers/webhooks.rs (M8) consumes both kinds and produces Deliver.
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WebhookJob {

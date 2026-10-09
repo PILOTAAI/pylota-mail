@@ -734,7 +734,7 @@ pub enum IndexJob {
     Triage         { tenant_id: String, identity_id: String, message_id: String,
                      #[serde(default)] reason: TriageReason, #[serde(default)] attempt: u32 }, // triage.md
     DeleteVectors  { tenant_id: String, vector_ids: Vec<String> /* ≤ 500 */, #[serde(default)] also_next: bool },
-    Reconcile      { tenant_id: String, identity_id: String },
+    Reconcile      { tenant_id: String, identity_id: String, run_date: String /* YYYY-MM-DD, § 6.6 */ },
 }
 #[derive(Default)]
 pub enum EmbedReason { #[default] New, AttachmentText, Release, Reembed, Reconcile, Rechunk }
@@ -907,7 +907,9 @@ written in the message transaction.
 
 1. Page through identities in D1
    (`SELECT id, tenant_id, mailbox_do_id FROM identities WHERE status IN ('active','paused') AND id > ?1 ORDER BY id LIMIT 100`)
-   and send one `Reconcile` job per identity to `pm-index` (`sendBatch` of 100).
+   and send one `Reconcile` job per identity to `pm-index` (`sendBatch` of 100), each carrying the run's
+   `run_date` (today, UTC). When the last page is sent, write the run's summary row in D1
+   `index_reconcile` (`identity_id = '*'`, `queued` = the number of jobs sent).
 2. Each `Reconcile` job asks the mailbox for, at most 500 messages each:
    - messages with `pending` rows older than 1 hour, or `failed` rows;
    - eligible messages with no chunk rows, received more than 1 hour ago, with non-empty text;
@@ -915,10 +917,22 @@ written in the message transaction.
 3. The consumer enqueues `Embed { reason: Reconcile }` for the first two lists. For the sample, it calls
    `getByIds` in batches of 20 (the per-call maximum is not documented; verify at build time) and marks
    any missing ID `pending`, then enqueues an `Embed` for its message.
-4. Each job reports `(embedded_rows, pending_rows, failed_rows)` in a log line and a metric. The cron
-   also reads the index's vector count from `describe()` (spike S6 confirms that the V2 binding returns
-   it) and emits `vector_count_drift = index_count − Σ embedded_rows`. An alert fires when the drift is
-   above 1% for two nights in a row.
+4. Each job reports `(embedded_rows, pending_rows, failed_rows)` in a log line and a metric, and records
+   them in D1: `INSERT OR REPLACE INTO index_reconcile (run_date, identity_id, embedded_rows, pending_rows,
+   failed_rows, reported_at)`, so a retried job overwrites its own row instead of counting twice
+   ([Data model](data-model.md#1-d1-control-plane)). `embedded_rows` counts every `chunks` row with status
+   `embedded`, whatever its model tag, because during a re-embed the old index still holds those vectors.
+5. **Drift.** The `*/15` cron evaluates the run when the UTC hour is 03 and the minute is below 15, and
+   again on each later tick that day until it has evaluated it. It reads the summary row and
+   `SELECT COUNT(*), SUM(embedded_rows) FROM index_reconcile WHERE run_date = ?1 AND identity_id <> '*'`.
+   When fewer identities reported than were queued, it waits for the next tick; at 23:45 UTC it gives up
+   and leaves `drift_pct` `NULL` (an incomplete run neither raises nor clears the alert). Otherwise it reads
+   the index's vector count with `VectorIndex::describe()` on `VECTORS` (spike S6 confirms that the V2
+   binding returns it), emits `vector_count_drift = index_count − Σ embedded_rows`, and writes
+   `index_count`, `embedded_rows` and `drift_pct` on the summary row. The "two nights" state is the
+   previous run's summary row: the alert fires when this run's `drift_pct` and the previous day's are both
+   more than 1 away from zero (too many vectors or too few). The same tick deletes `index_reconcile` rows
+   older than 7 days.
 
 ### 6.7 Deletion on erasure
 
@@ -1723,7 +1737,7 @@ written there.
 | `it::erasure::f6_probe_empty` | FTS rows, refs and vectors deleted; both probes return 0 | FR-SRCH-11, [F6] |
 | `it::search::f7_quarantine_hidden` | Quarantined mail is absent unless `include_quarantined` and `quarantine:review`; without `quarantine:review`, `include_quarantined: true` and `is:quarantined` are filtered silently (`200`, no quarantined hits, never `403`); semantic read-back also hides it | FR-IN-5, [F7] |
 | `it::search::f8_budget` | `limit` ≤ 50, `snippet_chars`, `group_by=thread`, 256 KB cap sets `truncated` and a continuing cursor | FR-SRCH-5, [F8] |
-| `it::index::f14_retry_and_reconcile` | Failed upserts retried; nightly reconciliation re-enqueues missing and failed rows | [F14] |
+| `it::index::f14_retry_and_reconcile` | Failed upserts retried; nightly reconciliation re-enqueues missing and failed rows; a retried `Reconcile` job does not count twice in `index_reconcile`; with the fake's `describe()` count offset by 2%, the drift alert fires on the second night and not the first, and an incomplete run raises nothing | [F14] |
 | `it::search::f15_partial` | A slow mailbox misses the 900 ms deadline; `partial: true`, `failed_identities` set | NFR-PERF-5, [F15] |
 | `it::index::b12_extraction_failure` | `attachment_text_unavailable` appears in `why` | [B12] |
 | `core::search::cursor_tamper` | Modified payload, tag or kid, or an unknown kid → `invalid_request`; old `issued_at` → `cursor_expired`; other query → `invalid_request`; a cursor signed by the previous kid still verifies within 24 hours of a rotation | FR-SRCH-6 |
@@ -1750,7 +1764,7 @@ written there.
 | `it::search::related_excludes_thread` | Same thread excluded, shared refs boost, keyword fallback | [PRD §5](../prd.md#5-scope-and-priorities) Search P1 (find-related) |
 | `xtask eval-search` (nightly) | recall@10 ≥ 0.90 hybrid, regression ≤ 0.01 | NFR-QUAL-1 |
 | `xtask eval-agentic` (nightly) | citation precision ≥ 0.98 | NFR-QUAL-2 |
-| `it::bench::keyword_p95` (benchmark, M10) | Keyword p95 ≤ 200 ms on 50,000 messages in workerd; reports the figure, CI warns above | NFR-PERF-3 |
+| `it::bench::keyword_p95` (benchmark, M10, nightly) | Keyword p95 ≤ 200 ms on 50,000 messages in workerd, seeded with the bulk-seed hook ([Testing § 6.9](testing.md#69-benchmarks)); reports the figure, warns above | NFR-PERF-3 |
 
 [B10]: ../edge-cases.md
 [B11]: ../edge-cases.md
