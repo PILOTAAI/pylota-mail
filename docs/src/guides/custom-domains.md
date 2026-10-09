@@ -51,10 +51,13 @@ A Cloudflare zone can have at most 30 mail domains (routing and sending together
 - You need a key with `domains:write` (tenant or platform) to add a domain, and `identities:write` to add
   and promote addresses.
 - `cloudflare_zone`, `nameservers` and `delegated_subdomain` work through the Cloudflare API, so the
-  deployment needs `PM_CF_API_TOKEN`. Without it, the request fails with `422 cf_token_required`. The one
-  exception: an operator can add a `cloudflare_zone` **apex** with `pmail domains add`, which then uses their local
-  `CLOUDFLARE_API_TOKEN`. Subdomains, `nameservers` and `delegated_subdomain` always need the token on
-  the deployment. `dns_records`, `send_only` and `smtp_relay` need no Cloudflare token.
+  deployment needs `PM_CF_API_TOKEN`, with the permissions in
+  [Deploy to Cloudflare › Create a Cloudflare API token](../self-hosting.md#2-create-a-cloudflare-api-token).
+  Without it, the request fails with `422 cf_token_required`. The one exception: an operator can add a
+  `cloudflare_zone` **apex** with `pmail domains add --local-token`, which then uses their local
+  `CLOUDFLARE_API_TOKEN` ([CLI › Commands that use your Cloudflare token](../reference/cli.md#commands-that-use-your-cloudflare-token)).
+  Subdomains, `nameservers` and `delegated_subdomain` always need the token on the deployment.
+  `dns_records`, `send_only` and `smtp_relay` need no Cloudflare token.
 - The records you publish are always read from the provider when you ask for them. Never copy records
   from this page or anywhere else ([FR-DOM-3](../project/prd.md#63-domains)).
 
@@ -124,8 +127,9 @@ Every method follows the same four steps: add, publish, verify, move identities.
 
    This runs a check now (at most once a minute per domain). Checks use two independent DNS resolvers,
    and the state changes after two consecutive agreeing results, so it can take a few minutes. DNS
-   changes can also take time to reach the resolvers. When the domain first becomes `healthy`, a
-   `domain.verified` event is sent.
+   changes can also take time to reach the resolvers. When verification passes and the domain becomes
+   `healthy`, a `domain.verified` event is sent. If it passes with a warning, it becomes `degraded`
+   (`domain.degraded`), and `domain.recovered` follows once the warning is fixed.
 
 4. **Move identities onto it.** See [Move an identity to the new domain](#move-an-identity-to-the-new-domain).
 
@@ -158,8 +162,8 @@ Pylota Mail creates a Cloudflare zone for the domain, and you point the domain's
 **This hands the whole domain to the deployment**, which manages only mail records. Use it for a domain
 that has no website and no other mail.
 
-- Before creating the zone, Pylota Mail looks for a website (an A or AAAA record at the name, or a CNAME
-  or A record at `www`) and for mail (MX records). If it finds any, the request is refused with
+- Before creating the zone, Pylota Mail looks for a website (an A or AAAA record at the name, or a CNAME,
+  A or AAAA record at `www`) and for mail (MX records). If it finds any, the request is refused with
   `409 domain_not_dedicated`, and `details.records` lists what it found. Moving the nameservers would
   stop that website or mail. If you are sure, repeat the request with `"confirm_dedicated": true`
   (`--confirm-dedicated`).
@@ -235,8 +239,8 @@ through Amazon SES, signed for your domain.
 
 **The main drawback: forwarders that change the message.** Forwarding breaks SPF for the original
 sender, so Pylota Mail decides trust from the sender's DKIM signature and from ARC. A forwarder that
-rewrites the body (adds a footer, a disclaimer or a banner) breaks that signature. Such messages are
-marked `unauthenticated` and quarantined by default, so the agent does not see them until a person
+rewrites the body (adds a footer, a disclaimer or a banner) breaks that signature. Such messages fail
+authentication and are quarantined by default (`quarantine_reason: auth_failed`), so the agent does not see them until a person
 releases them ([Receiving › Quarantine](receiving.md#quarantine)). Prefer a mail system that forwards
 messages unchanged and adds ARC.
 
@@ -280,7 +284,8 @@ What to set up with your provider:
 send, and then every day, it sends a probe message through your relay to the platform domain. The probe
 passes when the `From` address arrives unchanged and DMARC passes for your domain. If your provider
 re-signs with its own domain the issue is `smtp_unaligned`; if it changes the `From` address,
-`smtp_from_rewritten`. Two failed probes in a row make the domain `failing`, and sends fall back to the
+`smtp_from_rewritten`. After a failed probe, another runs 20 minutes later. Two failed probes in a row
+make the domain `failing` (about 40 minutes from the first failure at most), and sends fall back to the
 platform address. Run a probe now with `pmail domains probe brightwell.example`
 (`POST /v1/domains/{domain_id}/probe`, at most once a minute); the result appears in
 `pmail domains health` within 15 minutes.
@@ -407,7 +412,7 @@ resolvers. One resolver's error or disagreement never changes the state
 |---|---|---|---|
 | `pending` | Newly added; records not checked yet | No. Addresses stay `pending` | `domain.created` |
 | `verifying` | Checks are running | No | – |
-| `healthy` | Every required record is correct | Yes | `domain.verified` (first time), `domain.recovered` (on return) |
+| `healthy` | Every required record is correct | Yes | `domain.verified` (verification passed), `domain.recovered` (on return from `degraded` or `failing`) |
 | `degraded` | An issue was found that does not break authentication | Yes | `domain.degraded` with `issues[]` |
 | `failing` | A required authentication record is missing or wrong, or (for `smtp_relay`) the alignment probe failed twice | **No.** Sends fall back to the identity's platform address | `domain.failing` with `issues[]` and `fallback_active` |
 | `suspended` | Failing for 14 days, or the domain's ownership signals changed | No | `domain.suspended` with `reason` |
@@ -441,8 +446,8 @@ Issues you may meet with the methods that keep DNS at your host:
 | `mx_missing` (fail) | `dns_records`, `smtp_relay` with `inbound: ses` | The MX record to Amazon SES is missing | Publish it as the `fix` says |
 | `dkim_missing`, `ses_dkim_failed` (fail) | `dns_records`, `send_only`, `smtp_relay` with `inbound: ses` | A DKIM CNAME is missing or wrong, or SES could not verify it | Publish the three CNAMEs exactly as the `fix` says |
 | `mail_from_failed` (degraded) | `dns_records`, `send_only` | The `pm-bounce` MX or TXT is missing. DKIM still aligns, so sending continues | Publish both `pm-bounce` records |
-| `smtp_unaligned`, `smtp_from_rewritten` (fail) | `smtp_relay` | Your provider signs with its own domain, or changes the `From` address | Turn on DKIM for your domain at your provider; allow the agent addresses as senders |
-| `smtp_probe_timeout` (degraded, then fail) | `smtp_relay` | No probe arrived within 15 minutes | Check that the relay accepts and sends mail from `probe_from` |
+| `smtp_unaligned`, `smtp_from_rewritten` (degraded the first time, then fail) | `smtp_relay` | Your provider signs with its own domain, or changes the `From` address | Turn on DKIM for your domain at your provider; allow the agent addresses as senders |
+| `smtp_probe_timeout` (fail before the first pass; after it, degraded, then fail after three in a row) | `smtp_relay` | No probe arrived within 15 minutes | Check that the relay accepts and sends mail from `probe_from` |
 | `smtp_auth_failed`, `smtp_tls_required` (fail) | `smtp_relay` | The relay refused the login, or offered no TLS | Update the credentials with `pmail domains update` |
 
 The full list, per method, is in
@@ -551,8 +556,9 @@ On a Cloudflare Enterprise account, yes, with `delegated_subdomain` once the ope
 Otherwise use `dns_records`.
 
 **Do I need `PM_CF_API_TOKEN`?**
-For `cloudflare_zone`, `nameservers` and `delegated_subdomain` added through the API, yes. Without it,
-an operator can still add a zone apex with `pmail domains add` and their local token; subdomains,
+For `cloudflare_zone`, `nameservers` and `delegated_subdomain` added through the API, yes; its
+permissions are in [Deploy to Cloudflare](../self-hosting.md#2-create-a-cloudflare-api-token). Without it,
+an operator can still add a zone apex with `pmail domains add --local-token` and their local token; subdomains,
 `nameservers` and `delegated_subdomain` need the token on the deployment. `dns_records`, `send_only` and
 `smtp_relay` do not use it.
 

@@ -55,7 +55,8 @@ Later triggers:
 ```rust
 // crates/api-types/src/internal/index_job.rs (variant of IndexJob, see search.md §6)
 Triage { tenant_id: String, identity_id: String, message_id: String,
-         #[serde(default)] reason: TriageReason }
+         #[serde(default)] reason: TriageReason, #[serde(default)] attempt: u32 }
+// attempt: retries are counted in the body and re-enqueued with a delay (search.md § 6)
 #[derive(Default)]
 pub enum TriageReason { #[default] Ingest, Release, Rerun, Reprocess }
 ```
@@ -81,8 +82,12 @@ pub enum TriageReason { #[default] Ingest, Release, Rerun, Reprocess }
    message was erased or quarantined meanwhile.
 9. **Settle the hold**: consume it when the commit stored a `done` record; release it otherwise
    (`failed`, a no-op commit, or a transient error that will be retried).
-10. **Account.** Add the model call's neurons to the `TenantQuota` counter `ai_neurons` (reported in
-    [usage](../../reference/api.md#usage-and-audit)).
+10. **Account.** Send `QuotaRequest::RecordUsage { metric: AiNeurons, n }` to the tenant's
+    `TenantQuota` (reported in [usage](../../reference/api.md#usage-and-audit) as `ai_neurons`). `n` is
+    computed from the response's `usage` token counts and the model's published neurons per token, a
+    table compiled into the Worker (the binding does not document a neurons field; verify the rates at
+    build time against Cloudflare's Workers AI pricing page). The agentic planner does the same after
+    each model call.
 
 ### 1.2 Metering
 
@@ -92,12 +97,12 @@ feature is `triage` in the workspace's `TenantQuota` object ([Billing design](bi
 
 - The consumer takes the hold at the start of each attempt with
   `QuotaRequest::Hold { feature: Triage, units: 1, ref: message_id, gates: [] }`, and settles it with
-  `Settle { feature: Triage, ref: message_id, consume: 1 }` (stored analysis) or `consume: 0`
+  `Settle { feature: Triage, ref: message_id, consume: 1, keep: 0 }` (stored analysis) or `consume: 0`
   (release). `TenantQuota` keeps one open hold per `(feature, ref)`, so a redelivered job reuses the
   open hold instead of taking a second one.
 - `TenantQuota` unavailable (overloaded, deadline): the attempt ends as a transient error and the queue
   retries it later. Triage is never skipped for this reason ([Billing design](billing.md)).
-- A hold expires after 10 minutes if it is never settled (FR-BILL-4, [M6]). One attempt takes at most
+- A hold expires after 10 minutes if it is never settled (FR-BILL-4, [W6]). One attempt takes at most
   about 25 seconds (two model calls of 10 seconds plus R2 reads), so a hold always outlives its attempt.
   A transient model error releases the hold before the queue retry, and the retry takes a new one.
 - `done` consumes one unit, whether the model ran or the rules alone decided. `failed` and `skipped`
@@ -107,7 +112,7 @@ feature is `triage` in the workspace's `TenantQuota` object ([Billing design](bi
   The rule flags are computed from the built-in rules alone; tenant rules and the model do not run. No
   `message.triaged` event is emitted. When the denial carries `first_in_period: true`, the consumer
   emits `billing.limit_reached` as Billing design specifies. Inbound mail is never refused or dropped
-  because of it (FR-BILL-8, [M7]). A re-run after an upgrade or top-up triages the message.
+  because of it (FR-BILL-8, [W7]). A re-run after an upgrade or top-up triages the message.
 - Quarantined messages are not triaged at ingest, so they take no hold; a release enqueues
   `Triage { reason: Release }`, which takes the hold then.
 - With billing `exempt` or `disabled`, the hold always succeeds (`granted` is `NULL`, unlimited) and
@@ -127,7 +132,7 @@ pub struct TriageInput {
     pub to: Vec<Mailbox>, pub cc: Vec<Mailbox>,
     pub subject: Option<String>,
     pub extracted_text: String,                // hidden text already removed (B11)
-    pub verdict: Verdict,                      // pass | fail | softfail | none | unaligned
+    pub verdict: Verdict,                      // pass | fail | softfail | none | unaligned | unverified
     pub auth: AuthSummary,                     // spf, dkim, dmarc results
     pub known_sender: bool,
     pub spam_score: f32,
@@ -160,11 +165,11 @@ pub struct TriageRecord {                      // serialised into messages.triag
 }
 #[serde(rename_all = "snake_case")]
 pub enum TriageReasonCode {
-    Allowance,          // skipped: the workspace's triage allowance is spent (FR-BILL-7, edge case M7)
+    Allowance,          // skipped: the workspace's triage allowance is spent (FR-BILL-7, edge case W7)
     PolicyDisabled,     // skipped: policy.triage.enabled = false
     NotEligible,        // skipped: hidden, throttled, DSN or MDN
     InvalidOutput,      // failed: model output invalid after one retry
-    ModelUnavailable,   // failed: model errors on the last queue attempt
+    ModelUnavailable,   // failed: model errors at attempt 9, the last re-enqueued try
     InputUnavailable,   // failed: message or R2 data needed for the input is missing
 }
 
@@ -187,7 +192,7 @@ pub enum RuleSource { Tenant(String), BuiltIn(&'static str) }
 ```
 
 The API serialises the first nine fields of `TriageRecord` (the object in the API reference), plus
-`reason`, which is present only when the status is `skipped` or `failed`: edge case M7 requires a skipped
+`reason`, which is present only when the status is `skipped` or `failed`: edge case W7 requires a skipped
 triage to report reason `allowance`. `rules` stays in `triage_json` for audit and debugging.
 
 The ingest path writes the skipped records for policy and eligibility directly
@@ -317,7 +322,7 @@ When `skip_model` is set (or `PM_TRIAGE_MODEL` is unavailable by configuration):
 | `needs_reply` | the rule value, else `0.0` |
 | `urgency` | `urgency_min` |
 | `summary` | `core::triage_rules::summary` ([below](#summaries-without-the-model)) |
-| `language` | detected from `extracted_text` with a pure-Rust language identifier (pin at build time), mapped to a BCP 47 primary tag; `und` when confidence is below 0.5 or the text is under 40 characters |
+| `language` | detected from `extracted_text` with `whatlang` 0.18.0 ([Rust workspace §3](rust-workspace.md#3-workspace-dependencies)); its ISO 639-3 code is mapped to a BCP 47 primary tag (the ISO 639-1 code where one exists, else the 639-3 code); `und` when confidence is below 0.5 or the text is under 40 characters |
 | `risk_flags` | rule flags |
 | `model` | `"rules"` |
 
@@ -572,8 +577,8 @@ FR-TRI-4 requires that output is validated against the schema and that invalid o
 |---|---|---|---|---|
 | Valid (first try or retry) | `done` | merged fields ([§5.2](#52-merging-rules-and-model-output)), `model` = model ID | ack; hold consumed | `message.triaged` |
 | Still invalid after the retry | `failed` | `reason: invalid_output`; `category`, `needs_reply`, `urgency`, `summary`, `language` are `null`; `risk_flags` = rule flags | ack (not retried: the input would produce the same output); hold released | `message.triaged` |
-| Model error, timeout, rate limit, or "JSON Mode couldn't be met" | stays `pending` | – | hold released; retry with delay `min(30 · 2^attempts, 3600)` s | none |
-| Model error on the queue's last attempt (10) | `failed` | `reason: model_unavailable`, model fields `null`, rule flags kept | ack; hold released | `message.triaged` |
+| Model error, timeout, rate limit, or "JSON Mode couldn't be met" | stays `pending` | – | hold released; re-enqueue with `attempt + 1` and `delay_seconds = min(30 · 2^attempt, 3600)`, then ack | none |
+| Model error at `attempt = 9` (the tenth try) | `failed` | `reason: model_unavailable`, model fields `null`, rule flags kept | ack; hold released | `message.triaged` |
 | Message or R2 data needed for input missing | `failed` | `reason: input_unavailable` | ack; hold released | `message.triaged` |
 | Rules-only | `done` | [§5.1](#51-rules-only-record) | ack; hold consumed | `message.triaged` |
 | Hold denied (allowance spent) | `skipped` | `reason: allowance`; model fields `null`; rule risk flags kept | ack; no model call | none |
@@ -659,7 +664,7 @@ WHERE seq = ?1
 | One immediate retry for invalid output; no queue retries for it | No retry storms on a model that keeps failing the schema |
 | Debounced re-runs (60 s) | Repeated `POST …/triage` calls cost one job |
 | One `triage` allowance hold per message, consumed only for a stored analysis ([§1.2](#12-metering)) | Spent allowances stop model calls; failures are refunded |
-| `ai_neurons` counted per tenant in `TenantQuota` and `usage_daily` | Visible in `GET /v1/usage/daily` and `quota.warning` events |
+| `ai_neurons` counted per tenant in `TenantQuota` and `usage_daily` | Visible in `GET /v1/usage/daily`. It has no cap, so it never raises `quota.warning` |
 
 ## 13. Evaluation set and NFR-QUAL-3
 
@@ -698,11 +703,11 @@ validation and failure handling without network access.
 | `core::sanitize::b11_*` | Hidden text is stripped before triage and `hidden_text` is raised | [B11] |
 | `it::triage::e1_fenced` | Every untrusted string in the model input is inside a nonce fence; spoofed fences are escaped | FR-TRI-4, [E1] |
 | `it::triage::invalid_output_failed` | Invalid output, after one retry, ends `failed` with model fields `null` and rule flags kept; never guessed | FR-TRI-4 |
-| `it::triage::model_unavailable_retries` | Model errors leave `pending` and retry; the last attempt ends `failed` with reason `model_unavailable` | FR-TRI-4 |
+| `it::triage::model_unavailable_retries` | Model errors leave `pending` and re-enqueue with `attempt + 1` and the delay schedule (the queue's attempt count is never read); `attempt = 9` ends `failed` with reason `model_unavailable` | FR-TRI-4 |
 | `it::triage::output_shapes` | The extractor accepts each of the four response shapes | FR-TRI-4 |
 | `it::triage::skip_quarantined` | Quarantined mail has `triage_status` NULL and takes no hold; release sets `pending`, enqueues `Triage { reason: Release }` and charges then | FR-TRI-1, FR-IN-5, FR-BILL-7 |
 | `it::triage::billing_hold` | One hold per message (`ref` = message ID) survives redelivery; `done` consumes it, `failed` and transient errors release it | FR-BILL-4, FR-BILL-7 |
-| `it::billing::m7_inbound_never_refused` | With the triage allowance spent, mail is stored and triage ends `skipped` with reason `allowance`, rule risk flags kept, no model call and no event | FR-BILL-7, FR-BILL-8, [M7] |
+| `it::billing::w7_inbound_never_refused` | With the triage allowance spent, mail is stored and triage ends `skipped` with reason `allowance`, rule risk flags kept, no model call and no event | FR-BILL-7, FR-BILL-8, [W7] |
 | `it::triage::events` | `message.triaged` is emitted for `done` and `failed`, not for `skipped` | FR-TRI-1, FR-WH-4 |
 | `it::triage::thread_rollup` | The roll-up follows the latest triaged inbound message; a later outbound keeps `needs_reply = 0` | FR-TRI-1 |
 | `it::triage::rerun` | `POST …/triage` returns `202`, debounces, refuses outbound, honours quarantine visibility | FR-TRI-1 |
@@ -714,5 +719,5 @@ validation and failure handling without network access.
 [D8]: ../edge-cases.md
 [E1]: ../edge-cases.md
 [J3]: ../edge-cases.md
-[M6]: ../edge-cases.md
-[M7]: ../edge-cases.md
+[W6]: ../edge-cases.md
+[W7]: ../edge-cases.md

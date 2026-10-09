@@ -50,13 +50,16 @@ For every request to `/mcp`, in this order:
    `Allow: POST`. This is what the current revision asks of a server receiving legacy traffic, and
    what the 2025 revisions allow ("return HTTP 405 Method Not Allowed, indicating that the server does
    not offer an SSE stream at this endpoint"; "The server MAY respond to this request with HTTP 405").
-   `OPTIONS` returns `204` with no CORS grant (browsers are not supported clients in v1.0).
+   `OPTIONS` returns `204` with no CORS grant (browsers are not supported clients in v1.0). Every other
+   method (`PUT`, `PATCH`, `HEAD`, …) also returns `405` with `Allow: POST`.
 2. **Origin.** If an `Origin` header is present and is not `https://{PM_API_HOST}`, return
    `403 Forbidden` with a JSON-RPC error that has no `id` (both revisions: servers "MUST validate the
    Origin header… If the Origin header is present and invalid, servers MUST respond with HTTP 403").
    Native clients and Claude's cloud connectors send no `Origin`.
 3. **Size and type.** The body must be at most 7 MiB (the REST limit, so `mail_send` can carry
-   attachments) and `Content-Type: application/json`; otherwise `413` or `415` with a JSON-RPC error.
+   attachments) and `Content-Type: application/json`. A larger body → `413` with a JSON-RPC error
+   `-32000` whose `data` is the `payload_too_large` envelope; another content type → `415` with
+   `-32600` (Invalid Request). Both have `id: null`, because the body is not read.
 4. **Parse** one JSON-RPC 2.0 object. Malformed JSON → `400` with error `-32700` (Parse error). A JSON
    array (a batch) or a non-object → `400` with `-32600` (Invalid Request).
 5. **Authenticate** the bearer key with the same code as the REST API (`auth.rs`). A missing, unknown,
@@ -95,6 +98,10 @@ JSON.
 
 - `initialize`: negotiate the version: if the client's `protocolVersion` is `2025-11-25` or
   `2025-06-18`, echo it; otherwise answer `2025-11-25` (the client decides whether to continue). The
+  lifecycle page requires this: if the server does not support the requested version it "MUST respond
+  with another protocol version it supports"
+  ([Lifecycle › Version negotiation](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle#version-negotiation),
+  read 2026-10-09). So `initialize` never returns `-32022`. The
   result:
 
   ```json
@@ -114,23 +121,38 @@ JSON.
   session.
 - `notifications/initialized` → `202`. `notifications/cancelled` → `202`; it cannot reach a request
   running in another isolate, so it is best effort and the request completes or times out.
-- JSON-RPC errors in legacy responses use HTTP `200`, except the version-header failure (`400`).
+- HTTP statuses follow the rule in [§2.4](#24-errors-at-the-protocol-level), the same in both eras.
+  The one difference is an unknown method: `200` with `-32601` in a legacy response, `404` in a modern
+  one.
 
 ### 2.4 Errors at the protocol level
 
+**HTTP status rule.** A JSON-RPC error is returned with HTTP `200` and the error object in the body,
+in both eras. The HTTP status carries the failure only when the request cannot be served as JSON-RPC:
+`400` for a malformed request (a parse error, a batch or non-object body, a header mismatch, an
+unsupported protocol version), `401` for failed authentication, and the transport's own statuses `403`
+(Origin), `405` (HTTP method), `413` (body size), `415` (content type), `429` (`RL_API`) and `500` (a
+failure outside a tool). The one exception is set by the 2026-07-28 transport: a modern request for a
+method the server does not implement gets `404` with `-32601` (Streamable HTTP › Request Metadata,
+read 2026-10-09). A JSON-RPC notification the server accepts gets `202` with no body.
+
 | Situation | HTTP | JSON-RPC error |
 |---|---|---|
+| HTTP method other than `POST` and `OPTIONS` | 405 | none (empty body); `Allow: POST` |
+| Origin not allowed | 403 | `-32000`, no `id` |
+| Body over 7 MiB | 413 | `-32000`, `id: null`, `data` = `payload_too_large` envelope |
+| `Content-Type` other than `application/json` | 415 | `-32600` Invalid Request, `id: null` |
 | Malformed JSON | 400 | `-32700` Parse error, `id: null` |
 | Batch or invalid request object | 400 | `-32600` Invalid Request |
+| Authentication failed | 401 | `-32000`, `data` = error envelope |
+| `RL_API` exceeded | 429 | `-32000`, `data` = `rate_limited` envelope; `Retry-After` header |
+| Header mismatch (modern) | 400 | `-32020` HeaderMismatch |
+| Unsupported protocol version in modern `_meta`, or in the `MCP-Protocol-Version` header of a legacy request other than `initialize` | 400 | `-32022` with `data.supported` and `data.requested`. A legacy `initialize` with an unknown `protocolVersion` is never an error: it is answered `200` with `2025-11-25` ([§2.3](#23-legacy-era)) |
 | Unknown method (modern) | 404 | `-32601` Method not found, as the transport requires |
 | Unknown method (legacy) | 200 | `-32601` |
 | `tools/call` for an unknown tool, or a tool the key may not use | 200 | `-32602` with the message `Unknown tool: <name>` (the same for both, so hidden tools stay hidden) |
 | `tools/call` without `name` or with non-object `arguments` | 200 | `-32602` |
-| Header mismatch (modern) | 400 | `-32020` HeaderMismatch |
-| Unsupported protocol version | 400 | `-32022` with `data.supported` and `data.requested` |
-| Authentication failed | 401 | `-32000`, `data` = error envelope |
-| Origin not allowed | 403 | `-32000`, no `id` |
-| `RL_API` exceeded | 429 | `-32000`, `data` = `rate_limited` envelope; `Retry-After` header |
+| `prompts/get` for an unknown prompt, or for `mail_search_strategy` by a key without `search:read` | 200 | `-32602` with the message `Unknown prompt: <name>` |
 | Internal failure outside a tool | 500 | `-32603` Internal error, `data.request_id` |
 
 Errors that happen while running a tool are **tool execution errors**, not protocol errors
@@ -146,7 +168,7 @@ Errors that happen while running a tool are **tool execution errors**, not proto
 | `tools/list` | both | the tools the key may use, in the fixed order of [§4](#4-tools); one page (no `nextCursor`); modern adds `"ttlMs": 300000, "cacheScope": "private"` because the list depends on the key |
 | `tools/call` | both | [§4](#4-tools) and [§5](#5-tool-errors) |
 | `prompts/list` | both | `mail_search_strategy` when the key holds `search:read` |
-| `prompts/get` | both | [§6.1](#61-the-mail_search_strategy-prompt) |
+| `prompts/get` | both | [§6.1](#61-the-mail_search_strategy-prompt); an unknown prompt, or the prompt for a key without `search:read`, gives `-32602` ([§2.4](#24-errors-at-the-protocol-level)) |
 | `subscriptions/listen`, `resources/*`, `completion/complete`, `logging/setLevel` | – | `-32601` |
 
 `listChanged` is `false`: a key's permissions only change when the key is replaced, which needs a new
@@ -198,6 +220,8 @@ design therefore takes the S5 fallback from the [build plan](../build-plan.md#m1
   compares, so the local types cannot drift from the official SDK.
 - If a later `rmcp` release makes tokio optional, an ADR can switch the Worker to its types.
 
+This decision is recorded in [ADR 0009](../adr/0009-local-mcp-protocol-types.md).
+
 ```rust
 // crates/worker/src/mcp/schemas.rs
 pub struct JsonRpcRequest { pub jsonrpc: TwoPointZero, pub id: RequestId, pub method: String,
@@ -241,26 +265,30 @@ Field names are serialised in camelCase as in `schema.ts` (`protocolVersion`, `s
 ## 3. Authentication and tool filtering
 
 The bearer key resolves to `(level, tenant_id?, identity_id?, permissions, mode)` exactly as for REST
-(FR-KEY-3). `tools/list` returns only the tools whose permission the key holds (FR-MCP-1); a call to
-any other tool returns `-32602 Unknown tool`, the same answer as for a tool that does not exist.
+(FR-KEY-3). `tools/list` returns only the tools the key may use: it holds the tool's permission and
+meets any key-level condition in the table below (FR-MCP-1). A call to any other tool returns
+`-32602 Unknown tool`, the same answer as for a tool that does not exist. A missing permission is
+therefore never a tool error.
 
 | Tool | Permission | Extra condition |
 |---|---|---|
 | `mail_list_identities` | `identities:read` | – |
 | `mail_list_threads` | `messages:read` | – |
 | `mail_search` | `search:read` | – |
-| `mail_deep_search` | `search:agentic` | the tenant's `policy.search.agentic_enabled` (checked per call; a disabled policy gives a tool error) |
+| `mail_deep_search` | `search:read` and `search:agentic` (both, as for `POST …/search` with `mode: "agentic"`; a key with only one never sees the tool) | the tenant's `policy.search.agentic_enabled` (checked per call; a disabled policy gives a tool error) |
 | `mail_get_thread` | `messages:read` | – |
 | `mail_get_message` | `messages:read` | – |
 | `mail_get_attachment_text` | `attachments:read` | – |
 | `mail_find_related` | `search:read` | – |
 | `mail_search_contacts` | `search:read` | – |
 | `mail_wait` | `search:read` | – |
-| `mail_get_usage` | `usage:read` | held implicitly by every tenant and identity key for its own workspace, as for REST `GET /v1/usage`, so those keys always see it; never listed for platform keys (they have no workspace and use REST with `tenant_id`) |
+| `mail_get_usage` | `usage:read` | held implicitly by every tenant and identity key for its own workspace, as for REST `GET /v1/usage`, so those keys always see it; never listed for platform keys (they have no workspace of their own: they need `usage:read` explicitly and call REST `GET /v1/usage` with `tenant_id`) |
 | `mail_send` | `messages:send` | – |
 | `mail_reply` | `messages:send` | – |
 | `mail_forward` | `messages:send` | – |
 | `mail_update_labels` | `messages:write` | – |
+| `mail_sign_assertion` | `identities:sign` | tenant and identity keys only: a platform key can never hold `identities:sign` ([Agent signing keys](agent-keys.md#6-permissions-limits-and-plans)), so it never sees the tool; an identity key signs only as its own identity |
+| `mail_sign_http_request` | `identities:sign` | as `mail_sign_assertion`; `PM_WEB_BOT_AUTH` and the tenant's `policy.web_bot_auth.allowed` are checked per call (tool errors `web_bot_auth_disabled` and `policy_denied`) |
 
 **Identity argument.** Identity-scoped tools take an optional `identity` argument: an identity ID
 (`idn_…`) or one of its active or retiring addresses.
@@ -271,7 +299,10 @@ any other tool returns `-32602 Unknown tool`, the same answer as for a tool that
 - A tenant or platform key must pass `identity`. An address is resolved with the same logic as
   `GET /v1/identities/lookup`.
 - `mail_search` and `mail_deep_search` take `scope: "tenant"` for tenant and platform keys (a platform
-  key also passes `tenant_id`). An identity key asking for tenant scope gets `scope_denied` ([F3]).
+  key also passes `tenant_id`), and then call `POST /v1/tenants/{tenant_id}/search`. An identity key
+  asking for tenant scope gets `scope_denied` ([F3]). With tenant scope, `identity_ids` (at most 100)
+  limits the search to those identities, as in REST; without it, a tenant with more than 100 identities
+  gets `scope_too_large`.
 
 ## 4. Tools
 
@@ -280,23 +311,28 @@ checks, rate limits, idempotency and error codes. The table maps every tool:
 
 | Tool | REST endpoint | Rate limit |
 |---|---|---|
-| `mail_list_identities` | `GET /v1/identities` | `RL_API` |
-| `mail_list_threads` | `GET /v1/identities/{id}/threads` | `RL_API` |
+| `mail_list_identities` | `GET /v1/identities` (`status`, `purpose` and `tenant_id` are its query filters) | – (`RL_API` only) |
+| `mail_list_threads` | `GET /v1/identities/{id}/threads` | – (`RL_API` only) |
 | `mail_search` | `POST /v1/identities/{id}/search` or `POST /v1/tenants/{id}/search` | `RL_SEARCH` |
 | `mail_deep_search` | the same, with `mode: "agentic"` | `RL_AGENTIC` and the tenant daily cap |
-| `mail_get_thread` | `GET /v1/identities/{id}/threads/{thread_id}` | `RL_API` |
-| `mail_get_message` | `GET /v1/identities/{id}/messages/{message_id}` | `RL_API` |
-| `mail_get_attachment_text` | `GET /v1/identities/{id}/messages/{message_id}/attachments/{attachment_id}/text` | `RL_API` |
+| `mail_get_thread` | `GET /v1/identities/{id}/threads/{thread_id}` | – (`RL_API` only) |
+| `mail_get_message` | `GET /v1/identities/{id}/messages/{message_id}` | – (`RL_API` only) |
+| `mail_get_attachment_text` | `GET /v1/identities/{id}/messages/{message_id}/attachments/{attachment_id}/text` | – (`RL_API` only) |
 | `mail_find_related` | `GET /v1/identities/{id}/messages/{message_id}/related` | `RL_SEARCH` |
 | `mail_search_contacts` | `GET /v1/identities/{id}/contacts` | `RL_SEARCH` |
-| `mail_wait` | `GET /v1/identities/{id}/wait` | `RL_API` |
-| `mail_get_usage` | `GET /v1/usage` (the key's own workspace) | `RL_API` |
+| `mail_wait` | `GET /v1/identities/{id}/wait` (the tool's `timeout_seconds` is the REST `timeout`) | – (`RL_API` only) |
+| `mail_get_usage` | `GET /v1/usage` (the key's own workspace) | – (`RL_API` only) |
 | `mail_send` | `POST /v1/identities/{id}/messages` with `Idempotency-Key` | `RL_SEND` (per identity) |
 | `mail_reply` | `POST …/messages/{message_id}/reply` or `…/reply-all` with `Idempotency-Key` | `RL_SEND` |
 | `mail_forward` | `POST …/messages/{message_id}/forward` with `Idempotency-Key` | `RL_SEND` |
-| `mail_update_labels` | `PATCH …/messages/{message_id}` or `PATCH …/threads/{thread_id}` | `RL_API` |
+| `mail_update_labels` | `PATCH …/messages/{message_id}` or `PATCH …/threads/{thread_id}` | – (`RL_API` only) |
+| `mail_sign_assertion` | `POST /v1/identities/{id}/assertions` (no `Idempotency-Key`: each call mints a new token) | `RL_SIGN` (per identity, shared with `mail_sign_http_request` and both REST endpoints) |
+| `mail_sign_http_request` | `POST /v1/identities/{id}/http-signatures` (no `Idempotency-Key`) | `RL_SIGN` |
 
-`RL_API` is also charged once per HTTP request at the transport ([§2.1](#21-request-handling)).
+`RL_API` is charged **once per MCP request**, at the transport ([§2.1](#21-request-handling), step 6). The
+tool then calls the REST handler's service function with that check already done, so `RL_API` is never
+charged a second time; the tool's own bucket in the last column (`RL_SEARCH`, `RL_AGENTIC`, `RL_SEND`,
+`RL_SIGN`) is charged in addition, as it is for the REST request.
 
 ### 4.1 Annotations
 
@@ -309,6 +345,7 @@ Annotation defaults in `schema.ts` are `readOnlyHint: false`, `destructiveHint: 
 | All read tools (`mail_list_identities` to `mail_get_usage`) | `true` | `false` | `true` | `false` |
 | `mail_send`, `mail_reply`, `mail_forward` | `false` | `false` (adds a message, deletes nothing) | `true` (the same `idempotency_key` has no further effect) | `true` (emails outside parties) |
 | `mail_update_labels` | `false` | `true` (`labels_remove` removes state) | `true` | `false` |
+| `mail_sign_assertion`, `mail_sign_http_request` | `false` (no mail state changes, but each call issues a new credential, is counted in `usage_daily` and may create the identity's first key) | `false` (changes or deletes no existing state) | `false` (every call returns a new token or signature, with a new `jti` or `nonce`) | `false` (the Worker contacts no one; the agent presents the result) |
 
 ### 4.2 Output and size budgets
 
@@ -320,7 +357,8 @@ Every successful call returns:
 
 `outputSchema` is the JSON Schema of the REST response type, generated by `utoipa` from the same Rust
 type in `crates/api-types`, with every `$ref` inlined so clients need no reference resolution. MCP
-results are smaller than REST results by default, because they land in a model's context:
+defaults and caps are never larger than the REST ones, and several are smaller, because results land in
+a model's context:
 
 | Tool | Defaults and caps (REST limits still apply) |
 |---|---|
@@ -330,15 +368,22 @@ results are smaller than REST results by default, because they land in a model's
 | `mail_deep_search` | `evidence` trimmed to the 10 best items; `trace` kept |
 | `mail_get_thread` | `messages_limit` default 10, max 50; each message's `extracted_text` (or `text`) cut to 4,000 characters |
 | `mail_get_message` | `extracted_text` and `text` cut to 16,000 characters each |
-| `mail_get_attachment_text` | `pages` default `1-3`; text cut to 32,000 characters |
+| `mail_get_attachment_text` | `pages` default `1-3`; each returned page's `text` cut to 32,000 characters (the cap applies per page, not to the pages together) |
 | `mail_find_related` | `limit` default 5, max 20 |
 | `mail_search_contacts` | `limit` default 10, max 50 |
 | `mail_get_usage` | none; the whole `GET /v1/usage` response, including the plan catalog |
+| `mail_sign_assertion`, `mail_sign_http_request` | none; the results are a few KB and are never cut, because a cut token or header would not verify |
 | any tool | the compact JSON of `structuredContent` is at most 96 KB |
 
-A cut text field ends with `…` and the object gains `"<field>_truncated": true`. If a result is still
-over 96 KB, list items are dropped from the end and `truncated: true` is set (with a `next_cursor`
-where the endpoint has one).
+A cut text field ends with `…`, and the object that holds it gains `"<field>_truncated": true` (for
+attachment text, the page object gains `text_truncated: true`). If a result is still over 96 KB, list
+items (hits, messages, pages) are dropped from the end, with a `next_cursor` where the endpoint has one.
+Either kind of cut also sets `truncated: true` on the result object.
+
+A truncated result still conforms to the tool's `outputSchema`: each schema of a tool whose result can
+be cut declares the optional `*_truncated` booleans and `truncated` (already a required field of the
+search and attachment-text responses, optional elsewhere), so a client that validates
+`structuredContent` accepts a cut result and can see that it was cut.
 
 ### 4.3 Definitions
 
@@ -353,13 +398,16 @@ Title "List mail identities". Description:
 ```json
 { "type": "object", "additionalProperties": false, "properties": {
     "tenant_id": { "type": "string", "pattern": "^ten_[0-9A-HJKMNP-TV-Z]{26}$", "description": "Platform keys only: limit to one tenant." },
-    "status": { "type": "string", "enum": ["active", "paused"] },
-    "purpose": { "type": "string", "maxLength": 64 },
+    "status": { "type": "string", "enum": ["active", "paused"], "description": "Only identities with this status." },
+    "purpose": { "type": "string", "maxLength": 64, "description": "Only identities with this purpose tag." },
     "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 25 },
     "cursor": { "type": "string" } } }
 ```
 
-Output: `{ data: Identity[], next_cursor }` (the [Identity object](../../reference/api.md#identity-object)).
+`tenant_id`, `status`, `purpose`, `limit` and `cursor` are passed as the query parameters of
+`GET /v1/identities`. The `status` enum offers only `active` and `paused`: the REST filter also accepts
+`deleting` and `deleted`, but those identities cannot act. Output: `{ data: Identity[], next_cursor }`
+(the [Identity object](../../reference/api.md#identity-object)).
 
 #### `mail_list_threads`
 
@@ -394,6 +442,7 @@ Title "Search mail". Description:
     "identity": { "type": "string", "maxLength": 254 },
     "scope": { "type": "string", "enum": ["identity", "tenant"], "default": "identity", "description": "tenant searches every identity of the tenant (tenant and platform keys)." },
     "tenant_id": { "type": "string", "pattern": "^ten_[0-9A-HJKMNP-TV-Z]{26}$", "description": "Platform keys with scope tenant." },
+    "identity_ids": { "type": "array", "uniqueItems": true, "minItems": 1, "maxItems": 100, "items": { "type": "string", "pattern": "^idn_[0-9A-HJKMNP-TV-Z]{26}$" }, "description": "Scope tenant only: search only these identities. Needed when the tenant has more than 100 identities." },
     "mode": { "type": "string", "enum": ["keyword", "semantic", "hybrid"], "default": "hybrid" },
     "group_by": { "type": "string", "enum": ["message", "thread"], "default": "message" },
     "limit": { "type": "integer", "minimum": 1, "maximum": 25, "default": 10 },
@@ -417,16 +466,22 @@ Title "Answer a question from mail". Description:
 
 ```json
 { "type": "object", "additionalProperties": false, "required": ["question"], "properties": {
-    "question": { "type": "string", "minLength": 1, "maxLength": 1000 },
+    "question": { "type": "string", "minLength": 1, "maxLength": 1024 },
     "identity": { "type": "string", "maxLength": 254 },
     "scope": { "type": "string", "enum": ["identity", "tenant"], "default": "identity" },
     "tenant_id": { "type": "string", "pattern": "^ten_[0-9A-HJKMNP-TV-Z]{26}$" },
-    "max_steps": { "type": "integer", "minimum": 2, "maximum": 10, "default": 6 },
-    "max_seconds": { "type": "integer", "minimum": 3, "maximum": 30, "default": 8 },
+    "identity_ids": { "type": "array", "uniqueItems": true, "minItems": 1, "maxItems": 100, "items": { "type": "string", "pattern": "^idn_[0-9A-HJKMNP-TV-Z]{26}$" }, "description": "Scope tenant only: search only these identities." },
+    "max_steps": { "type": "integer", "minimum": 2, "maximum": 10, "description": "Defaults to, and is capped by, the tenant's agentic step limit (6 unless changed)." },
+    "max_seconds": { "type": "integer", "minimum": 3, "maximum": 30, "description": "Defaults to, and is capped by, the tenant's agentic time limit (8 unless changed)." },
     "include_quarantined": { "type": "boolean", "default": false } } }
 ```
 
-Output: the agentic response (`status`, `answer`, `evidence`, `trace`, `degraded`, `usage`).
+`question` is the REST `q` (at most 1,024 characters), and `max_steps` and `max_seconds` are the REST
+`budget`. As in REST, each defaults to `policy.search.agentic_max_steps` or
+`policy.search.agentic_max_seconds` (6 and 8 unless changed), and a larger value is lowered to the
+policy's value, not refused; outside 2–10 or 3–30 is `invalid_request`. The schema therefore declares
+no `default`. Output: the agentic response (`status`, `answer`, `evidence`, `trace`, `degraded`,
+`usage`).
 
 #### `mail_get_thread`
 
@@ -470,7 +525,7 @@ Title "Read attachment text". Description:
     "message_id": { "type": "string", "pattern": "^msg_[0-9A-HJKMNP-TV-Z]{26}$" },
     "attachment_id": { "type": "string", "pattern": "^att_[0-9A-HJKMNP-TV-Z]{26}$" },
     "identity": { "type": "string", "maxLength": 254 },
-    "pages": { "type": "string", "pattern": "^[0-9]{1,3}(-[0-9]{1,3})?$", "default": "1-3" } } }
+    "pages": { "type": "string", "pattern": "^[1-9][0-9]{0,2}(-[1-9][0-9]{0,2})?$", "default": "1-3" } } }
 ```
 
 Output:
@@ -479,10 +534,16 @@ Output:
 { "type": "object", "required": ["status", "pages", "total_pages", "truncated"], "properties": {
     "status": { "type": "string", "enum": ["pending", "ready", "unavailable", "skipped"] },
     "pages": { "type": "array", "items": { "type": "object", "required": ["page", "text"],
-               "properties": { "page": { "type": "integer" }, "text": { "type": "string" } } } },
-    "total_pages": { "type": ["integer", "null"] },
+               "properties": { "page": { "type": "integer", "minimum": 1 }, "text": { "type": "string" },
+                               "text_truncated": { "type": "boolean" } } } },
+    "total_pages": { "type": ["integer", "null"], "minimum": 0 },
     "truncated": { "type": "boolean" } } }
 ```
+
+Each page's `text` is cut to 32,000 characters on its own: a cut page ends with `…` and has
+`text_truncated: true`, and `truncated` is then `true`. Pages that would take the result over 96 KB are
+dropped from the end, which also sets `truncated: true` ([§4.2](#42-output-and-size-budgets)). Page
+numbers start at 1, as in REST.
 
 #### `mail_find_related`
 
@@ -511,7 +572,8 @@ Title "Search contacts". Description:
     "cursor": { "type": "string" } } }
 ```
 
-Output: `{ data: Contact[], next_cursor }`.
+`q` must not be empty: REST lists every contact for an empty `q`, but the tool is for finding one
+contact, and a full list would fill the model's context. Output: `{ data: Contact[], next_cursor }`.
 
 #### `mail_wait`
 
@@ -529,7 +591,8 @@ Title "Wait for a message". Description:
     "timeout_seconds": { "type": "integer", "minimum": 1, "maximum": 60, "default": 30 } } }
 ```
 
-Output: `{ message, verification, timed_out }` as in the
+`timeout_seconds` is passed as the REST `timeout` query parameter. Output:
+`{ message, verification, timed_out }` as in the
 [API](../../reference/api.md#get-v1identitiesidentity_idwait--searchread).
 
 #### `mail_get_usage`
@@ -541,7 +604,7 @@ Title "Check plan allowances". Description:
 { "type": "object", "properties": {}, "additionalProperties": false }
 ```
 
-Output: the [usage response](../../reference/api.md#get-v1usage--any-key-its-own-workspace-usageread-for-other-workspaces)
+Output: the usage response of `GET /v1/usage` ([API › Usage and audit](../../reference/api.md#usage-and-audit))
 (`billing`, `plan`, `features`, `topups`, `plans`) for the key's own workspace. The tool takes no
 `tenant_id`; a platform key never sees it ([§3](#3-authentication-and-tool-filtering)).
 
@@ -553,7 +616,7 @@ Title "Send an email". Description:
 ```json
 { "type": "object", "additionalProperties": false, "required": ["to", "subject", "idempotency_key"], "properties": {
     "identity": { "type": "string", "maxLength": 254 },
-    "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 255, "pattern": "^[\\x21-\\x7E]+$" },
+    "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 255, "pattern": "^[\\x20-\\x7E]{1,255}$" },
     "to": { "$ref": "#/$defs/recipients", "minItems": 1 },
     "cc": { "$ref": "#/$defs/recipients" },
     "bcc": { "$ref": "#/$defs/recipients" },
@@ -571,7 +634,7 @@ Title "Send an email". Description:
     "thread_id": { "type": "string", "pattern": "^thr_[0-9A-HJKMNP-TV-Z]{26}$" },
     "from_address": { "type": "string", "maxLength": 254 },
     "labels": { "type": "array", "maxItems": 64, "items": { "type": "string" } },
-    "headers": { "type": "object", "additionalProperties": { "type": "string", "maxLength": 2048 } },
+    "headers": { "type": "object", "additionalProperties": { "type": "string", "maxLength": 2048 }, "description": "X- headers, plus Importance, Priority, Sensitivity, Keywords, Comments and Organization." },
     "metadata": { "type": "object", "additionalProperties": { "type": "string", "maxLength": 512 } },
     "unsubscribe": { "type": "object" },
     "consent": { "type": "object" } },
@@ -581,11 +644,14 @@ Title "Send an email". Description:
         "properties": { "address": { "type": "string", "maxLength": 254 }, "name": { "type": "string", "maxLength": 78 } } } ] } } } }
 ```
 
-The server inlines `$defs` before publishing the schema. `maxItems` 49 is the hard maximum per list
-(Cloudflare allows 50 recipients and one is kept for the hidden journal copy); the handler still
-checks `to` + `cc` + `bcc` against `policy.max_recipients` (`too_many_recipients`). At least one of
-`text` and `html` is required (checked by the handler, `invalid_request` otherwise). Output: the
-[Message object](../../reference/api.md#message-object) plus `deduplicated`.
+The server inlines `$defs` before publishing the schema. `idempotency_key` has the pattern of the REST
+`Idempotency-Key` header, `^[\x20-\x7E]{1,255}$` (1–255 printable ASCII characters, spaces included), in
+all three send tools; a value that fails it gets the REST code ([§5](#5-tool-errors)). `maxItems` 49
+is the hard maximum per list (Cloudflare allows 50 recipients and one is kept for the hidden journal
+copy); the handler still checks `to` + `cc` + `bcc` against `policy.max_recipients`
+(`too_many_recipients`). At least one of `text` and `html` is required (checked by the handler,
+`invalid_request` otherwise). Output: the [Message object](../../reference/api.md#message-object) plus
+`deduplicated`.
 
 #### `mail_reply`
 
@@ -596,7 +662,7 @@ Title "Reply to an email". Description:
 { "type": "object", "additionalProperties": false, "required": ["message_id", "idempotency_key"], "properties": {
     "message_id": { "type": "string", "pattern": "^msg_[0-9A-HJKMNP-TV-Z]{26}$" },
     "identity": { "type": "string", "maxLength": 254 },
-    "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 255, "pattern": "^[\\x21-\\x7E]+$" },
+    "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 255, "pattern": "^[\\x20-\\x7E]{1,255}$" },
     "reply_all": { "type": "boolean", "default": false },
     "text": { "type": "string" },
     "html": { "type": "string" },
@@ -615,7 +681,7 @@ Title "Forward an email". Description:
 { "type": "object", "additionalProperties": false, "required": ["message_id", "to", "idempotency_key"], "properties": {
     "message_id": { "type": "string", "pattern": "^msg_[0-9A-HJKMNP-TV-Z]{26}$" },
     "identity": { "type": "string", "maxLength": 254 },
-    "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 255, "pattern": "^[\\x21-\\x7E]+$" },
+    "idempotency_key": { "type": "string", "minLength": 1, "maxLength": 255, "pattern": "^[\\x20-\\x7E]{1,255}$" },
     "to": { "type": "array", "minItems": 1, "maxItems": 49, "items": { "type": "string", "maxLength": 254 } },
     "text": { "type": "string" },
     "include_attachments": { "type": "boolean", "default": true } } }
@@ -639,7 +705,78 @@ Title "Label or mark mail". Description:
   "oneOf": [ { "required": ["message_id"] }, { "required": ["thread_id"] } ] }
 ```
 
-Output: `{ id, labels, read }` for the message or thread.
+Output: `{ id, labels, read }` for the message or thread. A call with none of `labels_add`,
+`labels_remove` and `read` changes nothing and returns `invalid_request` (path `labels_add`), as the REST
+`PATCH` does through `minProperties: 1`.
+
+#### `mail_sign_assertion`
+
+Title "Sign an agent assertion". Description:
+`Get a short-lived signed token (a JWT) that proves to a third-party service that you are this mailbox's agent. It names the identity's address, display name and workspace, says that it is an AI agent, and says whether an accountable human stands behind it. Use it when a service asks you to prove who you are and checks tokens against this deployment's published keys (the JWKS at jwks_uri). Set audience to the value the service expects, and pass its challenge as nonce if it gave you one. Send the token only to that service. It expires within minutes, and each call makes a new one. Anything in ext is visible to the service, so put nothing secret in it.`
+
+```json
+{ "type": "object", "additionalProperties": false, "required": ["audience"], "properties": {
+    "identity": { "type": "string", "maxLength": 254, "description": "Identity id (idn_…) or address. Required for tenant keys." },
+    "audience": { "type": "string", "minLength": 1, "maxLength": 256, "pattern": "^[\\x20-\\x7E]{1,256}$", "description": "The service's URL or the identifier it expects in aud." },
+    "expires_in": { "type": "integer", "minimum": 60, "maximum": 600, "default": 300, "description": "Seconds until the token expires." },
+    "nonce": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[\\x20-\\x7E]{1,128}$", "description": "The service's challenge, copied into the token." },
+    "ext": { "type": "object", "description": "Extra claims for the service, at most 2 KB as JSON, placed under the ext claim. Registered and Pylota claim names are refused." } } }
+```
+
+Output:
+
+```json
+{ "type": "object", "required": ["assertion", "kid", "expires_at", "jwks_uri"], "properties": {
+    "assertion": { "type": "string", "description": "The token, a compact JWS." },
+    "kid": { "type": "string", "pattern": "^[A-Za-z0-9_-]{43}$" },
+    "expires_at": { "type": "string", "format": "date-time" },
+    "jwks_uri": { "type": "string", "format": "uri" } } }
+```
+
+The tool calls `POST /v1/identities/{identity_id}/assertions` with the arguments other than `identity`
+as the body, and returns its `201` body ([Agent signing keys › Agent assertions](agent-keys.md#4-agent-assertions)).
+Nothing is recorded for replay, as in REST; the token is never stored or logged. The handler checks
+what the schema cannot: `ext` at most 2 KB and free of registered and Pylota claim names
+(`invalid_request`, [O6](../edge-cases.md)).
+
+#### `mail_sign_http_request`
+
+Title "Sign an HTTP request". Description:
+`Get Web Bot Auth headers that let a website verify that your HTTP request comes from this mailbox's agent, through this deployment. Pass the exact https URL your HTTP client will request (and the method, if you add @method to components). Attach every returned header (Signature-Agent, From, Signature-Input, Signature) to that request unchanged, and send it before expires_at. This tool does not make the request: your own HTTP client does. Fails with web_bot_auth_disabled when this deployment has signed requests turned off, and with policy_denied when the workspace has not allowed them; then make the request unsigned or ask a person.`
+
+```json
+{ "type": "object", "additionalProperties": false, "required": ["url"], "properties": {
+    "identity": { "type": "string", "maxLength": 254, "description": "Identity id (idn_…) or address. Required for tenant keys." },
+    "url": { "type": "string", "maxLength": 2048, "pattern": "^https://", "description": "The https URL the request will go to." },
+    "method": { "type": "string", "pattern": "^[!#$%&'*+.^_`|~0-9A-Z-]+$", "description": "The request method, an upper-case token. Signed only when components includes @method, and then required." },
+    "expires_in": { "type": "integer", "minimum": 30, "maximum": 300, "default": 60, "description": "Seconds until the signature expires." },
+    "components": { "type": "array", "uniqueItems": true, "maxItems": 6,
+        "items": { "type": "string", "enum": ["@authority", "signature-agent", "from", "@method", "@path", "@query"] },
+        "description": "Parts of the request to sign. @authority, signature-agent and from are always signed." } } }
+```
+
+Output:
+
+```json
+{ "type": "object", "required": ["headers", "expires_at"], "properties": {
+    "headers": { "type": "object", "additionalProperties": false,
+                 "required": ["Signature-Agent", "From", "Signature-Input", "Signature"], "properties": {
+        "Signature-Agent": { "type": "string" },
+        "From": { "type": "string" },
+        "Signature-Input": { "type": "string" },
+        "Signature": { "type": "string" } } },
+    "expires_at": { "type": "string", "format": "date-time" } } }
+```
+
+The tool calls `POST /v1/identities/{identity_id}/http-signatures` with the arguments other than
+`identity` as the body, and returns its `200` body ([Agent signing keys › Signed HTTP requests](agent-keys.md#5-signed-http-requests-web-bot-auth)).
+The Worker never makes the request. Nothing is recorded for replay, and signatures are not logged. The
+handler checks what the schema cannot: an IDN host becomes its A-label in `@authority`, and a component
+whose value is not ASCII is refused (`invalid_request`, [O10](../edge-cases.md)).
+
+Both signing tools arrive with milestone M25 of the [build plan](../build-plan.md). Signed HTTP requests
+also need spike S13 to pass; until `PM_WEB_BOT_AUTH=on`, `mail_sign_http_request` is listed but every
+call gets `web_bot_auth_disabled`.
 
 ## 5. Tool errors
 
@@ -661,14 +798,23 @@ errors).
 
 | Cause | Envelope code |
 |---|---|
-| Arguments that fail the input schema (types, patterns, ranges, missing required fields, `additionalProperties`) | `invalid_request`, `details.errors[] = {path, message}` |
+| Arguments that fail the input schema (types, patterns, ranges, missing required fields, `additionalProperties`) | `invalid_request`, `details.errors[] = {path, message}`, except `idempotency_key`: missing → `idempotency_key_required`, too long or not printable ASCII → `invalid_idempotency_key`, the REST codes |
 | Query parse failure | `invalid_query` with `details.position` and `details.expected` |
-| Identity not reachable by the key, or not found | `identity_not_found` |
+| Identity not reachable by the key, or not found (including a `deleting` or `deleted` identity) | `identity_not_found` |
 | Tenant scope with an identity key | `scope_denied` |
+| Tenant scope over more than 100 identities without `identity_ids` | `scope_too_large` (HTTP 422) |
 | Any REST error (not found, conflict, policy, limits, server) | the same code, HTTP status in `details.http_status` |
-| `RL_SEARCH`, `RL_AGENTIC`, `RL_SEND` exceeded | `rate_limited` with `details.retry_after` |
+| `RL_SEARCH`, `RL_AGENTIC`, `RL_SEND`, `RL_SIGN` exceeded | `rate_limited` with `details.retry_after` |
 | Agentic disabled by policy | `agentic_disabled` (HTTP 422 in `details.http_status`) |
 | A send tool on a workspace whose `sends` allowance is spent (FR-BILL-6) | `billing_limit` with `details.feature`, `granted`, `used`, `resets_at`, `upgrade_url`; nothing was stored, so the same `idempotency_key` succeeds after an upgrade or top-up |
+| A send or signing tool for a paused identity | `identity_paused` (HTTP 409), `details.reason`. A signing tool gets it for every identity of a suspended tenant too ([O1](../edge-cases.md)); a send there gets `tenant_suspended` first, as in REST |
+| A signing rule the schema cannot express: `ext` over 2 KB or using a registered or Pylota claim name, a component value that is not ASCII ([O6](../edge-cases.md), [O10](../edge-cases.md)) | `invalid_request` with `details.errors[]` |
+| `mail_sign_http_request` while `PM_WEB_BOT_AUTH=off` ([O9](../edge-cases.md)) | `web_bot_auth_disabled` (HTTP 422) |
+| `mail_sign_http_request` while the tenant's `policy.web_bot_auth.allowed` is `false` ([O13](../edge-cases.md)) | `policy_denied` (HTTP 403) |
+
+A key without a tool's permission never reaches the tool: the call is `-32602 Unknown tool`
+([§2.4](#24-errors-at-the-protocol-level)), so `permission_denied` for the tool's own permission is not
+returned. This is why platform keys, which can never hold `identities:sign`, see neither signing tool.
 
 ## 6. Prompt and instructions
 
@@ -736,10 +882,12 @@ idempotency_key; reuse it when you retry. The mail_search_strategy prompt has th
 - **Rate limits**: [§2.1](#21-request-handling) and [§4](#4-tools). Buckets are shared with REST, so a
   key has one budget whichever interface it uses.
 - **Body**: 7 MiB per request.
-- **Long calls**: `mail_wait` at most 60 seconds; `mail_deep_search` at most 30 seconds (default 8).
+- **Long calls**: `mail_wait` at most 60 seconds; `mail_deep_search` at most 30 seconds (default: the
+  tenant's `agentic_max_seconds`, 8 unless changed).
 - **Logging**: each call logs the method, tool name, key ID, identity ID, duration, outcome and error
   code. Arguments are never logged; `mail_search` and `mail_deep_search` log
-  `query_hash = hex(HMAC-SHA256(PM_HASH_KEY, q))[..16]` (FR-PRV-6).
+  `query_hash = hex(HMAC-SHA256(PM_HASH_KEY, q))[..16]` (FR-PRV-6). The signing tools' results (tokens
+  and signatures) are never logged either ([Agent signing keys](agent-keys.md#10-security-and-privacy)).
 - **Untrusted content**: every string from email in a result is untrusted. The tool descriptions, the
   prompt and the instructions say so; the service never presents mail content as instructions.
 - **Test mode**: a `pmk_test_…` key works on test tenants only, exactly as in REST ([L4]).
@@ -777,15 +925,17 @@ v1.1 needs an ADR and updates to [Configuration](../../reference/configuration.m
 |---|---|---|
 | `it::mcp::tools_list_filtered_by_permission` | Each permission set lists exactly its tools; a hidden tool and a non-existent tool give the same `-32602` | FR-MCP-1, M15 |
 | `it::mcp::call_maps_to_rest` (table test) | Every tool returns the same data as its REST endpoint for the same inputs, including idempotent replay for the send tools | FR-MCP-1, FR-OUT-1, M15 |
-| `it::mcp::error_mapping` | Schema failures, REST errors and rate limits become `isError` results with the envelope; protocol errors use the codes in §2.4 | FR-API-2, M15 |
+| `it::mcp::rl_api_once_per_call` | 600 read-tool calls in one minute succeed and the 601st request gets `429` (not the 301st); a search tool call also uses one `RL_SEARCH` slot | FR-MCP-1, M15 |
+| `it::mcp::error_mapping` | Schema failures, REST errors and rate limits become `isError` results with the envelope (a missing or malformed `idempotency_key` gives `idempotency_key_required` or `invalid_idempotency_key`); protocol errors use the codes and HTTP statuses in §2.4 | FR-API-2, M15 |
 | `it::mcp::modern_headers` | Missing or mismatched `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name` give `400`/`-32020`; base64-encoded `Mcp-Name` is decoded | §2.2 |
-| `it::mcp::unsupported_version` | Unknown versions give `400`/`-32022` with `supported` | §2.2, §2.3 |
+| `it::mcp::unsupported_version` | An unknown `_meta` version, and an unknown `MCP-Protocol-Version` on a legacy request, give `400`/`-32022` with `supported`; a legacy `initialize` with `protocolVersion: "2024-11-05"` gets `200` with `protocolVersion: "2025-11-25"` | §2.2, §2.3 |
 | `it::mcp::legacy_session` | `initialize` works without minting `Mcp-Session-Id`; a sent session ID is ignored; `GET` and `DELETE` give `405` | §2.3, M15 "session handling" |
 | `it::mcp::origin_403` | A foreign `Origin` gets `403` | §2.1 |
 | `it::mcp::auth_401` | Missing, expired and revoked keys give `401` with `WWW-Authenticate` | FR-MCP-1 |
 | `it::mcp::sse_deep_search_progress` | Progress notifications per step, keep-alive, final response; closing the stream stops the loop | §2.6 |
-| `it::mcp::size_budgets` | Truncation flags and the 96 KB cap | §4.2 |
+| `it::mcp::size_budgets` | Truncation flags and the 96 KB cap; attachment text is cut per page; every cut result still validates against its tool's `outputSchema` and has `truncated: true` | §4.2 |
 | `it::mcp::get_usage` | `mail_get_usage` is listed for tenant and identity keys that do not hold `usage:read` explicitly and never for platform keys; it returns the same body as `GET /v1/usage` for the key's own workspace; any argument gives `invalid_request` | §3, §4.3, FR-BILL-11 |
+| `it::mcp::sign_tools` | `mail_sign_assertion` and `mail_sign_http_request` are listed only for tenant and identity keys holding `identities:sign`; an identity key naming another identity gets `identity_not_found`; the results have the REST shapes and verify (the token against the identity's JWKS); two identical calls return different tokens; a paused identity gets `identity_paused`, and `PM_WEB_BOT_AUTH=off` and a tenant not opted in give `web_bot_auth_disabled` and `policy_denied` as `isError` results | §3, §4.3, §5, FR-IDN-7, FR-IDN-8 |
 | `it::mcp::rmcp_roundtrip` (native) | Every local protocol type round-trips through `rmcp::model` 3.5.1 | S5 fallback |
 | `it::mcp::inspector_replay` | A recorded MCP Inspector session replays green | M15 |
 | `it::auth::f2_permission` | A key without `search:read` cannot see or call search tools | [F2] |

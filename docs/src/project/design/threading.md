@@ -447,9 +447,10 @@ truncated at a character boundary.
 | `core::thread_token::a2_non_token_tags` | `+invoices`, `+t`, `+T03K.9F2MQ7XA` (upper case, lower-cased first), leading-zero seq, a seq of 13 characters |
 | `core::thread_token::a2_rotated_kid` | A token minted under an older kid verifies with `current: false` while that kid is in the ring, and is `Invalid` once it leaves; an unknown kid is `Invalid` |
 | `core::thread_token::a12_budget` | The longest username plus suffix (40) with a 12-character seq gives a 64-octet local part |
+| `it::send::reply_to_carries_token` | A send from a `subaddress` domain has a `Reply-To` sub-address whose thread token ([§2](#2-thread-token)) verifies for that thread; a send from a domain with `reply_token = 'none'` has no `Reply-To` (FR-OUT-6) |
 | `it::inbound::a2_forged_token_ignored` | A forged token files by headers, flags `thread_join_unverified`, identity unchanged (A2) |
 | `it::inbound::d10_token_bruteforce` | Eleventh failure in an hour from one sender is not verified; the 101st failure across senders suspends verification; mail still accepted (D10) |
-| `core::thread::c1_token_only` / `core::thread::c1_no_headers_new_thread` / `core::thread::c1_subject_never_joins` | C1 |
+| `core::thread::c1_token_only` / `core::thread::c1_no_headers_new_thread` / `core::thread::c1_subject_never_joins` | C1; the resolution order of FR-THR-1 (token, then headers, then a new thread; the subject never joins) |
 | `core::thread::c2_trim_references` | 150 references → first + 19 most recent, order kept, duplicates removed (C2) |
 | `core::thread::c2_rfc5322_parent_rules` | Parent without References uses its In-Reply-To |
 | `it::addresses::c3_reply_from_retiring` | After a promote, replies go from the retiring address the counterparty used; after retirement, from the primary (C3) |

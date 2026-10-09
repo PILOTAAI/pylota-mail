@@ -51,9 +51,9 @@ with reason `model_unavailable`.
 | Category | Typical mail |
 |---|---|
 | `customer_request` | A customer asks for something: a booking change, a question, a complaint |
-| `vendor` | Suppliers and partners: garages, body shops, parts, cleaning, insurers' claim handlers |
+| `vendor` | Suppliers and partners: garages, body shops, parts, cleaning |
 | `billing` | Invoices, receipts, payment confirmations, statements |
-| `legal_compliance` | Fines, penalty charge notices, legal letters, regulators |
+| `legal_compliance` | Fines, penalty charge notices, insurance claims and decisions, legal letters, regulators |
 | `verification` | Sign-up codes, verification and password-reset links |
 | `notification` | Automated notices from systems: account alerts, shipping updates |
 | `newsletter` | Newsletters the identity subscribed to |
@@ -165,7 +165,7 @@ Rules live in the tenant policy, in `triage.rules` (up to 50 rules):
             "to_identity": ["claims"],
             "body_contains": ["claim number", "claim reference"]
           },
-          "set": { "category": "vendor", "labels_add": ["claim"], "urgency_min": 2 }
+          "set": { "category": "legal_compliance", "labels_add": ["claim"], "urgency_min": 2 }
         }
       ]
     }
@@ -263,7 +263,9 @@ cannot make anything happen. Actions stay with your application, and the people 
 - Triage runs on Workers AI **in your own Cloudflare account**. The model is set by
   `PM_TRIAGE_MODEL` (default `@cf/openai/gpt-oss-20b`).
 - If you set `PM_AI_GATEWAY`, model calls (which carry mail content) pass through that AI Gateway.
-  Review its logging and caching settings.
+  Pylota Mail turns off the gateway's log collection and caching on every call that carries mail
+  content, so the gateway keeps only request metadata (model, time, tokens) for those calls. Its rate
+  limits and other settings still apply.
 - Mail content is never written to logs at any log level.
 - To turn triage off for a tenant, set `triage.enabled: false`. New messages then get
   `status: "skipped"`.

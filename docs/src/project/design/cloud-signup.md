@@ -8,8 +8,8 @@ open point 6 of [Console and workspaces](console.md#open-points) and extends tha
 | | |
 |---|---|
 | Requirements | FR-CON-8 to FR-CON-13 ([PRD](../prd.md)) |
-| Edge cases | [M20–M34](../edge-cases.md) |
-| Code | `crates/worker/src/console/{signup.rs, oauth.rs, totp.rs, landing.rs, onboarding.rs, pages/overview.rs}` |
+| Edge cases | [W20–W34](../edge-cases.md) |
+| Code | `crates/worker/src/console/{signup.rs, oauth.rs, totp.rs, landing.rs, onboarding.rs, pages/overview.rs}`; `crates/core/src/totp.rs` (RFC 6238 codes, pure) |
 | Tables | D1 `users` (new columns), `oauth_identities`, `oauth_states`, `waitlist` ([§11](#11-data-model)) |
 
 ## 1. Who signs in where
@@ -71,25 +71,31 @@ Both flows are server-side redirects. They need no JavaScript.
    `code_challenge` (S256) and the scopes above.
 2. `GET /console/oauth/{provider}/callback`. The handler requires the `state` row to exist, be unexpired
    and unused, and match the `__Host-pm_oauth` cookie. It marks the row used, then exchanges the `code` with
-   the PKCE verifier at the token endpoint ([M20](../edge-cases.md)).
+   the PKCE verifier at the token endpoint ([W20](../edge-cases.md)).
 3. **Google.** The ID token comes straight from Google's token endpoint over TLS, so TLS server validation
    may stand in for checking its signature (OpenID Connect Core 1.0, §3.1.3.7, step 6). The handler still
    checks `iss` (`https://accounts.google.com` or `accounts.google.com`), `aud` = the client ID, `exp`,
    `nonce`, and `email_verified = true`. The subject is the `sub` claim.
 4. **GitHub.** `GET https://api.github.com/user` gives the numeric `id`, which is the subject.
    `GET /user/emails` gives the address marked `primary` and `verified`. If there is none, the flow is
-   refused with a page telling the person to verify an email address on GitHub ([M21](../edge-cases.md)).
+   refused with a page telling the person to verify an email address on GitHub ([W21](../edge-cases.md)).
 5. **Find or create the person.** When the flow started from an invitation link, the verified address
    must first equal the invited address. Otherwise the flow is refused, nothing is created or linked, and
-   the invitation stays pending ([M23](../edge-cases.md)). Then:
-   1. `oauth_identities` has `(provider, subject)` → that user.
+   the invitation stays pending ([W23](../edge-cases.md)). Then:
+   1. `oauth_identities` has `(provider, subject)` → that user; set its `last_used_at = now`.
    2. Otherwise a `users` row with the verified email exists → link: insert `oauth_identities`. The same
-      person can then use any method ([M22](../edge-cases.md)).
+      person can then use any method ([W22](../edge-cases.md)).
    3. Otherwise, if sign-up is open or a pending invitation exists for that verified address, create the
       user ([§6](#6-sign-up)). If neither, show the "no workspace yet" page; no account is created
-      ([M32](../edge-cases.md)).
+      ([W32](../edge-cases.md)).
 6. If the person has two-step verification, ask for it ([§5](#5-two-step-verification)). Then create the
    session and route ([§7](#7-where-people-land)).
+
+`intent` selects the page shown when no account matches: `sign_up` continues to workspace creation,
+`sign_in` shows "no workspace yet" ([W32](../edge-cases.md)). Re-authentication never uses OAuth: it is an
+emailed code ([Console › Re-authentication](console.md#re-authentication)). `/console/settings/security`
+lists the person's linked providers with the address each was linked with (`email_at_link`) and when it
+was last used (`last_used_at`).
 
 Provider endpoints and claim names must be re-read from Google's and GitHub's current documentation when
 M24 is built. Errors from a provider (`error=access_denied`, timeouts) show a page with a "try another way"
@@ -100,14 +106,16 @@ link. They never reveal whether an account exists.
 - **Enrol** at `/console/settings/security`. It needs re-authentication. The page shows a QR code
   rendered on the server as an inline SVG (the `qrcode` crate, pure Rust) and the base32 secret as text.
   The person confirms with a current code. The secret (20 random bytes) is sealed under `PM_MASTER_KEY` in
-  `users.totp_sealed`.
+  `users.totp_sealed`, and `totp_enabled_at` is set in the same statement. "Enrolled" means
+  `totp_enabled_at IS NOT NULL`: the sign-in step and the workspace requirement read it, and
+  `/console/settings/security` shows the date.
 - **Codes** follow RFC 6238: HMAC-SHA1, 30-second step, six digits, one step of clock drift either way. A
   code is refused if it was already used in its step. Attempts are limited to 5 a minute per person, and
   10 failures in a row lock two-step sign-in for 15 minutes. The counters are columns of `users`
   (`totp_window_start`, `totp_window_count`, `totp_failures`, `totp_locked_until`, [§11](#11-data-model));
   a success resets `totp_failures`.
 - **Recovery codes.** Ten codes of 10 characters (Crockford base32) are shown once at enrolment, and each
-  works once. Generating new ones invalidates the old ([M28](../edge-cases.md)). They are stored sealed:
+  works once. Generating new ones invalidates the old ([W28](../edge-cases.md)). They are stored sealed:
   `users.recovery_codes_sealed` is a `pm1` envelope under `PM_MASTER_KEY` of
   `[{ "hash": SHA-256(code), "used_at": null }]`. They are not keyed hashes under the `link` keyring,
   because a link key is deleted 7 days after rotation and recovery codes live for months. The
@@ -116,8 +124,9 @@ link. They never reveal whether an account exists.
   created. It is also asked for at re-authentication when enrolled.
 - **Workspace requirement.** An owner can set `require_two_factor` in workspace settings. Pylota Mail Cloud
   recommends it for Team workspaces. A member without two-step verification who opens that workspace goes
-  to enrolment first ([M27](../edge-cases.md)). The API is unaffected: keys are not people.
-- Turning it off needs re-authentication with a current code. It emails the person and writes an audit row.
+  to enrolment first ([W27](../edge-cases.md)). The API is unaffected: keys are not people.
+- Turning it off needs re-authentication with a current code. It sets `totp_sealed`, `totp_enabled_at`,
+  `totp_last_step` and `recovery_codes_sealed` to `NULL`, emails the person and writes an audit row.
 
 ## 6. Sign-up
 
@@ -138,7 +147,9 @@ platform API:
 | Response | `200 { "invited": 50, "waiting": 262 }` |
 | Effect | Invites the oldest confirmed, uninvited entries. Each gets a normal sign-up link valid for 7 days, which works while `PM_SIGNUP` is `waitlist`. Its token is stored only as a keyed hash under the current `link` key (`waitlist.invite_token_hash`, with the kid in `key_kid`), like an invitation |
 
-Unconfirmed entries are deleted after 7 days, and confirmed ones 30 days after invitation.
+An address is written to `waitlist` only when its confirmation link is used (`confirmed_at`), so there are
+no unconfirmed entries: an unused confirmation token simply expires after 10 minutes, like a sign-in
+token. Invitations go to the oldest `confirmed_at` first. Entries are deleted 30 days after invitation.
 
 ### 6.2 After launch: open sign-up
 
@@ -152,16 +163,16 @@ An unknown plan value means `free`.
 2. **Prove the address.** With email, the account is created only when the link or code is used, so there
    are never unverified accounts. With Google or GitHub, the provider's verified address is used.
    Addresses on the built-in list of disposable-mail domains (it ships with each release) or on a domain in
-   `PM_SIGNUP_BLOCKED_DOMAINS` are refused before any mail is sent ([M29](../edge-cases.md)).
+   `PM_SIGNUP_BLOCKED_DOMAINS` are refused before any mail is sent ([W29](../edge-cases.md)).
 3. **Create the workspace** (`/console/workspaces/new`), shown when the person has no workspace and no
    pending invitation. The fields are the workspace name, the address suffix (pre-filled from the name, for
    example `.brightwell`, with the resulting example address shown under it) and the time zone. A taken
-   suffix returns the form with `suffix_taken` ([M33](../edge-cases.md)). On success the tenant is
+   suffix returns the form with `suffix_taken` ([W33](../edge-cases.md)). On success the tenant is
    created on the Free plan with this person as owner, and `users.last_tenant_id` is set.
 4. **Pay, when a paid plan was chosen.** The owner goes straight to Stripe Checkout for that plan
    ([Billing › Checkout](billing.md#checkout)). Coming back from Checkout is [§9](#9-coming-back-from-checkout).
    Cancelling Checkout lands on the Overview, on Free, with the banner "Finish upgrading to Developer"
-   ([M24](../edge-cases.md)).
+   ([W24](../edge-cases.md)).
 5. **Land on the Overview** with the first-run checklist ([§8](#8-the-overview-the-screen-people-land-on)).
 
 ## 7. Where people land
@@ -170,7 +181,7 @@ After any successful sign-in (and two-step verification), the first matching row
 
 | Situation | Lands on |
 |---|---|
-| A valid `next` was carried through sign-in: a relative path starting with `/console/`, with no `//`, no backslash and no scheme ([M31](../edge-cases.md)) | That page |
+| A valid `next` was carried through sign-in: a relative path starting with `/console/`, with no `//`, no backslash and no scheme ([W31](../edge-cases.md)) | That page |
 | A pending invitation exists for this address | Accept the invitation, then that workspace's Overview |
 | No workspace, and sign-up is open | Create your workspace ([§6.2](#62-after-launch-open-sign-up)) |
 | No workspace, and sign-up is closed or waitlist | "No workspace yet", explaining how to be invited |
@@ -194,7 +205,9 @@ Quarantine, Domains, Webhooks, API keys, Connect, Members, Plan and usage, Audit
    - a domain `failing` or `suspended` ("Sending from bookings@brightwell.example uses your Pylota Mail
      address until the DNS is fixed");
    - an identity paused for bounces or complaints;
-   - two-step verification required but missing.
+   - two-step verification required but missing;
+   - your notification emails paused after a bounce or complaint, with "Confirm your address"
+     ([Notifications § 5](notifications.md#5-the-emails)).
 2. **First-run checklist**, until its required steps are done ([below](#first-run-checklist)).
 3. **Needs a person.** The actions that only a person should take, each linking to the screen that
    resolves it:
@@ -203,6 +216,8 @@ Quarantine, Domains, Webhooks, API keys, Connect, Members, Plan and usage, Audit
    - domains with issues to fix;
    - webhook endpoints that are failing or disabled;
    - invitations about to expire.
+
+   The daily "needs a person" email reads the same counts ([Notifications](notifications.md#3-how-notifications-are-produced)).
 4. **Usage.** A meter per allowance (inboxes, sends, triage analyses, custom domains, storage, seats) from
    `GET /v1/usage`, with the reset date and a link to Plan and usage.
 5. **Inboxes.** Per identity, for the last 24 hours: received, sent, waiting for a reply, unread. Each row
@@ -216,7 +231,8 @@ On a deployment with `PM_BILLING=off`, items 1 (billing banners) and 4 (plan lim
 
 Each step's state is worked out from real data on every render, never stored, so it cannot drift. Only
 "dismiss the checklist" is stored (`tenants.onboarding_dismissed_at`), and it is offered once the required
-steps are done.
+steps are done: the "Dismiss" button (owners and admins) posts to a console handler that sets the column
+to the current time, and the Overview render reads it and leaves the checklist out while it is set.
 
 | Step | Required | Done when | Screen |
 |---|---|---|---|
@@ -238,26 +254,26 @@ Stripe redirects to `/console/plan/return?session_id={CHECKOUT_SESSION_ID}`.
 
 1. The handler retrieves the Checkout Session from Stripe with `PM_STRIPE_SECRET_KEY`. It requires the
    session's customer to equal this workspace's `billing_accounts.stripe_customer_id`. Otherwise it shows
-   a neutral "Nothing to show" page and changes nothing ([M26](../edge-cases.md)).
+   a neutral "Nothing to show" page and changes nothing ([W26](../edge-cases.md)).
 2. Stripe webhooks are the only source of plan state (FR-BILL). If the webhook has already changed the
    plan, the page says "You're on Team" and links to the Overview.
 3. If it has not, the page says "Confirming your payment" and reloads itself with
    `<meta http-equiv="refresh" content="3">` (no JavaScript), at most 7 times. After that it says "Payment
    received; your plan updates within a minute" and links to the Overview. The Overview shows the same
-   message until the webhook arrives ([M25](../edge-cases.md)).
+   message until the webhook arrives ([W25](../edge-cases.md)).
 
 ## 10. Abuse and safety on Cloud
 
 | Risk | Control |
 |---|---|
 | Sign-in mail used as a spam cannon, and code guessing | 3 link or code requests per 10 minutes per address and 10 attempts per code, after which the token is burned ([Sign-in](console.md#sign-in)). Plus a rate-limit binding `RL_SIGNIN`: 10 requests per 60 s per client IP, keyed by `CF-Connecting-IP`, on `POST /console/sign-in`, `/console/sign-in/link`, `/console/sign-in/code`, `/console/sign-up` and `/console/waitlist`. This closes [Console open point 1](console.md#open-points) |
-| Free workspaces created to send spam | A new-workspace ramp: `tenant_daily_send_cap` is 50 for the first 7 days on Free. It lifts on day 7 if the bounce and complaint rates are under the auto-pause thresholds, or at once on a paid plan. The usual auto-pause still applies ([M30](../edge-cases.md)) |
-| Disposable addresses | `PM_SIGNUP_BLOCKED_DOMAINS` ([M29](../edge-cases.md)) |
-| Who system mail comes from | `PM_SYSTEM_FROM`, for example `Pylota Mail <no-reply@pylotamail.com>`, sent through the platform domain. It is the "platform identity" that other pages name as the sender of sign-in, invitation and notification mail. This closes [Console open point 2](console.md#open-points) |
+| Free workspaces created to send spam | A new-workspace ramp: `tenant_daily_send_cap` is 50 for the first 7 days on Free. It lifts on day 7 if the bounce and complaint rates are under the auto-pause thresholds, or at once on a paid plan. The usual auto-pause still applies ([W30](../edge-cases.md)) |
+| Disposable addresses | `PM_SIGNUP_BLOCKED_DOMAINS` ([W29](../edge-cases.md)) |
+| Who system mail comes from | `PM_SYSTEM_FROM`, for example `Pylota Mail <no-reply@pylotamail.com>`, sent through the platform domain by the system identity ([Identities and domains › The system identity](identity-domains.md#the-system-identity)). It is the identity that other pages name as the sender of sign-in, invitation and notification mail. This closes [Console open point 2](console.md#open-points) |
 | Open redirects through `next` | [§7](#7-where-people-land) |
 | Lost access to the sign-in address | No self-service recovery. Pylota support verifies the requester against the workspace's Stripe billing details and a recent invoice number, then moves ownership to a new verified address. The audit log records it with `via: support` |
 | Lost authenticator | Recovery codes; otherwise the support route above |
-| Leaving | A person can delete their account at `/console/settings` when they own no workspace (otherwise `409 owner_required`) ([M34](../edge-cases.md)). An owner can delete a workspace after re-authentication and typing its name. That cancels the subscription at once and starts tenant erasure ([Privacy](privacy.md)). Deleting an account deletes the person's sessions, `oauth_identities` and `waitlist` row, and scrubs the `users` row ([Privacy › People](privacy.md#69-people-console-accounts)) |
+| Leaving | A person can delete their account at `/console/settings` when they own no workspace (otherwise `409 owner_required`) ([W34](../edge-cases.md)). An owner can delete a workspace after re-authentication and typing its name. That cancels the subscription at once and starts tenant erasure ([Privacy](privacy.md)). Deleting an account deletes the person's sessions, `oauth_identities` and `waitlist` row, and scrubs the `users` row ([Privacy › People](privacy.md#69-people-console-accounts)) |
 
 ## 11. Data model
 
@@ -294,8 +310,8 @@ CREATE TABLE oauth_states (
   state_hash   TEXT PRIMARY KEY,           -- keyed hash of state
   cookie_hash  TEXT NOT NULL,              -- keyed hash of the __Host-pm_oauth value
   key_kid      TEXT NOT NULL,              -- the link-key kid of state_hash and cookie_hash
-  provider     TEXT NOT NULL,
-  intent       TEXT NOT NULL CHECK (intent IN ('sign_in','sign_up','reauth')),
+  provider     TEXT NOT NULL CHECK (provider IN ('google','github')),
+  intent       TEXT NOT NULL CHECK (intent IN ('sign_in','sign_up')),
   pkce_sealed  BLOB NOT NULL,
   nonce        TEXT,
   next_path    TEXT,
@@ -339,21 +355,22 @@ The global retention job deletes `oauth_states` rows 24 hours after `expires_at`
 | Test | Covers |
 |---|---|
 | `it::signup::email_creates_account_only_on_use` | No `users` row until the link or code is used; terms version recorded |
-| `it::signup::plan_intent_to_checkout` | `?plan=team` → workspace → Checkout; cancel → Free with banner ([M24](../edge-cases.md)) |
-| `it::signup::closed_and_waitlist` | No account is created when sign-up is closed; waitlist double opt-in and batch invite through `POST /v1/platform/waitlist/invite` ([M32](../edge-cases.md)) |
-| `it::signup::disposable_domain_refused` | An address on a `PM_SIGNUP_BLOCKED_DOMAINS` domain is refused at email sign-up before any mail is sent, and at Google or GitHub sign-up ([M29](../edge-cases.md)) |
-| `it::signup::suffix_taken_race` | Two workspaces created at once with the same suffix: one succeeds, the other form returns `suffix_taken` ([M33](../edge-cases.md)) |
-| `it::console::delete_account_owner_required` | Deleting your account while you own a workspace → `409 owner_required`; after ownership moves, the deletion succeeds ([M34](../edge-cases.md)) |
-| `it::oauth::state_cookie_binding` | Missing, reused, expired or other-browser state → refused ([M20](../edge-cases.md)) |
-| `it::oauth::unverified_email_refused` | GitHub without a verified primary address; Google `email_verified: false` ([M21](../edge-cases.md)) |
-| `it::oauth::link_by_verified_email` | Google, then an email link → one user ([M22](../edge-cases.md)) |
-| `it::oauth::invitation_email_mismatch` | Invitation for one address, OAuth with another → refused, invitation still pending ([M23](../edge-cases.md)); with the invited address on a deployment where sign-up is closed → account created and invitation accepted |
+| `it::signup::plan_intent_to_checkout` | `?plan=team` → workspace → Checkout; cancel → Free with banner ([W24](../edge-cases.md)) |
+| `it::signup::closed_and_waitlist` | No account is created when sign-up is closed; waitlist double opt-in and batch invite through `POST /v1/platform/waitlist/invite` ([W32](../edge-cases.md)) |
+| `it::signup::disposable_domain_refused` | An address on a `PM_SIGNUP_BLOCKED_DOMAINS` domain is refused at email sign-up before any mail is sent, and at Google or GitHub sign-up ([W29](../edge-cases.md)) |
+| `it::signup::suffix_taken_race` | Two workspaces created at once with the same suffix: one succeeds, the other form returns `suffix_taken` ([W33](../edge-cases.md)) |
+| `it::console::delete_account_owner_required` | Deleting your account while you own a workspace → `409 owner_required`; after ownership moves, the deletion succeeds ([W34](../edge-cases.md)) |
+| `it::oauth::state_cookie_binding` | Missing, reused, expired or other-browser state → refused ([W20](../edge-cases.md)) |
+| `it::oauth::unverified_email_refused` | GitHub without a verified primary address; Google `email_verified: false` ([W21](../edge-cases.md)) |
+| `it::oauth::link_by_verified_email` | Google, then an email link → one user ([W22](../edge-cases.md)) |
+| `it::oauth::invitation_email_mismatch` | Invitation for one address, OAuth with another → refused, invitation still pending ([W23](../edge-cases.md)); with the invited address on a deployment where sign-up is closed → account created and invitation accepted |
 | `core::totp::rfc6238_vectors` | RFC 6238 test vectors; drift ±1; replay in the same step refused |
-| `it::totp::workspace_requirement` | `require_two_factor` sends an unenrolled member to enrolment ([M27](../edge-cases.md)); recovery code works once ([M28](../edge-cases.md)) |
-| `it::totp::recovery_codes_survive_key_rotation` | Recovery codes are stored only in `recovery_codes_sealed` (no plain code in D1); one still works after the `link` key is rotated and the fake clock moves 8 days on; with all ten used, the page points to the support route ([M28](../edge-cases.md)) |
-| `it::landing::routing_table` | Every row of §7, including a hostile `next` ([M31](../edge-cases.md)) |
-| `it::checkout::return_wrong_workspace` | A session ID for another customer changes nothing ([M26](../edge-cases.md)) |
-| `it::checkout::return_before_webhook` | Waits, then "within a minute"; the plan is applied by the webhook only ([M25](../edge-cases.md)) |
-| `it::onboarding::derived_steps` | Each checklist step turns done from real data alone |
-| `it::abuse::free_ramp` | 51st send on day 1 of a Free workspace → `429 daily_cap_reached`; lifted on upgrade ([M30](../edge-cases.md)) |
+| `it::totp::workspace_requirement` | `require_two_factor` sends an unenrolled member to enrolment before the workspace opens; API keys of that workspace still work ([W27](../edge-cases.md)) |
+| `it::totp::recovery_code_single_use` | A recovery code signs in once and is refused the second time; generating new codes makes every old code fail ([W28](../edge-cases.md)) |
+| `it::totp::recovery_codes_survive_key_rotation` | Recovery codes are stored only in `recovery_codes_sealed` (no plain code in D1); one still works after the `link` key is rotated and the fake clock moves 8 days on; with all ten used, the page points to the support route ([W28](../edge-cases.md)) |
+| `it::landing::routing_table` | Every row of §7, including a hostile `next` ([W31](../edge-cases.md), FR-CON-11) |
+| `it::checkout::return_wrong_workspace` | A session ID for another customer changes nothing ([W26](../edge-cases.md)) |
+| `it::checkout::return_before_webhook` | Waits, then "within a minute"; the plan is applied by the webhook only ([W25](../edge-cases.md), FR-CON-13) |
+| `it::onboarding::derived_steps` | Each checklist step turns done from real data alone; each Overview banner condition shows its banner and hides it once resolved (FR-CON-12) |
+| `it::abuse::free_ramp` | 51st send on day 1 of a Free workspace → `429 daily_cap_reached`; lifted on upgrade ([W30](../edge-cases.md)) |
 | `it::hosts::console_api_split` | With two hosts, console paths 404 on the API host and API paths 404 on the console host; no `Set-Cookie` on the API host |

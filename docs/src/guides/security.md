@@ -7,8 +7,8 @@ what you need to do to deploy and integrate it safely. The internal design is in
 In short:
 
 - **Pylota Mail** isolates tenants and identities, scopes every request by its key, authenticates
-  inbound mail, quarantines what is unsafe, marks all mail content as untrusted, signs webhooks, and
-  never puts mail content in logs.
+  inbound mail, quarantines what is unsafe, marks all mail content as untrusted, signs webhooks, keeps
+  identity signing keys sealed inside the Worker, and never puts mail content in logs.
 - **You** give each agent the narrowest key, verify webhooks, treat mail as untrusted data in your
   prompts, keep people in the loop for risky actions, and protect your keys and secrets.
 
@@ -26,11 +26,20 @@ A key also holds a list of permissions ([REST API › Permissions](../reference/
 Both must allow a request. A key can never create a key wider than itself in level, tenant, identity
 or permissions (`403 key_scope_exceeded`) ([FR-KEY-1](../project/prd.md#61-tenancy-and-access)).
 
+Some permissions belong to particular levels. `tenants:manage` and `platform:ops` are for platform keys
+only. `members:read`, `members:manage`, `suppressions:manage`, `audit:read` and `usage:read` cannot be
+listed on identity keys (an identity key still reads its own workspace's `GET /v1/usage`, as every
+tenant and identity key does). `identities:sign` cannot be held by platform keys. Creating a key that
+lists a permission its level cannot hold is refused with `400 invalid_request` and
+`details.reason: "permission_not_allowed_for_level"`. Creating a platform key also needs an explicit,
+non-empty `permissions` list (`400 invalid_request` without one): there is no implicit full set.
+
 ### Least privilege by use case
 
 | Use case | Level | Permissions |
 |---|---|---|
 | An agent with its own mailbox | `identity` | `messages:read`, `messages:send`, `search:read`, `attachments:read` (add `search:agentic` if it asks questions) |
+| An agent that proves who it is to other services or websites | `identity` | What it otherwise needs, plus `identities:sign` ([Agents › Agent assertions](agents.md#agent-assertions)) |
 | A read-only agent | `identity` | `messages:read`, `search:read` |
 | A coordinator agent across a tenant | `tenant` | `identities:read`, `messages:read`, `search:read` |
 | Your webhook consumer | `tenant` | `messages:read`, `attachments:read` (to fetch content the events refer to) |
@@ -95,11 +104,17 @@ overlap every delivery carries both signatures.
 The keys that sign thread tokens, download links, console sign-in tokens and search cursors are not
 secrets you hold: the Worker generates them, keeps them sealed under `PM_MASTER_KEY`, and never returns
 them. Rotate them with `POST /v1/platform/keys/thread/rotate`, `…/link/rotate` or `…/cursor/rotate` (a
-platform key with `platform:ops`), or `pmail keys rotate thread|link|cursor`. Old thread tokens keep
+platform key with `platform:ops`), or `pmail keys rotate thread|link|cursor|web_bot_auth`. Old thread tokens keep
 verifying for 90 days, old links and console tokens for 7 days, and old search cursors for 24 hours
 ([Configuration › Thread and link keys](../reference/configuration.md#thread-and-link-keys)). If you think
 one of these keys leaked, add `?revoke_previous=true` (`--revoke-previous`): everything the old key signed
 stops working at once; for the `link` key that also signs console users out. Then rotate `PM_MASTER_KEY`.
+
+The deployment key that signs [Web Bot Auth requests](agents.md#signed-http-requests) works the same way:
+`POST /v1/platform/keys/web_bot_auth/rotate` or `pmail keys rotate web_bot_auth`. The previous key stays
+in the key directory for 7 days, or is dropped at once with `?revoke_previous=true`. While
+`PM_WEB_BOT_AUTH=off` the rotation is refused with `422 web_bot_auth_disabled`. Identity signing keys
+have their own routes ([Identity signing keys](#identity-signing-keys)).
 
 **SMTP relay passwords.** If a domain sends through your own mail provider (`smtp_relay`), its SMTP
 password is stored sealed and is never shown again, logged or exported. Change it with
@@ -109,6 +124,40 @@ passes.
 Protect `CLOUDFLARE_API_TOKEN` too: anyone holding it can change the deployment. Keep it out of the
 CLI config file, scope it to the permissions in [Deploy to Cloudflare](../self-hosting.md#2-create-a-cloudflare-api-token),
 and delete it when you no longer need it.
+
+## Identity signing keys
+
+Each identity can have an Ed25519 key that signs its [agent assertions](agents.md#agent-assertions)
+([Agent signing keys](../project/design/agent-keys.md#10-security-and-privacy)). Signed HTTP requests
+use the deployment's key instead, as above.
+
+- **Sealed and never exported.** The key is generated inside the Worker on the identity's first signing
+  request (or with `POST /v1/identities/{identity_id}/keys`), sealed under `PM_MASTER_KEY`, and used
+  and wiped from memory there. No API returns a private key, and you cannot import one.
+  `pmail secrets rotate-master` re-seals it without changing its public key or key ID.
+- **Published.** The public key is listed, with no authentication, at
+  `/.well-known/jwks/{identity_id}.json` (cached for up to 5 minutes). Its key ID (`kid`) is the key's
+  JWK thumbprint.
+- **Rotation.** `POST /v1/identities/{identity_id}/keys/rotate` makes a new key active at once. The old
+  one becomes `retiring`: it signs nothing, but stays published for 7 days by default
+  (`PM_IDENTITY_KEY_OVERLAP_DAYS`), so assertions it signed still verify.
+- **Revocation.** If a key may have leaked, `POST …/keys/{kid}/revoke` retires it at once. It leaves the
+  key set, and verifiers drop it within the 5-minute cache. Key routes keep working while the identity
+  is paused, so you can deal with a leak before resuming it.
+- **The kill switch.** Pausing an identity, or suspending its tenant, stops new signatures
+  (`409 identity_paused`) and withdraws its key set (`404`), so a service that refetches it stops
+  accepting the identity's assertions within the cache time.
+- **Erasure.** Deleting an identity deletes its keys and tombstones their key IDs, which are never
+  published again.
+- **Replay protection lies with verifiers.** Pylota Mail keeps no record of the tokens it mints, so it
+  cannot spot a replay. Verifiers keep `jti` until `exp`, send a `nonce` challenge where they can, and
+  accept only short expiries; HTTP signatures carry `nonce`, `created` and `expires` for the same
+  purpose.
+
+Managing keys needs `identities:write` (CLI `pmail identity-keys`), or an owner or admin on the
+identity page in the console, which asks for a recent sign-in. Each create, rotation and revocation is
+audit-logged. Minting with the key needs `identities:sign`. Tokens and signatures are never stored or
+logged; only daily counts are kept.
 
 ## Console sign-in
 
@@ -161,6 +210,9 @@ What Pylota Mail does ([E1](../project/edge-cases.md), [F10](../project/edge-cas
   `payment_change_request` and `credential_request`.
 - Trust metadata (`verdict`, `known_sender`, `display_name_spoof`, `lookalike_domain`,
   `reply_to_mismatch`) travels with every message.
+- Notification emails to people carry counts only, never a subject, sender, snippet or attachment name,
+  so text from mail never reaches them
+  ([Receiving › Notifications by email](receiving.md#notifications-by-email)).
 
 What you should do:
 
@@ -201,8 +253,10 @@ What you should do:
 
 Mail that fails authentication, exceeds the spam threshold, carries a risky attachment or is an
 unsolicited one-time code is quarantined: stored, but invisible to every key without
-`quarantine:review` ([FR-IN-5](../project/prd.md#64-inbound)). It is left out of thread lists, search
-results and MCP tools, and its `message.quarantined` event carries no text.
+`quarantine:review` ([FR-IN-5](../project/prd.md#64-inbound)). Lists, search results and MCP tools
+leave it out by default, and its `message.quarantined` event carries no text. It appears only when a
+request asks for it explicitly (a `status` filter on a list, `include_quarantined` in search) **and**
+the key holds `quarantine:review`. Mail stored `hidden` or `throttled` follows the same rule.
 
 - Release is a human action. It needs `quarantine:review`, takes a reason, and is audit-logged.
 - Receive-allow lists skip spam quarantine but **never** authentication quarantine.
@@ -218,12 +272,13 @@ See [Receiving › Quarantine](receiving.md#quarantine).
 | Searches per key | 120 per minute. Agentic: 20 per minute and 500 per tenant per day |
 | Sends per identity | 120 per minute, 500 per day. Per tenant: 5,000 per day |
 | Recipients per message | 10 (maximum 49) |
+| Agent assertions and signed HTTP requests | 600 per minute per identity, together (`429 rate_limited`) |
 | Automatic pause | Complaint rate over 0.3% of the last 1,000 sends, or bounce rate over 5% of the last 200 ([FR-DLV-3](../project/prd.md#66-delivery)) |
-| Inbound per sender | 60 messages per hour per identity; the excess is hidden and alerted ([D5](../project/edge-cases.md)) |
+| Inbound per sender | 60 messages per hour per identity; the excess is stored as `throttled` (kept, but out of lists and webhooks) and alerted ([D5](../project/edge-cases.md)) |
 | Automatic replies | Never to automated mail; at most 2 per thread before a person acts ([D6](../project/edge-cases.md)) |
 | Thread tokens | 40-bit HMACs. After 10 failed verifications per sender, or 100 per mailbox, in an hour, tokens are not verified for the rest of the hour. Failures are flagged. A token never grants access to data ([D10](../project/edge-cases.md)) |
 | Backscatter | Bounces for mail never sent are dropped and counted ([D4](../project/edge-cases.md)) |
-| Reserved names | Role names (`postmaster`, `abuse`, `support` and the rest) are refused on the shared platform domain, `postmaster` and `abuse` also on your own domain, and look-alikes of them everywhere ([A4](../project/edge-cases.md)) |
+| Reserved names | Role names (`postmaster`, `abuse`, `support` and the rest) are refused on the shared platform domain wherever they would stand alone (the default tenant's usernames; other tenants' platform addresses carry their suffix), `postmaster` and `abuse` also on your own domain, and look-alikes of them everywhere ([A4](../project/edge-cases.md)) |
 | Test tenants | Cannot send outside the deployment ([L1](../project/edge-cases.md)) |
 
 ## Tenant isolation
@@ -239,7 +294,8 @@ successful accesses ([NFR-SEC-1](../project/prd.md#7-non-functional-requirements
 - Each identity's mail lives in its own Durable Object. Vectors are stored in a per-tenant namespace
   and hold no text. Raw mail and attachments sit under tenant-prefixed keys in R2.
 - Deleted and erased addresses are tombstoned and can never be reassigned to another identity, in any
-  tenant ([A5](../project/edge-cases.md)).
+  tenant ([A5](../project/edge-cases.md)). The key IDs of a deleted identity's signing keys are
+  tombstoned the same way and never published again ([O7](../project/edge-cases.md)).
 
 ## Spoofed mail
 
@@ -248,16 +304,18 @@ successful accesses ([NFR-SEC-1](../project/prd.md#7-non-functional-requirements
   Any other copy of that header, which a sender could forge, is ignored ([D9](../project/edge-cases.md)).
 - Display-name spoofing and look-alike domains are flagged by comparing against known contacts and the
   tenant's own domains ([D2](../project/edge-cases.md)).
-- A reply goes to `Reply-To` only when it shares the sender's organisational domain or is a known
-  contact ([D3](../project/edge-cases.md)).
+- A reply goes to `Reply-To` only when the sender is a known sender, or the `Reply-To` address shares
+  the sender's organisational domain or is a contact the identity has written to
+  ([D3](../project/edge-cases.md)).
 
 ## Logs and audit
 
 - Logs never contain message bodies, attachment content or clear-text email addresses, at any log level
   ([FR-PRV-6](../project/prd.md#612-privacy)).
-- The audit log records administrative and sensitive actions (key creation, quarantine release, hold
-  changes, suppression removals, resolving uncertain sends) with the acting key and request ID, never
-  message content. Read it with `audit:read`.
+- The audit log records administrative and sensitive actions (key creation, identity signing key
+  changes, quarantine release, hold changes, suppression removals, resolving uncertain sends) with the
+  acting key and request ID, never message content. Read it with `audit:read`.
+- Agent assertions and HTTP signatures are never stored or logged; only daily counts are kept.
 
 ## Reporting a vulnerability
 

@@ -60,7 +60,7 @@ The research of 2026-10-09 found:
 - SES domains behave differently from routing domains for unknown and retired recipients. The custom
   domains guide documents the difference.
 - Three spikes gate three methods: S10 for `delegated_subdomain`, S11 for `dns_records`, S12 for
-  `smtp_relay`. `cloudflare_zone`, `nameservers` and `send_only` do not depend on them.
+  `smtp_relay` (whose `inbound: ses` option also needs S11). `cloudflare_zone`, `nameservers` and `send_only` do not depend on them.
 - New surface to secure: the SNS endpoint (signature version 2 only, one topic), sealed SMTP credentials,
   an SES IAM user limited to one policy, and the S3 bucket policy bound to the receipt rule.
 - Cost per message falls for SES domains ($0.10 per 1,000 sent against $0.35 on Email Sending).

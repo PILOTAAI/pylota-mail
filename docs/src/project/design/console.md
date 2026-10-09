@@ -2,17 +2,18 @@
 
 Binding design for the console at `/console`, and for the workspaces, members, roles, invitations, sign-in
 and sessions behind it. It implements FR-CON-1 to FR-CON-7 and NFR-CON-1, build plan milestone M21, and
-the edge-case rows M8–M10 and M15–M18 in the [edge-case register](../edge-cases.md). The plan and usage
+the edge-case rows W8–W10 and W15–W18 in the [edge-case register](../edge-cases.md); and the console parts
+of agent signing keys (FR-IDN-6, M25) and of notifications (FR-CON-14, FR-CON-15, M26; rows O17–O19). The plan and usage
 page and everything about money is in [Plans, metering and billing](billing.md). Self-serve sign-up,
 Google and GitHub sign-in, two-step verification, the landing rules and the Overview (FR-CON-8 to
 FR-CON-13) are in [Cloud sign-up, sign-in and first run](cloud-signup.md), which extends this design.
 
 | | |
 |---|---|
-| Code | `crates/worker/src/console/{mod.rs, router.rs, session.rs, signin.rs, csrf.rs, layout.rs, pages/*.rs}`, `crates/worker/src/members/{mod.rs, invitations.rs, roles.rs}`, `handlers/members.rs` |
-| Tables | D1 `users`, `members`, `invitations`, `login_tokens`, `sessions` ([Data model](data-model.md#1-d1-control-plane)); `oauth_identities`, `oauth_states`, `waitlist` ([Cloud sign-up §11](cloud-signup.md#11-data-model)) |
-| Configuration | `PM_CONSOLE`, `PM_CONSOLE_HOST`, `PM_SYSTEM_FROM`, `PM_SIGNUP` ([Configuration](../../reference/configuration.md#variables)); binding `RL_SIGNIN` ([Bindings](../../reference/configuration.md#bindings)) |
-| Contracts | Members and invitations endpoints and the `members:manage` permission ([REST API](../../reference/api.md#members)); `member.*` events ([Webhook events](../../reference/events.md#workspaces-members-and-billing)); `409 owner_required`, `402 billing_limit` ([Errors](../../reference/errors.md)) |
+| Code | `crates/worker/src/console/{mod.rs, router.rs, session.rs, signin.rs, csrf.rs, layout.rs, pages/*.rs}` (`pages/notifications.rs` for the settings screen), `crates/worker/src/members/{mod.rs, invitations.rs, roles.rs}`, `handlers/members.rs`, `crates/worker/src/notify/unsubscribe.rs` |
+| Tables | D1 `users`, `members`, `invitations`, `login_tokens`, `sessions` ([Data model](data-model.md#1-d1-control-plane)); `oauth_identities`, `oauth_states`, `waitlist` ([Cloud sign-up §11](cloud-signup.md#11-data-model)); `notification_prefs` ([Notifications §2](notifications.md#2-preferences)); `identity_keys` ([Agent signing keys §8](agent-keys.md#8-data-model)) |
+| Configuration | `PM_CONSOLE`, `PM_SIGNUP`, `PM_NOTIFICATIONS` ([Configuration](../../reference/configuration.md#variables)); also `PM_CONSOLE_HOST` and `PM_SYSTEM_FROM`, which are top-level settings read with the console off; binding `RL_SIGNIN` ([Bindings](../../reference/configuration.md#bindings)) |
+| Contracts | Members and invitations endpoints and the `members:read` and `members:manage` permissions ([REST API](../../reference/api.md#members)); `member.*` events ([Webhook events](../../reference/events.md#workspaces-members-and-billing)); `409 owner_required`, `402 billing_limit` ([Errors](../../reference/errors.md)) |
 | Limits | [Limits › Console](../../reference/limits.md#console) |
 | External facts verified on 2026-10-09 | The Fetch Standard's "append a request `Origin` header" algorithm (fetch.spec.whatwg.org) |
 
@@ -24,11 +25,15 @@ domains, members, quarantine release and billing ([PRD §4](../prd.md#4-goals-an
 webmail client: it has no compose or reply form.
 
 - **Same Worker.** `fetch` routes `/console` and `/console/*` to `console::router`. With `PM_CONSOLE=off`
-  those routes are not registered and answer `404` with the standard envelope (FR-CON-7). The members API
-  keeps working.
+  those routes are not registered and answer `404` with the standard envelope (FR-CON-7), except two
+  pairs that mail links to: the invitation-accept pair ([Invitations](#invitations)) and the unsubscribe
+  pair, `GET` and `POST /console/notifications/unsubscribe` ([Unsubscribe links](#unsubscribe-links)), so
+  the `List-Unsubscribe` header of every notification works. The members API, invitation emails and
+  notifications keep working.
 - **Its own host, if configured.** The console is served on `PM_CONSOLE_HOST`, which defaults to
-  `PM_API_HOST`. When the two differ, console paths answer only on the console host and API paths (REST,
-  MCP, `/hooks/*`, `/billing/stripe/webhook`, `/health`, `/v1/links/*`) only on the API host; anything else gets `404`, and no
+  `PM_API_HOST`. When the two differ, console paths answer only on the console host and API paths (REST
+  `/v1/*` with signed links `/v1/links/*`, MCP `/mcp`, `/openapi.json`, `/health`, `/.well-known/*`,
+  `/hooks/*` and `/billing/stripe/webhook`) only on the API host; anything else gets `404`, and no
   cookie is set or read on the API host ([Cloud sign-up §2](cloud-signup.md#2-hostnames)).
 - **Rendered on the server in Rust** with `maud` templates (`layout.rs`, `pages/*.rs`). Pages are HTML and
   one stylesheet, `/console/assets/console.css`. There is no JavaScript, no web font, and no request to
@@ -45,15 +50,18 @@ webmail client: it has no compose or reply form.
   }
   ```
 
-  The permissions come from the member's role ([Roles](#roles)). Validation, error codes, idempotency,
-  metering and audit are therefore identical to the API's.
+  The permissions come from the member's role ([Roles](#roles)). For every level check a session acts as a
+  **tenant-level** principal of its workspace (`level = tenant`, `tenant_id` the session's): it may do
+  what a tenant key holding the same permissions may do (tenant search, `resume` of an abuse pause,
+  tenant-scope erasure, `nameservers` when policy allows it), and never what needs a platform key.
+  Validation, error codes, idempotency, metering and audit are therefore identical to the API's.
 - **Budget.** Server render time p95 ≤ 300 ms (NFR-CON-1). A page makes at most one D1 query for the
   session, then the same calls the API would make.
 
 ## Workspaces
 
 A workspace is a tenant (FR-CON-2). Everything in it (identities, domains, keys, webhooks, plan) belongs
-to that tenant, and its scope always comes from the session, never from a form field ([M18]).
+to that tenant, and its scope always comes from the session, never from a form field ([W18]).
 
 - A workspace has exactly one owner and any number of members up to its seat limit. The unique partial
   index `members_one_owner` (`ON members(tenant_id) WHERE role = 'owner'`) makes a second owner
@@ -82,43 +90,57 @@ role's session principal holds, so the same checks run as for an API key.
 | Labels, read state, re-run triage | Yes | Yes | Yes | No |
 | See quarantined mail and release it (sensitive) | Yes | Yes | Yes | No |
 | Create, pause and resume identities | Yes | Yes | No | No |
+| See an identity's signing keys and its JWKS link | Yes | Yes | Yes | Yes |
+| Create, rotate and revoke an identity's signing keys (sensitive) | Yes | Yes | No | No |
 | See domains, their health and DNS records | Yes | Yes | Yes | Yes |
 | Add, verify and remove domains (add and remove are sensitive) | Yes | Yes | No | No |
 | Webhook endpoints: create, edit, rotate the secret, replay | Yes | Yes | No | No |
 | API keys: list, create (sensitive), revoke | Yes | Yes | No | No |
-| Erasure and legal holds (sensitive) | Yes | Yes | No | No |
+| Erasure and legal holds (sensitive): message, thread, counterparty and identity scope | Yes | Yes | No | No |
+| Delete the workspace (tenant-scope erasure, sensitive) | Yes | No | No | No |
 | See members and pending invitations | Yes | Yes | Yes | Yes |
 | Invite, revoke invitations, change roles, remove members (sensitive) | Yes | Yes, except anything that touches the owner | No | No |
 | Transfer ownership to an admin (sensitive) | Yes | No | No | No |
 | See plan and usage | Yes | Yes | Yes | Yes |
 | Upgrade, buy top-ups, open the Customer Portal (sensitive) | Yes | No | No | No |
 | See the audit log | Yes | Yes | No | No |
+| Your own notification settings for this workspace | Yes | Yes | Yes | Yes |
 | Leave the workspace | No: transfer ownership first | Yes | Yes | Yes |
 
 | Role | Permission set of the session principal |
 |---|---|
-| `owner` | Every tenant-level permission: `identities:*`, `domains:*`, `messages:*`, `attachments:read`, `search:read`, `search:agentic`, `quarantine:review`, `webhooks:manage`, `keys:manage`, `erasure:manage`, `suppressions:manage`, `usage:read`, `audit:read`, `members:manage`; plus the console-only rights to buy and manage billing and to transfer ownership |
-| `admin` | The owner's tenant-level permissions, without billing and without ownership transfer |
-| `member` | `identities:read`, `domains:read`, `messages:read`, `messages:write`, `attachments:read`, `search:read`, `search:agentic`, `quarantine:review`, `usage:read` |
-| `viewer` | `identities:read`, `domains:read`, `messages:read`, `attachments:read`, `search:read`, `usage:read` |
+| `owner` | Every tenant-level permission: `identities:read`, `identities:write`, `identities:sign`, `domains:read`, `domains:write`, `messages:read`, `messages:send`, `messages:write`, `attachments:read`, `search:read`, `search:agentic`, `quarantine:review`, `webhooks:read`, `webhooks:manage`, `keys:manage`, `erasure:manage`, `suppressions:manage`, `usage:read`, `audit:read`, `members:read`, `members:manage`; plus the console-only owner rights: billing, ownership transfer, deleting the workspace, and the workspace settings below |
+| `admin` | The owner's tenant-level permissions (`identities:sign` included), without the console-only owner rights. Its `erasure:manage` covers every scope except `tenant`: the console's tenant-erasure route also checks `role = owner` |
+| `member` | `identities:read`, `domains:read`, `messages:read`, `messages:write`, `attachments:read`, `search:read`, `search:agentic`, `quarantine:review`, `usage:read`, `members:read` |
+| `viewer` | `identities:read`, `domains:read`, `messages:read`, `attachments:read`, `search:read`, `usage:read`, `members:read` |
 
 Rules:
 
 - **One owner.** The owner cannot leave, be removed, or have their role changed; each attempt returns
-  `409 owner_required` ([M10]). Ownership moves only by a transfer to an existing admin
+  `409 owner_required` ([W10]). Ownership moves only by a transfer to an existing admin
   ([Members](#members)).
 - **Admins and the owner.** An admin can manage admins, members and viewers, but cannot change the owner
   or make anyone owner.
 - **Keys from the console** are tenant-level or identity-level, never platform-level, and can never hold a
-  permission the session lacks (FR-KEY-1).
+  permission the session lacks (FR-KEY-1). Owners and admins hold `identities:sign`, so they can create
+  API keys that sign as an identity; members and viewers cannot. The level rules of
+  [Security §4.6](security.md#46-creating-keys-fr-key-1) apply as in the API: an identity-level key never
+  carries a tenant-only permission (`members:read`, `members:manage`, `suppressions:manage`,
+  `audit:read`, `usage:read`), so the key form does not offer them for that level.
 - **Tenant policy** is changed with a platform key, as in the API (`PATCH /v1/tenants/{id}` needs
   `tenants:manage`). The settings page shows the effective policy read-only.
+- **Workspace settings** (name, time zone, `require_two_factor`) are console-only owner rights, like
+  billing: the settings form posts to a console handler that checks `role = owner` and updates exactly
+  those three columns of `tenants`, with an audit row. It never calls `PATCH /v1/tenants` and never
+  touches the platform-only fields (`policy`, `status`, `mode`, `slug`, `address_suffix`, billing).
+- **Members list.** Every role can see members and pending invitations, through
+  `GET /v1/tenants/{tenant_id}/members`, which needs `members:read` (included in `members:manage`).
 - **Quarantine release** is possible for a signed-in person with the role above. On Pylota Mail Cloud no API
   key can release; a self-hosted deployment can also allow keys with `quarantine:review` (FR-CON-6).
 - **Every handler checks the role**, through the console's route table, which registers each route with its
   required permission exactly like the API's deny-by-default table
   ([Security](security.md#51-deny-by-default-router-table)). A viewer's `POST` to a write route gets `403`,
-  and a resource ID from another workspace gets the same `404` as a missing one ([M18]).
+  and a resource ID from another workspace gets the same `404` as a missing one ([W18]).
 
 ## Sign-in
 
@@ -163,14 +185,16 @@ Every method ends in the same session creation ([Sessions](#sessions)), and the 
 5. After the response (`wait_until`), send the email only if the address belongs to an `active` user with
    at least one membership, or has a pending invitation. Otherwise send nothing.
 
-The email goes through the normal outbound pipeline from the default tenant (billing `disabled` or
-`exempt`, so it is never metered), from `PM_SYSTEM_FROM` (default `Pylota Mail <no-reply@{PM_PLATFORM_DOMAIN}>`),
+The email goes through the normal outbound pipeline from the **system identity**
+([Identities and domains › The system identity](identity-domains.md#the-system-identity)), whose address
+is `PM_SYSTEM_FROM` (default `Pylota Mail <no-reply@{PM_PLATFORM_DOMAIN}>`) and whose tenant is the
+default tenant (billing `disabled` or `exempt`, so it is never metered),
 with `Idempotency-Key: signin:{login_token_id}`; tests use the simulator (build plan M21). It contains the
 link `https://{PM_CONSOLE_HOST}/console/sign-in/link?t=<token>`, the code, and the request time. It never
 says whether the address has an account.
 
 Doing the lookup and the send after the response keeps the response identical in content and timing for
-registered and unregistered addresses ([M15]).
+registered and unregistered addresses ([W15]).
 
 ### Using the link
 
@@ -220,7 +244,7 @@ token, invitation, OAuth flow and session hashed under it stops working, and peo
 
 | Property | Value |
 |---|---|
-| Cookie | `__Host-pm_session=<value>; Path=/; Secure; HttpOnly; SameSite=Lax` ([M16]) |
+| Cookie | `__Host-pm_session=<value>; Path=/; Secure; HttpOnly; SameSite=Lax` ([W16]) |
 | Value | The link key's kid, then 32 random bytes in base64url. Only `id_hash` and `key_kid` are stored ([Keyed hashes](#keyed-hashes)) |
 | Lifetime | `expires_at = min(last_seen_at + 7 days, authenticated_at + 30 days)` |
 | `last_seen_at` | Updated at most once a minute, which also moves `expires_at` |
@@ -251,8 +275,11 @@ session of the user. Revoked and expired rows are deleted 30 days later.
 ### Re-authentication
 
 Sensitive actions require a sign-in within the last 10 minutes and write an audit row (FR-CON-5):
-creating keys, inviting or removing members, changing roles, transferring ownership, adding or removing
-domains, releasing quarantine, erasure and legal holds, and billing (Checkout and the Customer Portal).
+creating keys, creating, rotating or revoking an identity's signing keys, inviting or removing members,
+changing roles, transferring ownership, adding or removing domains, releasing quarantine, erasure and
+legal holds, and billing (Checkout and the Customer Portal). Confirming your address after a notification
+bounce is audited but needs no recent sign-in, because the re-authentication code would go to the
+suppressed address ([Notification settings](#notification-settings)).
 
 If `authenticated_at` is older, the `POST` answers `303` to `/console/reauth?next=<path>`. That page sends a
 code to the signed-in address (a new `login_tokens` row, counted in the same limits), and also asks for a
@@ -262,7 +289,7 @@ replays a form on its own.
 
 ## CSRF
 
-Three layers, all required ([M16]):
+Three layers, all required ([W16]):
 
 1. **Token.** Every form has a hidden `_csrf` field: `base64url(HMAC-SHA256(csrf_secret, "console-form"))`.
    A `POST` without it, or with a different value (constant-time comparison), gets `403`.
@@ -274,6 +301,12 @@ The forms used before a session exists (sign-in, code, link, invitation acceptan
 are checked by `Origin` alone; they cannot act as a signed-in person. The OAuth callback is a `GET` from
 the provider and is bound to the browser by its `state` and `__Host-pm_oauth` cookie instead
 ([Cloud sign-up §4](cloud-signup.md#4-google-and-github)).
+
+The unsubscribe pair (`GET` and `POST /console/notifications/unsubscribe`) is exempt from all three
+layers: it needs no session, and its `POST` is checked by neither the CSRF token nor `Origin`, because a
+mail provider sends the RFC 8058 one-click `POST` with neither ([W16](../edge-cases.md)). The token in
+the URL is its only authority, and it can only turn one notification kind off for one person in one
+workspace ([Unsubscribe links](#unsubscribe-links)).
 
 Console pages are served with `Referrer-Policy: same-origin`, not the API's `no-referrer`. The Fetch
 Standard sets the `Origin` header of a non-CORS `POST` to `null` when the page's referrer policy is
@@ -288,7 +321,7 @@ styles is there for sanitised mail, which uses inline styles and inherits the pa
 ## Showing untrusted mail
 
 Mail content is untrusted ([Security](security.md#8-untrusted-content)). The console shows it so that it
-cannot act ([M17]):
+cannot act ([W17]):
 
 - The default view is text: `extracted_text`, or the full `text`, HTML-escaped.
 - The HTML view puts the sanitised HTML (sanitised at ingest) in `<iframe sandbox srcdoc="…">`. The
@@ -311,13 +344,19 @@ Members are invited by email (FR-CON-4). The owner and admins can invite, from t
 2. If a pending invitation for the address exists (`invitations_pending` is unique per workspace and
    address), it is re-sent instead: new token, `expires_at` restarted, no new seat.
 3. Take a `seats` hold in `TenantQuota` (`ref` = the new `inv_` ID). With no seat left the request fails
-   with `402 billing_limit` and `details.feature: "seats"`, before anything is written ([M8],
+   with `402 billing_limit` and `details.feature: "seats"`, before anything is written ([W8],
    [Billing](billing.md#what-the-worker-meters)).
 4. Insert the invitation (`token_hash` and `key_kid` as in [Keyed hashes](#keyed-hashes),
    `expires_at = now + 7 days`) with its audit row and `member.invited` event in one D1 batch, then settle
    the hold.
-5. Email the link `https://{PM_CONSOLE_HOST}/console/invitations/accept?t=<token>` from the default
-   tenant and `PM_SYSTEM_FROM`, as for sign-in.
+5. Email the link `https://{PM_CONSOLE_HOST}/console/invitations/accept?t=<token>` from the system
+   identity, as for sign-in. The email says who invited the person: the inviter's name from
+   `invitations.invited_by` (the signed-in user; `NULL` when an API key created the invitation, and then the
+   workspace name alone). This works with `PM_CONSOLE=off` too: `PM_CONSOLE_HOST` and
+   `PM_SYSTEM_FROM` are top-level settings, and with the console off the router still registers the two
+   invitation routes (`GET` and `POST /console/invitations/accept`). Accepting there creates the user
+   and the membership and shows "You are now a member of {workspace}"; no session is created, because
+   the deployment has no console to sign in to.
 
 A pending invitation counts as a seat until it is accepted, revoked or expires.
 
@@ -337,10 +376,14 @@ and releases their seats; acceptance also checks `expires_at`, so a late click n
 It takes effect on the person's next request, because the role is read on every request.
 
 **Removing a member** (owner or admin, sensitive; `DELETE /v1/tenants/{id}/members/{user_id}`) and
-**leaving** run one D1 batch: delete the `members` row, revoke every session of that user whose active
-workspace is this one, write the audit row and the `member.removed` event. Then the seat is released with
-`Adjust −1`; if that call is lost, the hourly reconciliation corrects the count. The person's next request
-redirects to sign-in ([M9]). The owner cannot be removed and cannot leave (`409 owner_required`, [M10]).
+**leaving** run one D1 batch: delete the `members` row, delete the person's `notification_prefs` rows
+for this workspace, revoke every session of that user whose active workspace is this one, write the
+audit row and the `member.removed` event. Then the seat is released with `Adjust −1`; if that call is
+lost, the hourly reconciliation corrects the count. After the batch the handler calls
+`NotifierRequest::MemberRemoved { user_id }` on the workspace's Notifier, which drops the person's
+pending notifications in this workspace, so nothing more is sent to them about it ([O19](../edge-cases.md),
+[Notifications §2](notifications.md#2-preferences)). The person's next request
+redirects to sign-in ([W9]). The owner cannot be removed and cannot leave (`409 owner_required`, [W10]).
 
 **Transferring ownership** (owner only, sensitive) to an existing admin. One D1 batch, in this order,
 because the unique index on the owner is checked statement by statement:
@@ -359,7 +402,105 @@ Both statements change one row, or neither does (the target is not an admin): th
 `400 invalid_request` ("the new owner must be an admin of this workspace") and the workspace still has
 its owner. The batch also writes the audit row
 `member.ownership_transfer` and two `member.role_changed` events. Stripe's customer email does not change;
-the new owner can update it in the Customer Portal.
+the new owner can update it in the Customer Portal. After the batch commits, the handler sends the
+`account` email ([Account emails](#account-emails)).
+
+## Identity signing keys
+
+The identity page `/console/inboxes/{idn}` has a **Signing keys** section for the identity's agent
+signing keys ([Agent signing keys](agent-keys.md)). It calls the same service functions as the API's
+identity-key routes:
+
+| Action | Who | Same as |
+|---|---|---|
+| List every key (kid, `status`, `created_at`, `verify_until`, `retired_at`) and show the JWKS link `https://{PM_API_HOST}/.well-known/jwks/{identity_id}.json` | All roles (`identities:read`) | `GET /v1/identities/{identity_id}/keys` |
+| Create the first key | Owner, admin (`identities:write`); sensitive | `POST /v1/identities/{identity_id}/keys` |
+| Rotate: a new active key, the previous one `retiring` until `verify_until` | Owner, admin; sensitive | `POST /v1/identities/{identity_id}/keys/rotate` |
+| Revoke one key at once | Owner, admin; sensitive | `POST /v1/identities/{identity_id}/keys/{kid}/revoke` |
+
+- Each change needs a recent sign-in ([Re-authentication](#re-authentication)), writes the audit row
+  `identity_key.create`, `identity_key.rotate` or `identity_key.revoke` (the actions the API writes) and
+  emits the matching `identity.key_*` event. A create that finds an active key, or a revoke of a key
+  that is already `retired`, changes nothing and writes no audit row or event.
+- Key management stays available while the identity is paused, so a suspected leak can be handled before
+  it resumes; the page says that a paused identity's JWKS is withdrawn and that it cannot sign.
+- The page shows public data only. No private key is ever displayed, and the console has no form that
+  mints an assertion or a signed request: agents sign through the API and MCP.
+
+## Notifications
+
+People get email about their workspace: usage alerts, new mail in inboxes they follow, the daily list of
+things that need a person, and `account` emails ([Notifications](notifications.md)). The console owns the
+preferences, the unsubscribe links and the `account` emails its own handlers trigger.
+
+### Notification settings
+
+`/console/settings/notifications` sets the signed-in person's own preferences for the active workspace,
+one `notification_prefs` row per kind ([Notifications §2](notifications.md#2-preferences)). Every role
+can open it. Nobody can change another person's preferences, and there is no API for them: API keys are
+not people.
+
+| Kind | Choices on the page | Default (no row) |
+|---|---|---|
+| `usage` | `off` or `instant` | `instant` for owner and admin; `off` for member and viewer |
+| `new_mail` | `off`, `instant`, `hourly` or `daily`; the inboxes to follow (every inbox, or chosen ones); the filter (`all`, or only messages triage marks `needs_reply`) | `off` |
+| `needs_person` | `off` or `daily` | `daily` for owner and admin; `off` for member and viewer |
+| `account` | Always on, shown read-only | On |
+
+- **Saving** is a `POST` with the CSRF token; it is not a sensitive action. It upserts the row for
+  `(user_id, tenant_id, kind)` with the user and workspace taken from the session, never from the form
+  ([W18]). A mode the kind does not accept, or an inbox ID outside the workspace, is refused like any
+  invalid or foreign value; the system identity is never offered. A kind with no row follows the default
+  of the person's current role.
+- **Bounce banner.** A hard bounce or complaint on a notification sets `paused_reason` on every
+  preference of the person in every workspace ([O17](../edge-cases.md)). Every console page then shows a
+  banner, and this page explains it with a **Confirm my address** button. Confirming needs the session
+  but not a recent sign-in: re-authentication codes, like every message from the system identity, are
+  not delivered to the suppressed address. One D1 batch clears `paused_reason` on all of the person's rows, removes the system
+  identity's suppression of their address (the default tenant's `suppressions` row for it) and writes
+  the audit row `user.notifications_resume`.
+- **Cap notice.** When the person's daily cap (50) or the workspace's (200) has been reached, the page
+  says so: further notifications that day go into the next daily digest ([O24](../edge-cases.md)).
+- **When notifications are off.** With `PM_NOTIFICATIONS=off`, or while the workspace is suspended, the
+  page says that only `account` emails are sent ([O26](../edge-cases.md)). With `PM_BILLING=off`, it says
+  that `usage` covers only features with an operator quota in tenant policy ([O23](../edge-cases.md)).
+
+### Unsubscribe links
+
+Every `usage`, `new_mail` and `needs_person` email carries
+`List-Unsubscribe: <https://{PM_CONSOLE_HOST}/console/notifications/unsubscribe?t={token}>` and
+`List-Unsubscribe-Post: List-Unsubscribe=One-Click` (RFC 8058). The token (a MAC under the current `link`
+key with its kid, binding the person, the workspace and the kind, valid 90 days) is defined in
+[Notifications §5](notifications.md#5-the-emails).
+
+| Route | Does |
+|---|---|
+| `GET /console/notifications/unsubscribe?t=…` | Changes nothing. With a valid token it shows the workspace and the kind with one **Unsubscribe** button, a form that `POST`s to the same URL. A mail scanner that opens the link unsubscribes no one |
+| `POST /console/notifications/unsubscribe?t=…` | Verifies the token and sets that kind to `off` for that person and workspace (an upsert of the `notification_prefs` row), then shows a confirmation page with a link to the settings page. This is the request a mail provider sends for a one-click unsubscribe |
+
+- No session is needed and none is created. Both routes are exempt from the CSRF token and `Origin`
+  check ([CSRF](#csrf)), and both are served even with `PM_CONSOLE=off`.
+- An expired, altered or foreign token (another person's, another workspace's, or one whose `link` key
+  has left its 7-day verify window after a rotation) changes nothing and gets the same page, linking to
+  `/console/settings/notifications`, whichever check failed ([O18](../edge-cases.md)).
+- It is not a sensitive action and writes no audit row: it only turns a notification off, as the person
+  asked. `account` emails have no unsubscribe header.
+
+### Account emails
+
+`account` emails cannot be turned off ([Notifications §1](notifications.md#1-kinds)). The console
+handlers that perform one of these actions call `NotifierRequest::Account { user_id, event }` on the
+`Notifier` of the person's active workspace after their D1 batch commits:
+
+| Event | Handler | Sent to |
+|---|---|---|
+| Two-step verification turned off | `/console/settings/security` ([Cloud sign-up §5](cloud-signup.md#5-two-step-verification)) | The person |
+| A new sign-in method linked | The Google or GitHub callback, when it links a provider identity to an existing person ([Cloud sign-up §4](cloud-signup.md#4-google-and-github)) | The person |
+| Ownership transferred | [Members](#members) | The previous owner and the new owner |
+
+The fourth `account` event, a failed payment, belongs to [Billing](billing.md) and goes to the owner. `account` emails are
+sent with `PM_NOTIFICATIONS=off`, to a suspended workspace, past the daily caps and while a person's
+other preferences are paused.
 
 ## Screens
 
@@ -371,12 +512,13 @@ the new owner can update it in the Customer Portal.
 | `/console/waitlist` | Join the waitlist, with double opt-in (`PM_SIGNUP=waitlist`; [Cloud sign-up §6.1](cloud-signup.md#61-before-launch-the-waitlist)) | Anyone |
 | `/console/oauth/{provider}/start`, `/console/oauth/{provider}/callback` | Redirects to and from Google or GitHub; no page of their own ([Cloud sign-up §4](cloud-signup.md#4-google-and-github)) | Anyone |
 | `/console/invitations/accept` | Accept an invitation | Anyone with a link |
+| `/console/notifications/unsubscribe` | Confirm and apply a one-click unsubscribe from a notification kind ([Unsubscribe links](#unsubscribe-links)) | Anyone with a link; no session |
 | `/console/reauth` | Confirm it is you, with a code (and a two-step code when enrolled) | Signed in |
 | `/console/workspaces` | Workspace picker and switcher | Signed in |
 | `/console/workspaces/new` | Create your workspace: name, address suffix, time zone ([Cloud sign-up §6.2](cloud-signup.md#62-after-launch-open-sign-up)) | Signed in, with no workspace or pending invitation, when sign-up is open |
 | `/console` | Overview, the workspace home: banners, the first-run checklist, "Needs a person", usage meters, inboxes and recent activity ([Cloud sign-up §8](cloud-signup.md#8-the-overview-the-screen-people-land-on)) | All roles (viewers without action buttons) |
 | `/console/connect` | Connect your agent: the `claude mcp add` line, `.mcp.json`, a `curl` request and `pmail login`, with a key ID filled in, never a secret | Owner, admin |
-| `/console/inboxes`, `/console/inboxes/{idn}` | Identities with their addresses and status; one identity's threads with triage | All roles |
+| `/console/inboxes`, `/console/inboxes/{idn}` | Identities with their addresses and status; one identity's threads with triage, and its signing keys with the JWKS link ([Identity signing keys](#identity-signing-keys)) | All roles. Create, rotate and revoke signing keys: owner, admin |
 | `/console/inboxes/{idn}/threads/{thr}` | A thread; each message in text view, HTML on request ([Showing untrusted mail](#showing-untrusted-mail)) | All roles |
 | `/console/search` | Search one identity or the whole workspace, with facets; agentic answers with citations | All roles (agentic: not viewers) |
 | `/console/quarantine` | Quarantined mail with reasons; release | Owner, admin, member |
@@ -387,8 +529,9 @@ the new owner can update it in the Customer Portal.
 | `/console/plan` | Plan, a meter per allowance, upgrade, top-ups, manage billing ([Billing](billing.md#checkout)) | View: all roles. Buy: owner |
 | `/console/plan/return` | Return from Stripe Checkout: confirms the plan once the webhook has applied it ([Cloud sign-up §9](cloud-signup.md#9-coming-back-from-checkout)) | Owner |
 | `/console/audit` | Audit log with filters | Owner, admin |
-| `/console/settings` | Your name and sessions; delete your account; workspace name, time zone, `require_two_factor` (owner) and effective policy (read-only) | All roles |
+| `/console/settings` | Your name and sessions; the terms version you accepted and when (`users.terms_version`, `terms_accepted_at`; "not recorded" for people who joined by invitation before sign-up opened); delete your account; workspace name, time zone and `require_two_factor` (owner only, through the console-only owner handler; never the platform-only tenant fields) and the effective policy (read-only) | All roles |
 | `/console/settings/security` | Two-step verification: enrol with a QR code, recovery codes, turn off (re-authentication needed) ([Cloud sign-up §5](cloud-signup.md#5-two-step-verification)) | Signed in |
+| `/console/settings/notifications` | Your notification preferences for the active workspace: kinds, modes, followed inboxes and the `needs_reply` filter; the bounce banner and **Confirm my address**; the daily-cap notice ([Notification settings](#notification-settings)) | All roles, each for themselves |
 
 With `PM_BILLING=off`, `/console/plan` shows usage only, with no plans or buttons.
 
@@ -404,6 +547,8 @@ The schema is in [Data model](data-model.md#1-d1-control-plane). How this design
 | `login_tokens` | One row per sign-in or re-authentication request, holding both the link and the code hashes and the attempt count. Deleted 24 hours after expiry |
 | `sessions` | Console sessions with their CSRF secret and the time of the last sign-in. Deleted 30 days after expiry or revocation |
 | `oauth_identities`, `oauth_states`, `waitlist` | Google and GitHub links, OAuth flows in progress, and the waitlist ([Cloud sign-up §11](cloud-signup.md#11-data-model)) |
+| `notification_prefs` | One row per person, workspace and kind that has been saved or paused; a missing row means the default for the person's role. Written by the settings page and by unsubscribe; `paused_reason` is set by a notification bounce or complaint and cleared by **Confirm my address**. Deleted for that workspace when a member is removed or leaves, for every workspace when a person deletes their account, and with the workspace by tenant erasure |
+| `identity_keys` | Read for the identity page's key list; written only through the identity-key service functions that the API uses |
 
 Tokens, codes, cookie values and OAuth `state` values in these tables are always keyed hashes under a
 `link` key, with its kid, never the value itself. Values the Worker must use again (TOTP secrets,
@@ -426,6 +571,8 @@ Every sensitive action writes an `audit_log` row in the same D1 batch as the cha
 | `member.ownership_transfer` | Ownership transferred | Two `member.role_changed` events |
 | `user.delete` | A person deleted their account ([Privacy › People](privacy.md#69-people-console-accounts)) | – |
 | `user.two_factor_enable`, `user.two_factor_disable` | Two-step verification turned on or off ([Cloud sign-up §5](cloud-signup.md#5-two-step-verification)) | – |
+| `user.notifications_resume` | A person confirmed their address after a notification bounce or complaint ([Notification settings](#notification-settings)); `tenant_id` is `NULL`, because it clears the pause in every workspace | – |
+| `identity_key.create`, `identity_key.rotate`, `identity_key.revoke` | An identity's signing key created, rotated or revoked on the identity page (the API writes the same actions) | `identity.key_created`, `identity.key_rotated`, `identity.key_revoked` |
 | `waitlist.invite` | The operator invited a batch from the waitlist ([Cloud sign-up §6.1](cloud-signup.md#61-before-launch-the-waitlist)) | – |
 
 The other sensitive actions use the same audit actions as the API (for example `key.create`,
@@ -440,8 +587,8 @@ the workspace's `tenant_id` and delivered like `webhook.disabled`
 
 1. **`RL_SIGNIN`.** Closed: 10 requests per 60 seconds per client IP, keyed by `CF-Connecting-IP`
    ([Sign-in](#sign-in), [Cloud sign-up §10](cloud-signup.md#10-abuse-and-safety-on-cloud)).
-2. **System mail sender.** Closed: `PM_SYSTEM_FROM` names the platform identity that sends sign-in,
-   invitation and notification mail ([Cloud sign-up §10](cloud-signup.md#10-abuse-and-safety-on-cloud),
+2. **System mail sender.** Closed: `PM_SYSTEM_FROM` is the address of the system identity that sends
+   sign-in, invitation and notification mail ([Identities and domains › The system identity](identity-domains.md#the-system-identity)) ([Cloud sign-up §10](cloud-signup.md#10-abuse-and-safety-on-cloud),
    [§12](cloud-signup.md#12-configuration)).
 3. **Actor of console actions.** Closed: `audit_log.actor_user_id` records the person
    ([Data model](data-model.md#1-d1-control-plane)), and `message.released` carries `released_by_user_id`
@@ -459,28 +606,32 @@ the workspace's `tenant_id` and delivered like `webhook.disabled`
 
 | Test | Proves | Covers |
 |---|---|---|
-| `it::members::m8_seat_limit` | An invitation with no seat left gets `402` with `feature: seats`; pending invitations count as seats; a re-sent invitation takes no new seat | [M8], FR-CON-4 |
-| `it::members::m9_remove_revokes_sessions` | After removal the member's next request redirects to sign-in, including a request made with a session created before the removal | [M9], FR-CON-4 |
-| `it::members::m10_owner_required` | Removing, demoting or leaving as the owner gets `409 owner_required`; a transfer to a non-admin changes nothing | [M10], FR-CON-2 |
-| `it::console::m15_signin_limits` | A fourth request in 10 minutes is refused; a token burns after 10 failed codes; an 11th request from one client IP within 60 seconds is refused by `RL_SIGNIN`; responses for known and unknown addresses are byte-identical apart from the request ID, and no email goes to an unknown address | [M15], FR-CON-3 |
-| `it::console::m16_csrf` | A `POST` without the token, with another session's token, without `Origin`, with `Origin: null` or a foreign origin gets `403`; the cookie has `__Host-`, `Secure`, `HttpOnly` and `SameSite=Lax` | [M16], FR-CON-1 |
-| `it::console::m17_hostile_html` | The hostile-HTML corpus renders in a sandboxed `srcdoc` frame under the CSP: no script runs, no remote request is made, no form posts | [M17], FR-CON-6 |
-| `it::console::m18_role_and_scope` (table test) | Each role against each route of [Roles](#roles) gets exactly the allowed outcome; IDs from another workspace give `404`; a `tenant_id` in a form is ignored | [M18], FR-CON-2 |
+| `it::members::w8_seat_limit` | An invitation with no seat left gets `402` with `feature: seats`; pending invitations count as seats; a re-sent invitation takes no new seat | [W8], FR-CON-4 |
+| `it::members::w9_remove_revokes_sessions` | After removal the member's next request redirects to sign-in, including a request made with a session created before the removal | [W9], FR-CON-4 |
+| `it::members::w10_owner_required` | Removing, demoting or leaving as the owner gets `409 owner_required`; a transfer to a non-admin changes nothing | [W10], FR-CON-2 |
+| `it::console::w15_signin_limits` | A fourth request in 10 minutes is refused; a token burns after 10 failed codes; an 11th request from one client IP within 60 seconds is refused by `RL_SIGNIN`; responses for known and unknown addresses are byte-identical apart from the request ID, and no email goes to an unknown address | [W15], FR-CON-3 |
+| `it::console::w16_csrf` | A `POST` without the token, with another session's token, without `Origin`, with `Origin: null` or a foreign origin gets `403`; the cookie has `__Host-`, `Secure`, `HttpOnly` and `SameSite=Lax`; the unsubscribe `POST` alone is accepted without a session, token or `Origin` | [W16], FR-CON-1 |
+| `it::console::w17_hostile_html` | The hostile-HTML corpus renders in a sandboxed `srcdoc` frame under the CSP: no script runs, no remote request is made, no form posts | [W17], FR-CON-6 |
+| `it::console::w18_role_and_scope` (table test) | Each role against each route of [Roles](#roles) gets exactly the allowed outcome; IDs from another workspace give `404`; a `tenant_id` in a form is ignored | [W18], FR-CON-2 |
 | `it::console::signin_link_and_code` | The link `GET` does not consume the token; link and code are single use and burn each other; expired tokens fail | FR-CON-3 |
 | `it::console::session_lifetime` | 7-day rolling and 30-day absolute expiry with a fake clock; sign-out and sign-out-everywhere | FR-CON-3 |
 | `it::console::reauth_sensitive` | Each sensitive action redirects to re-authentication after 10 minutes, writes an audit row, and the session is rotated | FR-CON-5 |
 | `it::members::invitation_lifecycle` | Accept, re-send, revoke and expire, with the seat count after each | FR-CON-4 |
 | `it::members::ownership_transfer` | Exactly one owner before and after; concurrent transfers leave one owner | FR-CON-2 |
 | `it::console::quarantine_release` | A member releases with re-authentication and an audit row; with key release off, an API key cannot release | FR-CON-6 |
-| `it::console::disabled` | `PM_CONSOLE=off` removes every `/console` route; the members API still works | FR-CON-7 |
+| `it::console::disabled` | `PM_CONSOLE=off` removes every `/console` route except the invitation-accept and unsubscribe pairs; the members API still works | FR-CON-7 |
+| `it::console::notification_settings` | Each role sees its defaults; saving writes rows for the session's person and workspace only; a mode a kind does not accept and an inbox from another workspace are refused; `account` cannot be turned off; the cap notice appears after the 50th email of the day | FR-CON-14, FR-CON-15 |
+| `it::console::identity_keys_page` | Every role sees the key list and the JWKS link; only owner and admin can create, rotate and revoke, each after re-authentication with an `identity_key.*` audit row and event; a paused identity's keys can still be revoked | FR-IDN-6, [W18] |
+| `it::console::account_emails` | Turning two-step verification off, linking a sign-in method and transferring ownership each send one `account` email after the batch commits, also with `PM_NOTIFICATIONS=off` | FR-CON-15 |
+| `it::notify::one_click_unsubscribe`, `it::notify::bounce_pauses_prefs`, `it::notify::member_removed_drops_pending` ([Notifications §10](notifications.md#10-tests)) | Unsubscribe without a session; the bounce banner and **Confirm my address**; member removal deletes preferences | [O17](../edge-cases.md)–[O19](../edge-cases.md) |
 | `cli::setup::owner_email` ([CLI and setup](cli.md)) plus `it::console::first_owner_signin` | `pmail setup --owner-email` creates the default tenant's owner, who receives a link and can sign in | FR-CON-7 |
 | Playwright `console_no_js` | Every console route works with `javaScriptEnabled: false`; an axe scan finds no serious violation | FR-CON-1, M21 |
 | `it::console::render_budget` | Server render time p95 ≤ 300 ms on the fixture workspace | NFR-CON-1 |
 
-[M8]: ../edge-cases.md
-[M9]: ../edge-cases.md
-[M10]: ../edge-cases.md
-[M15]: ../edge-cases.md
-[M16]: ../edge-cases.md
-[M17]: ../edge-cases.md
-[M18]: ../edge-cases.md
+[W8]: ../edge-cases.md
+[W9]: ../edge-cases.md
+[W10]: ../edge-cases.md
+[W15]: ../edge-cases.md
+[W16]: ../edge-cases.md
+[W17]: ../edge-cases.md
+[W18]: ../edge-cases.md

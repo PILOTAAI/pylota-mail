@@ -21,13 +21,16 @@ info:
     - **Not described here.** The server-rendered console (`/console/*`, including `/console/sign-in…`,
       `/console/sign-up`, `/console/waitlist`, `/console/workspaces/new`,
       `/console/oauth/{provider}/start`, `/console/oauth/{provider}/callback`,
-      `/console/settings/security`, `/console/plan/return` and `/console/connect`) and
+      `/console/settings/security`, `/console/settings/notifications`, `/console/plan/return`,
+      `/console/connect` and the notification unsubscribe pair `/console/notifications/unsubscribe`) and
       `/billing/stripe/webhook` (Stripe events) are served by the same Worker but are not part of the
-      developer API: they use session cookies, OAuth state and Stripe signatures, not API keys.
+      developer API: they use session cookies, OAuth state, unsubscribe tokens and Stripe signatures, not
+      API keys.
     - **Hosts.** The console answers on `PM_CONSOLE_HOST`, which defaults to `PM_API_HOST`. When the two
-      differ, console paths answer only on `PM_CONSOLE_HOST` and API paths (REST, MCP, `/hooks/*`,
-      `/billing/stripe/webhook`, `/health`, `/v1/links/*`) only on `PM_API_HOST`; anything else returns `404`, and no cookie is set
-      or read on the API host.
+      differ, console paths answer only on `PM_CONSOLE_HOST`, and the API host `PM_API_HOST` serves only
+      the REST API (`/v1/*`), MCP (`/mcp`), `/openapi.json`, `/health`, `/.well-known/*`, signed links
+      (`/v1/links/*`), `/hooks/*` and `/billing/stripe/webhook`; anything else returns `404`, and no
+      cookie is set or read on the API host.
     - **Format.** JSON (`application/json; charset=utf-8`). Times are RFC 3339 UTC strings. Sizes are bytes.
     - **IDs** are a type prefix, an underscore and a 26-character upper-case Crockford base32 ULID
       (`ten_ idn_ adr_ dom_ thr_ msg_ att_ whk_ dlv_ evt_ key_ era_ exp_ job_ aud_ req_ usr_ inv_ dlq_ hld_ prb_`).
@@ -35,7 +38,8 @@ info:
       `{ "data": [...], "next_cursor": "…" | null }`. Cursors are opaque and expire after 24 hours
       (`410 cursor_expired`).
     - **Idempotency.** `Idempotency-Key` is required on send, reply, reply-all and forward (except on a
-      dry run, `dry_run=true`), and optional on every other `POST`. Keys are kept for 30 days, scoped per
+      dry run, `dry_run=true`), and optional on every other `POST` except the two signing endpoints
+      (`…/assertions` and `…/http-signatures`), which ignore it and never record it. Keys are kept for 30 days, scoped per
       identity for mail and per tenant for everything else. A replay returns the original response with the header `Idempotent-Replayed: true`
       (and `"deduplicated": true` in mail responses).
     - **Rate limits.** Every authenticated response carries `RateLimit-Limit`, `RateLimit-Remaining` and
@@ -55,8 +59,8 @@ info:
     | `x-required-permission` | operation | Array of permissions the key must hold, all of them. `[]` means any valid key |
     | `x-key-levels` | operation | Key levels (`platform`, `tenant`, `identity`) that can call the operation at all |
     | `x-permission-notes` | operation | Conditional permission or scope rules that the two fields above cannot express |
-    | `x-rate-limit-buckets` | operation | Rate-limit buckets the request counts against (`api`, `search`, `agentic`, `send`) |
-    | `x-idempotency` | operation | `required`, `optional` or `none` for the `Idempotency-Key` header. `required` means a request without it fails with `400 idempotency_key_required`, except a dry run (`dry_run=true`) |
+    | `x-rate-limit-buckets` | operation | Rate-limit buckets the request counts against (`api`, `search`, `agentic`, `send`, `sign`) |
+    | `x-idempotency` | operation | `required`, `optional` or `none` for the `Idempotency-Key` header. `required` means a request without it fails with `400 idempotency_key_required`, except a dry run (`dry_run=true`). `none` means the header is ignored and never recorded |
     | `x-error-codes` | response | The `error.code` values this operation can return with that status |
 
     ## Licence
@@ -85,6 +89,10 @@ tags:
     description: Agent identities (one mailbox each).
   - name: Addresses
     description: The addresses of an identity, with promotion to primary and retirement.
+  - name: Identity keys
+    description: >-
+      An identity's Ed25519 signing keys, agent assertions (signed JWTs) and signed HTTP requests (Web Bot
+      Auth). Private keys never leave the Worker and no endpoint returns them.
   - name: Domains
     description: The platform domain and tenant domains, DNS records and health.
   - name: Threads
@@ -120,7 +128,9 @@ tags:
   - name: Links and hooks
     description: Signed links and the two Amazon SES notification endpoints (delivery events and inbound mail). No API key.
   - name: Well-known
-    description: Documents served at `/.well-known/` on the API host.
+    description: >-
+      Documents served at `/.well-known/` on the API host: the security contact, each identity's JWK Set
+      and the Web Bot Auth key directory. No API key.
   - name: Events
     description: Webhook events delivered to your endpoints (Standard Webhooks).
 
@@ -559,13 +569,23 @@ paths:
       summary: List the identities the key can reach
       description: >-
         A platform key sees every identity and can filter by `tenant_id`. A tenant key sees its tenant's
-        identities. An identity key sees only its own identity.
+        identities. An identity key sees only its own identity. The system identity (the sender of
+        `PM_SYSTEM_FROM`) is never listed.
       x-required-permission: ['identities:read']
       x-key-levels: [platform, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
         - $ref: '#/components/parameters/TenantIdQuery'
+        - name: status
+          in: query
+          description: Only identities with this status.
+          schema: {$ref: '#/components/schemas/IdentityStatus'}
+        - name: purpose
+          in: query
+          description: Only identities with this purpose tag.
+          schema:
+            type: string
         - $ref: '#/components/parameters/Limit'
         - $ref: '#/components/parameters/Cursor'
       responses:
@@ -699,7 +719,9 @@ paths:
       summary: Delete an identity
       description: >-
         Starts an identity-scope erasure (FR-IDN-4). The identity's addresses are tombstoned and can never
-        be assigned to another identity; later mail to them gets `550 5.1.1`.
+        be assigned to another identity; later mail to them gets `550 5.1.1`. Its signing keys are deleted
+        and their key IDs tombstoned, so they are never published again ([O7]). While the identity is
+        `deleting` or `deleted`, signing and its JWK Set return `404 identity_not_found`.
       x-required-permission: ['identities:write', 'erasure:manage']
       x-key-levels: [platform, tenant, identity]
       x-rate-limit-buckets: [api]
@@ -1043,6 +1065,524 @@ paths:
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
 
+  # ───────────────────────────────────────── Identity keys ────────────────────────────────────────
+
+  /identities/{identity_id}/keys:
+    parameters:
+      - $ref: '#/components/parameters/IdentityIdPath'
+    get:
+      operationId: listIdentityKeys
+      tags: [Identity keys]
+      summary: List an identity's signing keys
+      description: >-
+        Every key the identity has, `retired` ones included, newest first, with its state, `created_at`,
+        `verify_until` and public JWK. Private keys are never returned. Key management stays available
+        while the identity is paused (including every identity of a suspended tenant), so a suspected leak
+        can be handled before it resumes. A `deleting` or `deleted` identity returns `404 identity_not_found`.
+      x-required-permission: ['identities:read']
+      x-key-levels: [platform, tenant, identity]
+      x-rate-limit-buckets: [api]
+      x-idempotency: none
+      parameters:
+        - name: status
+          in: query
+          description: Only keys in this state.
+          schema: {$ref: '#/components/schemas/IdentityKeyStatus'}
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: A page of keys, newest first.
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
+            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
+            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/IdentityKeyPage'}
+              example:
+                data:
+                  - kid: zMkUmAQOlq9JtFPzTK1XINZdWd7gmhXxgA8Ph7cNKHo
+                    identity_id: idn_01J9Z3K8V4QW7X2M5N6P8R0T1Y
+                    status: active
+                    alg: EdDSA
+                    public_jwk:
+                      kty: OKP
+                      crv: Ed25519
+                      x: NjwMjIq2mTA1VpuDzRvkMIfQ0sCSHWavo0KT_4FcKO0
+                      kid: zMkUmAQOlq9JtFPzTK1XINZdWd7gmhXxgA8Ph7cNKHo
+                      alg: EdDSA
+                      use: sig
+                    created_at: '2026-10-09T09:00:00Z'
+                    verify_until: null
+                    retired_at: null
+                  - kid: kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k
+                    identity_id: idn_01J9Z3K8V4QW7X2M5N6P8R0T1Y
+                    status: retiring
+                    alg: EdDSA
+                    public_jwk:
+                      kty: OKP
+                      crv: Ed25519
+                      x: 11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo
+                      kid: kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k
+                      alg: EdDSA
+                      use: sig
+                    created_at: '2026-10-02T09:00:00Z'
+                    verify_until: '2026-10-16T09:00:00Z'
+                    retired_at: null
+                next_cursor: null
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '410': {$ref: '#/components/responses/CursorExpired'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    post:
+      operationId: createIdentityKey
+      tags: [Identity keys]
+      summary: Create the identity's first signing key
+      description: >-
+        Creates the identity's first Ed25519 key when none is `active` and returns it with `201`; when an
+        active key exists, returns it unchanged with `200`. No body is needed (an empty JSON object is
+        accepted). Keys are also created lazily, on the identity's first signing request. The 32-byte seed
+        comes from the platform CSPRNG, is sealed under `PM_MASTER_KEY` at once and never leaves the
+        Worker. A thumbprint found in the key tombstones is refused and a new seed drawn. When a key is
+        created, `identity.key_created` is emitted and the audit action is `identity_key.create`. Available
+        while the identity is paused; a `deleting` or `deleted` identity returns `404 identity_not_found`.
+      x-required-permission: ['identities:write']
+      x-key-levels: [platform, tenant, identity]
+      x-rate-limit-buckets: [api]
+      x-idempotency: optional
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyOptional'
+      responses:
+        '201':
+          description: The identity had no active key; this one was created and is `active`.
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
+            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
+            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
+            Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/IdentityKey'}
+              example:
+                kid: kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k
+                identity_id: idn_01J9Z3K8V4QW7X2M5N6P8R0T1Y
+                status: active
+                alg: EdDSA
+                public_jwk:
+                  kty: OKP
+                  crv: Ed25519
+                  x: 11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo
+                  kid: kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k
+                  alg: EdDSA
+                  use: sig
+                created_at: '2026-10-02T09:00:00Z'
+                verify_until: null
+                retired_at: null
+        '200':
+          description: The identity already has an active key. It is returned unchanged and no event is emitted.
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
+            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
+            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
+            Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/IdentityKey'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/IdempotencyConflict'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+
+  /identities/{identity_id}/keys/rotate:
+    parameters:
+      - $ref: '#/components/parameters/IdentityIdPath'
+    post:
+      operationId: rotateIdentityKey
+      tags: [Identity keys]
+      summary: Rotate an identity's signing key
+      description: >-
+        Creates a new `active` key at once and moves the previous active key to `retiring`, with
+        `verify_until` = now + `PM_IDENTITY_KEY_OVERLAP_DAYS` (default 7 days). The retiring key stays in
+        the JWK Set and does not sign, so an assertion signed just before the rotation still verifies until
+        then ([O2]); new assertions use the new key. With no active key, it creates the first one and
+        `previous` is `null`. No body. Emits `identity.key_rotated`; the audit action is
+        `identity_key.rotate`. Available while the identity is paused; a `deleting` or `deleted` identity
+        returns `404 identity_not_found`.
+      x-required-permission: ['identities:write']
+      x-key-levels: [platform, tenant, identity]
+      x-rate-limit-buckets: [api]
+      x-idempotency: optional
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyOptional'
+      responses:
+        '200':
+          description: The new active key, and the previous key, now `retiring` (or `null`).
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
+            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
+            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
+            Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/IdentityKeyRotation'}
+              example:
+                key:
+                  kid: zMkUmAQOlq9JtFPzTK1XINZdWd7gmhXxgA8Ph7cNKHo
+                  identity_id: idn_01J9Z3K8V4QW7X2M5N6P8R0T1Y
+                  status: active
+                  alg: EdDSA
+                  public_jwk:
+                    kty: OKP
+                    crv: Ed25519
+                    x: NjwMjIq2mTA1VpuDzRvkMIfQ0sCSHWavo0KT_4FcKO0
+                    kid: zMkUmAQOlq9JtFPzTK1XINZdWd7gmhXxgA8Ph7cNKHo
+                    alg: EdDSA
+                    use: sig
+                  created_at: '2026-10-09T09:00:00Z'
+                  verify_until: null
+                  retired_at: null
+                previous:
+                  kid: kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k
+                  identity_id: idn_01J9Z3K8V4QW7X2M5N6P8R0T1Y
+                  status: retiring
+                  alg: EdDSA
+                  public_jwk:
+                    kty: OKP
+                    crv: Ed25519
+                    x: 11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo
+                    kid: kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k
+                    alg: EdDSA
+                    use: sig
+                  created_at: '2026-10-02T09:00:00Z'
+                  verify_until: '2026-10-16T09:00:00Z'
+                  retired_at: null
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/IdempotencyConflict'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+
+  /identities/{identity_id}/keys/{kid}/revoke:
+    parameters:
+      - $ref: '#/components/parameters/IdentityIdPath'
+      - $ref: '#/components/parameters/IdentityKeyKidPath'
+    post:
+      operationId: revokeIdentityKey
+      tags: [Identity keys]
+      summary: Revoke an identity's signing key
+      description: >-
+        Moves the key straight to `retired`, whatever its state, for a suspected compromise. It is absent
+        from the next JWK Set response; verifiers cache the set for at most 5 minutes, so they stop
+        accepting it within that time ([O3]). The row is kept until the identity is deleted, so its
+        thumbprint is never reused. An unknown `kid` returns `404 key_not_found`. A key that is already
+        `retired` is returned unchanged with `200`, and no event is emitted. Otherwise emits
+        `identity.key_revoked`; the audit action is `identity_key.revoke`. No body. Available while the
+        identity is paused.
+      x-required-permission: ['identities:write']
+      x-key-levels: [platform, tenant, identity]
+      x-rate-limit-buckets: [api]
+      x-idempotency: optional
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyOptional'
+      responses:
+        '200':
+          description: The key, now `retired` with `retired_at` set.
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
+            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
+            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
+            Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/IdentityKey'}
+              example:
+                kid: kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k
+                identity_id: idn_01J9Z3K8V4QW7X2M5N6P8R0T1Y
+                status: retired
+                alg: EdDSA
+                public_jwk:
+                  kty: OKP
+                  crv: Ed25519
+                  x: 11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo
+                  kid: kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k
+                  alg: EdDSA
+                  use: sig
+                created_at: '2026-10-02T09:00:00Z'
+                verify_until: '2026-10-16T09:00:00Z'
+                retired_at: '2026-10-09T10:30:00Z'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404':
+          description: >-
+            The identity is unknown, out of scope, `deleting` or `deleted` (`identity_not_found`), or it has
+            no key with this `kid` (`key_not_found`).
+          x-error-codes: [identity_not_found, key_not_found]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '409': {$ref: '#/components/responses/IdempotencyConflict'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+
+  /identities/{identity_id}/assertions:
+    parameters:
+      - $ref: '#/components/parameters/IdentityIdPath'
+    post:
+      operationId: createAssertion
+      tags: [Identity keys]
+      summary: Mint an agent assertion
+      description: |
+        Mints a short-lived JWT, signed with the identity's active Ed25519 key, that any service can verify
+        against the identity's JWK Set (`/.well-known/jwks/{identity_id}.json`). The identity's first
+        signing request creates its key when it has none.
+
+        - **Header**: `{"alg":"EdDSA","typ":"agent-assertion+jwt","kid":"<thumbprint>"}`.
+        - **Claims**: `iss` (`https://{PM_API_HOST}`), `sub` (the identity ID), `aud` (the requested
+          audience), `iat` and `nbf` (now), `exp` (now + `expires_in`), `jti` (a new ULID), `email` (the
+          identity's primary address), `email_verified` (`true`), `name` (the display name), `org` (the
+          workspace name), `accountable_human` (`true` when the identity has an accountable owner; the
+          owner's name and address are never included), `ai_agent` (`true`), and `nonce` and `ext` when given.
+        - **Not stored.** Each call mints a new token, so `Idempotency-Key` is ignored and never recorded.
+          The token is never stored or logged; only a count is kept (`usage_daily` metric `assertions`).
+          Signing is not metered against any plan allowance.
+        - **Refusals**: `400 invalid_request` for a missing or invalid `audience`, an `expires_in` outside
+          60–600 or an invalid `ext` ([O4], [O5], [O6]); `403 tenant_suspended` when the tenant is suspended (checked first, as on sends);
+          `409 identity_paused` for a paused identity; `404 identity_not_found` for a `deleting` or
+          `deleted` identity ([O1]).
+
+        A verifier checks `alg` and `typ`, trusts only the issuers it knows, fetches
+        `{iss}/.well-known/jwks/{sub}.json` (caching it for at most 5 minutes), verifies the signature, and
+        checks `aud`, `nbf` and `exp` with 60 seconds of clock skew and `jti` against replays
+        (`project/design/agent-keys.md`, section 4.3). The Rust SDK does this in `verify_assertion`.
+      x-required-permission: ['identities:sign']
+      x-key-levels: [tenant, identity]
+      x-permission-notes: Platform keys cannot hold `identities:sign`. An identity key signs only as its own identity.
+      x-rate-limit-buckets: [api, sign]
+      x-idempotency: none
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AssertionRequest'}
+            example:
+              audience: https://portal.supplier.example
+              expires_in: 300
+              nonce: b3f1c2d47a9e
+              ext:
+                booking_ref: BK-2291
+      responses:
+        '201':
+          description: The assertion. It is not stored, so keep it until it expires.
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
+            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
+            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AssertionResponse'}
+              example:
+                assertion: eyJhbGciOiJFZERTQSIsInR5cCI6ImFnZW50LWFzc2VydGlvbitqd3QiLCJraWQiOiJ6TWtVbUFRT2xxOUp0RlB6VEsxWElOWmRXZDdnbWhYeGdBOFBoN2NOS0hvIn0.eyJpc3MiOiJodHRwczovL21haWwuZXhhbXBsZS5jb20iLCJzdWIiOiJpZG5fMDFKOVozSzhWNFFXN1gyTTVONlA4UjBUMVkiLCJhdWQiOiJodHRwczovL3BvcnRhbC5zdXBwbGllci5leGFtcGxlIiwiaWF0IjoxNzkxNTQ3MjAwLCJuYmYiOjE3OTE1NDcyMDAsImV4cCI6MTc5MTU0NzUwMCwianRpIjoiMDFNNEc4SE1HMFo2RzI1RVZBTjM2UFFHMEgiLCJlbWFpbCI6ImJvb2tpbmdzLmFjbWVAYWdlbnRzLmV4YW1wbGUiLCJlbWFpbF92ZXJpZmllZCI6dHJ1ZSwibmFtZSI6IkFjbWUgQ2FyIEhpcmUiLCJvcmciOiJBY21lIENhciBIaXJlIiwiYWNjb3VudGFibGVfaHVtYW4iOnRydWUsImFpX2FnZW50Ijp0cnVlLCJub25jZSI6ImIzZjFjMmQ0N2E5ZSIsImV4dCI6eyJib29raW5nX3JlZiI6IkJLLTIyOTEifX0.zXMLhbxydQao1zuFx3DOdVpo9gXgDCn9iYUcCDtJdGak3-oQkHl58mKW0YIT3AUbMyKK-7KYZXjWiYVKsa_pDQ
+                kid: zMkUmAQOlq9JtFPzTK1XINZdWd7gmhXxgA8Ph7cNKHo
+                expires_at: '2026-10-09T12:05:00Z'
+                jwks_uri: https://mail.example.com/.well-known/jwks/idn_01J9Z3K8V4QW7X2M5N6P8R0T1Y.json
+        '400':
+          description: >-
+            The request is invalid: `audience` missing, longer than 256 characters or not printable ASCII;
+            `expires_in` outside 60–600; `nonce` invalid; or `ext` larger than 2 KB as JSON or using a claim
+            name the service sets ([O4], [O5], [O6]). `details.errors[]` names the field. Nothing is signed.
+          x-error-codes: [invalid_request]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403':
+          description: The key lacks `identities:sign` (platform keys can never hold it), or the identity is outside the key's scope, or the tenant is suspended (checked before the identity's pause, as on sends).
+          x-error-codes: [permission_denied, scope_denied, tenant_suspended]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '404':
+          description: The identity is unknown, out of scope, `deleting` or `deleted`.
+          x-error-codes: [identity_not_found]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '409':
+          description: >-
+            The identity is paused. Nothing is signed ([O1]). An identity of a suspended tenant gets
+            `403 tenant_suspended` first.
+          x-error-codes: [identity_paused]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+          description: >-
+            Over a rate limit: the key's request limit, or `RL_SIGN`, 600 signing calls a minute per identity
+            for assertions and HTTP signatures together.
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+
+  /identities/{identity_id}/http-signatures:
+    parameters:
+      - $ref: '#/components/parameters/IdentityIdPath'
+    post:
+      operationId: createHttpSignature
+      tags: [Identity keys]
+      summary: Sign an HTTP request (Web Bot Auth)
+      description: |
+        Returns the headers that turn an HTTP request into a Web Bot Auth signed request (RFC 9421), signed
+        with the deployment's active `web_bot_auth` key, with the identity's primary address in a signed
+        `From` header. The Worker never makes the request itself, and nothing is created or stored.
+
+        - **`Signature-Agent`** is a structured-field string, in double quotes, naming the deployment's
+          origin; its key directory is at `/.well-known/http-message-signatures-directory` there.
+        - **`From`** carries the identity's primary address (RFC 9110: whoever is responsible for the request).
+        - **`Signature-Input`** and **`Signature`**: the signature base is built as in RFC 9421 section 2.5,
+          with `alg="ed25519"`, `keyid` (the deployment key's JWK thumbprint), a `nonce` of 64 random bytes
+          (base64), `tag="web-bot-auth"`, `created` and `expires`.
+        - An internationalised host becomes its A-label in `@authority`; a component whose value is not
+          ASCII is refused with `400 invalid_request` ([O10]). An `expires_in` outside 30–300 seconds is
+          refused ([O11]).
+        - `Idempotency-Key` is ignored and never recorded. Only a count is kept (`usage_daily` metric
+          `http_signatures`); signatures are not logged. Signing is not metered against any plan allowance.
+        - **Refusals**: `422 web_bot_auth_disabled` while `PM_WEB_BOT_AUTH=off` ([O9]); `403 policy_denied`
+          while tenant policy `web_bot_auth.allowed` is `false`, the default ([O13]); `403 tenant_suspended`
+          when the tenant is suspended (checked first, as on sends); `409 identity_paused` for a paused identity; `404 identity_not_found` for
+          a `deleting` or `deleted` identity ([O1]).
+
+        `PM_WEB_BOT_AUTH` can be turned on only after spike S13 has passed; until then signed HTTP requests
+        are off and assertions are unaffected.
+      x-required-permission: ['identities:sign']
+      x-key-levels: [tenant, identity]
+      x-permission-notes: Platform keys cannot hold `identities:sign`. An identity key signs only as its own identity. The tenant must also have opted in (`policy.web_bot_auth.allowed`).
+      x-rate-limit-buckets: [api, sign]
+      x-idempotency: none
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/HttpSignatureRequest'}
+            example:
+              url: https://www.brightwell.example/fleet/availability?from=2026-10-12
+              method: GET
+              expires_in: 60
+              components: ['@authority', signature-agent, from]
+      responses:
+        '200':
+          description: The four headers to attach to the request, and when the signature expires.
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
+            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
+            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/HttpSignatureResponse'}
+              example:
+                headers:
+                  Signature-Agent: '"https://mail.example.com"'
+                  From: bookings.acme@agents.example
+                  Signature-Input: 'sig1=("@authority" "signature-agent" "from");created=1791547200;expires=1791547260;keyid="poqkLGiymh_W0uP6PZFw-dvez3QJT5SolqXBCW38r0U";alg="ed25519";nonce="e8N7S2MFd/qrd6T2R3tdfAuuANngKI7LFtKYI/vowzk4lAZYadIX6wW25MwG7DCT9RUKAJ0qVkU0mEeLElW1qg==";tag="web-bot-auth"'
+                  Signature: 'sig1=:jdq0SqOwHdyHr9+r5jw3iYZH6aNGKijYp/EstF4RQTQdi5N5YYKrD+mCT1HA1nZDsi6nJKuHxUi/5Syp3rLWBA==:'
+                expires_at: '2026-10-09T12:01:00Z'
+        '400':
+          description: >-
+            The request is invalid: `url` missing, not `https` or longer than 2,048 characters; `method` not an
+            upper-case token, or missing while `components` has `@method`; `expires_in` outside 30–300 ([O11]); a component that is not allowed, or whose
+            value is not ASCII ([O10]). `details.errors[]` names the field. Nothing is signed.
+          x-error-codes: [invalid_request]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403':
+          description: >-
+            The key lacks `identities:sign` (platform keys can never hold it) or the identity is outside its
+            scope; or the tenant has not opted in to signed HTTP requests (`policy_denied`: tenant policy
+            `web_bot_auth.allowed` is `false`, [O13]); or the tenant is suspended (`tenant_suspended`, checked
+            before the identity's pause, as on sends).
+          x-error-codes: [permission_denied, scope_denied, policy_denied, tenant_suspended]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+              example:
+                error:
+                  code: policy_denied
+                  message: This workspace has not turned on signed HTTP requests.
+                  retryable: false
+                  fix: Ask a platform operator to set web_bot_auth.allowed to true in the tenant's policy.
+                  request_id: req_01J9Z4K8V4QW7X2M5N6P8R0T1Y
+        '404':
+          description: The identity is unknown, out of scope, `deleting` or `deleted`.
+          x-error-codes: [identity_not_found]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '409':
+          description: >-
+            The identity is paused. Nothing is signed ([O1]). An identity of a suspended tenant gets
+            `403 tenant_suspended` first.
+          x-error-codes: [identity_paused]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '422':
+          description: Signed HTTP requests are turned off on this deployment (`PM_WEB_BOT_AUTH=off`, the default) ([O9]).
+          x-error-codes: [web_bot_auth_disabled]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+          description: >-
+            Over a rate limit: the key's request limit, or `RL_SIGN`, 600 signing calls a minute per identity
+            for assertions and HTTP signatures together.
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+
   # ──────────────────────────────────────────── Domains ───────────────────────────────────────────
 
   /tenants/{tenant_id}/domains:
@@ -1062,11 +1602,11 @@ paths:
         spelling of `nameservers`.
 
         - **`cloudflare_zone`, `nameservers`, `delegated_subdomain`** need `PM_CF_API_TOKEN`
-          (`422 cf_token_required`). For an apex `cloudflare_zone`, `pmail domains add` with a local token
-          works instead (catch-all, no literal rules).
+          (`422 cf_token_required`). For an apex `cloudflare_zone`, `pmail domains add --local-token` with the
+          operator's own Cloudflare token works instead (catch-all, no literal rules).
         - **`nameservers`** creates the zone. Tenant keys need the policy `domains.allow_create_zone: true`
           (`422 transport_unavailable`, `zone_creation_not_allowed`). A name with A, AAAA or MX records, or a
-          `www` CNAME or A record, needs `confirm_dedicated: true` (`409 domain_not_dedicated`, with
+          `www` CNAME, A or AAAA record, needs `confirm_dedicated: true` (`409 domain_not_dedicated`, with
           `details.records`) ([N21]). The response's `records` are the zone's `NS` records for the
           registrar. A zone not activated within 28 days is deleted by Cloudflare and the domain becomes
           `removed` (`zone_expired`) ([N23]).
@@ -1216,8 +1756,10 @@ paths:
                     reason: ses_receiving_not_configured
         '429':
           description: >-
-            A rate limit was hit (`rate_limited`), or Cloudflare refused to create a zone with error 1105
-            (`upstream_rate_limited`; `Retry-After` and `details.retry_after` are `10800`).
+            A rate limit was hit (`rate_limited`), or a provider's limit stopped the create
+            (`upstream_rate_limited`): Cloudflare refused to create a zone with error 1105 (`Retry-After` and
+            `details.retry_after` are `10800`), or the deployment's SES control-plane budget of one call per
+            second had no slot within 5 seconds (`Retry-After` is the wait).
           x-error-codes: [rate_limited, upstream_rate_limited]
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
@@ -1680,7 +2222,11 @@ paths:
       operationId: listThreads
       tags: [Threads]
       summary: List threads
-      description: Threads in the mailbox, sorted by `last_at` descending. Quarantined mail is hidden unless the key holds `quarantine:review`.
+      description: >-
+        Threads in the mailbox, sorted by `last_at` descending. Built from visible mail only: quarantined,
+        hidden and throttled messages are never listed or counted here, whatever the key's permissions. A
+        key with `quarantine:review` reaches them through `GET …/messages` with an explicit `status` filter,
+        or `GET …/quarantine` (quarantined messages only).
       x-required-permission: ['messages:read']
       x-key-levels: [platform, tenant, identity]
       x-rate-limit-buckets: [api]
@@ -1933,10 +2479,14 @@ paths:
       summary: List messages
       description: >-
         Messages in the mailbox, newest first. Each item is a Message object in its default form
-        (`extracted_text`, no `text`, `html` or `headers`). Quarantined mail is hidden unless the key
-        holds `quarantine:review`.
+        (`extracted_text`, no `text`, `html` or `headers`). Quarantined, hidden and throttled messages are
+        excluded by default, whatever the key's permissions. They are listed only when the request filters
+        on that status explicitly (`status=quarantined`, `hidden` or `throttled`) and the key holds
+        `quarantine:review`. A key without it that sends such a filter gets `200` with none of those
+        messages, never `403`, as search treats `include_quarantined`.
       x-required-permission: ['messages:read']
       x-key-levels: [platform, tenant, identity]
+      x-permission-notes: A `status` filter of `quarantined`, `hidden` or `throttled` returns those messages only if the key also holds `quarantine:review`; without it the page has none of them (never `403`).
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -1950,7 +2500,10 @@ paths:
           schema: {$ref: '#/components/schemas/Direction'}
         - name: status
           in: query
-          description: Only messages with this status.
+          description: >-
+            Only messages with this status. Without it, quarantined, hidden and throttled messages are left
+            out. `quarantined`, `hidden` and `throttled` return messages only to a key that holds
+            `quarantine:review`; for any other key the page has none of them.
           schema: {$ref: '#/components/schemas/MessageStatus'}
         - name: label
           in: query
@@ -2093,7 +2646,7 @@ paths:
         adds them. Quarantined messages need `quarantine:review`.
       x-required-permission: ['messages:read']
       x-key-levels: [platform, tenant, identity]
-      x-permission-notes: A quarantined message needs `quarantine:review` as well; without it the message is `404 message_not_found`.
+      x-permission-notes: A `quarantined`, `hidden` or `throttled` message needs `quarantine:review` as well; without it the message is `404 message_not_found`, as if it did not exist.
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -2221,7 +2774,7 @@ paths:
       operationId: deleteMessage
       tags: [Messages]
       summary: Erase a message
-      description: Starts an erasure request of scope `message` for this message.
+      description: Starts an erasure request of scope `message` for this message. A message in a thread under a legal hold is refused with `423 legal_hold` and nothing is created; an erasure request (`createErasureRequest`) instead skips held threads and lists them in its receipt.
       x-required-permission: ['erasure:manage']
       x-key-levels: [platform, tenant, identity]
       x-rate-limit-buckets: [api]
@@ -3126,14 +3679,15 @@ paths:
       description: People and services the identity has exchanged mail with.
       x-required-permission: ['search:read']
       x-key-levels: [platform, tenant, identity]
-      x-rate-limit-buckets: [api]
+      x-rate-limit-buckets: [api, search]
       x-idempotency: none
       parameters:
         - name: q
           in: query
-          description: A name, address or domain prefix.
+          description: A name, address or domain prefix. Empty or absent lists every contact, most recent first.
           schema:
             type: string
+            maxLength: 100
           example: admiral
         - $ref: '#/components/parameters/Limit'
         - $ref: '#/components/parameters/Cursor'
@@ -3686,8 +4240,10 @@ paths:
       summary: Replay events to an endpoint
       description: >-
         Queues events for redelivery to this endpoint, either by ID or by time range (optionally only those
-        whose last delivery is in a given status, for example `dead`). Events older than 30 days cannot be
-        replayed. Returns the number of events queued.
+        whose last delivery is in a given status, for example `dead`). An event can be replayed for 30 days
+        from its `occurred_at` (or `retention.events_days`, if shorter, because the payloads are gone after
+        that); the window never starts from when a delivery went `dead`. Older events are not queued.
+        Returns the number of events queued.
       x-required-permission: ['webhooks:manage']
       x-key-levels: [platform, tenant]
       x-rate-limit-buckets: [api]
@@ -4009,6 +4565,16 @@ paths:
         otherwise `403 key_scope_exceeded` (FR-KEY-1). A tenant or identity key's `mode` follows its tenant.
         The response carries `secret` (`pmk_live_…` or `pmk_test_…`), **shown only once**; only a keyed
         hash is stored (FR-KEY-2).
+
+        - **Explicit permissions.** `permissions` is required at every level, `platform` included: there is
+          no implicit full set. A missing or empty list is `400 invalid_request`.
+        - **Permissions tied to levels.** A permission the new key's level cannot hold is refused, whoever
+          the caller is, with `400 invalid_request` and `details.reason = "permission_not_allowed_for_level"`: `tenants:manage`
+          and `platform:ops` on a tenant or identity key; `members:read`, `members:manage`,
+          `suppressions:manage`, `audit:read` and `usage:read` on an identity key (an identity key holds
+          `usage:read` implicitly for its own workspace's `GET /v1/usage`); `identities:sign` on a platform
+          key. The table is under `Permission`.
+        - **Order.** These two checks run first; the scope check (`403 key_scope_exceeded`) comes after them.
       x-required-permission: ['keys:manage']
       x-key-levels: [platform, tenant, identity]
       x-rate-limit-buckets: [api]
@@ -4025,7 +4591,7 @@ paths:
               level: identity
               tenant_id: ten_01J9Z3K8V4QW7X2M5N6P8R0T1Y
               identity_id: idn_01J9Z3K8V4QW7X2M5N6P8R0T1Y
-              permissions: ['messages:read', 'messages:send', 'search:read', 'attachments:read']
+              permissions: ['messages:read', 'messages:send', 'search:read', 'attachments:read', 'identities:sign']
               expires_at: '2027-10-09T00:00:00Z'
       responses:
         '201':
@@ -4039,7 +4605,30 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ApiKeyCreated'}
-        '400': {$ref: '#/components/responses/BadRequest'}
+        '400':
+          description: >-
+            The request is invalid (`details.errors[]` holds `{path, message}`): for example `permissions`
+            missing or empty, or `tenant_id` or `identity_id` missing for the level. A permission the new
+            key's level cannot hold is `invalid_request` with `details.reason =
+            "permission_not_allowed_for_level"`.
+          x-error-codes: [invalid_request, invalid_idempotency_key]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+              example:
+                error:
+                  code: invalid_request
+                  message: A platform key cannot hold identities:sign.
+                  retryable: false
+                  fix: Remove identities:sign, or create a tenant or identity key to sign as an identity.
+                  request_id: req_01J9Z4K8V4QW7X2M5N6P8R0T1Y
+                  details:
+                    reason: permission_not_allowed_for_level
+                    errors:
+                      - path: permissions[2]
+                        message: identities:sign cannot be held by a platform key
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403':
           description: The key lacks `keys:manage`, the target is out of scope, or the new key would be wider than the caller.
@@ -4193,7 +4782,8 @@ paths:
       description: |
         Deletes data for one scope and returns a receipt counting what was deleted in each store
         (FR-PRV-3). Keyword rows, references and vectors are removed together, and a probe query afterwards
-        must return nothing (FR-SRCH-11). Held threads are skipped and listed in the receipt (FR-PRV-4).
+        must return nothing (FR-SRCH-11). Held threads are skipped and listed in the receipt (FR-PRV-4); a
+        hold never makes this request fail (no `423`).
         An `erasure.completed` event is emitted.
 
         | `scope` | Also needs | Deletes |
@@ -4238,7 +4828,6 @@ paths:
         '404': {$ref: '#/components/responses/NotFound'}
         '409': {$ref: '#/components/responses/IdempotencyConflict'}
         '413': {$ref: '#/components/responses/PayloadTooLarge'}
-        '423': {$ref: '#/components/responses/LegalHold'}
         '429': {$ref: '#/components/responses/TooManyRequests'}
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
@@ -4431,19 +5020,27 @@ paths:
       summary: Get the plan and allowances
       description: |
         The workspace's plan and the state of every allowance in the current period. Agents read it to know
-        their limits before they hit `402 billing_limit`. Platform keys pass `tenant_id`.
+        their limits before they hit `402 billing_limit`.
 
+        - **Who can read it.** Every tenant and identity key holds `usage:read` implicitly for its own
+          workspace, so they can always call this without listing it. A platform key must hold `usage:read`
+          explicitly and must pass `tenant_id`; without `tenant_id` it gets `400 invalid_request`.
         - `billing` is `metered`, `exempt` (no limits) or `disabled` (self-hosted without billing; `features`
           show counts with `granted: null`, `unlimited: true`, plus any operator quota from tenant policy).
         - `used` for `storage_gb` is measured, rounded up, and refreshed at least hourly.
         - `granted` includes top-ups. `plans` is the catalog from `PM_PLAN_CATALOG`.
-      x-required-permission: []
+      x-required-permission: ['usage:read']
       x-key-levels: [platform, tenant, identity]
-      x-permission-notes: Any key can read its own workspace. Another workspace (a platform key's `tenant_id`) needs `usage:read`.
+      x-permission-notes: >-
+        Tenant and identity keys hold `usage:read` implicitly for their own workspace. Platform keys must
+        hold it explicitly and pass `tenant_id` (`400 invalid_request` without it).
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
-        - $ref: '#/components/parameters/TenantIdQuery'
+        - name: tenant_id
+          in: query
+          description: Required for platform keys (`400 invalid_request` without it). Other keys always read their own workspace.
+          schema: {$ref: '#/components/schemas/TenantId'}
       responses:
         '200':
           description: The plan, every allowance and the plan catalog.
@@ -4482,7 +5079,27 @@ paths:
                     included: {inboxes: 5, sends: 1000, triage: 500, custom_domains: 0, storage_gb: 1, seats: 1}
                     topups: false
                     support: github_issues
-        '400': {$ref: '#/components/responses/BadRequest'}
+        '400':
+          description: >-
+            The request is invalid, or a platform key did not pass `tenant_id` (`invalid_request`,
+            `details.errors[0].path = "tenant_id"`).
+          x-error-codes: [invalid_request]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+              example:
+                error:
+                  code: invalid_request
+                  message: 'tenant_id: required for a platform key.'
+                  retryable: false
+                  fix: Pass the workspace's tenant_id.
+                  request_id: req_01J9Z4K8V4QW7X2M5N6P8R0T1Y
+                  details:
+                    errors:
+                      - path: tenant_id
+                        message: required for a platform key
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
@@ -4497,7 +5114,9 @@ paths:
       summary: Get daily usage
       description: >-
         Usage per UTC day. `from` and `to` are dates at most 92 days apart. A platform key can name a tenant
-        with `tenant_id`; a tenant key gets its own tenant.
+        with `tenant_id` and needs `usage:read` explicitly; a tenant key gets its own tenant and holds
+        `usage:read` implicitly for it. `assertions` and `http_signatures` count signing calls, which are
+        not metered against any plan allowance.
       x-required-permission: ['usage:read']
       x-key-levels: [platform, tenant]
       x-rate-limit-buckets: [api]
@@ -4536,6 +5155,8 @@ paths:
                     triage: 298
                     search: 940
                     agentic: 41
+                    assertions: 57
+                    http_signatures: 0
                     ai_neurons: 18233
                     storage_bytes: 2147483648
         '400': {$ref: '#/components/responses/BadRequest'}
@@ -4662,7 +5283,8 @@ paths:
       summary: List audit events
       description: >-
         Audit entries, newest first. They never hold message content or clear-text addresses. Audit rows
-        cover administrative actions: keys, tenants, identity status, quarantine releases, holds,
+        cover administrative actions: keys, tenants, identity status, identity signing keys
+        (`identity_key.create`, `identity_key.rotate`, `identity_key.revoke`), quarantine releases, holds,
         suppression removals, erasure, resolve, members, billing and platform operations. **Sends are not
         audit rows**: each send is recorded by its message, its events (`message.sent` and the delivery
         events) and its per-recipient delivery log. To review what a key sent, list the outbound messages
@@ -4707,6 +5329,7 @@ paths:
                   - id: aud_01JA2B3C4D5E6F7G8H9J0K1M2N
                     tenant_id: ten_01J9Z3K8V4QW7X2M5N6P8R0T1Y
                     actor_key_id: key_01J9Z3K8V4QW7X2M5N6P8R0T1Y
+                    actor_user_id: null
                     action: quarantine.release
                     target_type: message
                     target_id: msg_01JA2B3C4D5E6F7G8H9J0K1M2N
@@ -4734,8 +5357,9 @@ paths:
       description: >-
         Console users of the workspace, its pending invitations and its seats. The console is the main way
         to manage members; these endpoints let an integrator provision people (for example, the owner of
-        each customer workspace).
-      x-required-permission: ['members:manage']
+        each customer workspace). Needs `members:read`, which every console role holds and `members:manage`
+        includes.
+      x-required-permission: ['members:read']
       x-key-levels: [platform, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: none
@@ -4756,11 +5380,13 @@ paths:
                     email: sam@acmecarhire.example
                     name: Sam Patel
                     role: owner
+                    last_login_at: '2026-10-09T10:05:00Z'
                     created_at: '2026-10-09T10:00:00Z'
                 invitations:
                   - id: inv_01JA2B3C4D5E6F7G8H9J0K1M2N
                     email: kim@acmecarhire.example
                     role: member
+                    invited_by: usr_01JA2B3C4D5E6F7G8H9J0K1M2N
                     expires_at: '2026-10-16T10:00:00Z'
                 seats:
                   granted: 2
@@ -4897,7 +5523,7 @@ paths:
     post:
       operationId: rotateSigningKey
       tags: [Platform]
-      summary: Rotate a thread, link or cursor signing key
+      summary: Rotate a thread, link, cursor or Web Bot Auth signing key
       description: |
         Generates a new key inside the Worker and makes it current. No body. Key material is never
         returned, by this or any other endpoint.
@@ -4907,13 +5533,16 @@ paths:
         | `thread` | Thread tokens | 90 days |
         | `link` | Download links, console sign-in, invitation and session tokens, and OAuth state hashes | 7 days |
         | `cursor` | Search cursors (the cursor lifetime) | 24 hours |
+        | `web_bot_auth` | Web Bot Auth HTTP signatures and the key directory. Its `kid` is the key's 43-character JWK thumbprint, where the other purposes use one character | 7 days (it stays in the key directory) |
 
         With `revoke_previous=true`, the previous key is deleted in the same D1 batch, so what it signed
         stops verifying at once: thread tokens fall back to header threading; open links, console sign-in
         tokens, invitations, sessions and OAuth flows under it fail; open search cursors fail with
-        `400 invalid_request`. The response then has `previous.verify_until` equal to the rotation time and
-        `previous.revoked: true`. After a suspected leak, rotate with `revoke_previous=true`, then rotate
-        `PM_MASTER_KEY`. Audit action `signing_key.rotate`, with `details.revoke_previous`.
+        `400 invalid_request`; a previous `web_bot_auth` key leaves the key directory. The response then has
+        `previous.verify_until` equal to the rotation time and `previous.revoked: true`. After a suspected
+        leak, rotate with `revoke_previous=true`, then rotate `PM_MASTER_KEY`. Rotating `web_bot_auth` while
+        `PM_WEB_BOT_AUTH=off` returns `422 web_bot_auth_disabled` ([O9]). Audit action `signing_key.rotate`
+        (for every purpose, `web_bot_auth` included), with `details.revoke_previous`.
       x-required-permission: ['platform:ops']
       x-key-levels: [platform]
       x-rate-limit-buckets: [api]
@@ -4959,10 +5588,28 @@ paths:
                       kid: 'A'
                       verify_until: '2026-10-09T10:00:00Z'
                       revoked: true
+                web_bot_auth:
+                  summary: The Web Bot Auth deployment key
+                  value:
+                    purpose: web_bot_auth
+                    kid: poqkLGiymh_W0uP6PZFw-dvez3QJT5SolqXBCW38r0U
+                    created_at: '2026-10-09T10:00:00Z'
+                    previous:
+                      kid: 521omx3NZ4BMQZPNvThhZbY7uITn_wjh09-53ZFC0wk
+                      verify_until: '2026-10-16T10:00:00Z'
+                      revoked: false
         '400': {$ref: '#/components/responses/BadRequest'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '409': {$ref: '#/components/responses/IdempotencyConflict'}
+        '422':
+          description: '`purpose` is `web_bot_auth` and signed HTTP requests are turned off (`PM_WEB_BOT_AUTH=off`) ([O9]).'
+          x-error-codes: [web_bot_auth_disabled]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
         '429': {$ref: '#/components/responses/TooManyRequests'}
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
@@ -5392,10 +6039,14 @@ paths:
     get:
       operationId: getIdentityJwks
       tags: [Well-known]
-      summary: Public signing keys of an identity (P1)
+      summary: Public signing keys of an identity
       description: >-
-        P1. A JSON Web Key Set with the identity's public signing keys (EdDSA). Unknown and erased
-        identities return `404 identity_not_found`.
+        No authentication. The JSON Web Key Set (RFC 7517) that verifiers of the identity's agent assertions
+        fetch: its `active` and `retiring` Ed25519 keys (`alg: EdDSA`). A revoked or `retired` key is absent
+        from the next response ([O3]). An unknown, `deleting`, `deleted`, paused or suspended identity gets
+        the same `404 identity_not_found`, so the endpoint reveals nothing beyond what a valid assertion
+        already names; pausing withdraws the set, which is the kill switch ([O1]). Identity IDs are ULIDs
+        and never derived from addresses, so the endpoint cannot test whether an address exists.
       security: []
       x-rate-limit-buckets: []
       x-idempotency: none
@@ -5404,10 +6055,86 @@ paths:
           description: The identity's JWK Set.
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
+            Cache-Control: {$ref: '#/components/headers/Cache-Control-Jwks'}
+          content:
+            application/jwk-set+json:
+              schema: {$ref: '#/components/schemas/Jwks'}
+              example:
+                keys:
+                  - kty: OKP
+                    crv: Ed25519
+                    x: NjwMjIq2mTA1VpuDzRvkMIfQ0sCSHWavo0KT_4FcKO0
+                    kid: zMkUmAQOlq9JtFPzTK1XINZdWd7gmhXxgA8Ph7cNKHo
+                    alg: EdDSA
+                    use: sig
+                  - kty: OKP
+                    crv: Ed25519
+                    x: 11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo
+                    kid: kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k
+                    alg: EdDSA
+                    use: sig
+        '404':
+          description: The identity is unknown, `deleting`, `deleted`, paused, or in a suspended tenant.
+          x-error-codes: [identity_not_found]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
           content:
             application/json:
-              schema: {$ref: '#/components/schemas/Jwks'}
-        '404': {$ref: '#/components/responses/NotFound'}
+              schema: {$ref: '#/components/schemas/Error'}
+
+  /.well-known/http-message-signatures-directory:
+    servers:
+      - url: https://{host}
+        description: Deployment root (unversioned).
+        variables:
+          host:
+            default: mail.example.com
+            description: The deployment's API host (`PM_API_HOST`).
+    get:
+      operationId: getHttpMessageSignaturesDirectory
+      tags: [Well-known]
+      summary: Web Bot Auth key directory
+      description: >-
+        No authentication, HTTPS only. With `PM_WEB_BOT_AUTH=on`, the deployment's Web Bot Auth keys
+        (`active` and `retiring`) as a JWK Set, as draft-meunier-http-message-signatures-directory-03 and
+        Cloudflare's Web Bot Auth page require (read 2026-10-09). The response is signed once per listed
+        key: `Signature-Input` covers `("@authority";req)` with `alg="ed25519"`, `keyid` (the key's JWK
+        thumbprint), a 64-byte random `nonce`, `tag="http-message-signatures-directory"`, `created` (now)
+        and `expires` (now + 300), so a copy served from another host does not verify. At most three keys
+        are listed: one active and two retiring ([O12]). After a rotation the previous key stays listed for
+        7 days, unless the rotation set `revoke_previous=true`. With `PM_WEB_BOT_AUTH=off` (the default) it returns `404 key_not_found`. Registering the
+        directory with Cloudflare's verified-bot programme is an optional operator step; signatures verify
+        for any Web Bot Auth verifier without it.
+      security: []
+      x-rate-limit-buckets: []
+      x-idempotency: none
+      responses:
+        '200':
+          description: The deployment's Web Bot Auth keys.
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            Cache-Control: {$ref: '#/components/headers/Cache-Control-Directory'}
+            Signature-Input: {$ref: '#/components/headers/Directory-Signature-Input'}
+            Signature: {$ref: '#/components/headers/Directory-Signature'}
+          content:
+            application/http-message-signatures-directory+json:
+              schema: {$ref: '#/components/schemas/HttpMessageSignaturesDirectory'}
+              example:
+                keys:
+                  - kty: OKP
+                    crv: Ed25519
+                    x: JrQLj5P_89iXES9-vFgrIy29clF9CC_oPPsw3c5D0bs
+                  - kty: OKP
+                    crv: Ed25519
+                    x: O6a8lanqRcSF-wEOHWvY3W6blE9tdjJqKHercAsamF8
+        '404':
+          description: Signed HTTP requests are turned off (`PM_WEB_BOT_AUTH=off`), so there is no directory ([O9]).
+          x-error-codes: [key_not_found]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
 
 webhooks:
 
@@ -5919,7 +6646,7 @@ webhooks:
       operationId: onIdentityDeleted
       tags: [Events]
       summary: 'identity.deleted'
-      description: 'An identity was deleted; an identity-scope erasure started.'
+      description: 'An identity was deleted: emitted once, when the identity-scope erasure that deletes it completes and the identity becomes `deleted` (after held threads are released, if any). It comes from the erasure job with `identity_id` set.'
       security: []
       parameters:
         - $ref: '#/components/parameters/WebhookIdHeader'
@@ -6019,6 +6746,106 @@ webhooks:
         content:
           application/json:
             schema: {$ref: '#/components/schemas/IdentityAddressRetiredEvent'}
+      responses:
+        '2XX': {$ref: '#/components/responses/WebhookAccepted'}
+        '410': {$ref: '#/components/responses/WebhookGone'}
+        default: {$ref: '#/components/responses/WebhookFailed'}
+
+  identity.key_created:
+    post:
+      operationId: onIdentityKeyCreated
+      tags: [Events]
+      summary: 'identity.key_created'
+      description: 'A signing key was created for an identity that had no active key, lazily by a signing request or by `POST …/keys`. Not sent when `POST …/keys` returns the existing active key; the new key of a rotation emits `identity.key_rotated` instead.'
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/WebhookIdHeader'
+        - $ref: '#/components/parameters/WebhookTimestampHeader'
+        - $ref: '#/components/parameters/WebhookSignatureHeader'
+        - $ref: '#/components/parameters/WebhookUserAgentHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/IdentityKeyCreatedEvent'}
+            example:
+              id: evt_01J9Z5K8V4QW7X2M5N6P8R0T1Y
+              type: identity.key_created
+              api_version: '2026-10-01'
+              occurred_at: '2026-10-02T09:00:00.120Z'
+              tenant_id: ten_01J9Z3K8V4QW7X2M5N6P8R0T1Y
+              identity_id: idn_01J9Z3K8V4QW7X2M5N6P8R0T1Y
+              sequence: 1203
+              data:
+                identity_id: idn_01J9Z3K8V4QW7X2M5N6P8R0T1Y
+                kid: kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k
+      responses:
+        '2XX': {$ref: '#/components/responses/WebhookAccepted'}
+        '410': {$ref: '#/components/responses/WebhookGone'}
+        default: {$ref: '#/components/responses/WebhookFailed'}
+
+  identity.key_rotated:
+    post:
+      operationId: onIdentityKeyRotated
+      tags: [Events]
+      summary: 'identity.key_rotated'
+      description: 'An identity signing key was rotated: `kid` is the new active key and `previous_kid` the key now `retiring` (`null` when the rotation created the first key).'
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/WebhookIdHeader'
+        - $ref: '#/components/parameters/WebhookTimestampHeader'
+        - $ref: '#/components/parameters/WebhookSignatureHeader'
+        - $ref: '#/components/parameters/WebhookUserAgentHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/IdentityKeyRotatedEvent'}
+            example:
+              id: evt_01JA2B3C4D5E6F7G8H9J0K1M2N
+              type: identity.key_rotated
+              api_version: '2026-10-01'
+              occurred_at: '2026-10-09T09:00:00.088Z'
+              tenant_id: ten_01J9Z3K8V4QW7X2M5N6P8R0T1Y
+              identity_id: idn_01J9Z3K8V4QW7X2M5N6P8R0T1Y
+              sequence: 1856
+              data:
+                identity_id: idn_01J9Z3K8V4QW7X2M5N6P8R0T1Y
+                kid: zMkUmAQOlq9JtFPzTK1XINZdWd7gmhXxgA8Ph7cNKHo
+                previous_kid: kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k
+      responses:
+        '2XX': {$ref: '#/components/responses/WebhookAccepted'}
+        '410': {$ref: '#/components/responses/WebhookGone'}
+        default: {$ref: '#/components/responses/WebhookFailed'}
+
+  identity.key_revoked:
+    post:
+      operationId: onIdentityKeyRevoked
+      tags: [Events]
+      summary: 'identity.key_revoked'
+      description: 'An identity signing key was revoked and is `retired`; it has left the identity''s JWK Set. Not sent for a key that was already `retired`.'
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/WebhookIdHeader'
+        - $ref: '#/components/parameters/WebhookTimestampHeader'
+        - $ref: '#/components/parameters/WebhookSignatureHeader'
+        - $ref: '#/components/parameters/WebhookUserAgentHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/IdentityKeyRevokedEvent'}
+            example:
+              id: evt_01JA2B3C4D5E6F7G8H9J0K1M2P
+              type: identity.key_revoked
+              api_version: '2026-10-01'
+              occurred_at: '2026-10-09T10:30:00.051Z'
+              tenant_id: ten_01J9Z3K8V4QW7X2M5N6P8R0T1Y
+              identity_id: idn_01J9Z3K8V4QW7X2M5N6P8R0T1Y
+              sequence: 1861
+              data:
+                identity_id: idn_01J9Z3K8V4QW7X2M5N6P8R0T1Y
+                kid: kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k
       responses:
         '2XX': {$ref: '#/components/responses/WebhookAccepted'}
         '410': {$ref: '#/components/responses/WebhookGone'}
@@ -6697,14 +7524,18 @@ components:
       in: path
       required: true
       schema: {$ref: '#/components/schemas/JobId'}
+    IdentityKeyKidPath:
+      name: kid
+      in: path
+      required: true
+      description: The identity key's ID, its RFC 7638 JWK thumbprint (base64url, 43 characters).
+      schema: {$ref: '#/components/schemas/IdentityKeyKid'}
     SigningKeyPurposePath:
       name: purpose
       in: path
       required: true
-      description: '`thread` (thread tokens), `link` (download links, console sign-in, invitation and session tokens, OAuth state hashes) or `cursor` (search cursors).'
-      schema:
-        type: string
-        enum: [thread, link, cursor]
+      description: '`thread` (thread tokens), `link` (download links, console sign-in, invitation and session tokens, OAuth state hashes), `cursor` (search cursors) or `web_bot_auth` (Web Bot Auth HTTP signatures and the key directory).'
+      schema: {$ref: '#/components/schemas/SigningKeyPurpose'}
     LinkTokenPath:
       name: token
       in: path
@@ -6818,6 +7649,29 @@ components:
       schema:
         type: string
         enum: ['private, no-store']
+    Cache-Control-Jwks:
+      description: Always `public, max-age=300`. Verifiers cache an identity's JWK Set for at most 5 minutes.
+      schema:
+        type: string
+        enum: ['public, max-age=300']
+    Cache-Control-Directory:
+      description: Always `max-age=86400`.
+      schema:
+        type: string
+        enum: ['max-age=86400']
+    Directory-Signature-Input:
+      description: >-
+        One RFC 9421 signature per listed key, each over `("@authority";req)` with `alg="ed25519"`, `keyid`
+        (the key's JWK thumbprint), a 64-byte random `nonce`, `tag="http-message-signatures-directory"`,
+        `created` and `expires` (`created` + 300).
+      schema:
+        type: string
+      example: 'sig1=("@authority";req);alg="ed25519";keyid="poqkLGiymh_W0uP6PZFw-dvez3QJT5SolqXBCW38r0U";nonce="ZO3/XMEZjrvSnLtAP9M7jK0WGQf3J+pbmQRUpKDhF9/jsNCWqUh2sq+TH4WTX3/GpNoSZUa8eNWMKqxWp2/c2g==";tag="http-message-signatures-directory";created=1791547200;expires=1791547500, sig2=("@authority";req);alg="ed25519";keyid="521omx3NZ4BMQZPNvThhZbY7uITn_wjh09-53ZFC0wk";nonce="enN8xXfGRxQLlICS8VZg3pIsSGnRkOvRFSiH10a4TS4v/hyiFG3AWhUObSlUdRZ6jaf4I7fUvl1zbaMYOA0v6g==";tag="http-message-signatures-directory";created=1791547200;expires=1791547500'
+    Directory-Signature:
+      description: The signatures named in `Signature-Input`, one per listed key.
+      schema:
+        type: string
+      example: 'sig1=:TD5arhV1ved6xtx63cUIFCMONT248cpDeVUAljLgkdozbjMNpJGr/WAx4PzHj+WeG0xMHQF1BOdFLDsfjdjvBA==:, sig2=:pWhbkxEjP/MBnlByqa5/AWesMuWGG7SUVe1jlM0KFpeYt14tMetCabzPnowCg1wLJGVwK0EfqafEsJLCrASjVQ==:'
 
   responses:
 
@@ -6952,9 +7806,10 @@ components:
       description: >-
         The send conflicts with the idempotency record or with the identity, thread or domain state.
         `idempotency_conflict` carries `details.original_message_id` when known; `identity_paused` carries
-        `details.reason`; `thread_busy` carries `details.retry_after`. `recipient_not_known` means
-        `send_policy.require_known_recipient` is on and a recipient is not a known contact ([E2]).
-      x-error-codes: [idempotency_conflict, request_in_progress, identity_paused, identity_owner_required, thread_busy, domain_not_ready, auto_reply_not_allowed, recipient_not_known]
+        `details.reason`; `thread_busy` carries `details.retry_after`. A recipient refused by
+        `send_policy.require_known_recipient` is not an error: its delivery is `suppressed` with
+        `policy: unknown_recipient` ([E2]).
+      x-error-codes: [idempotency_conflict, request_in_progress, identity_paused, identity_owner_required, thread_busy, domain_not_ready, auto_reply_not_allowed]
       headers:
         Request-Id: {$ref: '#/components/headers/Request-Id'}
       content:
@@ -7172,7 +8027,8 @@ components:
       description: >-
         Anything else (including a timeout, TLS or DNS error, redirect or `3xx`) is a failure. Failures retry
         at about 30 s, 2 min, 10 min, 30 min, 1 h, 2 h, 4 h, 8 h, 12 h, 12 h, 12 h and 19 h (±10% jitter,
-        about 72 hours in all), then the delivery is `dead` and can be replayed for 30 days. After 100
+        about 72 hours in all), then the delivery is `dead`. The event can be replayed for 30 days from its
+        `occurred_at` (or `retention.events_days`, if shorter), not from when the delivery went dead. After 100
         consecutive failures over at least 24 hours the endpoint is disabled (`disabled_reason: failing`).
 
   schemas:
@@ -7367,10 +8223,13 @@ components:
         reason:
           description: >-
             `identity_paused`: why the identity is paused. `transport_unavailable`: why the deployment or
-            the domain's method cannot do what was asked.
+            the domain's method cannot do what was asked. `invalid_request` on `POST /v1/keys`:
+            `permission_not_allowed_for_level` when `permissions` lists one the new key's level cannot hold.
           anyOf:
             - $ref: '#/components/schemas/PauseReason'
             - $ref: '#/components/schemas/TransportUnavailableReason'
+            - type: string
+              const: permission_not_allowed_for_level
         records:
           type: array
           description: >-
@@ -7394,7 +8253,8 @@ components:
           minimum: 0
           description: >-
             `rate_limited` and `thread_busy`: seconds to wait before retrying. `upstream_rate_limited`:
-            `10800` (3 hours), as in `Retry-After`.
+            as in `Retry-After`: `10800` (3 hours) after a Cloudflare 1105, or the wait for the next SES
+            control-plane slot.
         resets_at:
           type: [string, 'null']
           format: date-time
@@ -7435,6 +8295,7 @@ components:
         - tenant_suspended
         - test_mode_recipient
         - invalid_signature
+        - policy_denied
         # Validation
         - invalid_request
         - idempotency_key_required
@@ -7481,7 +8342,6 @@ components:
         - existing_mx
         - domain_not_dedicated
         - zone_hold
-        - recipient_not_known
         - owner_required
         - plan_managed_by_stripe
         - address_taken
@@ -7509,6 +8369,7 @@ components:
         - agentic_disabled
         - address_limit_reached
         - webhook_limit_reached
+        - web_bot_auth_disabled
         - billing_limit
         - rate_limited
         - daily_cap_reached
@@ -7545,7 +8406,8 @@ components:
         | Permission | Allows |
         |---|---|
         | `tenants:manage` | Create, update and suspend tenants, and their billing accounts (platform keys only) |
-        | `identities:read`, `identities:write` | Read, and create, update, pause or delete identities and addresses, and test forwarding |
+        | `identities:read`, `identities:write` | Read, and create, update, pause or delete identities and addresses, and test forwarding; read, and create, rotate or revoke identity signing keys. Deleting an identity also needs `erasure:manage`, because it starts an identity-scope erasure |
+        | `identities:sign` | Mint agent assertions and Web Bot Auth HTTP signatures as an identity. Tenant and identity keys (an identity key only for its own identity); platform keys cannot hold it |
         | `domains:read`, `domains:write` | Read, and add, update, verify, probe or remove domains |
         | `messages:read` | Threads, messages, raw MIME, deliveries |
         | `messages:send` | Send, reply, reply-all, forward, cancel |
@@ -7559,14 +8421,26 @@ components:
         | `keys:manage` | API keys within the caller's scope |
         | `erasure:manage` | Erasure requests, legal holds, exports |
         | `suppressions:manage` | Suppressions and allow or block lists |
-        | `usage:read` | Plan, allowances and usage figures (every key can read its own workspace's `GET /v1/usage` without it) |
+        | `usage:read` | Plan, allowances and usage figures. Every tenant and identity key holds it implicitly for its own workspace; platform keys must hold it explicitly and pass `tenant_id` |
         | `audit:read` | Audit log |
-        | `members:manage` | Console members and invitations (tenant and platform keys) |
+        | `members:read` | List console members and pending invitations (tenant and platform keys; every console role holds it) |
+        | `members:manage` | Invite, revoke, change roles and remove console members (tenant and platform keys). Includes `members:read` |
         | `platform:ops` | Platform operations: signing-key rotation, the dead-letter queue, maintenance jobs, waitlist invitations (platform keys only) |
+
+        Which key levels can hold a permission. `POST /v1/keys` refuses any other combination with
+        `400 invalid_request` and `details.reason = "permission_not_allowed_for_level"`:
+
+        | Permissions | Key levels |
+        |---|---|
+        | `tenants:manage`, `platform:ops` | platform |
+        | `members:read`, `members:manage`, `suppressions:manage`, `audit:read`, `usage:read` | platform, tenant |
+        | `identities:sign` | tenant, identity |
+        | Every other permission | platform, tenant, identity |
       enum:
         - 'tenants:manage'
         - 'identities:read'
         - 'identities:write'
+        - 'identities:sign'
         - 'domains:read'
         - 'domains:write'
         - 'messages:read'
@@ -7583,6 +8457,7 @@ components:
         - 'suppressions:manage'
         - 'usage:read'
         - 'audit:read'
+        - 'members:read'
         - 'members:manage'
         - 'platform:ops'
     KeyLevel:
@@ -7695,7 +8570,7 @@ components:
         mode: {$ref: '#/components/schemas/Mode'}
         timezone:
           type: string
-          description: IANA time zone.
+          description: IANA time zone name (for example `Europe/London`). An unknown name is refused with `400 invalid_request` (path `timezone`).
           default: UTC
         address_suffix: {$ref: '#/components/schemas/AddressSuffix'}
         policy:
@@ -7728,7 +8603,7 @@ components:
           minLength: 1
         timezone:
           type: string
-          description: IANA time zone.
+          description: IANA time zone name (for example `Europe/London`). An unknown name is refused with `400 invalid_request` (path `timezone`).
         policy:
           $ref: '#/components/schemas/TenantPolicyPatch'
         status:
@@ -7741,7 +8616,7 @@ components:
       description: >-
         The full effective policy of a tenant: the built-in defaults shown here, then `PM_DEFAULT_POLICY`,
         then the tenant's own values, deep-merged.
-      required: [identity_daily_send_cap, tenant_daily_send_cap, max_recipients, send_allowlist_only, large_attachments, link_ttl_hours, ai_disclosure, auto_reply, quarantine, inbound, retention, triage, search, webhook_text_bytes, abuse, domains, domain_fallback]
+      required: [identity_daily_send_cap, tenant_daily_send_cap, max_recipients, send_allowlist_only, large_attachments, link_ttl_hours, ai_disclosure, auto_reply, quarantine, inbound, retention, triage, search, webhook_text_bytes, abuse, domains, domain_fallback, web_bot_auth]
       properties:
         identity_daily_send_cap:
           type: integer
@@ -7879,8 +8754,11 @@ components:
             events_days:
               type: integer
               minimum: 1
+              maximum: 365
               default: 30
-              description: Days events and delivery logs are kept.
+              description: >-
+                Days events, delivery logs and replayable event payloads are kept. Webhook replay reaches back
+                30 days from an event's `occurred_at`, or this many days if fewer.
           default:
             raw_days: 90
             message_days: null
@@ -7922,12 +8800,14 @@ components:
               description: Agentic searches per tenant per day. Then `429 agentic_budget_exhausted`.
             agentic_max_steps:
               type: integer
-              minimum: 1
+              minimum: 2
+              maximum: 10
               default: 6
               description: The default, and the maximum, `budget.max_steps`.
             agentic_max_seconds:
               type: integer
-              minimum: 1
+              minimum: 3
+              maximum: 30
               default: 8
               description: The default, and the maximum, `budget.max_seconds`.
             refs_packs:
@@ -7994,6 +8874,19 @@ components:
           type: boolean
           default: true
           description: '`false` fails sends on a failing domain (`domain_failing_no_fallback`) instead of using the platform address.'
+        web_bot_auth:
+          type: object
+          required: [allowed]
+          properties:
+            allowed:
+              type: boolean
+              default: false
+              description: >-
+                Lets the tenant's identities sign HTTP requests (Web Bot Auth). While it is `false`,
+                `POST …/http-signatures` returns `403 policy_denied` ([O13]). It has no effect while the
+                deployment has `PM_WEB_BOT_AUTH=off`. Agent assertions do not depend on it.
+          default:
+            allowed: false
 
     TenantPolicyPatch:
       type: object
@@ -8076,6 +8969,7 @@ components:
             events_days:
               type: [integer, 'null']
               minimum: 1
+              maximum: 365
         triage:
           type: [object, 'null']
           properties:
@@ -8099,10 +8993,12 @@ components:
               minimum: 0
             agentic_max_steps:
               type: [integer, 'null']
-              minimum: 1
+              minimum: 2
+              maximum: 10
             agentic_max_seconds:
               type: [integer, 'null']
-              minimum: 1
+              minimum: 3
+              maximum: 30
             refs_packs:
               type: [array, 'null']
               uniqueItems: true
@@ -8135,6 +9031,11 @@ components:
               type: [boolean, 'null']
         domain_fallback:
           type: [boolean, 'null']
+        web_bot_auth:
+          type: [object, 'null']
+          properties:
+            allowed:
+              type: [boolean, 'null']
     TriageCategoryDefinition:
       type: object
       description: A custom triage category. The description is given to the triage model.
@@ -8623,7 +9524,7 @@ components:
           enum: [pass, smtp_unaligned, smtp_from_rewritten, smtp_probe_timeout, smtp_auth_failed, smtp_tls_required, null]
     Domain:
       type: object
-      required: [id, tenant_id, name, method, kind, inbound, transport, is_apex, routing_mode, reply_token, receiving, sending, ses_region, mail_from_domain, smtp, probe, state, state_reason, state_changed_at, records, created_at]
+      required: [id, tenant_id, name, method, kind, inbound, transport, is_apex, routing_mode, reply_token, receiving, sending, ses_region, mail_from_domain, smtp, probe, state, state_reason, state_changed_at, delivery_events, details, records, created_at]
       properties:
         id: {$ref: '#/components/schemas/DomainId'}
         tenant_id:
@@ -8673,6 +9574,23 @@ components:
         state_changed_at:
           type: string
           format: date-time
+        delivery_events:
+          type: string
+          enum: [active, manual, none]
+          description: >-
+            `active`: provider delivery events reach the service. `manual`: a Cloudflare-transport domain was
+            created without an Email Sending event subscription (spike S9 fallback); delivery statuses stop at
+            `sent` until `pmail domains subscribe <domain>` has run. `none`: `sending` is false.
+        details:
+          description: '`null`, or the operator step that remains while `delivery_events` is `manual`.'
+          oneOf:
+            - type: object
+              required: [action]
+              properties:
+                action:
+                  type: string
+                  examples: ['run pmail domains subscribe agents.brightwell.example']
+            - type: 'null'
         records:
           type: array
           description: The records last read from the provider APIs, with their last check result.
@@ -8700,6 +9618,8 @@ components:
           state: pending
           state_reason: null
           state_changed_at: '2026-10-09T10:00:00Z'
+          delivery_events: active
+          details: null
           records:
             - type: TXT
               name: _pylota-mail.agents.brightwell.example
@@ -8761,7 +9681,7 @@ components:
           default: false
           description: >-
             `nameservers` only. Confirms that a website or mail on the name may stop. Without it, a name with
-            A, AAAA or MX records, or a `www` CNAME or A record, returns `409 domain_not_dedicated` ([N21]).
+            A, AAAA or MX records, or a `www` CNAME, A or AAAA record, returns `409 domain_not_dedicated` ([N21]).
         inbound:
           type: string
           description: '`smtp_relay` only, and required there: `forward` (the customer''s mailbox forwards) or `ses` (they also publish the SES MX and DKIM records).'
@@ -9057,7 +9977,7 @@ components:
       enum: [sent_via_fallback, parse_degraded, encrypted, message_id_conflict, reprocessed, reconciled, bcc, loopback, body_truncated]
     QuarantineReason:
       type: string
-      enum: [auth_failed, spam, risky_attachment, blocked_sender, otp_unsolicited]
+      enum: [auth_failed, auth_unverified, spam, risky_attachment, blocked_sender, otp_unsolicited]
     MessageHeader:
       type: object
       description: One header field as received, in order (untrusted content).
@@ -9145,7 +10065,7 @@ components:
             - $ref: '#/components/schemas/Trust'
             - type: 'null'
         triage:
-          description: Triage of an inbound message. `null` for outbound messages.
+          description: Triage of an inbound message. `null` for outbound messages, and for a quarantined message until it is released (triage then runs).
           oneOf:
             - $ref: '#/components/schemas/Triage'
             - type: 'null'
@@ -9296,7 +10216,11 @@ components:
 
     AuthVerdict:
       type: string
-      enum: [pass, fail, softfail, none, unaligned]
+      description: >-
+        `unverified`: the sender's DMARC policy is `quarantine` or `reject`, no aligned DKIM signature
+        passed, and SPF alignment could not be read because no trusted `Authentication-Results` header was
+        available (`PM_TRUSTED_AUTHSERV_ID` not yet set). It quarantines with `auth_unverified`.
+      enum: [pass, fail, softfail, none, unaligned, unverified]
     AuthResult:
       type: string
       description: An RFC 8601 authentication result for one method.
@@ -9391,7 +10315,7 @@ components:
           type: string
           description: >-
             Present only when `status` is `skipped` (`allowance`: the workspace's triage allowance is spent,
-            edge case M7; `policy_disabled`; `not_eligible`: hidden, throttled, DSN or MDN) or `failed`
+            edge case W7; `policy_disabled`; `not_eligible`: hidden, throttled, DSN or MDN) or `failed`
             (`invalid_output`, `model_unavailable`, `input_unavailable`).
           enum: [allowance, policy_disabled, not_eligible, invalid_output, model_unavailable, input_unavailable]
 
@@ -9401,7 +10325,7 @@ components:
     Delivery:
       type: object
       description: The delivery status of one recipient of an outbound message.
-      required: [address, field, status, smtp_code, bounce_type, updated_at]
+      required: [address, field, status, smtp_code, enhanced_code, bounce_type, updated_at]
       properties:
         address: {$ref: '#/components/schemas/EmailAddress'}
         field:
@@ -9411,6 +10335,10 @@ components:
         smtp_code:
           type: [string, 'null']
           examples: ['250']
+        enhanced_code:
+          type: [string, 'null']
+          description: The RFC 3463 enhanced status code from the provider or relay, when it gave one.
+          examples: ['5.1.1']
         bounce_type:
           type: [string, 'null']
           enum: [hard, soft, null]
@@ -9720,7 +10648,8 @@ components:
       properties:
         q:
           type: string
-          description: The query, in the query language described on `searchIdentity`.
+          maxLength: 1024
+          description: The query, in the query language described on `searchIdentity`. At most 1,024 characters; `""` matches all messages.
         mode:
           type: string
           enum: [keyword, semantic, hybrid]
@@ -9738,7 +10667,8 @@ components:
           default: 10
         snippet_chars:
           type: integer
-          minimum: 0
+          minimum: 40
+          maximum: 1000
           default: 240
           description: Maximum characters per snippet.
         facets:
@@ -9776,14 +10706,16 @@ components:
       properties:
         max_steps:
           type: integer
-          minimum: 1
+          minimum: 2
+          maximum: 10
           default: 6
-          description: Defaults to, and is capped by, `policy.search.agentic_max_steps`.
+          description: Defaults to, and is capped by, `policy.search.agentic_max_steps` (a larger value is lowered to it, not refused). Outside 2–10 is `400 invalid_request`.
         max_seconds:
           type: integer
-          minimum: 1
+          minimum: 3
+          maximum: 30
           default: 8
-          description: Defaults to, and is capped by, `policy.search.agentic_max_seconds`.
+          description: Defaults to, and is capped by, `policy.search.agentic_max_seconds` (a larger value is lowered to it, not refused). Outside 3–30 is `400 invalid_request`.
     AgenticRequest:
       type: object
       description: An agentic search. The planner's tools are read-only and cannot widen the caller's scope or filters ([F10]).
@@ -9792,7 +10724,8 @@ components:
         q:
           type: string
           minLength: 1
-          description: The question, in natural language.
+          maxLength: 1024
+          description: The question, in natural language, at most 1,024 characters.
         mode:
           type: string
           const: agentic
@@ -10215,7 +11148,7 @@ components:
           format: uri
           pattern: '^https://'
           description: HTTPS only. Private, loopback and reserved addresses are refused; redirects are not followed.
-          examples: [https://api.example.com/webhooks/mail]
+          examples: ['https://api.example.com/webhooks/mail']
         events:
           type: array
           minItems: 1
@@ -10310,7 +11243,9 @@ components:
         since:
           type: string
           format: date-time
-          description: At most 30 days ago.
+          description: >-
+            Events whose `occurred_at` is at or after this time. Only events at most 30 days old (or
+            `retention.events_days`, if shorter) can be replayed.
         until:
           type: string
           format: date-time
@@ -10443,8 +11378,10 @@ components:
       type: object
       description: >-
         `tenant_id` is required for `tenant` and `identity` keys, and `identity_id` for `identity` keys;
-        neither is allowed on `platform` keys. Level, tenant, identity and permissions must lie within the
-        caller's own (`403 key_scope_exceeded`).
+        neither is allowed on `platform` keys. `permissions` is required at every level, `platform`
+        included (no implicit full set). Level, tenant, identity and permissions must lie within the
+        caller's own (`403 key_scope_exceeded`), and each permission must be one the level can hold
+        (`400 invalid_request`, `details.reason = "permission_not_allowed_for_level"`; see `Permission`).
       required: [name, level, permissions]
       properties:
         name:
@@ -10469,8 +11406,8 @@ components:
       enum: [message, thread, counterparty, identity, tenant]
     ErasureStatus:
       type: string
-      description: '`completed_with_holds`: the erasure finished but skipped held threads, listed in the receipt''s `held`.'
-      enum: [queued, running, completed, completed_with_holds, failed]
+      description: '`completed_with_holds`: the erasure finished but skipped held threads, listed in the receipt''s `held`. `canceled`: a tenant erasure superseded it.'
+      enum: [queued, running, completed, completed_with_holds, failed, canceled]
     ErasureRequestCreate:
       description: An erasure request. `scope` selects which other fields are required.
       oneOf:
@@ -10618,13 +11555,16 @@ components:
           oneOf:
             - $ref: '#/components/schemas/ErasureReceipt'
             - type: 'null'
+        created_by_key_id:
+          type: [string, 'null']
+          description: The API key that started the request (`null` when a person started it in the console or the system started it, for example after a legal hold ended). Lets an operator list what a compromised key did ([J6]).
     ExportScope:
       type: string
       enum: [counterparty, identity]
     ExportStatus:
       type: string
-      description: '`expired` once the download is no longer available (7 days after creation).'
-      enum: [queued, running, completed, failed, expired]
+      description: '`expired` once the download is no longer available (7 days after creation). `canceled`: a tenant erasure superseded it.'
+      enum: [queued, running, completed, failed, canceled, expired]
     ExportCreate:
       description: A subject-access export. `scope` selects which other field is required.
       oneOf:
@@ -10683,7 +11623,7 @@ components:
 
     UsageDay:
       type: object
-      required: [day, inbound, outbound, sends, triage, search, agentic, ai_neurons, storage_bytes]
+      required: [day, inbound, outbound, sends, triage, search, agentic, assertions, http_signatures, ai_neurons, storage_bytes]
       properties:
         day:
           type: string
@@ -10709,6 +11649,14 @@ components:
         agentic:
           type: integer
           minimum: 0
+        assertions:
+          type: integer
+          minimum: 0
+          description: Agent assertions minted (`POST …/assertions`). Counted only; not metered against a plan allowance.
+        http_signatures:
+          type: integer
+          minimum: 0
+          description: Web Bot Auth HTTP signatures made (`POST …/http-signatures`). Counted only; not metered against a plan allowance.
         ai_neurons:
           type: integer
           minimum: 0
@@ -10885,7 +11833,7 @@ components:
             (`409 plan_managed_by_stripe` otherwise).
     AuditEvent:
       type: object
-      required: [id, tenant_id, actor_key_id, action, target_type, target_id, details, request_id, created_at]
+      required: [id, tenant_id, actor_key_id, actor_user_id, action, target_type, target_id, details, request_id, created_at]
       properties:
         id: {$ref: '#/components/schemas/AuditEventId'}
         tenant_id:
@@ -10893,9 +11841,14 @@ components:
             - $ref: '#/components/schemas/TenantId'
             - type: 'null'
         actor_key_id:
-          description: The key that acted, or `null` for the system (for example retention purges).
+          description: The key that acted, or `null` for a console user or the system (for example retention purges).
           oneOf:
             - $ref: '#/components/schemas/KeyId'
+            - type: 'null'
+        actor_user_id:
+          description: The console user who acted, or `null` for an API key or the system.
+          oneOf:
+            - $ref: '#/components/schemas/UserId'
             - type: 'null'
         action:
           type: string
@@ -10926,24 +11879,33 @@ components:
       enum: [admin, member, viewer]
     Member:
       type: object
-      required: [user_id, email, name, role, created_at]
+      required: [user_id, email, name, role, last_login_at, created_at]
       properties:
         user_id: {$ref: '#/components/schemas/UserId'}
         email: {$ref: '#/components/schemas/EmailAddress'}
         name:
           type: [string, 'null']
         role: {$ref: '#/components/schemas/MemberRole'}
+        last_login_at:
+          type: [string, 'null']
+          format: date-time
+          description: The person's last console sign-in, from `users.last_login_at`; `null` before the first.
         created_at:
           type: string
           format: date-time
     Invitation:
       type: object
       description: A pending invitation. It uses a seat until it is accepted, revoked or expires.
-      required: [id, email, role, expires_at]
+      required: [id, email, role, invited_by, expires_at]
       properties:
         id: {$ref: '#/components/schemas/InvitationId'}
         email: {$ref: '#/components/schemas/EmailAddress'}
         role: {$ref: '#/components/schemas/InvitationRole'}
+        invited_by:
+          description: The console user who sent it, or `null` when an API key created it.
+          oneOf:
+            - $ref: '#/components/schemas/UserId'
+            - type: 'null'
         expires_at:
           type: string
           format: date-time
@@ -10979,26 +11941,35 @@ components:
 
     # ── Platform operations ──────────────────────────────────────────────────────────────────────
 
+    SigningKeyPurpose:
+      type: string
+      description: >-
+        What a deployment signing key signs: `thread` (thread tokens), `link` (download links, console
+        sign-in, invitation and session tokens, OAuth state hashes), `cursor` (search cursors) or
+        `web_bot_auth` (Web Bot Auth HTTP signatures and the key directory).
+      enum: [thread, link, cursor, web_bot_auth]
     SigningKeyRotation:
       type: object
       description: The result of a signing-key rotation. Key material is never returned.
       required: [purpose, kid, created_at, previous]
       properties:
-        purpose:
-          type: string
-          enum: [thread, link, cursor]
+        purpose: {$ref: '#/components/schemas/SigningKeyPurpose'}
         kid:
           type: string
-          description: The new current key's ID.
-          examples: ['4']
+          description: >-
+            The new current key's ID: one character for `thread`, `link` and `cursor`; the 43-character
+            JWK thumbprint (base64url) for `web_bot_auth`.
+          examples: ['4', poqkLGiymh_W0uP6PZFw-dvez3QJT5SolqXBCW38r0U]
         created_at:
           type: string
           format: date-time
         previous:
-          type: object
+          type: [object, 'null']
           description: >-
-            The key it replaced, and until when it keeps verifying (90 days for `thread`, 7 days for `link`,
-            24 hours for `cursor`; the rotation time with `revoke_previous=true`).
+            The key it replaced, and until when it keeps verifying (90 days for `thread`, 7 days for `link`
+            and `web_bot_auth`, 24 hours for `cursor`; the rotation time with `revoke_previous=true`). A
+            previous `web_bot_auth` key stays in the key directory until then. `null` when the purpose had no
+            key yet: the rotation then creates the first one.
           required: [kid, verify_until, revoked]
           properties:
             kid:
@@ -11098,6 +12069,9 @@ components:
           additionalProperties:
             type: integer
             minimum: 0
+        created_by_key_id:
+          type: [string, 'null']
+          description: The API key that started the job, or `null` for jobs the system started (retention, backup).
     WaitlistInviteRequest:
       type: object
       required: [count]
@@ -11206,6 +12180,243 @@ components:
         use:
           type: string
           const: sig
+
+    # ── Identity keys and signatures ─────────────────────────────────────────────────────────────
+
+    IdentityKeyKid:
+      type: string
+      description: >-
+        An identity key's ID: the base64url RFC 7638 thumbprint of its public JWK (RFC 8037, appendix A.3).
+        A deleted identity's key IDs are tombstoned and never published again.
+      pattern: '^[A-Za-z0-9_-]{43}$'
+      examples: [kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k]
+    IdentityKeyStatus:
+      type: string
+      description: >-
+        `active` (signs and is published; at most one per identity), `retiring` (published, does not sign,
+        until `verify_until`) or `retired` (not published; kept until the identity is deleted, so its
+        thumbprint is never reused).
+      enum: [active, retiring, retired]
+    IdentityKey:
+      type: object
+      description: >-
+        One Ed25519 signing key of an identity. The private key is sealed under `PM_MASTER_KEY`, never
+        leaves the Worker and is never returned.
+      required: [kid, identity_id, status, alg, public_jwk, created_at, verify_until, retired_at]
+      properties:
+        kid: {$ref: '#/components/schemas/IdentityKeyKid'}
+        identity_id: {$ref: '#/components/schemas/IdentityId'}
+        status: {$ref: '#/components/schemas/IdentityKeyStatus'}
+        alg:
+          type: string
+          const: EdDSA
+        public_jwk:
+          description: The public key as published in the identity's JWK Set.
+          $ref: '#/components/schemas/Jwk'
+        created_at:
+          type: string
+          format: date-time
+        verify_until:
+          type: [string, 'null']
+          format: date-time
+          description: >-
+            Set when the key becomes `retiring`: the rotation time plus `PM_IDENTITY_KEY_OVERLAP_DAYS`
+            (default 7 days). The key stays in the JWK Set until then, unless it is revoked. `null` while the
+            key is `active`.
+        retired_at:
+          type: [string, 'null']
+          format: date-time
+          description: When the key became `retired`; `null` before that.
+      examples:
+        - kid: kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k
+          identity_id: idn_01J9Z3K8V4QW7X2M5N6P8R0T1Y
+          status: retiring
+          alg: EdDSA
+          public_jwk:
+            kty: OKP
+            crv: Ed25519
+            x: 11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo
+            kid: kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k
+            alg: EdDSA
+            use: sig
+          created_at: '2026-10-02T09:00:00Z'
+          verify_until: '2026-10-16T09:00:00Z'
+          retired_at: null
+    IdentityKeyPage:
+      type: object
+      required: [data, next_cursor]
+      properties:
+        data:
+          type: array
+          items: {$ref: '#/components/schemas/IdentityKey'}
+        next_cursor:
+          type: [string, 'null']
+    IdentityKeyRotation:
+      type: object
+      description: The result of rotating an identity key.
+      required: [key, previous]
+      properties:
+        key:
+          description: The new key, `active`.
+          $ref: '#/components/schemas/IdentityKey'
+        previous:
+          description: >-
+            The key that was active, now `retiring` with `verify_until` set; `null` when the identity had
+            no active key and the rotation created the first one.
+          oneOf:
+            - $ref: '#/components/schemas/IdentityKey'
+            - type: 'null'
+    AssertionRequest:
+      type: object
+      description: A request for an agent assertion.
+      required: [audience]
+      properties:
+        audience:
+          type: string
+          minLength: 1
+          maxLength: 256
+          pattern: '^[\x20-\x7E]{1,256}$'
+          description: >-
+            The verifier's expected audience, a URL or an identifier: 1–256 characters of printable ASCII.
+            Becomes the `aud` claim ([O4]).
+          examples: ['https://portal.supplier.example']
+        expires_in:
+          type: integer
+          minimum: 60
+          maximum: 600
+          default: 300
+          description: Seconds until the token expires ([O5]).
+        nonce:
+          type: string
+          minLength: 1
+          maxLength: 128
+          pattern: '^[\x20-\x7E]{1,128}$'
+          description: Copied into the `nonce` claim, for the verifier's own challenge. 1–128 characters of printable ASCII.
+        ext:
+          type: object
+          description: >-
+            Extra claims placed under the `ext` claim: at most 2 KB as JSON, and no member may use a
+            registered or Pylota claim name, so a claim the service sets is never overwritten ([O6]).
+          propertyNames:
+            not:
+              enum: [iss, sub, aud, iat, nbf, exp, jti, email, email_verified, name, org, accountable_human, ai_agent, nonce, ext]
+          examples:
+            - booking_ref: BK-2291
+    AssertionResponse:
+      type: object
+      description: A minted agent assertion. Neither the token nor its claims are stored.
+      required: [assertion, kid, expires_at, jwks_uri]
+      properties:
+        assertion:
+          type: string
+          description: >-
+            The token, a compact JWS (RFC 7519) with header `{"alg":"EdDSA","typ":"agent-assertion+jwt","kid":…}`
+            and the claims `iss`, `sub`, `aud`, `iat`, `nbf`, `exp`, `jti`, `email`, `email_verified`, `name`,
+            `org`, `accountable_human`, `ai_agent`, and `nonce` and `ext` when given.
+          pattern: '^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$'
+        kid: {$ref: '#/components/schemas/IdentityKeyKid'}
+        expires_at:
+          type: string
+          format: date-time
+          description: The `exp` claim.
+        jwks_uri:
+          type: string
+          format: uri
+          description: The identity's JWK Set, `https://{PM_API_HOST}/.well-known/jwks/{identity_id}.json`.
+    HttpSignatureRequest:
+      type: object
+      description: A request for Web Bot Auth signature headers.
+      required: [url]
+      properties:
+        url:
+          type: string
+          format: uri
+          maxLength: 2048
+          pattern: '^https://'
+          description: >-
+            The URL the agent will request: `https` only, at most 2,048 characters. An internationalised host
+            is converted to its A-label for `@authority` ([O10]).
+          examples: ['https://www.brightwell.example/fleet/availability?from=2026-10-12']
+        method:
+          type: string
+          pattern: '^[!#$%&''*+.^_`|~0-9A-Z-]+$'
+          description: >-
+            The request method, an upper-case token. Signed only if `@method` is in `components`, and then
+            required (`400 invalid_request` without it).
+          examples: [GET]
+        expires_in:
+          type: integer
+          minimum: 30
+          maximum: 300
+          default: 60
+          description: Seconds until the signature expires. Too short an expiry fails in transit ([O11]).
+        components:
+          type: array
+          uniqueItems: true
+          description: >-
+            The components to sign. `@authority`, `signature-agent` and `from` are always signed; `@method`,
+            `@path` and `@query` may be added. Any other component, or one whose value is not ASCII, is
+            refused with `400 invalid_request` ([O10]).
+          items:
+            type: string
+            enum: ['@authority', signature-agent, from, '@method', '@path', '@query']
+          default: ['@authority', signature-agent, from]
+    HttpSignatureResponse:
+      type: object
+      description: The headers to attach to the request. Nothing is stored.
+      required: [headers, expires_at]
+      properties:
+        headers:
+          type: object
+          required: [Signature-Agent, From, Signature-Input, Signature]
+          properties:
+            Signature-Agent:
+              type: string
+              description: The deployment's origin as a structured-field string, in double quotes.
+              examples: ['"https://mail.example.com"']
+            From:
+              description: The identity's primary address.
+              $ref: '#/components/schemas/EmailAddress'
+            Signature-Input:
+              type: string
+              description: >-
+                RFC 9421 signature parameters: the components, `created`, `expires`, `keyid` (the deployment
+                key's JWK thumbprint), `alg="ed25519"`, a base64 `nonce` of 64 random bytes and
+                `tag="web-bot-auth"`.
+            Signature:
+              type: string
+              description: The RFC 9421 signature, made with the deployment's active `web_bot_auth` key.
+        expires_at:
+          type: string
+          format: date-time
+          description: When the signature expires (`expires` in `Signature-Input`).
+    HttpMessageSignaturesDirectory:
+      type: object
+      description: >-
+        The Web Bot Auth key directory: a JWK Set (RFC 7517) of the deployment's `active` and `retiring`
+        Ed25519 keys, at most three. A verifier identifies a key by its RFC 8037 JWK thumbprint, which is the
+        `keyid` of the signatures made with it.
+      required: [keys]
+      properties:
+        keys:
+          type: array
+          minItems: 1
+          maxItems: 3
+          items: {$ref: '#/components/schemas/DirectoryJwk'}
+    DirectoryJwk:
+      type: object
+      description: An Ed25519 public key in the Web Bot Auth key directory.
+      required: [kty, crv, x]
+      properties:
+        kty:
+          type: string
+          const: OKP
+        crv:
+          type: string
+          const: Ed25519
+        x:
+          type: string
+          description: The public key, base64url-encoded without padding.
 
     # ── Pages ────────────────────────────────────────────────────────────────────────────────────
 
@@ -11367,6 +12578,9 @@ components:
         - identity.address_activated
         - identity.address_promoted
         - identity.address_retired
+        - identity.key_created
+        - identity.key_rotated
+        - identity.key_revoked
         - domain.created
         - domain.verified
         - domain.degraded
@@ -11418,6 +12632,9 @@ components:
         - $ref: '#/components/schemas/IdentityAddressActivatedEvent'
         - $ref: '#/components/schemas/IdentityAddressPromotedEvent'
         - $ref: '#/components/schemas/IdentityAddressRetiredEvent'
+        - $ref: '#/components/schemas/IdentityKeyCreatedEvent'
+        - $ref: '#/components/schemas/IdentityKeyRotatedEvent'
+        - $ref: '#/components/schemas/IdentityKeyRevokedEvent'
         - $ref: '#/components/schemas/DomainCreatedEvent'
         - $ref: '#/components/schemas/DomainVerifiedEvent'
         - $ref: '#/components/schemas/DomainDegradedEvent'
@@ -11468,6 +12685,9 @@ components:
           identity.address_activated: '#/components/schemas/IdentityAddressActivatedEvent'
           identity.address_promoted: '#/components/schemas/IdentityAddressPromotedEvent'
           identity.address_retired: '#/components/schemas/IdentityAddressRetiredEvent'
+          identity.key_created: '#/components/schemas/IdentityKeyCreatedEvent'
+          identity.key_rotated: '#/components/schemas/IdentityKeyRotatedEvent'
+          identity.key_revoked: '#/components/schemas/IdentityKeyRevokedEvent'
           domain.created: '#/components/schemas/DomainCreatedEvent'
           domain.verified: '#/components/schemas/DomainVerifiedEvent'
           domain.degraded: '#/components/schemas/DomainDegradedEvent'
@@ -11712,7 +12932,7 @@ components:
             data: {$ref: '#/components/schemas/IdentityResumedData'}
 
     IdentityDeletedEvent:
-      description: '`identity.deleted`: An identity was deleted; an identity-scope erasure started.'
+      description: '`identity.deleted`: An identity was deleted: emitted once, when the identity-scope erasure that deletes it completes and the identity becomes `deleted` (after held threads are released, if any). It comes from the erasure job with `identity_id` set.'
       allOf:
         - $ref: '#/components/schemas/EventBase'
         - type: object
@@ -11765,6 +12985,39 @@ components:
             type:
               const: identity.address_retired
             data: {$ref: '#/components/schemas/IdentityAddressData'}
+
+    IdentityKeyCreatedEvent:
+      description: '`identity.key_created`: A signing key was created for an identity that had no active key, lazily by a signing request or by `POST …/keys`.'
+      allOf:
+        - $ref: '#/components/schemas/EventBase'
+        - type: object
+          required: [type, data]
+          properties:
+            type:
+              const: identity.key_created
+            data: {$ref: '#/components/schemas/IdentityKeyEventData'}
+
+    IdentityKeyRotatedEvent:
+      description: '`identity.key_rotated`: An identity signing key was rotated: `kid` is the new active key, `previous_kid` the key now `retiring`.'
+      allOf:
+        - $ref: '#/components/schemas/EventBase'
+        - type: object
+          required: [type, data]
+          properties:
+            type:
+              const: identity.key_rotated
+            data: {$ref: '#/components/schemas/IdentityKeyRotatedData'}
+
+    IdentityKeyRevokedEvent:
+      description: '`identity.key_revoked`: An identity signing key was revoked and is `retired`.'
+      allOf:
+        - $ref: '#/components/schemas/EventBase'
+        - type: object
+          required: [type, data]
+          properties:
+            type:
+              const: identity.key_revoked
+            data: {$ref: '#/components/schemas/IdentityKeyEventData'}
 
     DomainCreatedEvent:
       description: '`domain.created`: A domain was added.'
@@ -12298,6 +13551,27 @@ components:
           description: The previous primary, now an alias with status `retiring` and its `retire_at`.
           $ref: '#/components/schemas/Address'
 
+    IdentityKeyEventData:
+      type: object
+      description: Payload of `identity.key_created` and `identity.key_revoked`.
+      required: [identity_id, kid]
+      properties:
+        identity_id: {$ref: '#/components/schemas/IdentityId'}
+        kid: {$ref: '#/components/schemas/IdentityKeyKid'}
+    IdentityKeyRotatedData:
+      type: object
+      required: [identity_id, kid, previous_kid]
+      properties:
+        identity_id: {$ref: '#/components/schemas/IdentityId'}
+        kid:
+          description: The new active key.
+          $ref: '#/components/schemas/IdentityKeyKid'
+        previous_kid:
+          description: The key now `retiring`, or `null` when the rotation created the identity's first key.
+          oneOf:
+            - $ref: '#/components/schemas/IdentityKeyKid'
+            - type: 'null'
+
     DomainEventData:
       type: object
       description: Payload of `domain.created` and `domain.verified`.
@@ -12400,7 +13674,8 @@ components:
       properties:
         metric:
           type: string
-          description: The quota, for example daily sends or agentic searches.
+          description: The daily send cap that was reached. v1 emits this event only for `sends` (the tenant cap and each identity's cap); the agentic budget answers `429 agentic_budget_exhausted` without a warning event.
+          enum: [sends]
         used:
           type: integer
           minimum: 0

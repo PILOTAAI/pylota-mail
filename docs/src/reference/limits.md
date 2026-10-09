@@ -12,7 +12,7 @@ Pylota Mail. Cloudflare's and Amazon's were read from their documentation on 202
 | Outbound message size, encoded, including attachments | 5 MiB | Cloudflare Email Sending | `413 message_too_large`, or a signed link if `large_attachments: link` |
 | Recipients per message (`to` + `cc` + `bcc`) | 49, default policy 10. Cloudflare allows 50; one is kept for the hidden journal copy of Message-ID strategy B | Cloudflare / Pylota Mail / policy | `400 too_many_recipients` |
 | Subject length | 998 characters | RFC 5322 / Cloudflare | `400 invalid_request` |
-| Custom headers on a send | 16 KB total, 20 allow-listed, values ≤ 2,048 bytes | Cloudflare | `400 header_not_allowed` / `invalid_request` |
+| Custom headers on a send | 16 KB total; at most 20 non-`X-` headers, service-set ones included (only six non-`X-` names are allowed); values ≤ 2,048 bytes | Cloudflare | `400 header_not_allowed` / `invalid_request` |
 | Inbound MIME nesting depth | 32 | Pylota Mail | Deeper parts are kept raw; flag `parse_degraded` |
 | Inbound MIME parts | 500 | Pylota Mail | Further parts are kept raw; flag `parse_degraded` |
 | Attachment text extracted | 20 MB input, 200 pages, 2 MB text | Pylota Mail | `text_status: unavailable` beyond it |
@@ -46,7 +46,7 @@ Applies to domains connected with `dns_records`, `send_only`, or `smtp_relay` wi
 | Rules per receipt rule set | 200, not adjustable | [SES quotas](https://docs.aws.amazon.com/ses/latest/dg/quotas.html), read 2026-10-09 | Pylota Mail uses at most 150 `pm-retired-{n}` rules |
 | Recipients per receipt rule | 500, not adjustable | [SES quotas](https://docs.aws.amazon.com/ses/latest/dg/quotas.html), read 2026-10-09 | When a `pm-retired-{n}` rule is full, the domain monitor opens the next one |
 | Retired addresses bounced per deployment | 75,000 (150 rules × 500) | Pylota Mail | Beyond it the oldest retired addresses leave the rules, and their mail is dropped without a bounce, like mail to an unknown address |
-| SES API requests other than sends | 1 per second | [SES quotas](https://docs.aws.amazon.com/ses/latest/dg/quotas.html), read 2026-10-09 | Receipt-rule updates are retried by the domain monitor |
+| SES API requests other than sends | 1 per second per account and region; not adjustable | [SES quotas](https://docs.aws.amazon.com/ses/latest/dg/quotas.html) (SES API sending quotas), read 2026-10-09 | One deployment-wide token bucket (the `SesControl` Durable Object) admits one control-plane call per second. Domain create, `PATCH` and removal wait up to 5 s, then get `429 upstream_rate_limited` with `Retry-After`; background checks wait up to 60 s, then retry later. Each SES domain's daily identity check runs at a fixed time of day derived from a hash of its ID, so checks spread across the day ([Domains on any DNS host §4.8](../project/design/domain-connections.md#48-ses-api-rate-one-request-per-second)) |
 | Sending from the SES sandbox | 200 messages per 24 hours, 1 per second, to verified addresses only | [SES quotas](https://docs.aws.amazon.com/ses/latest/dg/quotas.html), read 2026-10-09 | `pmail setup ses` stops until production access is enabled |
 | Raw message in S3, and notifications in the SQS backstop | 14 days | Pylota Mail (`pmail setup ses`) | An object deleted before ingestion is lost: its `queued` ledger row becomes `lost` and the `ses_object_lost` alert pages |
 
@@ -71,6 +71,7 @@ Applies to domains connected with `smtp_relay`.
 | Search per key | 120 per minute |
 | Agentic search per key | 20 per minute. Tenant daily cap 500 by default |
 | Sends per identity | 120 per minute. Daily caps from policy |
+| Signing per identity (`RL_SIGN`): agent assertions and signed HTTP requests together | 600 per minute. Not counted against any plan allowance |
 | Page size | 25 by default, 100 maximum |
 | Search `limit` | 10 by default, 50 maximum |
 | Search response size | 256 KB. Above it, results are cut and `truncated: true` |
@@ -81,12 +82,47 @@ Applies to domains connected with `smtp_relay`.
 | Metadata on identities and messages | 16 keys, 512 bytes per value |
 | Labels | 64 per message, 64 characters each |
 
+## Agent signing keys
+
+From [Agent signing keys and signed requests](../project/design/agent-keys.md). Every value outside its
+range gets `400 invalid_request`.
+
+| Limit | Value |
+|---|---|
+| Active signing keys per identity | 1, plus `retiring` keys during an overlap |
+| Overlap after an identity key rotation | `PM_IDENTITY_KEY_OVERLAP_DAYS`, default 7 days |
+| Identity JWKS cache | `Cache-Control: public, max-age=300`: verifiers should cache it for at most 5 minutes |
+| Assertion `audience` | 1–256 printable ASCII characters, required |
+| Assertion `expires_in` | 60–600 seconds, default 300 |
+| Assertion `nonce` | 1–128 printable ASCII characters |
+| Assertion `ext` | 2 KB as JSON; it cannot set a registered or Pylota claim |
+| HTTP signature `url` | `https` only, 2,048 characters |
+| HTTP signature `expires_in` | 30–300 seconds, default 60 |
+| HTTP signature components | Always `@authority`, `signature-agent` and `from`; optionally `@method`, `@path` and `@query`. ASCII values only |
+| Web Bot Auth key directory | At most 3 keys (one active, two retiring); a rotated deployment key stays listed for 7 days. `Cache-Control: max-age=86400` |
+
+## Notifications
+
+From [Notifications and usage alerts](../project/design/notifications.md).
+
+| Limit | Value |
+|---|---|
+| Notification email per person | 50 a day (in the workspace's time zone), all kinds except `account`; further items wait for the next daily digest |
+| Notification email per workspace | 200 a day, all kinds except `account` |
+| `new_mail`, `instant` | A 2-minute hold after the first message, then at most one email per person and inbox every 10 minutes |
+| `new_mail`, `hourly` and `daily` | One email at the top of each hour that had messages; one at 09:00 local time |
+| `needs_reply` filter | Waits up to 5 minutes for triage |
+| "Needs a person" digest | Daily at 09:00 in the workspace's time zone |
+| Usage alerts | 80% and 100% of each allowance; once per threshold per period for `sends` and `triage`; a 24-hour cooldown per feature and threshold for counts |
+| Unsubscribe link | 90 days, or until its `link` key leaves its 7-day window after a rotation |
+| Retries while the platform domain is failing | Hourly, for 24 hours |
+
 ## Storage
 
 | Limit | Value | Source |
 |---|---|---|
 | Durable Object SQLite per identity | 10 GB | Cloudflare. Alert at 70%. Raw MIME and attachments live in R2, so this is mostly text and index |
-| D1 database | 10 GB | Cloudflare. Control plane only. Event and delivery logs are pruned at 30 days |
+| D1 database | 10 GB | Cloudflare. Control plane only. Event and delivery logs are pruned after the tenant's `retention.events_days` (default 30) |
 | Vectorize vectors per index | 20,000,000 | Cloudflare. About 4,000–10,000 vectors per 1,000 messages |
 | Vectorize namespaces per index | 50,000 | Cloudflare. One per tenant, so at most 50,000 tenants per index |
 | Queue message | 128 KB | Cloudflare. Queues carry pointers only |
@@ -125,5 +161,5 @@ resets) are in [Plans and billing](../guides/plans.md). Read your workspace's li
 | Platform endpoints | 20 |
 | Timeout per attempt | 15 seconds |
 | Retry window | About 72 hours, 13 attempts |
-| Replay window | 30 days |
+| Replay window | 30 days from the event's `occurred_at` (never from when the delivery went dead), or the tenant's `retention.events_days` if that is shorter |
 | Response body read | 4 KB |

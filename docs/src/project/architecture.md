@@ -6,7 +6,7 @@ This page is the map. The [design documents](design/index.md) hold the detail fo
 ## 1. Shape of the system
 
 Pylota Mail is **one Cloudflare Worker written in Rust** (compiled to WebAssembly with `workers-rs`).
-It has five entry points and four Durable Object classes. It stores data in D1, Durable Object SQLite,
+It has five entry points and six Durable Object classes. It stores data in D1, Durable Object SQLite,
 R2 and Vectorize, and moves work through Queues.
 
 ```text
@@ -41,6 +41,8 @@ R2 and Vectorize, and moves work through Queues.
  SES events ─────── SNS ──▶ fetch() POST /hooks/ses ──▶ pm-outbound (transport events)     │
                     │                                                                      │
  mailbox DO outbox ─▶ pm-webhooks ──▶ queue() ── signed POST ──▶ integrator endpoints      │
+                    │                 └─ new mail ─▶ Notifier DO (tenant) ◀─ TenantQuota   │
+                    │                    alarm ─▶ system identity send ─▶ pm-outbound      │
  mailbox DO commit ─▶ pm-index ────▶ queue() ── chunk, embed (AI) ──▶ Vectorize            │
                     │                         └─ triage (AI), attachment text (toMarkdown) │
                     │                                                                      │
@@ -57,11 +59,11 @@ configured. The `ses_ingest` ledger in D1 passes each SES pointer to `pm-inbound
 
 | Handler | Triggered by | Does |
 |---|---|---|
-| `fetch` | HTTPS to the API host, and to the console host when `PM_CONSOLE_HOST` differs | On the API host: REST API `/v1/*`, MCP `/mcp`, `/openapi.json`, `/health`, `/.well-known/*`, signed links `/v1/links/*`, and the SNS endpoints `/hooks/ses` (SES delivery events) and `/hooks/ses/inbound` (SES inbound notifications). On the console host: `/console/*` |
+| `fetch` | HTTPS to the API host, and to the console host when `PM_CONSOLE_HOST` differs | On the API host: REST API `/v1/*`, MCP `/mcp`, `/openapi.json`, `/health`, `/.well-known/*` (the security contact, identity JWKS and the Web Bot Auth key directory), signed links `/v1/links/*`, the SNS endpoints `/hooks/ses` (SES delivery events) and `/hooks/ses/inbound` (SES inbound notifications), and the Stripe webhook `/billing/stripe/webhook`. On the console host: `/console/*` |
 | `email` | Email Routing, for domains with `inbound = routing` | Looks up the recipient, writes raw mail to R2, queues a pointer, and rejects unknown or retired addresses |
 | `queue` | Ten Cloudflare queues: five work queues and their five dead-letter queues | Inbound processing, outbound transport, delivery events, webhook delivery, indexing, triage, dead-letter recording. The SES backstop is an SQS queue in AWS, polled by `scheduled`, not one of these |
 | `scheduled` | Cron (every minute and every 15 minutes) | Every minute: address retirement, the platform-event outbox sweep, restarting queued jobs, the state-alert evaluator, draining the SES backstop queue. Every 15 minutes: domain health scheduling, retention, usage roll-up, the master-key re-seal sweep, the SES account check, the nightly backup job |
-| Durable Object `alarm` | Alarms set by each object | State machines: domain health, jobs, outbox dispatch, and in each mailbox the transport-claim, dispatch-retry, lock and reconciliation work for its own sends |
+| Durable Object `alarm` | Alarms set by each object | State machines: domain health, jobs, outbox dispatch, in each mailbox the transport-claim, dispatch-retry, lock and reconciliation work for its own sends, and in each tenant's `Notifier` the notification windows and the daily 09:00 run |
 
 ### Inbound sources and outbound transports
 
@@ -89,8 +91,8 @@ cookies, CSRF tokens, and role checks per handler. A console action calls the sa
 REST API, with a session principal whose permissions come from the member's role instead of an API key.
 
 The console is served on `PM_CONSOLE_HOST`, which defaults to `PM_API_HOST`. When the two differ, console
-paths answer only on the console host and API paths (REST, MCP, `/hooks/*`, `/billing/stripe/webhook`, `/health`, `/v1/links/*`) only
-on the API host; anything else gets `404`, and no cookie is set or read on the API host. People sign in with
+paths answer only on the console host and API paths (REST `/v1/*` with signed links `/v1/links/*`, MCP `/mcp`,
+`/openapi.json`, `/health`, `/.well-known/*`, `/hooks/*` and `/billing/stripe/webhook`) only on the API host; anything else gets `404`, and no cookie is set or read on the API host. People sign in with
 an email link or code, or with Google or GitHub where enabled, plus optional two-step verification
 ([Cloud sign-up](design/cloud-signup.md)).
 
@@ -106,7 +108,9 @@ waits on Stripe. See [Console design](design/console.md) and [Billing design](de
 | `IdentityMailbox` | identity | The mailbox: threads, messages, recipients, attachment metadata, labels, FTS5 index, references, contacts, triage, send ledger, idempotency records, event outbox, thread locks, chunk map |
 | `DomainMonitor` | domain | The domain verification and health state machine, check history, reminder schedule |
 | `JobRunner` | long-running job | The erasure, retention, export, re-embed, re-parse, re-index, domain-removal or backup state machine, with a step journal |
-| `TenantQuota` | tenant | Plan allowances and open holds (inboxes, sends, triage, custom domains, storage, seats), exact daily counters (agentic searches, AI usage) and abuse-rate windows |
+| `TenantQuota` | tenant | Plan allowances and open holds (inboxes, sends, triage, custom domains, storage, seats), exact daily counters (agentic searches, AI usage), abuse-rate windows and the usage-alert markers that make each 80% and 100% alert go out once |
+| `SesControl` | deployment (only when SES is configured) | The token bucket that keeps Amazon SES control-plane calls at one per second ([Domains on any DNS host §4.8](design/domain-connections.md#48-ses-api-rate-one-request-per-second)) |
+| `Notifier` | tenant | Notification email for the workspace's people: pending items, coalescing windows, the daily 09:00 schedule and the daily caps. It holds person and identity IDs and counts, never mail content ([Notifications](design/notifications.md#8-notifier-object)) |
 
 Every Durable Object ID is created with `unique_id_with_jurisdiction(<jurisdiction>)` (or `unique_id()`
 when the jurisdiction is `default`) and stored in D1. Objects are addressed with `id_from_string`. Names
@@ -117,8 +121,8 @@ are never hashed into IDs, because `workers-rs` only applies a jurisdiction to u
 
 | Store | Binding | Holds | Why there |
 |---|---|---|---|
-| D1 | `DB` | The control plane: tenants, identities, addresses (the directory), domains, API keys (hashed), webhook endpoints and delivery log, suppressions, allow and block lists, jobs, erasure requests, audit log, non-mail idempotency records, the sealed thread, link and cursor signing keys, dead-letter items, the `ses_ingest` ledger, and the console's people, members, sessions and billing accounts | Small, relational, and queried across tenants for routing and administration |
-| Durable Object SQLite | `MAILBOX` and others | Everything per mailbox, in one transaction | Strong consistency per mailbox, no cross-tenant write contention, 10 GB per object, one-call deletion |
+| D1 | `DB` | The control plane: tenants, identities, addresses (the directory), domains, API keys (hashed), webhook endpoints and delivery log, suppressions, allow and block lists, jobs, erasure requests, audit log, non-mail idempotency records, the sealed thread, link, cursor and Web Bot Auth signing keys, the agents' identity keys (sealed) and key tombstones, dead-letter items, the `ses_ingest` ledger, and the console's people, members, sessions, notification preferences and billing accounts | Small, relational, and queried across tenants for routing and administration |
+| Durable Object SQLite | `MAILBOX`, `DOMAINS`, `JOBS`, `QUOTA`, `SES_CONTROL`, `NOTIFY` | Everything per mailbox, in one transaction; each other object's own state | Strong consistency per mailbox, no cross-tenant write contention, 10 GB per object, one-call deletion |
 | R2 | `BLOBS` (and the optional `BACKUP`) | Raw `.eml`, attachments, extracted attachment text, exports | Large objects, free egress, erasure by prefix |
 | Vectorize | `VECTORS` (index `pm-mail-chunks`) | Chunk vectors and filter metadata only, never text | Semantic retrieval |
 | Queues | `Q_INBOUND`, `Q_OUTBOUND`, `Q_DELIVERY`, `Q_WEBHOOKS`, `Q_INDEX` | Pointers only (≤ 128 KB) | At-least-once async work with dead-letter queues |
@@ -256,7 +260,9 @@ as the change. An alarm drains the outbox to `pm-webhooks`. The consumer:
 - records a delivery row;
 - schedules retries with queue delays for up to 72 hours.
 
-Exhausted deliveries go to a dead-letter state and can be replayed. See [Webhooks and events](design/webhooks.md).
+Exhausted deliveries go to a dead-letter state and can be replayed for 30 days from the event's
+`occurred_at` (or the tenant's `retention.events_days`, if shorter). The same consumer hands new-mail
+events to the tenant's `Notifier` (section 4.7). See [Webhooks and events](design/webhooks.md).
 
 ### 4.5 Domains
 
@@ -275,6 +281,45 @@ for SES domains, and the daily alignment probe for `smtp_relay` domains. See
 [Identities, addresses and domains](design/identity-domains.md) and
 [Domains on any DNS host](design/domain-connections.md#6-health-checks-per-method).
 
+### 4.6 Agent signing
+
+An agent proves who it is outside email with keys that never leave the Worker:
+
+- **Agent assertion.** `POST /v1/identities/{id}/assertions` (permission `identities:sign`, rate limit
+  `RL_SIGN` per identity) reads the identity from D1 (a paused or suspended identity gets `409`), loads
+  its `active` row from `identity_keys` (creating the key on first use), unseals the Ed25519 seed with
+  `PM_MASTER_KEY`, and has `core::jwt` sign a short-lived JWT naming the identity, its address and its
+  workspace. The token is returned and never stored; `usage_daily` counts it.
+- **Verification.** Any service checks the token against the identity's JWKS,
+  `GET /.well-known/jwks/{identity_id}.json` on the API host, with no API key. Pausing an identity, or
+  suspending its tenant, stops signing and withdraws the JWKS.
+- **Signed HTTP request (Web Bot Auth).** `POST /v1/identities/{id}/http-signatures` has `core::httpsig`
+  build an RFC 9421 signature with the deployment's `web_bot_auth` key from `signing_keys`, and returns
+  the `Signature-Agent`, `From`, `Signature-Input` and `Signature` headers for the agent's own HTTP client:
+  the Worker never makes the request. Sites verify against the key directory,
+  `GET /.well-known/http-message-signatures-directory` on the API host, which is signed once per key.
+  It is off until spike S13 passes (`PM_WEB_BOT_AUTH`).
+
+See [Agent signing keys](design/agent-keys.md).
+
+### 4.7 Notifications
+
+1. **Sources.** The `pm-webhooks` consumer hands `message.received` (and `message.triaged` while a
+   `needs_reply` filter waits) to the tenant's `Notifier` object as `NotifierRequest::Event`, after its
+   delivery work and only when someone in the workspace follows new mail. `TenantQuota` sends
+   `NotifierRequest::UsageThreshold` when a hold first crosses 80% or 100% of an allowance. Console
+   handlers send `NotifierRequest::Account` after their D1 batch (two-step verification turned off, a
+   sign-in method linked, ownership transferred).
+2. **Coalescing.** The Notifier keeps pending counts per person and inbox, applies each person's
+   preferences from D1 `notification_prefs`, the daily caps and the time zone, and arms its alarm for the
+   next window or the daily 09:00 run.
+3. **Sending.** At the alarm it submits an ordinary `transactional` send from the system identity
+   (`PM_SYSTEM_FROM`) with an `Idempotency-Key` per person, kind, inbox and window, through the normal
+   outbound pipeline. The email holds counts and links, never content from mail, and carries a one-click
+   `List-Unsubscribe` link to the console.
+
+See [Notifications](design/notifications.md).
+
 ## 5. Consistency and delivery guarantees
 
 | Guarantee | How |
@@ -292,7 +337,8 @@ for SES domains, and the daily alignment probe for `smtp_relay` domains. See
 ```text
 crates/core         no I/O; builds native + wasm32. MIME parse/build, auth verdicts, sanitise,
                     quote stripping, references, threading rules, loop classification, query parser,
-                    fusion/rerank glue, citation verifier, triage rules, policy evaluation
+                    fusion/rerank glue, citation verifier, triage rules, policy evaluation, JWK
+                    thumbprints, JWT and HTTP message signatures, notification rendering
 crates/platform     the ONLY crate importing `worker`: traits + Cloudflare impls for D1, DO, R2,
                     Queues, AI, Vectorize (extern), Email (send), rate limits, clock, randomness
 crates/api-types    serde request/response types, error codes, utoipa → OpenAPI 3.1

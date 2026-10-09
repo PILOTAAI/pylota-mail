@@ -76,7 +76,7 @@ made safe for domains that are not empty.
    Pylota Mail Cloud sets it to `true`.
 2. **Dedicated-domain check ([N21](../edge-cases.md)).** Moving nameservers hands the whole domain to this
    deployment, which only manages mail records. Before creating the zone, the Worker queries both DoH
-   resolvers for `A`, `AAAA` and `MX` at the name and for `CNAME`/`A` at `www.{name}`. If any exist and the
+   resolvers for `A`, `AAAA` and `MX` at the name and for `CNAME`, `A` and `AAAA` at `www.{name}`. If any exist and the
    request lacks `"confirm_dedicated": true`, it refuses with `409 domain_not_dedicated`. `details.records`
    lists what it found, and the fix says the website or mail on that domain would stop.
 3. **Create the zone:** `POST /zones` with `"type": "full"`. A `1105` error ("too many attempts to add a
@@ -153,7 +153,7 @@ idempotent and reads before it writes. `{prefix}` below is the `--prefix` flag, 
 
 | Step | Resource | Settings |
 |---|---|---|
-| 1 | Region check | `PM_SES_REGION` must be one of the 22 regions that receive mail ([endpoints](https://docs.aws.amazon.com/general/latest/gr/ses.html#ses_inbound_endpoints), read 2026-10-09). With `PM_JURISDICTION=eu` it must be an EU region (`eu-central-1`, `eu-west-1`, `eu-west-2`, `eu-south-1`, `eu-west-3`, `eu-north-1`) unless `--allow-non-eu` |
+| 1 | Region check | `PM_SES_REGION` must be one of the 22 regions that receive mail ([endpoints](https://docs.aws.amazon.com/general/latest/gr/ses.html#ses_inbound_endpoints), read 2026-10-09). With `PM_JURISDICTION=eu` it must be in the EU or the UK (`eu-central-1`, `eu-west-1`, `eu-west-2` (London), `eu-south-1`, `eu-west-3`, `eu-north-1`) unless `--allow-non-eu`. For this check `eu` means "EU or UK", because the UK has an EU adequacy decision under the GDPR (European Commission [adequacy decisions](https://commission.europa.eu/law/law-topic/data-protection/international-dimension-data-protection/adequacy-decisions_en), renewed 19 December 2025, read 2026-10-09). It is not Cloudflare's `eu` jurisdiction, which means the EU only ([R2 data location](https://developers.cloudflare.com/r2/reference/data-location/), read 2026-10-09) |
 | 2 | Account checks | `GetAccount`: production access enabled (sandbox sends only to verified addresses, 200 a day). Setup prints the console steps to request it and stops if it is missing. It also warns when the account is on the Essentials plan ($0.16 per 1,000) and not à la carte ($0.10) ([pricing](https://aws.amazon.com/ses/pricing/), read 2026-10-09) |
 | 3 | S3 bucket `{prefix}-inbound` | Same region; block all public access; SSE-S3; lifecycle rule deleting `in/` after 14 days; bucket policy letting `ses.amazonaws.com` `s3:PutObject` on `in/*` only with `aws:SourceAccount` = the account and `aws:SourceArn` = the receipt rule |
 | 4 | SNS topic `pylota-mail-inbound` | `SignatureVersion = 2` (SHA-256). The default is 1 ([SetTopicAttributes](https://docs.aws.amazon.com/sns/latest/api/API_SetTopicAttributes.html), read 2026-10-09) |
@@ -200,6 +200,12 @@ It needs SES with receiving configured (`PM_SES_INBOUND_TOPIC_ARN` set); without
    and `BehaviorOnMxFailure = USE_DEFAULT_VALUE`. The MAIL FROM domain must not be a subdomain that sends
    or receives mail ([MAIL FROM](https://docs.aws.amazon.com/ses/latest/dg/mail-from.html), read
    2026-10-09). The local-part prefix `pm-bounce` is therefore reserved on every `external` domain.
+   **SPF preflight ([H2](../edge-cases.md)).** Before the call, resolve TXT at `pm-bounce.{domain}` on both
+   resolvers. No `v=spf1` record there is the normal case. When one exists and differs from the record in
+   [4.1](#41-what-each-method-asks-the-customer-to-publish), count the lookups of that record merged with
+   `include:amazonses.com` ([SPF lookup count](identity-domains.md#spf-lookup-count)). More than 10, or
+   more than 2 void lookups: refuse with `400 spf_lookup_limit`, `details.lookups`, and a fix saying to
+   replace the record at `pm-bounce.{domain}` with the expected one. Nothing has been created in SES yet.
 6. **Records** as in [4.1](#41-what-each-method-asks-the-customer-to-publish), stored in `records_json`.
 7. Insert the row with `kind = 'external'`, `inbound = 'ses'`, `transport = 'ses'`,
    `routing_mode = 'catch_all'`, `mail_from_domain`, `ses_region`, then start the monitor. Addresses on the
@@ -351,6 +357,55 @@ As [Outbound › Amazon SES](outbound.md#amazon-ses). The custom MAIL FROM makes
 (`USE_DEFAULT_VALUE`). SPF then stops aligning but DKIM still does, so the domain is `degraded`
 (`mail_from_failed`), not `failing` ([N11](../edge-cases.md)).
 
+### 4.8 SES API rate: one request per second
+
+Amazon SES throttles every API action except `SendEmail`, `SendRawEmail` and `SendTemplatedEmail` at
+**one request per second**, per account and region, and the quota is not adjustable
+([SES quotas › SES API sending quotas](https://docs.aws.amazon.com/ses/latest/dg/quotas.html), read
+2026-10-09). The Worker makes such control-plane calls from several places: domain create, `PATCH` to
+`ses` and removal (`CreateEmailIdentity`, `GetEmailIdentity`, `PutEmailIdentityMailFromAttributes`,
+`DeleteEmailIdentity`), the daily identity check of each SES domain, the 15-minute platform check
+(`GetAccount`, the active receipt rule set) and the retired-address rule sync (§4.6). With up to 10,000
+identities in a region, uncoordinated calls would be throttled.
+
+**One deployment-wide token bucket.** Every SES call other than sending first takes a token from the
+`SesControl` Durable Object, one per deployment: 1 token per second, burst 1.
+
+```rust
+// crates/worker/src/domains/ses_control.rs
+pub enum SesControlRequest {
+    Init,                                        // first call after the cron minted the object
+    Acquire { caller: SesCaller, deadline_ms: i64 },
+    // → Granted { at_ms } | Busy { retry_after_ms }
+}
+pub enum SesCaller { Request, DomainCheck, PlatformCheck, RuleSync, Removal }
+```
+
+- `Acquire` runs in one transaction: `at = max(now, meta.next_free_ms)`. If `at > deadline_ms` it returns
+  `Busy { retry_after_ms: at − now }` and consumes nothing; otherwise it stores `next_free_ms = at + 1000`
+  and returns `Granted { at_ms: at }`. The caller waits until `at` (a timer, no CPU), then calls SES. No
+  two callers are ever given the same second.
+- **Deadlines.** Request-path callers (domain create, `PATCH`, the start of removal) wait at most
+  5 seconds; `Busy` answers `429 upstream_rate_limited` with `Retry-After` and `details.retry_after`
+  (seconds, rounded up). Background callers wait at most 60 seconds; on `Busy` they set their alarm to
+  `retry_after_ms` later.
+- **Throttled anyway.** SES `ThrottlingException` or `TooManyRequestsException` on a control-plane call
+  (another client of the same AWS account) makes the caller acquire again after 2 seconds, at most three
+  times, then treat it as `Busy`. Each one increments `ses_control_throttled_total`.
+- **Singleton ID.** The object is created with `new_object_id` (so `PM_JURISDICTION` applies) and its ID
+  is stored in D1 `platform_objects` under `name = 'ses_control'`. The every-minute cron mints it when SES
+  is configured and the row is missing (`INSERT … ON CONFLICT (name) DO NOTHING`, then read back, as for
+  [monitor IDs](identity-domains.md#create)), then sends `Init`. It holds no personal data: its `meta` has
+  `schema_version` and `next_free_ms` only ([Data model §3](data-model.md#3-other-durable-objects)).
+
+**Daily identity checks are spread across the day.** Each `DomainMonitor` of a domain with an SES
+identity runs its `GetEmailIdentity` check once a day at a fixed offset from 00:00 UTC:
+`offset_s = u64::from_be_bytes(SHA-256(domain_id)[0..8]) % 86_400`. Its wake-up `alarm:ses_check` is the
+next such time. 10,000 domains then average one call every 8.6 seconds instead of bunching at midnight,
+and the bucket's queue stays short.
+
+Test: `it::ses::control_plane_rate` (below).
+
 ## 5. `smtp_relay`: the customer's own sending provider
 
 For customers who already send through Microsoft 365, Google Workspace, Postmark, Mailgun, SendGrid or
@@ -424,13 +479,34 @@ domain has to pass a **probe** before it may send, and again every day ([N18](..
 4. No probe arrives within 15 minutes: `smtp_probe_timeout`. Until the domain has passed its first probe
    this is `fail`, because the domain must never reach `healthy` or `degraded` without a pass. After a
    pass, it is degraded the first time and fail after three in a row.
+5. **Record the result.** The `DomainMonitor` writes `domains.probe_last_at` and `probe_last_json`
+   (`{result, dkim_d, dmarc, from_unchanged, at, failures_in_row, pending}`) in one D1 statement. The
+   alignment-probe health check reads them on every 15-minute check
+   ([§6](#6-health-checks-per-method)), and `GET /v1/domains/{id}` returns them as `probe.last_at` and
+   `probe.result`.
 
-Two consecutive failed probes follow the normal state machine to `failing`. Sends then fall back to the
-platform address (FR-DOM-6), so the domain never sends mail that fails DMARC. `POST /v1/domains/{id}/probe`
-runs a probe now, at most once a minute per domain (`429 rate_limited` otherwise).
+**Schedule.** The monitor keeps the next probe time in `alarm:probe`:
 
-New `smtp` values from `PATCH` are kept pending, and sends keep using the stored values, until a probe
-with the new values passes.
+| Last result | Next probe | Health-check level of the alignment issue |
+|---|---|---|
+| Pass | 24 hours later | – (`ok` while the pass is under 26 hours old) |
+| First `smtp_unaligned` or `smtp_from_rewritten` in a row | 20 minutes later | degraded (sends continue for at most one retry) |
+| Second or later in a row | Every hour until a pass, or until the domain is suspended | fail |
+| `smtp_probe_timeout` | 20 minutes later; hourly from the third in a row | as in step 4 |
+
+So two failed probes in a row (about 20 minutes apart) make the issue fail-level, and the state machine
+moves the domain to `failing` after its two agreeing checks: about 40 minutes from the first failure in
+the worst case. Probes are sent daily only while the domain passes. Sends from a `failing` domain fall back
+to the platform address (FR-DOM-6), so the domain never sends mail that fails DMARC for long.
+`POST /v1/domains/{id}/probe` runs a probe now, at most once a minute per domain (`429 rate_limited`
+otherwise).
+
+**Pending values.** New `smtp` values from `PATCH` are sealed into `domains.smtp_pending_sealed`, and sends
+keep using `smtp_sealed`. A probe runs at once with the pending values (`pending: true` in the result). When
+it passes, the monitor re-seals the values under the `smtp_sealed` aad, writes them to `smtp_sealed` and
+sets `smtp_pending_sealed = NULL` in the same D1 statement. A failed probe with pending values changes
+neither column and does not count towards `failures_in_row` of the live values: the stored values keep
+sending, and the result shows on the domain. A later `PATCH` replaces the pending values.
 
 ### 5.4 Delivery events from a relay
 
@@ -449,11 +525,11 @@ These rows add to [What each check verifies](identity-domains.md#what-each-check
 | Record or check | Applies to | `ok` when | Issue codes (level) |
 |---|---|---|---|
 | SES inbound MX at the domain | `inbound = ses` | The MX set contains `inbound-smtp.{ses_region}.amazonaws.com` | `mx_missing` (fail); `mx_unexpected`: another MX host too (degraded) ([N9](../edge-cases.md)); `mx_wrong_region`: an SES inbound host for another region (fail) ([N8](../edge-cases.md)) |
-| SES identity | `transport = ses` or `inbound = ses` | `GetEmailIdentity` (once a day): `VerifiedForSendingStatus = true` and `DkimAttributes.Status = SUCCESS` | `ses_dkim_failed` (fail) ([N10](../edge-cases.md)) |
+| SES identity | `transport = ses` or `inbound = ses` | `GetEmailIdentity` (once a day, at the domain's hash offset, through the SES token bucket, §4.8): `VerifiedForSendingStatus = true` and `DkimAttributes.Status = SUCCESS` | `ses_dkim_failed` (fail) ([N10](../edge-cases.md)) |
 | SES DKIM CNAMEs | as above | Each CNAME points at `{token}.{SigningHostedZone}` | `dkim_missing` (fail) |
 | MAIL FROM | `transport = ses` | `MailFromAttributes.MailFromDomainStatus = SUCCESS`, and the MX and SPF at `pm-bounce.{domain}` match | `mail_from_failed` (degraded) ([N11](../edge-cases.md)) |
 | SES account | deployment, in `pmail doctor` and the 15-minute platform check | Production access enabled, sending not paused, the receipt rule set active and containing `pm-deliver` | `ses_sending_paused`, `ses_rule_missing` (platform alerts; every SES domain uses fallback while sending is paused) ([N10](../edge-cases.md)) |
-| Alignment probe | `transport = smtp` | Last probe passed within 26 hours | `smtp_unaligned`, `smtp_from_rewritten` (fail); `smtp_probe_timeout` (fail before the first pass; after it degraded, then fail after three in a row) |
+| Alignment probe | `transport = smtp` | Last probe (with the live values) passed within 26 hours | `smtp_unaligned`, `smtp_from_rewritten` (degraded for the first in a row, fail from the second; [§5.3](#53-proving-alignment-the-probe)); `smtp_probe_timeout` (fail before the first pass; after it degraded, then fail after three in a row) |
 | SMTP login | `transport = smtp` | The last send or probe authenticated | `smtp_auth_failed`, `smtp_tls_required` (fail) |
 | Parent delegation | `kind = delegated` | NS for the subdomain at the parent equal the zone's `name_servers` | `nameservers_changed` (ownership) |
 | Doubled names | `external` | No record exists at `{name}.{registrable domain}` that matches an expected value | `record_doubled_name` (degraded) with a fix telling the user to enter the `host` value only ([N17](../edge-cases.md)) |
@@ -463,7 +539,8 @@ Ownership TXT and RDAP checks apply to every `external` and `delegated` domain, 
 ## 7. Data model
 
 ```sql
--- D1: domains (new and changed columns; full table in data-model.md)
+-- D1: domains (the columns the methods use; all are in 0001_init.sql, full table in data-model.md;
+-- no migration adds or changes them before v1.0)
 kind        TEXT NOT NULL CHECK (kind IN ('platform','zone','delegated','external')),
 method      TEXT NOT NULL CHECK (method IN ('platform','cloudflare_zone','nameservers','dns_records',
                                              'send_only','smtp_relay','delegated_subdomain')),
@@ -474,7 +551,7 @@ mail_from_domain  TEXT,          -- pm-bounce.{domain}
 smtp_sealed       BLOB,          -- pm1 envelope of {host, port, username, password, probe_from}
 smtp_pending_sealed BLOB,        -- values from PATCH waiting for a passing probe (pm1, aad column smtp_pending_sealed)
 probe_last_at     INTEGER,
-probe_last_json   TEXT,          -- {result, dkim_d, dmarc, from_unchanged, at}
+probe_last_json   TEXT,          -- {result, dkim_d, dmarc, from_unchanged, at, failures_in_row, pending}
 
 -- D1: exactly-once ingestion of SES messages
 CREATE TABLE ses_ingest (
@@ -482,8 +559,9 @@ CREATE TABLE ses_ingest (
   recipient   TEXT NOT NULL,               -- normalised envelope recipient
   received_at INTEGER NOT NULL,
   status      TEXT NOT NULL CHECK (status IN ('queued','held','done','dropped','lost')),
-  done_at     INTEGER,
-  PRIMARY KEY (object_key, recipient)
+  done_at     INTEGER,                     -- set with any terminal status; the retention job prunes by it
+  PRIMARY KEY (object_key, recipient),
+  CHECK ((status IN ('queued','held')) = (done_at IS NULL))
 );
 CREATE INDEX ses_ingest_pending ON ses_ingest (status, received_at) WHERE status IN ('queued','held');
 
@@ -566,8 +644,10 @@ Sending, so a `dns_records` domain costs less to serve than one on a Cloudflare 
   a sub-processor in the DPIA ([Privacy](privacy.md)).
 - Raw inbound mail rests in S3 only until it is ingested (normally seconds), and never longer than the
   14-day lifecycle rule. The bucket uses SSE-S3 and denies public access.
-- With `PM_JURISDICTION=eu`, setup refuses a non-EU SES region unless `--allow-non-eu` is given
-  ([N30](../edge-cases.md)). Whenever SES is configured, `/health` reports `ses_region`.
+- With `PM_JURISDICTION=eu`, setup refuses an SES region outside the EU and the UK unless `--allow-non-eu`
+  is given ([N30](../edge-cases.md)). For the SES region, `eu` means "EU or UK" (the UK has an EU GDPR
+  adequacy decision); Cloudflare's `eu` jurisdiction for D1, R2 and Durable Objects means the EU only.
+  This deployment's SES runs in `eu-west-2` (London), the owner's decision of 2026-10-09. Whenever SES is configured, `/health` reports `ses_region`.
 - An `smtp_relay` domain sends content to the customer's own provider, chosen by the customer.
 
 ## 12. Spikes
@@ -575,7 +655,7 @@ Sending, so a `dns_records` domain costs less to serve than one on a Cloudflare 
 | Spike | Must prove | Pass | Fallback |
 |---|---|---|---|
 | S10 Child zones | On an Enterprise account, a subdomain-setup child zone accepts Email Routing catch-all to the Worker and Email Sending onboarding, and both work end to end | Mail to any address at the child apex reaches `email()`; a send is DKIM-aligned | `delegated_subdomain` stays off; `dns_records` covers the case |
-| S11 SES receiving | Rule set, S3 action and topic as specified. The notification shape matches §4.5. S3 `GetObject` with SigV4 from a Worker. A 30 MB message. `user+tag@` routing. The retired-address bounce. The backstop picks up a message whose push failed | All pass in `eu-west-2` | `dns_records` does not ship in v1.0; `send_only` still does |
+| S11 SES receiving | Rule set, S3 action and topic as specified. The notification shape matches §4.5. S3 `GetObject` with SigV4 from a Worker. A 39 MB message ([N5](../edge-cases.md)). `user+tag@` routing. The retired-address bounce. The backstop picks up a message whose push failed | All pass in `eu-west-2` | `dns_records` and `smtp_relay` with `inbound: ses` do not ship in v1.0; `send_only` still does |
 | S12 SMTP from a Worker | Ports 465 and 587 with `StartTls` against two real providers. The certificate host name is checked (a wrong-name certificate is refused). Timeouts and the uncertain window behave as in §5.2 | All pass | `smtp_relay` does not ship in v1.0 |
 
 ## 13. Options considered and not taken
@@ -600,26 +680,29 @@ Sending, so a `dns_records` domain costs less to serve than one on a Cloudflare 
 | `it::ses::large_message_40mb` | A 39 MB message is ingested ([N5](../edge-cases.md)) |
 | `it::ses::unknown_recipient_dropped` | No bounce, metric incremented ([N6](../edge-cases.md)) |
 | `it::ses::retired_rule_sync` | Retire → address in `pm-retired-{n}`; 501st opens a new rule; cap 150 rules evicts the oldest ([N7](../edge-cases.md), [N29](../edge-cases.md)) |
+| `it::ses::h2_mail_from_spf_preflight` | `dns_records` and `send_only`: an existing SPF at `pm-bounce.{domain}` whose merge with `include:amazonses.com` needs 11 lookups → `400 spf_lookup_limit` with `details.lookups`, and no SES identity is created ([H2](../edge-cases.md)) |
 | `it::ses::verdict_mapping` | Virus `FAIL` quarantines, spam `FAIL` scores 0.9, SPF taken from SES, DKIM recomputed ([N27](../edge-cases.md)) |
 | `it::ses::cross_tenant_recipients` | One object with recipients in two tenants → two messages, no leakage ([N28](../edge-cases.md)) |
 | `it::ses::stuck_queued_row_resent` | The enqueue after the ledger insert fails → the backstop cron re-sends the pointer after 15 minutes → one message; a second pointer for a `done` row is acked without work ([N3](../edge-cases.md)) |
 | `it::ses::suspended_tenant_held` | A suspended tenant's SES mail is `held`, ingested when the tenant is resumed, and `dropped` without a bounce after 5 days; the S3 object is kept until then ([A6](../edge-cases.md)) |
 | `it::domains::existing_mx_external` | `dns_records` with MX elsewhere → `409 existing_mx`; with `replace_mx` → created, `mx_unexpected` until removed ([N9](../edge-cases.md)) |
-| `it::domains::nameservers_dedicated_check` | A/AAAA/MX/www present → `409 domain_not_dedicated`; confirmed → created ([N21](../edge-cases.md)) |
+| `it::domains::nameservers_dedicated_check` | A/AAAA/MX/www present → `409 domain_not_dedicated`; confirmed → created ([N21](../edge-cases.md)) (FR-DOM-12) |
 | `it::domains::zone_expired` | Pending zone deleted upstream → `removed`, `zone_expired`, `domain.removed` with `reason: "zone_expired"`; the final reminder is sent on day 21 ([N23](../edge-cases.md)) |
 | `it::domains::mx_wrong_region` | An MX at another region's SES inbound host → `mx_wrong_region` (fail) ([N8](../edge-cases.md)) |
+| `it::ses::control_plane_rate` | Twenty concurrent `Acquire` calls are granted one second apart; a request-path caller past its 5-second deadline gets `429 upstream_rate_limited` with `Retry-After`; the daily checks of 1,000 fake domains fall at their hash offsets, at most one per second; an SES `ThrottlingException` re-acquires after 2 s |
 | `it::ses::dkim_failed_or_paused` | `GetEmailIdentity` without DKIM `SUCCESS` → `ses_dkim_failed` → `failing` → fallback; account sending paused → `ses_sending_paused` alert and every SES domain uses fallback ([N10](../edge-cases.md)) |
 | `it::ses::mail_from_mx_missing` | MX at `pm-bounce.{domain}` removed → `mail_from_failed` (degraded); sends continue with SES's default MAIL FROM ([N11](../edge-cases.md)) |
 | `it::domains::zone_create_rate_limited` | Cloudflare `1105` on zone create → `429 upstream_rate_limited`, `Retry-After: 10800` ([N22](../edge-cases.md)) |
 | `it::domains::zone_hold` | A zone-hold error on create → `409 zone_hold` ([N24](../edge-cases.md)) |
 | `it::domains::delegation_removed` | The parent's NS for a `delegated_subdomain` change → `nameservers_changed` → `suspended` ([N25](../edge-cases.md)) |
 | `it::domains::ses_identity_limit` | 9,000 identities → `ses_identities_90pct` alert and a doctor warning; 10,000 → `422 transport_unavailable` with `ses_identity_limit` for `dns_records`, `send_only` and `smtp_relay` with `inbound: ses`, while `cloudflare_zone` still succeeds ([N26](../edge-cases.md)) |
-| `cli::setup::ses_region_check` | `pmail setup ses` refuses a region that cannot receive mail, and a non-EU region under `PM_JURISDICTION=eu` unless `--allow-non-eu` ([N30](../edge-cases.md)) |
+| `cli::setup::ses_region_check` | `pmail setup ses` refuses a region that cannot receive mail, and a region outside the EU and the UK under `PM_JURISDICTION=eu` unless `--allow-non-eu`; `eu-west-2` is accepted ([N30](../edge-cases.md)) |
 | `core::smtp::state_machine` | Every row of the client table, including no STARTTLS → refused before AUTH, `535` → auth failure, 5xx on one RCPT ([N14](../edge-cases.md), [N16](../edge-cases.md), [N20](../edge-cases.md)) |
 | `it::smtp::create_connect_check` | Domain create and `PATCH smtp`: port 25 → `400 smtp_port_not_allowed`; no STARTTLS → `422 smtp_tls_required` with no `AUTH` sent; `535` → `422 smtp_auth_failed`; nothing stored in each case ([N14](../edge-cases.md), [N16](../edge-cases.md)) |
 | `it::smtp::uncertain_after_final_dot` | Connection dropped after the final `.` → `uncertain`, never resent ([N15](../edge-cases.md)) |
-| `it::smtp::partial_rcpt` | `4xx` on one `RCPT` → that delivery is retried later; `5xx` on another → that delivery is `rejected` with the code; the rest are sent in the same session ([N20](../edge-cases.md)) |
+| `it::smtp::partial_rcpt` | `4xx` on one `RCPT` → `DATA` is still sent to the others, that delivery stays `queued` and is retried later (the message stays `queued` until then; its `sends` unit stays held); `5xx` on another → that delivery is `rejected` with the code; the rest are sent in the same session ([N20](../edge-cases.md)) |
 | `it::smtp::probe_unaligned_falls_back` | A relay re-signing with its own `d=` → `smtp_unaligned` ×2 → `failing` → the next send uses the platform address ([N18](../edge-cases.md)) |
+| `it::smtp::probe_schedule_and_pending` | Fake time: a failed probe is retried after 20 minutes and is degraded; the second failure is fail-level and the domain is `failing` within 40 minutes; probes then run hourly, and daily again after a pass. A `PATCH smtp` probe that passes moves `smtp_pending_sealed` into `smtp_sealed`; one that fails changes neither column nor the live `failures_in_row` ([N18](../edge-cases.md)) |
 | `it::smtp::dsn_to_bounce` | An RFC 3464 DSN for a sent message → `bounced` (hard) and a suppression ([N19](../edge-cases.md)) |
 | `it::forwarding::test_forwarding` | New address → `forwarding: unverified`; token arrives → `ok`; none in 10 minutes → `failed` ([N12](../edge-cases.md)) |
 | `it::forwarding::loop_capped` | An agent writing to its own external address, forwarded back, does not loop: the hop counter and the automatic-exchange cap stop it ([N13](../edge-cases.md)) |

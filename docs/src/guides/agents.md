@@ -2,8 +2,9 @@
 
 This guide is for developers connecting LLM agents to Pylota Mail, and for agents reading the docs.
 It covers which interface to use, how to scope keys per agent, what to tell an agent about mail, how
-to handle events without repeating work, where people should stay in the loop, and a checklist of
-the behaviours the integrating application owns.
+to handle events without repeating work, where people should stay in the loop, how an agent proves who
+it is to other services and websites, and a checklist of the behaviours the integrating application
+owns.
 
 ## Choose an interface
 
@@ -17,12 +18,16 @@ the behaviours the integrating application owns.
 A common setup: specialist agents use MCP with narrow identity keys, while the integrating
 application consumes webhooks and runs sends that need approval through the REST API.
 
-The 15 MCP tools are `mail_list_identities`, `mail_list_threads`, `mail_search`, `mail_deep_search`,
+The 17 MCP tools are `mail_list_identities`, `mail_list_threads`, `mail_search`, `mail_deep_search`,
 `mail_get_thread`, `mail_get_message`, `mail_get_attachment_text`, `mail_find_related`,
-`mail_search_contacts`, `mail_wait`, `mail_get_usage`, `mail_send`, `mail_reply`, `mail_forward` and
-`mail_update_labels`. Send tools require an `idempotency_key` argument. `mail_get_usage` shows the
-workspace's remaining allowances; every tenant and identity key can call it. The server also offers
-one prompt, `mail_search_strategy`.
+`mail_search_contacts`, `mail_wait`, `mail_get_usage`, `mail_send`, `mail_reply`, `mail_forward`,
+`mail_update_labels`, `mail_sign_assertion` and `mail_sign_http_request`. Send tools require an
+`idempotency_key` argument: 1–255 printable ASCII characters, spaces included
+(`^[\x20-\x7E]{1,255}$`), the same rule as the REST `Idempotency-Key` header. `mail_get_usage` shows
+the workspace's remaining allowances; every tenant and identity key can call it, and platform keys do
+not see it. The two signing tools need `identities:sign` and are hidden from keys without it
+([Agent assertions](#agent-assertions), [Signed HTTP requests](#signed-http-requests)). The server
+also offers one prompt, `mail_search_strategy`.
 
 ## Give each agent its own key
 
@@ -33,7 +38,9 @@ so the key is the boundary of what an agent can do, whatever it is told.
 |---|---|---|
 | A specialist with its own mailbox (bookings, maintenance) | `identity` | `messages:read`, `messages:send`, `search:read`, `attachments:read` |
 | A specialist that also answers questions from history | `identity` | as above, plus `search:agentic` |
-| A read-only research or summarising agent | `identity` or `tenant` | `messages:read`, `search:read`, `attachments:read` |
+| A read-only research or summarising agent | `identity` | `messages:read`, `search:read`, `attachments:read` |
+| The same agent across several mailboxes | `tenant` | `identities:read`, `messages:read`, `search:read`, `attachments:read`. A tenant key must name the identity on every call, and `identities:read` lets it look the identity up |
+| An agent that proves who it is to other services or websites | `identity` | What it otherwise needs, plus `identities:sign` ([Agent assertions](#agent-assertions)) |
 | A coordinator that routes work across a tenant's agents | `tenant` | `identities:read`, `messages:read`, `search:read`, plus `messages:send` only if it sends itself |
 | Your backend (webhooks, provisioning) | `tenant` | What it needs, for example `identities:write`, `webhooks:manage`, `messages:write` |
 
@@ -45,6 +52,10 @@ Rules:
   agent look it up and pass on only the answer.
 - **Keep human permissions away from agents.** `quarantine:review`, `erasure:manage`, `keys:manage`,
   `suppressions:manage` and `tenants:manage` belong to people and back-office services.
+- **Give `identities:sign` only to an agent that signs, on its own identity key.** It lets a key speak
+  for an identity to the outside world: an identity key only for its own identity, a tenant key for
+  every identity of the tenant. Platform keys cannot hold it: creating a platform key that lists it is
+  refused with `400 invalid_request`.
 - **One key per agent**, with a `name` that says which agent it is, so the audit log shows who did
   what, and so one key can be revoked without stopping the others.
 - Set `expires_at`, and rotate keys with an overlap ([Security](security.md#rotation)).
@@ -157,7 +168,7 @@ decision. Useful patterns:
 | **Cancel a queued message** | `POST …/messages/{id}/cancel` works only while the message is `queued`. That window is short (the target is p95 ≤ 60 s to the transport), so it is a safety net, not an approval step |
 | **Resolve an uncertain send** | A person checks what happened and calls `resolve` with `sent` or `not_sent`. Agents should never resolve their own uncertain sends |
 | **Mandatory review for risky mail** | Require approval before acting on messages with `payment_change_request`, `credential_request` or `prompt_injection_suspected`, or with a `verdict` other than `pass` when the action depends on who sent it ([D1](../project/edge-cases.md), [D8](../project/edge-cases.md)) |
-| **A person takes over** | Stop the agent from sending in that thread in your tool layer, and label the thread (for example `human`). To stop an identity entirely, pause it (`PATCH /v1/identities/{id}` with `{"status": "paused"}`): it keeps receiving, and every send is refused with `identity_paused` ([E6](../project/edge-cases.md), [K2](../project/edge-cases.md)) |
+| **A person takes over** | Stop the agent from sending in that thread in your tool layer, and label the thread (for example `human`). To stop an identity entirely, pause it (`PATCH /v1/identities/{id}` with `{"status": "paused"}`): it keeps receiving, every send and signing request is refused with `identity_paused`, and its key set is withdrawn ([E6](../project/edge-cases.md), [K2](../project/edge-cases.md)) |
 | **Quarantine release** | Only people with `quarantine:review` release mail. Never route release through an agent |
 
 ## Verification codes with `wait`
@@ -174,6 +185,138 @@ A code is released only for authenticated mail (`verdict: pass`) from the domain
 One-time-code mail that arrives when no `wait` for that domain was active in the previous 30 minutes
 is quarantined as `otp_unsolicited` ([E5](../project/edge-cases.md)), which is why the wait comes
 first. Details: [Receiving › Waiting for a verification code](receiving.md#waiting-for-a-verification-code).
+
+## Agent assertions
+
+When your agent signs up to, or calls, another service, that service may want proof of which agent it
+is dealing with. An **agent assertion** is a short-lived token (a JWT) signed with the identity's own
+Ed25519 key. The service checks it against the identity's published key set, with no account on your
+deployment ([Agent signing keys](../project/design/agent-keys.md)).
+
+The key needs `identities:sign` (tenant or identity key):
+
+| Interface | Call |
+|---|---|
+| REST | `POST /v1/identities/{identity_id}/assertions` |
+| MCP | `mail_sign_assertion`, with the same fields ([MCP server](../reference/mcp.md)) |
+| CLI | `pmail assertions create` ([CLI](../reference/cli.md)) |
+
+```bash
+curl -X POST https://mail.example.com/v1/identities/idn_01J9Z3K8V4/assertions \
+  -H "Authorization: Bearer $PYLOTA_MAIL_KEY" -H "Content-Type: application/json" \
+  -d '{"audience":"https://portal.supplier.example","expires_in":300,"nonce":"b3f1c2…",
+       "ext":{"booking_ref":"BK-2291"}}'
+```
+
+```json
+{ "assertion": "eyJhbGciOiJFZERTQSIs…", "kid": "kPrK_qmx…", "expires_at": "2026-10-09T12:05:00Z",
+  "jwks_uri": "https://mail.example.com/.well-known/jwks/idn_01J9Z3K8V4.json" }
+```
+
+| Field | Rules |
+|---|---|
+| `audience` | Required. The URL or identifier the other service expects, 1–256 printable ASCII characters |
+| `expires_in` | 60–600 seconds, default 300 |
+| `nonce` | Optional, 1–128 printable ASCII characters. Copy in the service's challenge, if it sends one |
+| `ext` | Optional object for your own claims, at most 2 KB as JSON. It cannot set the standard or Pylota claims |
+
+A value out of range gets `400 invalid_request`. The response is `201`. Hand the `assertion` to the
+service the way it asks for it. Every call mints a new token, so an `Idempotency-Key` header is ignored,
+and the token is never stored or logged.
+
+**What the audience learns.** The token's claims are `iss` (your deployment's API origin, for example
+`https://mail.example.com`), `sub` (the identity ID), `aud`, `iat`, `nbf`, `exp`, `jti` (a unique ID),
+`email` (the identity's primary address) with `email_verified: true`, `name` (the display name), `org`
+(the workspace name), `accountable_human` (`true` when the identity has an accountable owner),
+`ai_agent: true`, and your `nonce` and `ext`. The owner's name and address are never included.
+
+**The identity's key** is created on its first signing request (or with
+`POST /v1/identities/{identity_id}/keys`), sealed, and never leaves the Worker. Rotate it with
+`POST …/keys/rotate`, and revoke it at once with `POST …/keys/{kid}/revoke` if you suspect a leak
+(`identities:write`; CLI `pmail identity-keys`). A paused identity cannot sign (`409 identity_paused`)
+and its key set is withdrawn, so a service that refetches the key set stops accepting its assertions
+within 5 minutes ([Security › Identity signing keys](security.md#identity-signing-keys)). Assertions and signed HTTP
+requests together are limited to 600 a minute per identity (`429 rate_limited`), and are not counted
+against any plan allowance.
+
+### Verifying an assertion
+
+If you run the service on the other side, check every assertion in these six steps
+([Agent signing keys §4.3](../project/design/agent-keys.md#43-how-a-verifier-checks-it)):
+
+1. Decode the header. `alg` must be `EdDSA` and `typ` must be `agent-assertion+jwt`. Reject anything
+   else: no `none`, no algorithm switching.
+2. `iss` must be an issuer you trust, for example `https://mail.example.com`. Never fetch keys from a URL
+   the token supplies.
+3. Fetch `{iss}/.well-known/jwks/{sub}.json` (cache it for at most 5 minutes) and pick the key whose
+   `kid` matches. No match: reject. A `404` means the identity is unknown, paused or deleted: reject.
+4. Verify the Ed25519 signature over the JWS signing input.
+5. `aud` must equal your own audience. Check `nbf` and `exp`, allowing 60 seconds of clock skew.
+6. Keep `jti` until `exp` and reject a repeat.
+
+The Rust SDK follows these steps in `verify_assertion`, and
+`pmail assertions verify <token> --audience <audience>` runs them on your machine with no API key
+(`--issuer` defaults to your profile's URL).
+Replay protection is yours whichever you use: keep the `jti` cache, send a `nonce` challenge when you
+can, and accept only short expiries.
+
+## Signed HTTP requests
+
+When your agent fetches web pages or calls web APIs, a site may want to know that the request comes
+from a declared, accountable bot. Pylota Mail can sign the request with
+[Web Bot Auth](https://developers.cloudflare.com/bots/reference/bot-verification/web-bot-auth/)
+(RFC 9421 HTTP Message Signatures), using a key of the deployment, with the identity's address in a
+signed `From` header ([Agent signing keys §5](../project/design/agent-keys.md#5-signed-http-requests-web-bot-auth)).
+
+It is off unless both of these hold:
+
+- the operator turned it on with `PM_WEB_BOT_AUTH=on`
+  ([Deploy to Cloudflare › Signed HTTP requests](../self-hosting.md#signed-http-requests-web-bot-auth)).
+  Otherwise every request gets `422 web_bot_auth_disabled`;
+- the workspace opted in: tenant policy `web_bot_auth.allowed: true`, set with a platform key that
+  holds `tenants:manage` ([Configuration › Tenant policy](../reference/configuration.md#tenant-policy)).
+  Otherwise `403 policy_denied`.
+
+Signed HTTP requests are a P1 feature. The operator can turn them on only once the Web Bot Auth format
+check (spike S13) has passed; until then they stay off, and agent assertions work regardless.
+
+Ask for the headers with `identities:sign` (`POST /v1/identities/{identity_id}/http-signatures`, MCP
+`mail_sign_http_request`, or `pmail http-sign`, which prints the four headers):
+
+```bash
+curl -X POST https://mail.example.com/v1/identities/idn_01J9Z3K8V4/http-signatures \
+  -H "Authorization: Bearer $PYLOTA_MAIL_KEY" -H "Content-Type: application/json" \
+  -d '{"url":"https://www.brightwell.example/fleet/availability?from=2026-10-12","method":"GET","expires_in":60}'
+```
+
+```json
+{ "headers": {
+    "Signature-Agent": "\"https://mail.example.com\"",
+    "From": "bookings@acme.example.com",
+    "Signature-Input": "sig1=(\"@authority\" \"signature-agent\" \"from\");created=1791547200;expires=1791547260;keyid=\"poqkLGiy…\";alg=\"ed25519\";nonce=\"e8N7S2MF…\";tag=\"web-bot-auth\"",
+    "Signature": "sig1=:jdq0SqOw…:" },
+  "expires_at": "2026-10-09T12:01:00Z" }
+```
+
+Attach the four headers, unchanged, to your own request to that URL, and send it before `expires_at`.
+The Worker never makes the request itself, and nothing is stored.
+
+| Field | Rules |
+|---|---|
+| `url` | Required. `https` only, at most 2,048 characters. An internationalised host is signed in its ASCII form (A-label) |
+| `method` | Optional, upper case, for example `GET`. Signed only when `components` includes `@method` |
+| `expires_in` | 30–300 seconds, default 60 |
+| `components` | Optional. Always includes `@authority`, `signature-agent` and `from`; you may add `@method`, `@path` and `@query`. Any other header component, or a value that is not ASCII, gets `400 invalid_request` |
+
+- `From` carries the identity's primary address, so the site knows which agent made the request and
+  how to reach whoever is responsible for it. Sign only requests the identity should answer for.
+- Sign each request just before you send it. Keep the expiry short, but not so short that the request
+  expires in transit: the default 60 seconds suits most uses.
+- Sites verify with any Web Bot Auth verifier. `Signature-Agent` names your deployment's origin, which
+  publishes its key directory at `/.well-known/http-message-signatures-directory`. Cloudflare's
+  verified-bot programme recognises the signatures once the operator has registered that directory.
+- An identity whose agent misbehaves on the web is paused like any other abuse case, and pausing stops
+  new signatures at once.
 
 ## Integrator checklist
 

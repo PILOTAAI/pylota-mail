@@ -32,10 +32,42 @@ Items the documentation does not confirm are marked "verify at build time" with 
 | `paused` | `PATCH status: active` | reason `manual`: `identities:write`; reason `abuse_threshold`: platform or tenant key, audit-logged; reason `tenant_suspended`: refused (`409 identity_paused`) | `pause_reason = NULL`; `identity.resumed` | `active` |
 | `paused` (`tenant_suspended`) | Tenant resumed | – | `identity.resumed` | `active` |
 | `active`, `paused` | `DELETE` | `identities:write` and `erasure:manage` | Tombstone and remove every address; create the identity-scope erasure ([Privacy](privacy.md)) | `deleting` |
-| `deleting` | Erasure completed | – | `identity.deleted` (from the job's outbox) | `deleted` |
+| `deleting` | Erasure completed with no holds left | – | `identity.deleted`, once, from the erasure job's outbox with `identity_id` set ([Privacy § 6.5](privacy.md#65-identity-scope-fr-idn-4)) | `deleted` |
 
 A paused identity still receives and stores mail (FR-IDN-3). Every send needs an accountable human
 (`owner_name` and `owner_email`, FR-IDN-2); the check is in the send policy pipeline.
+
+### The system identity
+
+The deployment's own mail (console sign-in links and codes, invitations, and the other mail the designs
+send from `PM_SYSTEM_FROM`) goes out through one reserved identity, the **system identity**, through the
+normal outbound pipeline.
+
+- **Created by setup** ([CLI and setup §6.3](cli.md#63-steps), step 22) on the default tenant, at the
+  address of `PM_SYSTEM_FROM` (default `Pylota Mail <no-reply@{PM_PLATFORM_DOMAIN}>`): an `identities`
+  row with `is_system = 1`, `username` = the address's local part, `display_name` = its display name,
+  `owner_name = 'Operator'` and `owner_email` = setup's `--owner-email` (else
+  `postmaster@{PM_PLATFORM_DOMAIN}`), and `send_policy.daily_cap` = 50,000; plus one `active` primary
+  address on the platform domain. Setup writes both rows with `mailbox_do_id = ''`, and the every-minute
+  cron mints the mailbox and sends `MailboxRequest::Init`, as the [monitor hook](#create) does for
+  domains. At most one row has `is_system = 1` (a partial unique index).
+- **Exempt from username validation.** Its local part may be a reserved name (`no-reply` is), because
+  only setup writes it. It must still be ASCII, at most 64 octets, with a valid address syntax.
+- **Not listed to tenants.** List endpoints (`GET /v1/identities`, `GET /v1/tenants/{t}/identities`,
+  `mail_list_identities`, the console) never return it, and a tenant or identity key that names it gets
+  `404 identity_not_found`. Only a platform key reads or changes it, by ID. It is not counted against
+  `inboxes`.
+- **Mail sent to it** is stored in its mailbox like any identity's (bounces and replies to sign-in mail),
+  readable only with a platform key.
+- **Fixed retention.** Its mailbox keeps messages 30 days and raw MIME 7 days, whatever the default
+  tenant's `retention` policy says: the tenant retention job uses these cutoffs for the identity with
+  `is_system = 1` ([Privacy §5.2](privacy.md#52-steps-of-a-tenant-retention-job)). Deleting a person also
+  erases the system mail sent to them ([Privacy §6.9](privacy.md#69-people-console-accounts)).
+- **Changing `PM_SYSTEM_FROM`.** A re-run of setup adds the new address to the system identity and
+  promotes it; the old address retires as usual.
+- **Without the console** (`PM_CONSOLE=off`) it still exists and still sends invitations, because
+  `PM_SYSTEM_FROM` and `PM_CONSOLE_HOST` are top-level settings, not console settings
+  ([Rust workspace §6.1](rust-workspace.md#61-errors-and-configuration)).
 
 ### Create
 
@@ -77,8 +109,8 @@ those. Each identity then gets its event.
 One D1 batch:
 
 ```sql
-INSERT OR IGNORE INTO address_tombstones (address_hash, identity_id, reason, created_at)
-  SELECT ?2 /* computed per row in Rust: HMAC-SHA256(PM_HASH_KEY, address) */, identity_id, 'deleted', ?3
+INSERT OR IGNORE INTO address_tombstones (address_hash, identity_id, reason)
+  SELECT ?2 /* computed per row in Rust: HMAC-SHA256(PM_HASH_KEY, address) */, identity_id, 'deleted'
   FROM addresses WHERE identity_id = ?1;     -- executed once per address with its hash
 DELETE FROM addresses WHERE identity_id = ?1;
 UPDATE identities SET status = 'deleting', updated_at = ?3 WHERE id = ?1;
@@ -194,7 +226,7 @@ becomes an `active` alias rather than `retiring`.
 | `pending` | Domain reaches `healthy`/`degraded` and the address is routed | – | `identity.address_activated` | `active` |
 | `pending` | Literal rule creation fails ([H6](../edge-cases.md)) | – | Stays `pending`; retried by the domain's monitor (1, 5, 15, 60 minutes, then hourly); issue `routing_rule_failed` on the domain's health | `pending` |
 | `pending` | `DELETE …/addresses/{id}` | Never received mail | Delete the row and its rule | – |
-| `active` alias | `POST …/promote` | Domain `healthy` or `degraded` (else `409 domain_not_ready`) | In one batch: this address becomes `primary`; the previous primary becomes an alias, `retiring` with `retire_at = now + retire_previous_after_days` (default 90, range 0–365; 0 means `retired` now), except the platform address, which becomes an `active` alias; `identity.address_promoted` with `previous_primary` | `active` primary |
+| `active` alias | `POST …/promote` | Domain `healthy` or `degraded` (else `409 domain_not_ready`) | In one batch: this address becomes `primary`; the previous primary becomes an alias, `retiring` with `retire_at = now + retire_previous_after_days` (default 90, range 0–365; 0 means `retired` now), except the platform address, which becomes an `active` alias. When the promoted address is itself the platform address, this is a **rollback** as in the next row: the current primary becomes an `active` alias, not `retiring` ([A14](../edge-cases.md)); `identity.address_promoted` with `previous_primary` | `active` primary |
 | `retiring` alias | `POST …/promote` (**rollback**, FR-ADR-4) | Domain `healthy` or `degraded` | This address becomes `primary`, `retire_at = NULL`; the current primary becomes an `active` alias (the change is undone, not mirrored); `identity.address_promoted` | `active` primary |
 | `active` alias | `POST …/retire` | Not the primary (`409 address_is_primary`); not the platform address (`409 address_in_use`) | `after_days > 0`: `retiring`, `retire_at = now + after_days`; `0`: `retired` now with `identity.address_retired` | `retiring` / `retired` |
 | `retiring` | `POST …/retire` | – | `retire_at` updated (`0` retires now) | `retiring` / `retired` |
@@ -297,8 +329,9 @@ refused with `422 transport_unavailable`, `details.reason = "ses_identity_limit"
 **The Cloudflare token.** `PM_CF_API_TOKEN` must be set on the Worker for `cloudflare_zone`,
 `nameservers` and `delegated_subdomain`; without it, creating such a domain returns
 `422 cf_token_required`. `dns_records`, `send_only` and `smtp_relay` make no Cloudflare call. The one
-exception is an apex `cloudflare_zone` domain (catch-all, no literal rules): `pmail domains add` can
-onboard it with the operator's local `CLOUDFLARE_API_TOKEN` and insert the row itself
+exception is an apex `cloudflare_zone` domain (catch-all, no literal rules):
+`pmail domains add --local-token` can onboard it with the operator's local `CLOUDFLARE_API_TOKEN` and
+insert the row itself
 ([CLI and setup §18.1](cli.md#181-domains-add-without-pm_cf_api_token)), and the Worker's cron completes
 the row as for [the platform domain](#the-platform-domain). A subdomain, `nameservers` and
 `delegated_subdomain` cannot be added that way, because the Worker has to keep calling Cloudflare over the
@@ -365,6 +398,26 @@ The `cloudflare_zone` method. Needs `PM_CF_API_TOKEN` (`422 cf_token_required` w
 
    The returned ID is stored in `event_subscription_id`. The `email.sending` source shape is from
    Wrangler's source, not yet the API reference; S9 verifies it.
+
+   **Spike S9 fallback: manual delivery events.** When the subscription cannot be created at runtime
+   (the create call answers `401`, `403`, `404`, `405` or `501`: the API or the token cannot do it), the
+   domain is still created. The row is inserted with `event_subscription_id = NULL`, and the domain
+   object reports `delivery_events: "manual"` and `details.action = "run pmail domains subscribe
+   {domain}"` in the `201` response and in every later read, next to its records. `429` and `5xx` answers
+   are not this case: the create request fails with `502 upstream_error` as for any other onboarding
+   call, and is safe to retry. Delivery events for the domain start only once
+   `pmail domains subscribe {domain}` has run ([CLI and setup §18.4](cli.md#184-domains-subscribe)): it
+   creates the subscription with the operator's local `CLOUDFLARE_API_TOKEN` and records its ID. Until
+   then sends work, delivery statuses stay at `sent` (the transport's acceptance), uncertain sends are not
+   reconciled, and `pmail doctor` fails `sending.event_subscriptions` with that command as the fix. The
+   same applies to a `nameservers` domain, whose step 7 runs in the monitor once the zone is active. If
+   S9 also shows that the Worker cannot delete a subscription, domain removal keeps going and `pmail
+   doctor` lists the left-over subscription with the `wrangler queues subscription delete` command. Test:
+   `it::domains::s9_manual_delivery_events`.
+
+   `delivery_events` is derived, not stored: `active` when the domain sends through Cloudflare and has an
+   `event_subscription_id`, or sends through SES or SMTP (their events arrive through SNS or DSNs);
+   `manual` when it sends through Cloudflare without one; `none` when `sending` is false.
 8. **Read the records back (FR-DOM-3).** `GET /zones/{zone_id}/email/routing/dns` and
    `GET /zones/{zone_id}/email/sending/subdomains/{tag}/dns`; normalise each to
    `{ type, name, value, priority, purpose, required }` with `purpose` one of `mx`, `spf`, `dkim`,
@@ -450,8 +503,8 @@ UPDATE domains SET monitor_do_id = ?1, updated_at = ?2 WHERE id = ?3 AND monitor
 
 Only when the `UPDATE` changed the row does the cron send `DomainRequest::Init`, which starts
 verification, and emit `domain.created` for a row with a `tenant_id`. An overlapping run that lost the
-update discards its unused ID. The same hook completes the rows that `pmail domains add` inserts with the
-local token ([CLI and setup §18.1](cli.md#181-domains-add-without-pm_cf_api_token)). Setup polls the
+update discards its unused ID. The same hook completes the rows that `pmail domains add --local-token`
+inserts ([CLI and setup §18.1](cli.md#181-domains-add-without-pm_cf_api_token)). Setup polls the
 platform row's `monitor_do_id` for up to 2 minutes and reports `monitor: started`, or a warning naming
 the cron.
 
@@ -521,7 +574,9 @@ alignment is proved by the alignment probe instead
 `rdap_fingerprint = hex(sha256(registrar entity handle ‖ registrant entity handle or "" ‖ registration eventDate))`
 (RFC 9083 roles `registrar` and `registrant`, event `registration`). Requests follow [Security § 9.3](security.md#93-other-outbound-destinations) (HTTPS, at most one
 redirect to another bootstrap-listed host, 256 KB, 10 s). An RDAP error or timeout is ignored for that
-week. A change must be seen on two RDAP queries an hour apart.
+week. A change must be seen on two RDAP queries an hour apart: the first stores `meta.rdap_pending`
+(`{fingerprint, seen_at}`) and sets `alarm:ownership` to an hour later; the second confirms it (the same
+fingerprint) or clears it.
 
 ### Outcome per resolver and agreement
 
@@ -612,7 +667,7 @@ needs `ses_identity` set, SES configured and the SES DKIM records in `records_js
 domain, gets `422 transport_unavailable` with `details.reason = "method_not_supported"`. An `smtp_relay`
 domain changes its relay with `PATCH` and `smtp` instead (tenant or platform key with `domains:write`);
 the new values are kept pending until a probe passes
-([§5.1](domain-connections.md#51-configuration)). A transport change updates `domains.transport`,
+([§5.3](domain-connections.md#53-proving-alignment-the-probe)). A transport change updates `domains.transport`,
 writes an `audit_log` row (`domain.transport`), and asks the monitor for a check at once, because DKIM
 alignment differs per transport. The outbound consumer reads the transport at transport time, so queued
 mail moves with it.
@@ -648,29 +703,36 @@ Retired address rows stay, so their addresses are never reassigned.
 
 ## Cloudflare API token permissions
 
-`PM_CF_API_TOKEN` (Worker secret) is needed for `cloudflare_zone`, `nameservers` and
-`delegated_subdomain` domains ([Adding a domain](#adding-a-domain)); a deployment whose tenants use only
-`dns_records`, `send_only` or `smtp_relay` can leave it unset. It needs the following. Names are shown as on the API tab of the
-[permissions reference](https://developers.cloudflare.com/fundamentals/api/reference/permissions/) (read
-2026-10-09; the dashboard tab shows "Edit" where the API tab shows "Write").
-
-| Capability | Permission | Scope |
-|---|---|---|
-| Find zones; read zone status | Zone Read | Zone (all zones used for mail) |
-| Create a zone, and delete it on removal (`nameservers`, `delegated_subdomain`) | Zone Write (dashboard: Zone Edit). Whether a zone-scoped grant can create new zones is not stated; verify at build time | Account |
-| Enable routing, set sub-addressing, read routing DNS records | Zone Settings Write (dashboard: Zone Settings Edit) | Zone |
-| Catch-all and literal rules | Email Routing Rules Write (dashboard: Email Routing Rules Edit) | Zone |
-| Ownership TXT, MX removal for `replace_mx` | DNS Write | Zone |
-| Sending onboarding and DNS records, suppression list (G4) | Email Sending: Edit (named in the Email Service docs; not listed on the permissions page; scope verify at build time) | Account (verify) |
-| Event subscriptions to a queue; list queues | Queues Write (accepted by the create-subscription endpoint) | Account |
-| REST fallbacks (only if S6 fails) | Vectorize Write; Workers AI Read | Account |
-
-`pmail setup` uses the operator's own token, which additionally needs Workers Scripts Write, D1 Write,
-Workers R2 Storage Write, Vectorize Write, Workers Routes Write (the API host's Custom Domain) and Account
-Settings Read; the full list is in
+Two Cloudflare tokens exist, and their permissions are listed once, in one table:
 [Deploy to Cloudflare › Create a Cloudflare API token](../../self-hosting.md#2-create-a-cloudflare-api-token).
-It needs no Email Routing Addresses permission, because setup registers no destination address
-(role mail, under [Username validation](#username-validation), is sent as new messages, never
+That table names each permission as the dashboard shows it (for example Zone · Edit, which the API tab of
+Cloudflare's permissions reference calls Zone Write) and marks which token needs it.
+
+- The operator's own token, `CLOUDFLARE_API_TOKEN`, is used only by the CLI
+  ([CLI reference › Commands that use your Cloudflare token](../../reference/cli.md#commands-that-use-your-cloudflare-token)):
+  `pmail setup` onboards the platform domain with it ([The platform domain](#the-platform-domain)), and
+  `pmail domains add --local-token` an apex `cloudflare_zone` domain
+  ([CLI and setup §18.1](cli.md#181-domains-add-without-pm_cf_api_token)).
+- The Worker's token, the secret `PM_CF_API_TOKEN`, is what this design calls during a domain's life. It
+  is needed for `cloudflare_zone`, `nameservers` and `delegated_subdomain` domains
+  ([Adding a domain](#adding-a-domain)); a deployment whose tenants use only `dns_records`, `send_only` or
+  `smtp_relay` can leave it unset.
+
+What the Worker does with each permission marked for it in that table:
+
+| Permission (dashboard name) | The Worker uses it for |
+|---|---|
+| Zone · Read | Finding zones ([Kind `zone`](#kind-zone) step 1) and reading a new zone's status ([Creating a zone](#creating-a-zone)) |
+| Zone · Edit | Creating a zone for `nameservers` and `delegated_subdomain`, and deleting it on [removal](#domain-removal) (`delete_zone`). Whether a zone-scoped grant can create new zones is not stated; verify at build time |
+| Zone Settings · Edit | Enabling routing, setting sub-addressing and reading the routing DNS records (steps 5 and 8); `disable_routing` on removal |
+| Email Routing Rules · Edit | The catch-all rule on an apex and the literal rules per address on a subdomain ([Routing an address](#routing-an-address)) |
+| DNS · Edit | The ownership TXT, and MX removal for `replace_mx` (steps 2 and 4) |
+| Email Sending · Edit | Sending onboarding and its DNS records (step 6) and the suppression list (G4). It is named in the Email Service docs but not on the permissions page; its scope is verified at build time |
+| Queues · Edit | Listing queues and creating a domain's event subscription to `pm-delivery-events` (step 7) |
+| Vectorize · Edit, Workers AI · Read and Edit | Only the REST fallbacks, if spike S6 fails |
+
+Neither token needs an Email Routing Addresses permission, because nothing registers a destination
+address (role mail, under [Username validation](#username-validation), is sent as new messages, never
 forwarded).
 
 ## Tests
@@ -687,7 +749,7 @@ forwarded).
 | `it::identities::a13_delete_then_reply_rejected` | After delete, mail to its addresses gets `550 5.1.1` ([A13](../edge-cases.md), FR-IDN-4) |
 | `it::addresses::a11_newer_pending_replaces` | A second pending address on a domain replaces the first ([A11](../edge-cases.md)) |
 | `it::addresses::promote_retire_rollback` | Promote, retire after grace, rollback by promoting the retiring address, events emitted (FR-ADR-2–4) |
-| `it::addresses::a14_platform_address_kept` | Promoting away keeps the platform address `active`; retiring or deleting it is refused with `409 address_in_use`; promoting it again rolls back ([A14](../edge-cases.md), FR-ADR-2, FR-DOM-6) |
+| `it::addresses::a14_platform_address_kept` | Promoting away keeps the platform address `active`; retiring or deleting it is refused with `409 address_in_use`; promoting it again rolls back: it is `primary` and the custom address is an `active` alias with `retire_at = NULL` ([A14](../edge-cases.md), FR-ADR-2, FR-DOM-6) |
 | `core::address::a4_role_names_by_domain` | `support`, `sales`, `info`, `marketing` are refused on the platform domain and allowed on a tenant domain; `postmaster` and `abuse` are refused on both ([A4](../edge-cases.md), FR-ADR-6) |
 | `it::domains::transport_patch` | Platform key switches a domain to `ses` and back; a tenant key gets `403 scope_denied`; no SES identity gives `422 transport_unavailable` ([J5](../edge-cases.md)) |
 | `it::addresses::retirement_cron` | `retire_at` reached → `retired`, `identity.address_retired`, inbound `550 5.1.6` (FR-ADR-3) |
@@ -701,7 +763,8 @@ forwarded).
 | `core::domain_fsm::h7_resolver_disagreement` | One resolver erroring or disagreeing never changes state; two consecutive agreeing cycles do ([H7](../edge-cases.md), FR-DOM-4) |
 | `core::domain_fsm::transition_table` | Every row of the state machine table, including 14 days in `failing` and reminders at 24 h, 72 h and 7 days |
 | `it::send::g7_domain_states` | Retiring, pending and failing domain behaviour at send time ([G7](../edge-cases.md)) |
-| `it::domains::onboarding_idempotent` | Re-running a failed add against the recorded Cloudflare API fake creates nothing twice (FR-DOM-3, FR-OPS-1) |
+| `it::domains::onboarding_idempotent` | Adding a tenant domain with each Cloudflare method succeeds, and re-running a failed add against the recorded Cloudflare API fake creates nothing twice (FR-DOM-2, FR-DOM-3, FR-OPS-1) |
 | `it::domains::records_from_api` | Records in responses equal the fake provider's API answers, never templates (FR-DOM-3) |
-| `it::domains::cron_mints_missing_monitor` | A row with `monitor_do_id = ''` (platform, or inserted by `pmail domains add`) gets one `DomainMonitor`, `Init`, and `domain.created` when it has a `tenant_id`; two overlapping cron runs mint one ID |
+| `it::domains::s9_manual_delivery_events` | With the Cloudflare fake answering `403` to the subscription create, `cloudflare_zone` and `nameservers` domains are created with `event_subscription_id = NULL`, `delivery_events: "manual"` and `details.action = "run pmail domains subscribe {domain}"`; a `503` answer fails the create with `502 upstream_error`; once the subscription ID is recorded, `delivery_events` is `active` and a delivery event updates the recipient (spike S9 fallback, FR-DOM-3) |
+| `it::domains::cron_mints_missing_monitor` | A row with `monitor_do_id = ''` (platform, or inserted by `pmail domains add --local-token`) gets one `DomainMonitor`, `Init`, and `domain.created` when it has a `tenant_id`; two overlapping cron runs mint one ID |
 | `it::domains::cf_token_required_by_method` | Without `PM_CF_API_TOKEN`: `cloudflare_zone`, `nameservers` and `delegated_subdomain` → `422 cf_token_required`; `dns_records`, `send_only` and `smtp_relay` are unaffected |

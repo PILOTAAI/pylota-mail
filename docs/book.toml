@@ -21,6 +21,9 @@ no-section-label = true
 
 [output.html.search]
 enable = true
+# Index sections at ## only. At the default (3) the full design set makes the search index exceed
+# mdBook's 10 MB warning; search hits then land on the enclosing ## section.
+heading-split-level = 2
 
 # Without this, book.js fetches play.rust-lang.org on pages with Rust code blocks:
 # a third-party request the site CSP blocks and the docs promise not to make.

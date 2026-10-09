@@ -32,7 +32,8 @@ pmail search "from:@brightwell.example ref:AB12CDE has:attachment newer_than:45d
   --identity maintenance@acme.example.com --mode hybrid
 ```
 
-Search needs `search:read`. Agentic mode needs `search:agentic`. The MCP tools are `mail_search` and
+Search needs `search:read`. Agentic mode needs `search:read` and `search:agentic`, at identity or
+tenant scope ([Search across a tenant](#search-across-a-tenant)). The MCP tools are `mail_search` and
 `mail_deep_search`.
 
 ## Query operators
@@ -140,9 +141,9 @@ The request body takes more than the query string:
 | `filters` | `direction`, `labels`, `after`, `before`. The same as the operators, for code that builds queries |
 | `group_by` | `message` (default) or `thread`. With `thread`, each hit is one thread with `thread_id`, `subject`, `participants`, `message_count`, `last_at`, the best `snippet` and `why`, and `top_message_id` |
 | `limit` | Default 10, maximum 50 |
-| `snippet_chars` | Snippet length, default 240 |
+| `snippet_chars` | Snippet length, 40–1,000, default 240 |
 | `facets` | Counts by sender, sender domain, month, label, attachment type and category (`sender`, `sender_domain`, `month`, `label`, `attachment_type`, `category`), to help narrow a search |
-| `include_quarantined` | Include quarantined mail. Needs `quarantine:review` |
+| `include_quarantined` | Include quarantined mail, which search leaves out by default. Honoured only for a key with `quarantine:review`; for any other key quarantined mail stays out, with no error |
 | `require_mode` | `true` makes the request fail with `503 search_degraded` if the requested mode is unavailable, instead of degrading |
 
 ## Read the results
@@ -214,6 +215,9 @@ CLI: `pmail search "ref:AB12CDE" --tenant acme`.
 - Up to 100 identities. A tenant with more needs an `identity_ids` filter, otherwise
   `422 scope_too_large`.
 - An identity key asking for tenant scope gets `403 scope_denied` ([F3](../project/edge-cases.md)).
+- Every mode works here, `agentic` included: agentic search runs at identity or tenant scope, and at
+  tenant scope it needs a tenant or platform key with `search:read` and `search:agentic`. CLI:
+  `pmail ask "<question>" --tenant acme`.
 - If one identity's mailbox is slow or unavailable, the others are returned after a 900 ms deadline per
   identity, with `partial: true` and the missing ones in `failed_identities[]`
   ([F15](../project/edge-cases.md)).
@@ -282,20 +286,28 @@ an agent acts on an answer.
 With `"stream": true` and `Accept: text/event-stream`, the response is a server-sent event stream:
 
 ```text
+id: 1
+event: evidence
+data: {"hits":[{"message_id":"msg_01JA…","thread_id":"thr_01JA…","score":0.913,…}]}
+
+id: 2
 event: step
 data: {"step":1,"action":"search","q":"claim Golf photos","mode":"hybrid","hits":7,"ms":412}
 
-event: evidence
-data: {"message_id":"msg_01JA…","thread_id":"thr_01JA…","snippet":"…","why":["…"]}
-
+id: 3
 event: answer
-data: {"text":"Yes. Admiral accepted claim 7781 …","sentences":[…],"confidence":0.86}
+data: {"status":"answered","answer":{"text":"Yes. Admiral accepted claim 7781 …","sentences":[…],"confidence":0.86},"degraded":false}
 
+id: 4
 event: done
+data: {"status":"answered","answer":{…},"evidence":[…],"trace":[…],"degraded":false,"usage":{…}}
 ```
 
-`step` events are trace entries, `evidence` events are hits as they are found, then `answer` and
-`done`. A keep-alive comment is sent every 10 seconds. `pmail ask` uses the stream to show progress.
+`evidence` events carry the hits not sent before, `step` events carry each trace entry when it is
+complete, `answer` comes once, and `done` is always last. `done` carries the complete response, the same
+body as a call without `stream`, so a client may ignore every other event. A keep-alive comment
+(`: keep-alive`) is sent after every 10 seconds of silence. Streams cannot be resumed. `pmail ask` uses
+the stream to show progress.
 
 ### Budgets and costs
 

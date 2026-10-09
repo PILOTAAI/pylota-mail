@@ -21,6 +21,8 @@ garages, insurers and councils. Nothing in it is specific to car rental.
 | **Triage** | Every inbound message gets a category, a needs-reply score, an urgency from 0 to 3, a short summary and risk flags such as a payment-change request or suspected prompt injection |
 | **Safe retries** | Send, reply, reply-all and forward require an `Idempotency-Key`. A retry returns the first result instead of sending a second email. A send whose outcome cannot be known is marked `uncertain` and is never resent automatically |
 | **Four search modes** | `keyword` (full-text plus exact references such as plates and invoice numbers), `semantic`, `hybrid` (the default) and `agentic`, which plans searches and returns an answer whose citations are checked by code |
+| **Agents that can prove who they are** | Each identity can sign short-lived agent assertions that any service verifies against the identity's published key set. Where the operator and the workspace turn it on, agents can also sign their web requests with Web Bot Auth. Private keys never leave the Worker ([Using it from an agent](guides/agents.md#agent-assertions)) |
+| **Email for the people behind the agents** | Usage alerts at 80% and 100% of an allowance, opt-in new-mail notifications that carry counts and never content, and a daily list of what needs a person ([Notifications by email](guides/receiving.md#notifications-by-email)) |
 | **Your account, your data** | D1, Durable Objects, R2, Queues, Vectorize and Workers AI in the Cloudflare account you deploy to. D1, Durable Objects and R2 can be pinned to the EU |
 | **Privacy tools** | Retention policies, erasure with receipts, legal holds and subject-access export |
 
@@ -96,7 +98,8 @@ Pylota Mail v1.0 deliberately does not include ([PRD §4](project/prd.md#4-goals
   [Triage](guides/triage.md) ·
   [Custom domains](guides/custom-domains.md) ·
   [Security](guides/security.md) ·
-  [Privacy, retention and erasure](guides/privacy.md)
+  [Privacy, retention and erasure](guides/privacy.md) ·
+  [Plans and billing](guides/plans.md)
 - Reference:
   [REST API](reference/api.md) ·
   [Webhook events](reference/events.md) ·
