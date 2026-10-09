@@ -274,7 +274,7 @@ These hold for every crate compiled into the Worker (`core`, `api-types`, `platf
 6. **CPU.** The Worker sets `[limits] cpu_ms = 120000` (2 minutes) in `wrangler.toml` so that a
    25 MiB inbound message can be parsed, verified and sanitised in one queue invocation. S4 records the
    measured CPU time; the value is lowered to twice the measured p100 on the corpus. Spike S11 adds a
-   30 MB message received through SES.
+   39 MB message received through SES ([N5](../edge-cases.md)).
 7. **`core` builds for both targets**, checked in CI with
    `cargo build -p pylota-mail-core --target wasm32-unknown-unknown`.
 

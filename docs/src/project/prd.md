@@ -624,7 +624,7 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
 | A shared platform domain means shared reputation | Per-identity caps, complaint and bounce auto-pause, DMARC ramp, custom domains encouraged |
 | An LLM fabricates in agentic search or triage | Deterministic citation check, schema validation, untrusted-content fencing, read-only tools |
 | Web Bot Auth is still an IETF draft, and Cloudflare's verifier can change | Spike S13 checks the format against Cloudflare's test endpoint. Signed HTTP requests are P1 and stay off (`PM_WEB_BOT_AUTH=off`) unless S13 passes; agent assertions rely only on published RFCs (7517, 7519, 7638, 8037) |
-| SES receiving, SMTP from a Worker and child zones are unproven from a Worker | Spikes S11, S12 and S10 gate `dns_records`, `smtp_relay` and `delegated_subdomain`. A method whose spike fails moves to v1.1 by ADR; `cloudflare_zone`, `nameservers` and `send_only` do not depend on them |
+| SES receiving, SMTP from a Worker and child zones are unproven from a Worker | Spikes S11, S12 and S10 gate `dns_records`, `smtp_relay` and `delegated_subdomain` (`smtp_relay` with `inbound: ses` needs S11 too). A method whose spike fails moves to v1.1 by ADR; `cloudflare_zone`, `nameservers` and `send_only` do not depend on them |
 
 ## 11. Open questions
 

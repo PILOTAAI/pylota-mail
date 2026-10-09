@@ -655,7 +655,7 @@ Sending, so a `dns_records` domain costs less to serve than one on a Cloudflare 
 | Spike | Must prove | Pass | Fallback |
 |---|---|---|---|
 | S10 Child zones | On an Enterprise account, a subdomain-setup child zone accepts Email Routing catch-all to the Worker and Email Sending onboarding, and both work end to end | Mail to any address at the child apex reaches `email()`; a send is DKIM-aligned | `delegated_subdomain` stays off; `dns_records` covers the case |
-| S11 SES receiving | Rule set, S3 action and topic as specified. The notification shape matches §4.5. S3 `GetObject` with SigV4 from a Worker. A 30 MB message. `user+tag@` routing. The retired-address bounce. The backstop picks up a message whose push failed | All pass in `eu-west-2` | `dns_records` does not ship in v1.0; `send_only` still does |
+| S11 SES receiving | Rule set, S3 action and topic as specified. The notification shape matches §4.5. S3 `GetObject` with SigV4 from a Worker. A 39 MB message ([N5](../edge-cases.md)). `user+tag@` routing. The retired-address bounce. The backstop picks up a message whose push failed | All pass in `eu-west-2` | `dns_records` and `smtp_relay` with `inbound: ses` do not ship in v1.0; `send_only` still does |
 | S12 SMTP from a Worker | Ports 465 and 587 with `StartTls` against two real providers. The certificate host name is checked (a wrong-name certificate is refused). Timeouts and the uncertain window behave as in §5.2 | All pass | `smtp_relay` does not ship in v1.0 |
 
 ## 13. Options considered and not taken

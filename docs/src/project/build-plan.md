@@ -472,7 +472,8 @@ migration (the `domains` method columns, `ses_ingest`, `addresses.ses_bounce_rul
 - The cross-tenant suite covers `/hooks/ses/inbound` (no key) and the new routes.
 
 **Gate:** each method ships only when its spike passed: S11 for `dns_records`, S12 for `smtp_relay`, S10
-for `delegated_subdomain` (which also stays behind `PM_CF_SUBDOMAIN_SETUP`). `cloudflare_zone`,
+for `delegated_subdomain` (which also stays behind `PM_CF_SUBDOMAIN_SETUP`). `smtp_relay` with `inbound: ses`
+also needs S11; without it, `smtp_relay` ships with `inbound: forward` only. `cloudflare_zone`,
 `nameservers` and `send_only` do not wait for them. A method whose spike failed moves to v1.1 by ADR
 (PRD section 5).
 
