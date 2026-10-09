@@ -364,7 +364,10 @@ Amazon SES throttles every API action except `SendEmail`, `SendRawEmail` and `Se
 ([SES quotas › SES API sending quotas](https://docs.aws.amazon.com/ses/latest/dg/quotas.html), read
 2026-10-09). The Worker makes such control-plane calls from several places: domain create, `PATCH` to
 `ses` and removal (`CreateEmailIdentity`, `GetEmailIdentity`, `PutEmailIdentityMailFromAttributes`,
-`DeleteEmailIdentity`), the daily identity check of each SES domain, the 15-minute platform check
+`DeleteEmailIdentity`), including the optional failover identity of a `cloudflare_zone`, `nameservers` or
+`delegated_subdomain` domain ([Identities and domains › Kind `zone`](identity-domains.md#kind-zone), step
+6: a request-path caller at create, and a background caller when the monitor runs onboarding once a new
+zone is active or retries a skipped step), the daily identity check of each domain with an SES identity, the 15-minute platform check
 (`GetAccount`, the active receipt rule set) and the retired-address rule sync (§4.6). With up to 10,000
 identities in a region, uncoordinated calls would be throttled.
 
@@ -525,7 +528,7 @@ These rows add to [What each check verifies](identity-domains.md#what-each-check
 | Record or check | Applies to | `ok` when | Issue codes (level) |
 |---|---|---|---|
 | SES inbound MX at the domain | `inbound = ses` | The MX set contains `inbound-smtp.{ses_region}.amazonaws.com` | `mx_missing` (fail); `mx_unexpected`: another MX host too (degraded) ([N9](../edge-cases.md)); `mx_wrong_region`: an SES inbound host for another region (fail) ([N8](../edge-cases.md)) |
-| SES identity | `transport = ses` or `inbound = ses` | `GetEmailIdentity` (once a day, at the domain's hash offset, through the SES token bucket, §4.8): `VerifiedForSendingStatus = true` and `DkimAttributes.Status = SUCCESS` | `ses_dkim_failed` (fail) ([N10](../edge-cases.md)) |
+| SES identity | `transport = ses` or `inbound = ses`; on a Cloudflare-transport domain with `ses_identity` (the [J5](../edge-cases.md) failover identity), informational only: shown, never an issue that changes the state ([Identities and domains › What each check verifies](identity-domains.md#what-each-check-verifies)) | `GetEmailIdentity` (once a day, at the domain's hash offset, through the SES token bucket, §4.8): `VerifiedForSendingStatus = true` and `DkimAttributes.Status = SUCCESS` | `ses_dkim_failed` (fail) ([N10](../edge-cases.md)) |
 | SES DKIM CNAMEs | as above | Each CNAME points at `{token}.{SigningHostedZone}` | `dkim_missing` (fail) |
 | MAIL FROM | `transport = ses` | `MailFromAttributes.MailFromDomainStatus = SUCCESS`, and the MX and SPF at `pm-bounce.{domain}` match | `mail_from_failed` (degraded) ([N11](../edge-cases.md)) |
 | SES account | deployment, in `pmail doctor` and the 15-minute platform check | Production access enabled, sending not paused, the receipt rule set active and containing `pm-deliver` | `ses_sending_paused`, `ses_rule_missing` (platform alerts; every SES domain uses fallback while sending is paused) ([N10](../edge-cases.md)) |
@@ -546,7 +549,8 @@ method      TEXT NOT NULL CHECK (method IN ('platform','cloudflare_zone','namese
                                              'send_only','smtp_relay','delegated_subdomain')),
 inbound     TEXT NOT NULL CHECK (inbound IN ('routing','ses','forward','none')),
 transport   TEXT NOT NULL CHECK (transport IN ('cloudflare','ses','smtp')),
-ses_region        TEXT,          -- set when inbound or transport is ses
+ses_region        TEXT,          -- set when the domain has an SES identity: inbound or transport is ses, or the
+                                 -- J5 failover identity of a Cloudflare-method domain
 mail_from_domain  TEXT,          -- pm-bounce.{domain}
 smtp_sealed       BLOB,          -- pm1 envelope of {host, port, username, password, probe_from}
 smtp_pending_sealed BLOB,        -- values from PATCH waiting for a passing probe (pm1, aad column smtp_pending_sealed)

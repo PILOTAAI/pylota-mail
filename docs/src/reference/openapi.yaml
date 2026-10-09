@@ -38,12 +38,17 @@ info:
       `{ "data": [...], "next_cursor": "…" | null }`. Cursors are opaque and expire after 24 hours
       (`410 cursor_expired`).
     - **Idempotency.** `Idempotency-Key` is required on send, reply, reply-all and forward (except on a
-      dry run, `dry_run=true`), and optional on every other `POST` except the two signing endpoints
-      (`…/assertions` and `…/http-signatures`), which ignore it and never record it. Keys are kept for 30 days, scoped per
+      dry run, `dry_run=true`, where it is optional and never recorded), and optional on every other
+      `POST` except four (`x-idempotency: none`), which ignore it and never record it: the two signing
+      endpoints (`…/assertions` and `…/http-signatures`) and the two SNS endpoints (`/hooks/ses` and
+      `/hooks/ses/inbound`). Keys are kept for 30 days, scoped per
       identity for mail and per tenant for everything else. A replay returns the original response with the header `Idempotent-Replayed: true`
       (and `"deduplicated": true` in mail responses).
-    - **Rate limits.** Every authenticated response carries `RateLimit-Limit`, `RateLimit-Remaining` and
-      `RateLimit-Reset`. A `429` also carries `Retry-After`.
+    - **Rate limits.** Every authenticated response carries `RateLimit-Limit`: the limit of the bucket that
+      applied, per period. A `429` also carries `Retry-After` and `RateLimit-Reset`, the seconds to the end
+      of the bucket's current period; for `rate_limited` the two are equal, and the other `429` codes set
+      `Retry-After` to their own wait. `RateLimit-Remaining` is not sent: the Workers rate-limiting binding
+      answers only allow or deny, so the Worker cannot know how many requests are left.
     - **Errors.** Every non-2xx response uses the `Error` envelope. Handle unknown error codes by HTTP status.
     - **Evolution.** Additive changes (new fields, new event types, new enum values) can happen within
       `/v1`. Clients must ignore unknown fields and handle unknown enum values, even where this document
@@ -225,8 +230,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Me'}
@@ -288,8 +291,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -334,8 +335,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/TenantPage'}
@@ -366,8 +365,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Tenant'}
@@ -406,8 +403,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Tenant'}
@@ -466,8 +461,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -477,15 +470,13 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Identity'}
         '400':
           description: The request is invalid.
-          x-error-codes: [invalid_request, invalid_idempotency_key, address_reserved, address_unsupported, local_part_too_long]
+          x-error-codes: [invalid_request, invalid_idempotency_key, address_invalid, address_reserved, address_unsupported, local_part_too_long]
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
           content:
@@ -498,8 +489,11 @@ paths:
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
         '409':
-          description: The identity conflicts with an existing one, or the idempotency key is in use.
-          x-error-codes: [client_id_conflict, username_taken, address_taken, domain_not_ready, idempotency_conflict, request_in_progress]
+          description: >-
+            The identity conflicts with an existing one, the idempotency key is in use, or the primary
+            address on a `zone` subdomain would be the domain's 201st literal routing rule
+            (`domain_in_use`, `details.reason = "routing_rule_limit"`).
+          x-error-codes: [client_id_conflict, username_taken, address_taken, domain_not_ready, domain_in_use, idempotency_conflict, request_in_progress]
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
           content:
@@ -548,8 +542,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/IdentityPage'}
@@ -594,8 +586,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/IdentityPage'}
@@ -632,8 +622,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Identity'}
@@ -662,8 +650,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Identity'}
@@ -700,8 +686,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Identity'}
@@ -732,8 +716,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ErasureRequest'}
@@ -767,8 +749,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/AddressPage'}
@@ -808,8 +788,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -826,8 +804,10 @@ paths:
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
         '409':
-          description: The address is taken, or the idempotency key is in use.
-          x-error-codes: [address_taken, idempotency_conflict, request_in_progress]
+          description: >-
+            The address is taken, the idempotency key is in use, or the address is on a `zone` subdomain that
+            already has 200 literal routing rules (`domain_in_use`, `details.reason = "routing_rule_limit"`).
+          x-error-codes: [address_taken, domain_in_use, idempotency_conflict, request_in_progress]
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
           content:
@@ -884,8 +864,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -940,8 +918,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -984,8 +960,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
@@ -1029,8 +1003,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -1096,8 +1068,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/IdentityKeyPage'}
@@ -1164,8 +1134,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -1190,8 +1158,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -1232,8 +1198,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -1306,8 +1270,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -1397,8 +1359,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/AssertionResponse'}
@@ -1505,8 +1465,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/HttpSignatureResponse'}
@@ -1682,8 +1640,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -1765,7 +1721,6 @@ paths:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             Retry-After: {$ref: '#/components/headers/Retry-After'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
             RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
@@ -1796,8 +1751,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/DomainPage'}
@@ -1828,8 +1781,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Domain'}
@@ -1849,7 +1800,10 @@ paths:
         - **`transport`** (platform keys only; others get `403 scope_denied`) switches the transport that
           sends as a domain on Cloudflare: `cloudflare` or `ses`. This is the Email Sending failover of
           [J5]. `ses` needs the SES transport configured (`422 transport_unavailable`,
-          `ses_not_configured`) and a verified SES identity for the domain. `dns_records` and `send_only`
+          `ses_not_configured`) and an SES identity for the domain (`ses_region` set): a `cloudflare_zone`,
+          `nameservers` or `delegated_subdomain` domain gets one, with its three DKIM records, during
+          onboarding when the SES transport is configured; a domain onboarded without one gets
+          `422 transport_unavailable`. `dns_records` and `send_only`
           domains send only through `ses`, `smtp_relay` domains only through `smtp`, and the platform domain
           only through `cloudflare`; another value returns `422 transport_unavailable`,
           `method_not_supported`. The change applies to sends that reach the transport after it and starts
@@ -1890,8 +1844,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Domain'}
@@ -1918,7 +1870,28 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Error'}
-        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '429':
+          description: >-
+            A rate limit was hit (`rate_limited`), or the deployment's SES control-plane budget of one call per
+            second had no slot within 5 seconds (`upstream_rate_limited`; `Retry-After` is the wait).
+          x-error-codes: [rate_limited, upstream_rate_limited]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            Retry-After: {$ref: '#/components/headers/Retry-After'}
+            RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
+            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+              example:
+                error:
+                  code: upstream_rate_limited
+                  message: The Amazon SES control-plane budget had no free slot within 5 seconds.
+                  retryable: true
+                  fix: Wait for the number of seconds in the Retry-After header, then retry.
+                  request_id: req_01J9Z4K8V4QW7X2M5N6P8R0T1Y
+                  details:
+                    retry_after: 3
         '500': {$ref: '#/components/responses/InternalError'}
         '502':
           $ref: '#/components/responses/UpstreamError'
@@ -1944,8 +1917,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Domain'}
@@ -1960,7 +1931,28 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Error'}
-        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '429':
+          description: >-
+            A rate limit was hit (`rate_limited`), or the deployment's SES control-plane budget of one call per
+            second had no slot within 5 seconds (`upstream_rate_limited`; `Retry-After` is the wait).
+          x-error-codes: [rate_limited, upstream_rate_limited]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            Retry-After: {$ref: '#/components/headers/Retry-After'}
+            RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
+            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+              example:
+                error:
+                  code: upstream_rate_limited
+                  message: The Amazon SES control-plane budget had no free slot within 5 seconds.
+                  retryable: true
+                  fix: Wait for the number of seconds in the Retry-After header, then retry.
+                  request_id: req_01J9Z4K8V4QW7X2M5N6P8R0T1Y
+                  details:
+                    retry_after: 3
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
 
@@ -1986,8 +1978,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/DomainRecords'}
@@ -2045,8 +2035,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -2104,8 +2092,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -2139,8 +2125,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/DomainHealth'}
@@ -2190,8 +2174,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -2273,8 +2255,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ThreadPage'}
@@ -2341,8 +2321,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Thread'}
@@ -2381,8 +2359,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ThreadSummary'}
@@ -2426,8 +2402,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -2456,8 +2430,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ThreadSummary'}
@@ -2519,8 +2491,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/MessagePage'}
@@ -2563,8 +2533,11 @@ paths:
         - **`from_address`** must be an `active` address of the identity, or a `retiring` one on a thread
           that already uses it ([G7]; with `thread_id`). Otherwise `400 invalid_request` with
           `details.errors[0].path = "from_address"`. The default is the primary.
-        - **`headers`** accepts only `X-` headers plus `Importance`, `Priority`, `Sensitivity`, `Keywords`,
-          `Comments` and `Organization` (`400 header_not_allowed`). Everything else is set by the service.
+        - **`headers`** accepts only `X-` names matching `^X-[A-Za-z0-9_-]+$` plus `Importance`, `Priority`,
+          `Sensitivity`, `Keywords`, `Comments` and `Organization`, spelled exactly so (`400 header_not_allowed`).
+          `Importance` must be `high`, `normal` or `low`, `Priority` `normal`, `non-urgent` or `urgent`, and
+          `Sensitivity` `personal`, `private` or `company-confidential` (`400 invalid_request`). Everything
+          else is set by the service.
         - **Size**: the encoded message must fit the transport limit (5 MiB with Cloudflare), otherwise
           `413 message_too_large`. With `policy.large_attachments: "link"`, oversized attachments become
           expiring signed links instead.
@@ -2612,8 +2585,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -2657,8 +2628,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Message'}
@@ -2757,8 +2726,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Message'}
@@ -2785,8 +2752,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ErasureRequest'}
@@ -2811,6 +2776,7 @@ paths:
         MIME that was sent. Available for `policy.retention.raw_days` (default 90), then `410 raw_expired`.
       x-required-permission: ['messages:read']
       x-key-levels: [platform, tenant, identity]
+      x-permission-notes: A `quarantined`, `hidden` or `throttled` message needs `quarantine:review` as well; without it the message is `404 message_not_found`, as if it did not exist.
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -2819,8 +2785,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             message/rfc822:
               schema:
@@ -2850,7 +2814,7 @@ paths:
         type wins ([B10]). Attachments with a `risk` need `quarantine:review`.
       x-required-permission: ['attachments:read']
       x-key-levels: [platform, tenant, identity]
-      x-permission-notes: An attachment with a non-null `risk` needs `quarantine:review` as well (`403 permission_denied`).
+      x-permission-notes: A `quarantined`, `hidden` or `throttled` message needs `quarantine:review` as well; without it the attachment is `404 message_not_found`, as if the message did not exist. That check comes first; then an attachment with a non-null `risk` needs `quarantine:review` too (`403 permission_denied`).
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -2859,8 +2823,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Content-Disposition: {$ref: '#/components/headers/Content-Disposition-Attachment'}
             X-Content-Type-Options: {$ref: '#/components/headers/X-Content-Type-Options'}
             Content-Security-Policy: {$ref: '#/components/headers/Content-Security-Policy'}
@@ -2891,6 +2853,7 @@ paths:
         every page is returned, capped at 200 KB of text (`truncated: true` when cut).
       x-required-permission: ['attachments:read']
       x-key-levels: [platform, tenant, identity]
+      x-permission-notes: A `quarantined`, `hidden` or `throttled` message needs `quarantine:review` as well; without it the message is `404 message_not_found`, as if it did not exist.
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -2907,8 +2870,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/AttachmentText'}
@@ -2938,6 +2899,7 @@ paths:
       description: Queues triage again. A `message.triaged` event follows when it finishes (or fails).
       x-required-permission: ['messages:write']
       x-key-levels: [platform, tenant, identity]
+      x-permission-notes: A `quarantined`, `hidden` or `throttled` message needs `quarantine:review` as well; without it the message is `404 message_not_found`, as if it did not exist.
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -2948,8 +2910,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
         '400': {$ref: '#/components/responses/BadRequest'}
         '401': {$ref: '#/components/responses/Unauthorized'}
@@ -2991,8 +2951,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -3033,6 +2991,7 @@ paths:
         automated mail or over the automatic-exchange limit (`409 auto_reply_not_allowed`, [D6]).
       x-required-permission: ['messages:send']
       x-key-levels: [platform, tenant, identity]
+      x-permission-notes: 'The message replied to or forwarded must be visible to the key: a `quarantined` one needs `quarantine:review` as well, and a `hidden` or `throttled` one can never be the target; otherwise `404 message_not_found`, as if it did not exist.'
       x-rate-limit-buckets: [api, send]
       x-idempotency: required
       parameters:
@@ -3055,8 +3014,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -3091,6 +3048,7 @@ paths:
         `policy.max_recipients`.
       x-required-permission: ['messages:send']
       x-key-levels: [platform, tenant, identity]
+      x-permission-notes: 'The message replied to or forwarded must be visible to the key: a `quarantined` one needs `quarantine:review` as well, and a `hidden` or `throttled` one can never be the target; otherwise `404 message_not_found`, as if it did not exist.'
       x-rate-limit-buckets: [api, send]
       x-idempotency: required
       parameters:
@@ -3111,8 +3069,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -3147,6 +3103,7 @@ paths:
         `sendMessage`.
       x-required-permission: ['messages:send']
       x-key-levels: [platform, tenant, identity]
+      x-permission-notes: 'The message replied to or forwarded must be visible to the key: a `quarantined` one needs `quarantine:review` as well, and a `hidden` or `throttled` one can never be the target; otherwise `404 message_not_found`, as if it did not exist.'
       x-rate-limit-buckets: [api, send]
       x-idempotency: required
       parameters:
@@ -3168,8 +3125,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -3212,8 +3167,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -3266,8 +3219,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -3367,8 +3318,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -3555,8 +3504,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -3656,8 +3603,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/SearchHitList'}
@@ -3697,8 +3642,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ContactPage'}
@@ -3783,8 +3726,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/WaitResponse'}
@@ -3821,8 +3762,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/MessagePage'}
@@ -3869,8 +3808,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -3912,8 +3849,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/WebhookPage'}
@@ -3959,8 +3894,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -4001,8 +3934,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/WebhookPage'}
@@ -4033,8 +3964,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Webhook'}
@@ -4069,8 +3998,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Webhook'}
@@ -4097,8 +4024,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
@@ -4135,8 +4060,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -4171,8 +4094,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -4217,8 +4138,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/WebhookDeliveryPage'}
@@ -4272,8 +4191,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -4323,8 +4240,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/SuppressionPage'}
@@ -4361,8 +4276,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -4409,8 +4322,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
         '400': {$ref: '#/components/responses/BadRequest'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
@@ -4448,8 +4359,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ListEntryPage'}
@@ -4482,8 +4391,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ListEntry'}
@@ -4516,8 +4423,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ListEntry'}
@@ -4543,8 +4448,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
         '400': {$ref: '#/components/responses/BadRequest'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
@@ -4599,8 +4502,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -4662,8 +4563,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ApiKeyPage'}
@@ -4692,8 +4591,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ApiKey'}
@@ -4718,8 +4615,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
@@ -4756,8 +4651,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -4816,8 +4709,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -4853,8 +4744,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ErasureRequestPage'}
@@ -4886,8 +4775,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ErasureRequest'}
@@ -4953,8 +4840,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -4990,8 +4875,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Export'}
@@ -5047,8 +4930,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/UsageSummary'}
@@ -5141,8 +5022,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/DailyUsage'}
@@ -5218,8 +5097,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/BillingAccount'}
@@ -5254,8 +5131,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/BillingAccount'}
@@ -5319,8 +5194,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/AuditEventPage'}
@@ -5369,8 +5242,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/MemberList'}
@@ -5430,8 +5301,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -5468,8 +5337,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
@@ -5498,8 +5365,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
@@ -5561,8 +5426,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -5647,8 +5510,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/DlqItemPage'}
@@ -5693,8 +5554,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -5747,8 +5606,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -5791,8 +5648,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Job'}
@@ -5834,8 +5689,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -7605,22 +7458,21 @@ components:
       description: The request ID (`req_…`). Every response carries it, and errors echo it as `error.request_id`.
       schema: {$ref: '#/components/schemas/RequestId'}
     RateLimit-Limit:
-      description: The request quota of the bucket that applied to this request, per window.
-      schema:
-        type: integer
-        minimum: 0
-    RateLimit-Remaining:
-      description: Requests left in the current window.
+      description: >-
+        The limit of the rate-limit bucket that applied to this request, per period (for example `600` for
+        the per-key bucket of 600 requests a minute). Every authenticated response carries it.
       schema:
         type: integer
         minimum: 0
     RateLimit-Reset:
-      description: Seconds until the current window resets.
+      description: >-
+        Sent only with a `429`: seconds until the end of the bucket's current period. There is no
+        `RateLimit-Remaining` header, because the rate-limiting binding answers only allow or deny.
       schema:
         type: integer
         minimum: 0
     Retry-After:
-      description: Seconds to wait before retrying.
+      description: Seconds to wait before retrying. On a `429 rate_limited` it equals `RateLimit-Reset`.
       schema:
         type: integer
         minimum: 0
@@ -7901,8 +7753,6 @@ components:
       headers:
         Request-Id: {$ref: '#/components/headers/Request-Id'}
         RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-        RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-        RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
       content:
         application/json:
           schema: {$ref: '#/components/schemas/DryRunResult'}
@@ -7931,7 +7781,6 @@ components:
         Request-Id: {$ref: '#/components/headers/Request-Id'}
         Retry-After: {$ref: '#/components/headers/Retry-After'}
         RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-        RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
         RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
       content:
         application/json:
@@ -7954,7 +7803,6 @@ components:
         Request-Id: {$ref: '#/components/headers/Request-Id'}
         Retry-After: {$ref: '#/components/headers/Retry-After'}
         RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-        RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
         RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
       content:
         application/json:
@@ -7968,7 +7816,6 @@ components:
         Request-Id: {$ref: '#/components/headers/Request-Id'}
         Retry-After: {$ref: '#/components/headers/Retry-After'}
         RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-        RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
         RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
       content:
         application/json:
@@ -9214,10 +9061,20 @@ components:
     Username:
       type: string
       description: >-
-        Lower-case local-part stem. Reserved and confusable names (RFC 2142 roles, `noreply`,
-        `mailer-daemon`, homoglyphs) are refused with `address_reserved` ([A4]). Username plus tenant suffix
-        is at most 40 characters (`local_part_too_long`, [A12]).
+        The stored form of a username: the lower-case local-part stem. Requests send a `UsernameInput`,
+        which the service validates and lower-cases into this form.
       pattern: '^[a-z0-9][a-z0-9._-]{0,23}$'
+      examples: [bookings]
+    UsernameInput:
+      type: string
+      description: >-
+        A username as sent in a request. The schema does not constrain it: the service validates it with
+        the username rules ([A1], [A3], [A4], [A12]) and returns their own codes, never a generic
+        `invalid_request`. A reserved name, a confusable one (homoglyphs, mixed scripts, right-to-left
+        characters) or a name that folds to a reserved one gets `400 address_reserved`; any other non-ASCII
+        character `400 address_unsupported`; a name whose lower-cased form does not match the stored form
+        `^[a-z0-9][a-z0-9._-]{0,23}$` (at most 24 characters, no `..`, not ending in `.`) gets
+        `400 address_invalid`; username plus tenant suffix over 40 characters gets `400 local_part_too_long`.
       examples: [bookings]
     DisplayName:
       type: string
@@ -9254,8 +9111,12 @@ components:
           description: Sends per day for this identity. Defaults to the tenant's `identity_daily_send_cap`.
         auto_reply:
           type: string
-          description: 'Whether the identity may send `kind: "auto_reply"` messages.'
-          examples: [allowed]
+          enum: [allowed, denied]
+          default: allowed
+          description: >-
+            Whether the identity may send `kind: "auto_reply"` messages. `denied` refuses them
+            (`409 auto_reply_not_allowed`); `allowed`, the default, leaves the decision to the tenant's
+            `policy.auto_reply.allowed` and the exchange cap.
         require_known_recipient:
           type: boolean
           default: false
@@ -9302,7 +9163,7 @@ components:
       type: object
       required: [username, display_name]
       properties:
-        username: {$ref: '#/components/schemas/Username'}
+        username: {$ref: '#/components/schemas/UsernameInput'}
         display_name: {$ref: '#/components/schemas/DisplayName'}
         purpose:
           type: string
@@ -9388,9 +9249,12 @@ components:
         local_part:
           type: string
           description: >-
-            The local part on the tenant domain. At most 40 characters, leaving room for a thread token.
-            Reserved and confusable names are refused with `address_reserved`.
-          pattern: '^[a-z0-9][a-z0-9._-]{0,39}$'
+            The local part on the tenant domain. The schema does not constrain it: the service validates it
+            with the username rules for a tenant domain, with a maximum of 40 characters (room for a thread
+            token), and returns their own codes, never a generic `invalid_request`: `400 address_reserved`
+            for a reserved or confusable name, `400 address_unsupported` for any other non-ASCII character,
+            and `400 address_invalid` when the lower-cased form does not match the stored form
+            `^[a-z0-9][a-z0-9._-]{0,39}$` (no `..`, not ending in `.`).
           examples: [bookings]
         domain_id: {$ref: '#/components/schemas/DomainId'}
     PromoteAddressRequest:
@@ -9551,7 +9415,9 @@ components:
           type: boolean
         ses_region:
           type: [string, 'null']
-          description: The SES region when `inbound` or `transport` is `ses`.
+          description: >-
+            The region of the domain's SES identity: set when `inbound` or `transport` is `ses`, and on a
+            Cloudflare-method domain that has an SES identity for the [J5] failover; otherwise `null`.
           examples: [eu-west-2]
         mail_from_domain:
           type: [string, 'null']
@@ -9580,7 +9446,7 @@ components:
           description: >-
             `active`: provider delivery events reach the service. `manual`: a Cloudflare-transport domain was
             created without an Email Sending event subscription (spike S9 fallback); delivery statuses stop at
-            `sent` until `pmail domains subscribe <domain>` has run. `none`: `sending` is false.
+            `submitted` until `pmail domains subscribe <domain>` has run. `none`: `sending` is false.
         details:
           description: '`null`, or the operator step that remains while `delivery_events` is `manual`.'
           oneOf:
@@ -10351,10 +10217,12 @@ components:
       required: [kind, value]
       properties:
         kind:
-          description: A built-in kind, or `custom:<name>` for a tenant pattern.
+          description: >-
+            A built-in kind, or `custom:<name>` for a tenant pattern (a booking reference, for example, is
+            `custom:booking`).
           anyOf:
             - type: string
-              enum: [uk_plate, pcn, invoice, order, booking, amount, phone, email, domain, date]
+              enum: [uk_plate, pcn, invoice, order, amount, phone, email, domain, date]
             - type: string
               pattern: '^custom:.+$'
         value:
@@ -10423,12 +10291,30 @@ components:
     SendHeaders:
       type: object
       description: >-
-        Custom headers. Only `X-` headers plus `Importance`, `Priority`, `Sensitivity`, `Keywords`,
-        `Comments` and `Organization` are accepted (`400 header_not_allowed`); everything else is set by the
-        service. At most 16 KB in total; each value at most 2,048 bytes.
+        Custom headers, checked when the request arrives, never later at the transport. A name must be an
+        `X-` name matching `^X-[A-Za-z0-9_-]+$` (at most 100 bytes; `X-Pylota-*` and `X-AI-Generated` are
+        reserved) or one of `Importance`, `Priority`, `Sensitivity`, `Keywords`, `Comments` and
+        `Organization`, spelled exactly so; any other name is `400 header_not_allowed` (the schema leaves
+        names unconstrained, so that this code and not a generic `invalid_request` is returned). `Importance` takes
+        only `high`, `normal` or `low`, `Priority` only `normal`, `non-urgent` or `urgent`, and
+        `Sensitivity` only `personal`, `private` or `company-confidential`; another value, an empty value or
+        one with CR or LF is `400 invalid_request`. Everything else is set by the service. At most 16 KB in
+        total; each value at most 2,048 bytes.
       additionalProperties:
         type: string
+        minLength: 1
         maxLength: 2048
+        pattern: '^[^\r\n]+$'
+      properties:
+        Importance:
+          type: string
+          enum: [high, normal, low]
+        Priority:
+          type: string
+          enum: [normal, non-urgent, urgent]
+        Sensitivity:
+          type: string
+          enum: [personal, private, company-confidential]
       examples:
         - X-Booking-Ref: BK-2291
     SendRequest:
@@ -10465,6 +10351,7 @@ components:
           description: HTML body.
         attachments:
           type: array
+          maxItems: 32
           items: {$ref: '#/components/schemas/AttachmentInput'}
         kind:
           type: string
@@ -10508,6 +10395,7 @@ components:
           type: [string, 'null']
         attachments:
           type: array
+          maxItems: 32
           items: {$ref: '#/components/schemas/AttachmentInput'}
         kind:
           type: string
@@ -12071,7 +11959,7 @@ components:
             minimum: 0
         created_by_key_id:
           type: [string, 'null']
-          description: The API key that started the job, or `null` for jobs the system started (retention, backup).
+          description: The API key that started the job, or `null` for a job the system started itself (for example the `reembed` job that the cron creates during an embedding-model change).
     WaitlistInviteRequest:
       type: object
       required: [count]

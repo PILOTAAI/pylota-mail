@@ -739,8 +739,8 @@ set, the nightly copy limits the loss to objects created since the last run (RPO
 | `it::ops::slo_from_metrics` | Each SLO row of section 4 (NFR-REL-1 to NFR-REL-4, NFR-PERF-1 to NFR-PERF-6, NFR-PRV-1) is computed by the SLO evaluator from metric lines that a scripted flow emitted, with the expected good and total counts | section 4 |
 | `it::bench::send_api_p95` | 1,000 sends through the simulator in workerd: `send_api_ms` p95 ≤ 500 ms; reports the figure, CI warns above | NFR-PERF-1 |
 | `it::bench::queue_to_transport_p95` | 1,000 queued sends: `outbound_queue_to_transport_ms` p95 ≤ 60 s | NFR-PERF-2 |
-| `it::bench::hybrid_p95` | Hybrid search on the 50,000-message mailbox with the fake AI at the recorded Workers AI latencies: p95 ≤ 800 ms (the real figure comes from staging in M20) | NFR-PERF-4 |
-| `it::bench::tenant_fanout_p95` | Tenant search over 10 identities: p95 ≤ 1 s | NFR-PERF-5 |
+| `it::bench::hybrid_p95` | Hybrid search on the 50,000-message mailbox (bulk-seeded, nightly: [Testing § 6.8](testing.md#68-benchmarks)) with the fake AI at the recorded Workers AI latencies: p95 ≤ 800 ms (the real figure comes from staging in M20) | NFR-PERF-4 |
+| `it::bench::tenant_fanout_p95` | Tenant search over 10 identities (bulk-seeded, nightly): p95 ≤ 1 s | NFR-PERF-5 |
 | `it::bench::agentic_p95` | Agentic search with the scripted model at recorded latencies: p95 ≤ 8 s, first evidence ≤ 1.5 s | NFR-PERF-6 |
 | `live::slo::inbound_to_webhook` | On staging, Gmail and Outlook mail to a webhook endpoint over the live run: p95 ≤ 30 s, p99 ≤ 120 s | NFR-REL-3 |
 | `live::ops::idle_cost_review` | After a week of idling on staging, the Cloudflare usage report shows no compute beyond the cron and alarm invocations; recorded in the release notes | NFR-COST-1 |

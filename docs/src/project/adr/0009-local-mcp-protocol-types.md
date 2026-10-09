@@ -25,7 +25,7 @@ Taking a spike's fallback needs an ADR ([Decision records](index.md#when-to-writ
    MCP messages it serves as its own `serde` types in `crates/worker/src/mcp/schemas.rs`, following
    `schema.ts` of the `2026-07-28` and `2025-11-25` revisions.
 2. `rmcp` **must not** be a dependency of the Worker build. It is a native dev-dependency of
-   `crates/worker` (pinned `=3.5.1`), used by a round-trip test that serialises every local type and
+   `crates/worker` (pinned `=3.4.1`; amended 2026-10-10, see [Amendments](#amendments)), used by a round-trip test that serialises every local type and
    reads it back with `rmcp::model`, and by the live MCP client test.
 3. M1 still runs S5 against the local types and records the result: MCP Inspector and Claude Code
    connect, list tools and call one, and the bundle stays inside the S4 budget.
@@ -44,3 +44,11 @@ Taking a spike's fallback needs an ADR ([Decision records](index.md#when-to-writ
   "No tokio" rule and adds to the bundle. Not chosen.
 - **Fork `rmcp` with tokio made optional.** A fork is a maintained dependency with no upstream. Not
   chosen.
+
+## Amendments
+
+- **2026-10-10.** The pin in decision 2 is `=3.4.1`, not `=3.5.1`. 3.5.1 was published on 2026-10-05,
+  inside the two-week age rule for dependencies
+  ([Rust workspace §3](../design/rust-workspace.md#3-workspace-dependencies)). 3.4.1, published on
+  2026-09-23, lists the same features and the same non-optional tokio dependency (crates.io sparse index,
+  read 2026-10-10), so the context and the decision are unchanged.

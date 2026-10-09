@@ -56,7 +56,8 @@ Download the binary for your platform from the
 signed `SHA256SUMS` file in the same release. Builds exist for macOS (arm64, x64), Linux (x64, arm64)
 and Windows (x64).
 
-Or build it with Cargo:
+Or build it with Cargo, once `pylota-mail-cli` is published to crates.io (until then, build it from a
+checkout of the repository with `cargo install --path crates/cli --locked`):
 
 ```bash
 cargo install pylota-mail-cli --locked

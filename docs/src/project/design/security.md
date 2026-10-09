@@ -142,7 +142,7 @@ reused; the others are defined in section 13.
 
 | STRIDE | Threat | Mitigation | Test |
 |---|---|---|---|
-| S | Forged SES delivery event via `POST /hooks/ses`, or forged inbound notification via `POST /hooks/ses/inbound` (which would inject mail with chosen verdicts) | Both endpoints verify the SNS signature with the same code: `SignatureVersion` must be `2` (SHA256withRSA); version 1 (SHA-1) is refused. `SigningCertURL` must be `https` on host `sns.{PM_SES_REGION}.amazonaws.com`. `TopicArn` must equal that endpoint's topic (`PM_SES_SNS_TOPIC_ARN` for `/hooks/ses`, `PM_SES_INBOUND_TOPIC_ARN` for `/hooks/ses/inbound`). `Timestamp` within one hour (14 days on the SQS backstop path). Subscription confirmation only for that exact topic. Any failure → `403 invalid_signature` and `ses_sns_rejected_total`. `pmail setup ses` sets `SignatureVersion=2` on both topics ([N1](../edge-cases.md), [N2](../edge-cases.md), [Outbound › Amazon SES](outbound.md#amazon-ses), [Domains on any DNS host §4.5](domain-connections.md#45-inbound-through-ses)) | `core::sns::verify_v2_vectors`, `it::ses::sns_tampered_rejected` |
+| S | Forged SES delivery event via `POST /hooks/ses`, or forged inbound notification via `POST /hooks/ses/inbound` (which would inject mail with chosen verdicts) | Both endpoints verify the SNS signature with the same code: `SignatureVersion` must be `2` (SHA256withRSA); version 1 (SHA-1) is refused. `SigningCertURL` must be `https` on host `sns.{PM_SES_REGION}.amazonaws.com`. `TopicArn` must equal that endpoint's topic (`PM_SES_SNS_TOPIC_ARN` for `/hooks/ses`, `PM_SES_INBOUND_TOPIC_ARN` for `/hooks/ses/inbound`). `Timestamp` within one hour (14 days on the SQS backstop path). Subscription confirmation only for that exact topic. Any failure → `403 invalid_signature` and `ses_sns_rejected_total`. `pmail setup ses` sets `SignatureVersion=2` on both topics ([N1](../edge-cases.md), [N2](../edge-cases.md), [Outbound › Amazon SES](outbound.md#amazon-ses), [Domains on any DNS host §4.5](domain-connections.md#45-inbound-through-ses)) | `core::sns::verify_v2_vectors`, `it::ses::invalid_signature_403` |
 | S | SES verdicts used to mark forged mail as authenticated | Verdicts are read only from a notification signed for our inbound topic. SPF is taken from SES (it saw the connecting IP); DKIM, ARC and DMARC are recomputed over the raw bytes as for every source, and a disagreement with SES increments `ses_auth_disagreement_total` | `it::ses::verdict_mapping` |
 | T | The same inbound notification delivered twice (SNS retry, SQS backstop, or both) | `ses_ingest` ledger: `INSERT OR IGNORE` on `(object_key, recipient)`; only an inserted row enqueues a pointer ([N3](../edge-cases.md)) | `it::ses::push_and_backstop_once` |
 | I | One SES message with recipients in several tenants | Each recipient becomes its own pointer and is resolved in the directory separately ([N28](../edge-cases.md)) | `it::ses::cross_tenant_recipients` |
@@ -374,9 +374,11 @@ idempotency rule. The router is built from that table only; a request matching n
 `404` with the standard envelope. A route cannot be registered without a permission list and a scope
 rule (the registration function takes them as non-optional arguments), and public routes use the
 explicit `Scope::Public` variant. The permission list may be empty only for `Scope::Public` and for
-the two routes that every key may call on its own workspace: `GET /v1/me` and
-`GET /v1/tenants/{tenant_id}`. For the second, `foreign_permissions` (`tenants:manage`) is required as
-well when the target is not the key's own tenant, and always for a platform key. A unit test fails when
+two other routes: `GET /v1/me`, which any valid key may call (`Scope::AnyKey`), and
+`GET /v1/tenants/{tenant_id}`, which only platform and tenant keys may call (`min_level: Tenant`; an
+identity key gets `403 scope_denied` on its own tenant, step 3 of section 5.2). For the second,
+`foreign_permissions` (`tenants:manage`) is required as well when the target is not the key's own
+tenant, and always for a platform key, so a tenant key reads only its own tenant. A unit test fails when
 any other route has an empty list. `GET /v1/usage` is not one of them: it is registered with
 `usage:read`, which every tenant and identity key holds implicitly for its own workspace (section 4.6),
 while a platform key needs it listed and must pass `tenant_id` (`400 invalid_request` without it).
@@ -399,7 +401,7 @@ pub struct RouteSpec {
     pub permissions: &'static [Permission],  // all required
     pub foreign_permissions: &'static [Permission], // also required when the target is not the key's own tenant
     pub scope: Scope,
-    pub idempotency: Idempotency,            // Required | Optional
+    pub idempotency: Idempotency,            // Required | Optional | None (openapi x-idempotency)
     pub min_level: Option<Level>,            // e.g. Tenant for tenant search (FR-SRCH-10)
 }
 ```
@@ -674,7 +676,7 @@ header values or SQL.
 
 The [Inbound pipeline](inbound.md) owns the details. The security properties:
 
-- HTML is sanitised with `ammonia =4.2.1` using an allow-list: no scripts, event handlers, forms,
+- HTML is sanitised with `ammonia =4.2.0` using an allow-list: no scripts, event handlers, forms,
   frames, objects, embeds or `<meta http-equiv>`; links only `http`, `https` and `mailto`, with
   `rel="noopener noreferrer nofollow"`; images only `cid:` (remote `src` removed). The service never
   renders HTML.
@@ -840,6 +842,12 @@ fails. At delivery time a failure is recorded as a failed attempt with error `ss
 
 - The rate-limiting bindings are approximate and per location. Anything that must be exact (daily send
   caps, the agentic budget, abuse windows) is counted in `TenantQuota`.
+- **Headers.** A binding's `limit()` answers only allow or deny, so the Worker cannot report what is left.
+  Every authenticated response carries `RateLimit-Limit`, the `limit` of the bucket that applied (from the
+  binding's configuration in `wrangler.toml`). A `429 rate_limited` also carries `Retry-After` and
+  `RateLimit-Reset`, both the seconds to the end of the current period, computed from the clock as
+  `period − (now_s mod period)`. `RateLimit-Remaining` is never sent
+  ([REST API › Rate limits](../../reference/api.md#rate-limits)).
 - **Abuse auto-pause** (FR-DLV-3): `TenantQuota.outcomes` keeps the last 1,000 outcomes per identity.
   When the complaint rate over the last 1,000 exceeds `abuse.complaint_rate_pause` (default 0.003), or
   the bounce rate over the last 200 exceeds `abuse.bounce_rate_pause` (default 0.05), the identity is
@@ -862,7 +870,7 @@ fails. At delivery time a failure is recorded as a failed attempt with error `ss
 | Control | Rule |
 |---|---|
 | Exact pins | Every Cargo dependency is pinned `=x.y.z` (AGENTS.md); `Cargo.lock` is committed; every build and install uses `--locked`. `rust-toolchain.toml` pins the toolchain. The CLI invokes `npx --yes wrangler@4.139.0`, never an unpinned wrangler |
-| `cargo deny check` | In CI on every pull request: advisories, licences (allow-list: Apache-2.0, MIT, BSD-2-Clause, BSD-3-Clause, ISC, Zlib, Unicode-3.0, MPL-2.0; everything else needs an ADR), bans (no `openssl-sys`, no `tokio` in the wasm dependency graph, no duplicate versions of `sha2`, `hmac` or `aes-gcm`), sources (crates.io only, no git dependencies) |
+| `cargo deny check` | In CI on every pull request: advisories, licences (allow-list: Apache-2.0, MIT, BSD-2-Clause, BSD-3-Clause, ISC, Zlib, Unicode-3.0, MPL-2.0; everything else needs an ADR), bans (no `openssl-sys`; `tokio` only as a direct dependency of `worker`, which depends on it with no features: `{ crate = "tokio", wrappers = ["worker"] }`; no duplicate versions of `sha2`, `hmac` or `aes-gcm`), sources (crates.io only, no git dependencies). Bans are checked on the Worker's wasm graph (`cargo deny --manifest-path crates/worker/Cargo.toml --target wasm32-unknown-unknown --exclude-dev check bans`), because the native crates use tokio legitimately (`reqwest` in `sdk` and `cli`, `rmcp` as a dev-dependency); licences, advisories and sources over the whole workspace (`cargo deny --workspace check licenses advisories sources`). The flags are checked against the pinned `cargo-deny` at build time. `cargo xtask check-layering` also proves that tokio has no feature enabled in that graph ([Rust workspace §2](rust-workspace.md#2-crate-responsibilities-and-allowed-dependencies)) |
 | `cargo audit` | RustSec advisories on every pull request and daily on `main`; a new advisory opens an issue |
 | SBOM | `cargo cyclonedx --format json` for the Worker (`--target wasm32-unknown-unknown`) and for the CLI, attached to every release |
 | Signed releases | `SHA256SUMS` lists the Worker bundle and CLI binaries and has a detached signature `SHA256SUMS.sig` made with the release signing key ([Rust workspace](rust-workspace.md#9-xtask)). The verification key is compiled into `pmail`, which checks the signature and the bundle checksum before deploying (FR-OPS-2; signature format and verification in [CLI and setup](cli.md)). The signing key lives only in a GitHub Environment with required reviewers. Releases also carry build provenance from `actions/attest@v4` (permissions `id-token: write`, `attestations: write`, `contents: read`), verifiable with `gh attestation verify <file> -R PILOTAAI/pylota-mail` |
@@ -928,7 +936,7 @@ address used by the integration suite, captures all Worker output, and fails if 
 | `core::ssrf::url_rules` | Section 9.1 rules 1 to 4, including integer, hexadecimal and octal IPv4 literals and `hooks.example.com` allowed | FR-WH-5 |
 | `it::webhooks::ssrf_refused`, `it::webhooks::no_redirects_and_caps` | Guard at create and at delivery; `3xx` is a failure and is not followed; 15 s deadline; bodies over 4 KB are cut | FR-WH-5 |
 | `it::webhooks::signature_vectors` | Signatures match Standard Webhooks test vectors; both signatures during rotation | FR-WH-2 |
-| `core::sns::verify_v2_vectors`, `it::ses::sns_tampered_rejected` | Real version 2 notifications verify; version 1, a changed byte, a wrong certificate host, a wrong topic and a stale timestamp are refused with `403 invalid_signature`, on both `/hooks/ses` and `/hooks/ses/inbound` ([Outbound](outbound.md), [Domains on any DNS host](domain-connections.md#14-tests)) | spike S8, [N1](../edge-cases.md), [N2](../edge-cases.md) |
+| `core::sns::verify_v2_vectors`, `it::ses::invalid_signature_403` | Real version 2 notifications verify; version 1, a changed byte, a wrong certificate host, a wrong topic and a stale timestamp are refused with `403 invalid_signature`, on both `/hooks/ses` and `/hooks/ses/inbound` ([Outbound](outbound.md), [Domains on any DNS host](domain-connections.md#14-tests)) | spike S8, [N1](../edge-cases.md), [N2](../edge-cases.md) |
 | `it::ses::push_and_backstop_once`, `it::ses::cross_tenant_recipients`, `it::ses::verdict_mapping` | One message per object and recipient whichever path delivers it; no leakage between tenants in one object; SES verdicts used only as section 3.5 states | FR-DOM-9, [N3](../edge-cases.md), [N28](../edge-cases.md) |
 | `core::smtp::state_machine`, `it::smtp::probe_unaligned_falls_back` | No credentials without TLS; `535` is an auth failure; an unaligned relay goes to `failing` and sends fall back | FR-DOM-11, SEC-4, [N14](../edge-cases.md), [N16](../edge-cases.md), [N18](../edge-cases.md) |
 | `it::oauth::state_cookie_binding`, `it::oauth::unverified_email_refused`, `it::oauth::link_by_verified_email` | Missing, reused, expired or other-browser state refused; unverified addresses refused; linking only by verified email | FR-CON-9, [W20](../edge-cases.md)–[W22](../edge-cases.md) |

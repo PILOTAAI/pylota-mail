@@ -66,9 +66,16 @@ All crates use edition 2024, `rust-version` equal to the toolchain pin, and
 2. `pylota-mail-core` has no direct dependency on `pylota-mail-platform`, `reqwest` or `tokio`.
    (`mail-auth`'s `dns-doh` feature brings `reqwest`'s wasm backend in transitively; it is never
    called, because DNS answers are pre-filled, see section 3.)
-3. The normal dependency graph of `pylota-mail-worker` for `--filter-platform wasm32-unknown-unknown`
-   contains no `tokio`, no `gethostname` and no `hickory-resolver` (`rmcp`, which needs tokio, is a
-   native dev-dependency only; see [S5](index.md#spikes)).
+3. In the normal dependency graph of `pylota-mail-worker` for `wasm32-unknown-unknown`, `tokio` appears
+   only as a dependency of `worker`, with no features enabled, and `gethostname` and `hickory-resolver` do
+   not appear at all. `worker` 0.8.7 itself depends on `tokio ^1.28` with default features off, for every
+   target (crates.io sparse index, read 2026-10-10); a tokio with no features has no runtime, timers or
+   I/O. `rmcp`, which enables tokio's `rt`, `time`, `sync` and `macros` features, is a native
+   dev-dependency only (see [S5](index.md#spikes)). The check reads the graph with
+   `cargo tree -p pylota-mail-worker --target wasm32-unknown-unknown -e no-dev -i tokio -f '{p} {f}'`, so
+   features enabled only by dev-dependencies do not count: the output must be exactly one path, through
+   `worker`, with an empty feature list. The same rule is enforced again by `cargo deny`
+   ([Security › Supply chain](security.md#11-supply-chain)).
 4. Every entry in `[workspace.dependencies]` is an exact `=x.y.z` pin.
 
 **Entry points.** The `#[event(...)]` and `#[durable_object]` attribute macros of `workers-rs` 0.8.7
@@ -119,7 +126,7 @@ mail-parser  = { version = "=0.11.9", features = ["full_encoding"] }   # encodin
 mail-auth    = { version = "=0.13.3", default-features = false,
                  features = ["dns-doh", "rust-crypto", "arc"] }        # arc is needed for verify_arc
 mail-builder = { version = "=1.0.0", default-features = false }       # drops gethostname
-ammonia      = "=4.2.1"
+ammonia      = "=4.2.0"                                               # 4.2.1 is newer than two weeks
 
 # Serialisation, IDs, crypto
 serde      = { version = "=1.0.229", features = ["derive"] }
@@ -131,7 +138,7 @@ base64     = "=0.23.1"
 
 # API description, MCP, native clients
 utoipa  = "=6.0.0"
-rmcp    = "=3.5.1"                     # native dev-dependency only (worker tests, conformance); see S5 and the MCP design
+rmcp    = "=3.4.1"                     # native dev-dependency only (worker tests, conformance); see S5 and the MCP design
 clap    = { version = "=4.6.7", features = ["derive", "env"] }
 reqwest = { version = "=0.13.5", default-features = false, features = ["json", "rustls"] } # sdk, cli
 
@@ -184,8 +191,9 @@ Notes on specific crates (all read 2026-10-09):
   unification. `SigningKey` zeroises itself on drop (`zeroize`), and the unsealed 32-byte seed is held in
   `zeroize::Zeroizing` until the key is built. `zeroize` 1.9.1 (2026-10-06) is newer than two weeks, so
   1.9.0 is pinned ([Agent signing keys](agent-keys.md)).
-- **`whatlang` 0.18.0.** No dependencies. `detect(text)` returns the language (ISO 639-3), the script and
-  a confidence; [Triage](triage.md) maps the language to a BCP 47 primary tag through a compiled table.
+- **`whatlang` 0.18.0.** One dependency, `hashbrown` 0.15; its optional features (`serde`, `enum-map`,
+  `arbitrary`) stay off (crates.io sparse index, read 2026-10-10). `detect(text)` returns the language
+  (ISO 639-3), the script and a confidence; [Triage](triage.md) maps the language to a BCP 47 primary tag through a compiled table.
 - **`chrono` 0.4.45 and `chrono-tz` 0.10.4.** Without default features neither reads the clock: `core`
   receives `now` and converts it with `chrono_tz::Tz` parsed from `tenants.timezone`. An unknown zone
   name is refused when the tenant is created or updated (`400 invalid_request`, path `timezone`).
@@ -209,7 +217,9 @@ Notes on specific crates (all read 2026-10-09):
 - **`ulid` 3.0.0** renamed `Ulid::new()` to `Ulid::generate()`. With default features off it has no
   `rand` dependency; IDs are built with `Ulid::from_parts(timestamp_ms, random)`.
 - **`hmac` 0.13.0** needs `use hmac::{Hmac, KeyInit, Mac};` for `new_from_slice`.
-- **`ammonia` 4.2.1** panics in `clean()` if `link_rel` is set while `rel` is an allowed attribute, if a
+- **`ammonia` 4.2.0** (crates.io sparse index, read 2026-10-10: published 2026-09-17; 4.2.1, published
+  2026-10-03, is newer than the two-week rule allows) already carries the fixes for RUSTSEC-2026-0193 and
+  RUSTSEC-2026-0213. It panics in `clean()` if `link_rel` is set while `rel` is an allowed attribute, if a
   tag is in both `clean_content_tags` and `tags`, or if `attribute_filter` is set twice. The sanitiser
   builder in `core::sanitize` is constructed once and covered by a test that calls `clean("")`.
 - **`maud` 0.27.0** (published 2025-02-02, MIT OR Apache-2.0) has no default features; its `actix-web`
@@ -217,7 +227,7 @@ Notes on specific crates (all read 2026-10-09):
 - **`qrcode` 0.14.1** (published 2024-07-05, MIT OR Apache-2.0, MSRV 1.67.1) enables `image`, `svg` and
   `pic` by default. `default-features = false` with `svg` keeps the SVG renderer and leaves out the
   optional `image` dependency.
-- **`rmcp` 3.5.1** depends on `tokio` unconditionally, so it is only a native dev-dependency (MCP client tests); the Worker implements the MCP JSON-RPC types itself ([MCP server](mcp.md), [S5](index.md#spikes)).
+- **`rmcp` 3.4.1** depends on `tokio` (features `sync`, `macros`, `rt`, `time`) unconditionally, so it is only a native dev-dependency (MCP client tests); the Worker implements the MCP JSON-RPC types itself ([MCP server](mcp.md), [S5](index.md#spikes)). It is the newest release at least two weeks old (crates.io sparse index, read 2026-10-10: 3.4.1 published 2026-09-23; 3.5.0 on 2026-09-28 and 3.5.1 on 2026-10-05 are newer). 3.5.1 lists the same features and the same tokio dependency, and nothing in these designs needs a 3.5-only feature; that `rmcp::model` 3.4.1 has the `2026-07-28` protocol-version constant is verified at build time (the 3.x line started with 3.0.0 on 2026-07-28).
 
 ## 4. Release profile
 
@@ -248,9 +258,9 @@ opt-level = 1                  # native tests parse large corpus messages
 - **`panic = "abort"`.** Unwinding on wasm32 needs nightly and `-Zbuild-std`. With abort, `worker-build`
   0.8.7 enables panic recovery by default (it passes `--experimental-reset-state-function
   --force-enable-abort-handler` to `wasm-bindgen`): a panic aborts the current invocation, the panic hook
-  logs it, and the instance is re-initialised on the next request. Panic recovery first shipped in
-  `workers-rs` 0.6.2 (release notes, read 2026-10-09). Code still treats a panic as a bug: `core` is fuzzed,
-  and handlers never `unwrap()` on input-derived data.
+  logs it, and the instance is re-initialised on the next request. Panic recovery was implemented in
+  `workers-rs` 0.6.2 and is on by default from 0.6.5 (release notes, read 2026-10-09). Code still treats
+  a panic as a bug: `core` is fuzzed, and handlers never `unwrap()` on input-derived data.
 - **`strip = "symbols"`** removes the name section. `worker-build` then runs `wasm-opt` (binaryen 132)
   on the output.
 
@@ -259,7 +269,8 @@ opt-level = 1                  # native tests parse large corpus messages
 These hold for every crate compiled into the Worker (`core`, `api-types`, `platform`, `worker`):
 
 1. **No tokio, no threads, no blocking.** The Worker is single-threaded. Futures are `!Send`; platform
-   traits use `async fn` in traits without `Send` bounds.
+   traits use `async fn` in traits without `Send` bounds. The one tokio in the wasm graph is `worker`'s own
+   dependency, with no features (rule 3 of section 2): nothing in it starts a runtime or a timer.
 2. **No `SystemTime::now()` or `Instant::now()`**, directly or through a dependency. Time comes from
    `platform::Clock`. Known dependency traps: `mail-builder` (section 3), `ulid::Ulid::generate`.
 3. **Randomness** comes from `platform::Rng`, backed by `getrandom` 0.4.3 with the `wasm_js` feature
@@ -458,12 +469,14 @@ pub trait Ai {
 pub struct VectorRecord { pub id: String, pub namespace: String, pub values: Vec<f32>,
                           pub metadata: serde_json::Map<String, serde_json::Value> }
 pub struct VectorMatch { pub id: String, pub score: f32 }
+pub struct IndexInfo { pub vector_count: u64, pub dimensions: u32 }
 pub trait VectorIndex {
     async fn upsert(&self, vectors: &[VectorRecord]) -> PResult<String>;             // ≤ 1,000; returns mutationId
     async fn query(&self, namespace: &str, vector: &[f32], top_k: u32,
                    filter: &serde_json::Value) -> PResult<Vec<VectorMatch>>;         // returnMetadata "none", topK ≤ 100
     async fn delete_by_ids(&self, ids: &[String]) -> PResult<String>;
     async fn get_by_ids(&self, ids: &[String]) -> PResult<Vec<String>>;              // IDs that still exist (erasure probe)
+    async fn describe(&self) -> PResult<IndexInfo>;                                  // vector count (nightly drift, Search § 6.6)
 }
 
 // Email Sending (binding EMAIL) ---------------------------------------------------------
@@ -630,6 +643,8 @@ extern "C" {
     pub fn delete_by_ids(this: &VectorizeIndex, ids: &js_sys::Array) -> Result<js_sys::Promise, JsValue>;
     #[wasm_bindgen(method, catch, js_name = getByIds)]
     pub fn get_by_ids(this: &VectorizeIndex, ids: &js_sys::Array) -> Result<js_sys::Promise, JsValue>;
+    #[wasm_bindgen(method, catch)]
+    pub fn describe(this: &VectorizeIndex) -> Result<js_sys::Promise, JsValue>;
 
     // env.AI
     pub type AiBinding;
@@ -660,6 +675,9 @@ extern "C" {
   read 2026-10-09); S6 confirms them from Rust.
 - **Vectorize `getByIds`** returns the vectors that still exist; the erasure probe only needs their IDs
   ([Privacy](privacy.md#68-waiting-for-vectorize)).
+- **Vectorize `describe()`** resolves to the index's details; `IndexInfo` takes `vectorCount` and
+  `dimensions` from it. The nightly reconciliation compares the count with the mailboxes' embedded rows
+  ([Search § 6.6](search.md#66-nightly-reconciliation)); S6 confirms the field names on the V2 binding.
 - **`AI.toMarkdown`** receives `[{ name, blob }]`, where `blob` is a `web_sys::Blob` built from the bytes
   with the sniffed MIME type. Each result has `name`, `format` (`markdown`, `text` or `error`),
   `mimetype`, `tokens`, `data` and `error`
@@ -667,14 +685,20 @@ extern "C" {
   read 2026-10-09).
 
 **REST fallbacks** (taken only if S6 fails for that call; they need `PM_CF_API_TOKEN` and
-`PM_CF_ACCOUNT_ID`, and use `HttpClient` with `Authorization: Bearer …`):
+`PM_CF_ACCOUNT_ID`, and use `HttpClient` with `Authorization: Bearer …`). `{index_name}` is the index the
+call is for: the `index_name` of the `VECTORS` binding, or of `VECTORS_NEXT` during a re-embed
+(`pm-mail-chunks`, then `pm-mail-chunks-g{N}`, [Search § 7.3](search.md#73-re-embed-job-embedding-model-change)),
+never a fixed name. A Worker cannot read a binding's index name, so when a Vectorize REST fallback is taken
+`pmail deploy` also writes the two names into `[vars]` (`PM_VECTORS_INDEX`, and `PM_VECTORS_NEXT_INDEX`
+while `VECTORS_NEXT` is bound), added to Configuration with the spike result:
 
 | Call | REST endpoint |
 |---|---|
-| Vectorize query | `POST https://api.cloudflare.com/client/v4/accounts/{account_id}/vectorize/v2/indexes/pm-mail-chunks/query` |
-| Vectorize upsert | `POST …/vectorize/v2/indexes/pm-mail-chunks/upsert` (NDJSON body, `Content-Type: application/x-ndjson`) |
-| Vectorize delete | `POST …/vectorize/v2/indexes/pm-mail-chunks/delete_by_ids` with `{ "ids": [...] }` |
-| Vectorize get | `POST …/vectorize/v2/indexes/pm-mail-chunks/get_by_ids` with `{ "ids": [...] }` |
+| Vectorize query | `POST https://api.cloudflare.com/client/v4/accounts/{account_id}/vectorize/v2/indexes/{index_name}/query` |
+| Vectorize upsert | `POST …/vectorize/v2/indexes/{index_name}/upsert` (NDJSON body, `Content-Type: application/x-ndjson`) |
+| Vectorize delete | `POST …/vectorize/v2/indexes/{index_name}/delete_by_ids` with `{ "ids": [...] }` |
+| Vectorize get | `POST …/vectorize/v2/indexes/{index_name}/get_by_ids` with `{ "ids": [...] }` |
+| Vectorize describe | `GET …/vectorize/v2/indexes/{index_name}/info` (verify at build time, S6) |
 | toMarkdown | `POST https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/tomarkdown`, multipart, one `files` part per document (the REST response spells the field `mimeType`) |
 | `AI.run` (if the binding cannot pass the `gateway` option or a model's input) | `POST https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model}` with the same JSON input; through AI Gateway when `PM_AI_GATEWAY` is set (`https://gateway.ai.cloudflare.com/v1/{account_id}/{gateway_id}/workers-ai/{model}`, with the `cf-aig-collect-log: false` and `cf-aig-skip-cache: true` headers on content-bearing calls; header names from the AI Gateway logging and caching docs, read 2026-10-09). Endpoint shapes: verify at build time (S6) |
 
@@ -897,7 +921,7 @@ dataset = "pylota_mail_metrics"
 | Command | Does |
 |---|---|
 | `cargo xtask build-worker` | Runs `worker-build --release` (0.8.7) in `crates/worker`. Then measures `build/index.js` + `build/index_bg.wasm`: gzip level 9 total must be ≤ 10,485,760 bytes (NFR-SEC-2) and uncompressed ≤ 64 MiB, else it fails. Prints a size table by crate (from `twiggy`-style name-section data in a non-stripped copy) and warns above 8 MiB compressed |
-| `cargo xtask check-layering` | The `cargo metadata` checks in section 2 |
+| `cargo xtask check-layering` | The checks in section 2: rules 1, 2 and 4 from `cargo metadata`, rule 3 (tokio only under `worker`, with no features; no `gethostname` or `hickory-resolver`) from `cargo tree` on the wasm32 graph without dev-dependencies |
 | `cargo xtask itest` | Builds the Worker with the `itest-hooks` cargo feature, renders `deploy/wrangler.itest.toml` (same bindings, local resources, `PM_ENV = "local"`, test secrets, the fake-server URL and test token), starts the fake server on `127.0.0.1:8798`, applies D1 migrations with `--local --persist-to target/itest/state`, starts `npx --yes wrangler@4.139.0 dev --local --port 8799 --persist-to target/itest/state --test-scheduled --config deploy/wrangler.itest.toml`, waits for `GET /health`, then runs `cargo test -p pylota-mail-worker --features itest-hooks --test it -- --test-threads=1` with `PM_ITEST_URL`. Email events are injected through the local email-event endpoint that `wrangler dev` provides, and cron and alarm time through its scheduled-event endpoint and the `/__test/alarm` hook. Fault injection (R2 failure, D1 failure, transport outcomes) uses `PM_ENV = "local"`-only test hooks compiled behind `itest-hooks`, never in release bundles. The full sequence and the fakes are in [Testing › What cargo xtask itest does](testing.md#61-what-cargo-xtask-itest-does) |
 | `cargo xtask live` | Runs `cargo test -p pylota-mail-worker --features live --test live -- --test-threads=1` against staging ([Testing › Live suite](testing.md#10-live-end-to-end-suite-live)) |
 | `cargo xtask trace` | Checks the edge-case register and the PRD against the test names and `Covers:` lines, and prints the traceability matrix ([Testing](testing.md#112-cargo-xtask-trace)) |
@@ -942,7 +966,7 @@ The first five run for 60 seconds each in CI on every pull request (build plan M
 | `wasm` | `cargo build -p pylota-mail-core --target wasm32-unknown-unknown`, then `cargo xtask build-worker` | build error or size budget exceeded |
 | `itest` | `cargo xtask itest` (Node.js 22 and Wrangler 4.139.0 installed) | any failure |
 | `fuzz-smoke` | `cargo xtask fuzz --target {mime_parse,query_parse,address_parse,sanitize,dsn_parse} --time 60` | a crash |
-| `deny` | `cargo deny check` (licences compatible with FSL-1.1-ALv2 and its Apache-2.0 future licence, RustSec advisories, banned crates, sources limited to crates.io) | any finding |
+| `deny` | `cargo deny` over the whole workspace for licences (compatible with FSL-1.1-ALv2 and its Apache-2.0 future licence), RustSec advisories and sources (crates.io only), and over the Worker's wasm graph for banned crates, including tokio outside `worker` ([Security › Supply chain](security.md#11-supply-chain)) | any finding |
 | `audit` | `cargo audit` (RustSec) | any advisory |
 | `trace` | `cargo xtask trace` | a named test missing, or a `P0` requirement without a test |
 | `openapi` | `cargo xtask openapi` | a contract drift |
@@ -1029,7 +1053,7 @@ of [Errors](../../reference/errors.md) decodes with its `retryable` flag), `it::
 | Test | Covers |
 |---|---|
 | `sdk::coverage::every_operation` | The SDK has exactly one method per `openapi.yaml` operation (FR-SDK-1) |
-| `xtask::openapi_matches_contract` | `cargo xtask openapi`: the generated `openapi.json` (OpenAPI 3.1, every path under `/v1`) equals `docs/src/reference/openapi.yaml` semantically (FR-API-1) |
+| `xtask::openapi_matches_contract` | `cargo xtask openapi`: the generated `openapi.json` (OpenAPI 3.1; every path under `/v1`, except the root paths `/health`, `/openapi.json`, `/hooks/*` and `/.well-known/*`, whose path items override `servers`) equals `docs/src/reference/openapi.yaml` semantically (FR-API-1) |
 | `xtask::check_layering_rejects_worker_dep` | A fixture crate depending on `worker` fails the check (AGENTS.md rule) |
 | `platform::config::startup_rules` | Each row of the startup rules in §6.1: a malformed optional variable is `config_invalid` naming it; SES without `PM_SES_SNS_TOPIC_ARN` and `PM_BILLING=stripe` without its secrets start with `/health` `degraded` and the feature off; `PM_WEB_BOT_AUTH=on` in a release without signed requests is `config_invalid`; `PM_CONSOLE_HOST`, `PM_SYSTEM_FROM` and `PM_NOTIFICATIONS` are read with `PM_CONSOLE=off` |
 | `platform::ids::monotonic_within_ms` | IDs generated in one millisecond sort strictly; random overflow moves to the next millisecond |

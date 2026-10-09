@@ -194,13 +194,16 @@ tools answer with `application/json`.
 
 ### 2.7 Protocol types: `rmcp` and spike S5
 
-Spike S5 asks whether the server can be built on `rmcp` 3.5.1's protocol types without tokio. What
-was verified on 2026-10-09:
+Spike S5 asks whether the server can be built on `rmcp`'s protocol types without tokio. The pin is
+`rmcp` 3.4.1, the newest release at least two weeks old ([Rust workspace §3](rust-workspace.md#3-workspace-dependencies)).
+What was verified on 2026-10-09, and for 3.4.1 on 2026-10-10:
 
-- `rmcp` 3.5.1 was published on crates.io on 2026-10-05. Its README says it "implements the stable MCP
-  `2026-07-28` specification while remaining fully compatible with the `2025-11-25` release and
-  earlier versions", and its `ProtocolVersion` type has constants for `2026-07-28`, `2025-11-25` and
-  `2025-06-18` (read from the repository's `model.rs` on `main`).
+- `rmcp` 3.5.1 was published on crates.io on 2026-10-05, 3.4.1 on 2026-09-23; both list the same features
+  and the same tokio dependency (crates.io sparse index). The README on `main` says it "implements the
+  stable MCP `2026-07-28` specification while remaining fully compatible with the `2025-11-25` release
+  and earlier versions", and its `ProtocolVersion` type has constants for `2026-07-28`, `2025-11-25` and
+  `2025-06-18` (read from the repository's `model.rs` on `main`). That 3.4.1's `model` already has the
+  `2026-07-28` constant is verified at build time; the 3.x line began with 3.0.0 on 2026-07-28.
 - Its docs and README do not mention wasm. The `local` feature only switches `rmcp-macros` to
   non-`Send` futures.
 - Its dependency list makes **`tokio` (features `sync`, `macros`, `rt`, `time`) and `tokio-util`
@@ -208,13 +211,13 @@ was verified on 2026-10-09:
   and `time` as compiling for WASM, with timers panicking where the platform has none.
 
 So depending on `rmcp` always compiles tokio into the Worker, which `AGENTS.md` forbids ("No tokio"),
-and S5's pass criterion ("using `rmcp` 3.5.1 protocol types (no tokio)") cannot be met as written. The
+and S5's pass criterion ("using `rmcp` 3.4.1 protocol types (no tokio)") cannot be met as written. The
 design therefore takes the S5 fallback from the [build plan](../build-plan.md#m1--spikes-each-one-gates-design-choices):
 
 - **The Worker uses its own protocol types** in `mcp/schemas.rs`: plain `serde` structs for the
   JSON-RPC envelope and the messages listed below. They are small and follow `schema.ts` of
   `2026-07-28` and `2025-11-25`.
-- **`rmcp` is a native dev-dependency** of `crates/worker` (`rmcp = { version = "=3.5.1",
+- **`rmcp` is a native dev-dependency** of `crates/worker` (`rmcp = { version = "=3.4.1",
   default-features = false }`, plus whatever features its model module needs, pinned in the
   workspace). A round-trip test serialises every local type, deserialises it with `rmcp::model`, and
   compares, so the local types cannot drift from the official SDK.
@@ -634,7 +637,11 @@ Title "Send an email". Description:
     "thread_id": { "type": "string", "pattern": "^thr_[0-9A-HJKMNP-TV-Z]{26}$" },
     "from_address": { "type": "string", "maxLength": 254 },
     "labels": { "type": "array", "maxItems": 64, "items": { "type": "string" } },
-    "headers": { "type": "object", "additionalProperties": { "type": "string", "maxLength": 2048 }, "description": "X- headers, plus Importance, Priority, Sensitivity, Keywords, Comments and Organization." },
+    "headers": { "type": "object", "additionalProperties": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "properties": { "Importance": { "type": "string", "enum": ["high", "normal", "low"] },
+          "Priority": { "type": "string", "enum": ["normal", "non-urgent", "urgent"] },
+          "Sensitivity": { "type": "string", "enum": ["personal", "private", "company-confidential"] } },
+        "description": "X- headers whose name matches ^X-[A-Za-z0-9_-]+$, plus Importance, Priority, Sensitivity, Keywords, Comments and Organization, spelled exactly so. Any other name gets header_not_allowed." },
     "metadata": { "type": "object", "additionalProperties": { "type": "string", "maxLength": 512 } },
     "unsubscribe": { "type": "object" },
     "consent": { "type": "object" } },
@@ -936,7 +943,7 @@ v1.1 needs an ADR and updates to [Configuration](../../reference/configuration.m
 | `it::mcp::size_budgets` | Truncation flags and the 96 KB cap; attachment text is cut per page; every cut result still validates against its tool's `outputSchema` and has `truncated: true` | §4.2 |
 | `it::mcp::get_usage` | `mail_get_usage` is listed for tenant and identity keys that do not hold `usage:read` explicitly and never for platform keys; it returns the same body as `GET /v1/usage` for the key's own workspace; any argument gives `invalid_request` | §3, §4.3, FR-BILL-11 |
 | `it::mcp::sign_tools` | `mail_sign_assertion` and `mail_sign_http_request` are listed only for tenant and identity keys holding `identities:sign`; an identity key naming another identity gets `identity_not_found`; the results have the REST shapes and verify (the token against the identity's JWKS); two identical calls return different tokens; a paused identity gets `identity_paused`, and `PM_WEB_BOT_AUTH=off` and a tenant not opted in give `web_bot_auth_disabled` and `policy_denied` as `isError` results | §3, §4.3, §5, FR-IDN-7, FR-IDN-8 |
-| `it::mcp::rmcp_roundtrip` (native) | Every local protocol type round-trips through `rmcp::model` 3.5.1 | S5 fallback |
+| `it::mcp::rmcp_roundtrip` (native) | Every local protocol type round-trips through `rmcp::model` 3.4.1 | S5 fallback |
 | `it::mcp::inspector_replay` | A recorded MCP Inspector session replays green | M15 |
 | `it::auth::f2_permission` | A key without `search:read` cannot see or call search tools | [F2] |
 | `it::search::f3_tenant_scope_denied` | `scope: "tenant"` with an identity key is refused | [F3] |

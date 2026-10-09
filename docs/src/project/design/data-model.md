@@ -56,7 +56,9 @@ CREATE TABLE tenants (
   quota_do_id      TEXT NOT NULL,                          -- TenantQuota Durable Object id; minted with the row,
                                                            -- then QuotaRequest::Init { tenant_id }
   notify_do_id     TEXT NOT NULL,                          -- Notifier Durable Object id; minted with the row,
-                                                           -- then NotifierRequest::Init { tenant_id } (Notifications § 8)
+                                                           -- then NotifierRequest::Init { tenant_id } (Notifications § 8);
+                                                           -- '' until M26 builds the Notifier, as mailbox_do_id
+                                                           -- is '' until the cron mints it
   require_two_factor      INTEGER NOT NULL DEFAULT 0       -- members need two-step verification (console)
                           CHECK (require_two_factor IN (0,1)),
   onboarding_dismissed_at INTEGER,                         -- first-run checklist dismissed: written by the dismiss
@@ -94,8 +96,10 @@ CREATE TABLE domains (
   event_subscription_id TEXT,                              -- Email Sending → pm-delivery-events; NULL on a
                                                            -- cloudflare-transport domain = delivery_events
                                                            -- "manual" (S9 fallback, identity-domains.md)
-  ses_identity          TEXT,                              -- SES email identity name, if inbound or transport = ses
-  ses_region            TEXT,                              -- set when inbound or transport is ses
+  ses_identity          TEXT,                              -- SES email identity name, if inbound or transport = ses,
+                                                           -- or the J5 failover identity of a cloudflare_zone,
+                                                           -- nameservers or delegated_subdomain domain
+  ses_region            TEXT,                              -- set whenever ses_identity is
   mail_from_domain      TEXT,                              -- pm-bounce.{domain}, the custom MAIL FROM (SES transport)
   smtp_sealed           BLOB,                              -- smtp_relay: pm1 envelope of {host, port, username,
                                                            -- password, probe_from}
@@ -445,6 +449,25 @@ CREATE TABLE ses_ingest (
 );
 CREATE INDEX ses_ingest_pending ON ses_ingest(status, received_at) WHERE status IN ('queued','held');
 
+-- Nightly vector reconciliation (Search § 6.6): one row per identity and run, written by that identity's
+-- Reconcile job (INSERT OR REPLACE, so a queue retry does not count twice), plus one summary row per run
+-- (identity_id = '*') written by the */15 cron. Read by the cron's drift check; rows older than 7 days are
+-- deleted by the same cron.
+CREATE TABLE index_reconcile (
+  run_date      TEXT NOT NULL,                             -- YYYY-MM-DD (UTC) of the 02:00 run
+  identity_id   TEXT NOT NULL,                             -- idn_, or '*' for the run's summary row
+  embedded_rows INTEGER NOT NULL DEFAULT 0,                -- chunks rows with status 'embedded' ('*': the sum)
+  pending_rows  INTEGER NOT NULL DEFAULT 0,
+  failed_rows   INTEGER NOT NULL DEFAULT 0,
+  queued        INTEGER,                                   -- '*' only: Reconcile jobs queued for the run
+  index_count   INTEGER,                                   -- '*' only: describe() vector count when evaluated
+  drift_pct     REAL,                                      -- '*' only: (index_count − embedded_rows) / embedded_rows
+                                                           -- × 100; NULL until evaluated, or when not every
+                                                           -- identity reported
+  reported_at   INTEGER NOT NULL,
+  PRIMARY KEY (run_date, identity_id)
+);
+
 -- ---------- Console: people, workspaces membership, sessions ----------
 CREATE TABLE users (
   id                    TEXT PRIMARY KEY,                  -- usr_
@@ -734,6 +757,8 @@ CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 --       wait:{domain}   time until which a wait for that sender domain counts (RegisterWait: now + timeout
 --                       + 10 s, refreshed every 10 s; Inbound › The wait handler, E4; read by the
 --                       unsolicited-code check, E5)
+--       outbox_backoff  consecutive failed outbox dispatches; the retry delay is 30 s doubled per failure,
+--                       at most 5 minutes; cleared by a successful dispatch (Webhooks › Dispatching)
 --       alarm:{purpose} pending wake-ups: outbox, claim, dispatch, maintenance (Design § 4). Thread locks
 --                       expire lazily and reconciliation is event-driven, so neither has an alarm.
 -- parser_version is a column of messages (and a core constant), not a meta key.
@@ -990,6 +1015,7 @@ CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 --   failing_since    when the domain entered failing (suspension after 14 days)
 --   reminders_sent_json  reminders already sent for the current state; reset on every state change
 --   event_seq        outbox sequence (Webhooks › Outbox)
+--   outbox_backoff   consecutive failed outbox dispatches, for the retry delay (Webhooks › Dispatching)
 --   rdap_pending     {fingerprint, seen_at}: an RDAP change seen once; confirmed by a second query at
 --                    least an hour later (alarm:ownership is set to seen_at + 1 hour), cleared otherwise
 --   probe:{token}    pending alignment probe {probe_id, sent_at}; dropped after 15 minutes (smtp_probe_timeout)
@@ -1016,6 +1042,7 @@ CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 --   schema_version   applied schema (Design § 4, rule 6)
 --   job_id, kind, tenant_id  written by Start; tenant_id is the owner checked on every request (Design § 4)
 --   event_seq        outbox sequence (Webhooks › Outbox)
+--   outbox_backoff   consecutive failed outbox dispatches, for the retry delay (Webhooks › Dispatching)
 --   target_address   erasure by address only, from init to finalise (Privacy § 6.4)
 --   zip_cd:{n}       export ZIP central-directory entries of batch n, until finalise (Privacy § 9.1)
 --   alarm:step, alarm:outbox  pending wake-ups (Design § 4, rule 5)
@@ -1134,6 +1161,7 @@ CREATE TABLE sent (                                        -- per-day counters f
 | Key | Content | Custom metadata | Deleted by |
 |---|---|---|---|
 | `inbound-staging/{yyyy}/{mm}/{dd}/{ulid}.eml` | Raw message before routing resolves | `envelope_to_hash` | The inbound consumer after the move, or the lifecycle rule (1 day) |
+| `inbound-staging/ses/{key}` | Raw message received through SES, copied from S3 (`in/{key}`) before its recipients are resolved | – | The lifecycle rule (1 day); a held message whose copy is gone is fetched from S3 again |
 | `t/{ten}/i/{idn}/m/{msg}/raw.eml` | Raw inbound MIME | `tenant`, `identity`, `message` | Retention (`raw_days`), erasure |
 | `t/{ten}/i/{idn}/m/{msg}/a/{att}` | Attachment bytes | same, plus `sha256` | Erasure, message retention |
 | `t/{ten}/i/{idn}/m/{msg}/a/{att}.md` | Extracted text (Markdown, with page markers) | same | as above |
@@ -1141,8 +1169,11 @@ CREATE TABLE sent (                                        -- per-day counters f
 | `t/{ten}/i/{idn}/out/{msg}/a/{att}` | Outbound attachment bytes (linked attachments, and copies for `GET …/attachments/{id}`) | `tenant`, `identity`, `message`, `sha256` | Retention, erasure |
 | `t/{ten}/exports/{exp}.zip` | Subject-access export | `tenant`, `export` | 7 days after creation |
 
-`email()` writes straight to the final key when routing resolved (the normal case). The staging prefix
-is used only when the directory lookup fails transiently and the message is accepted for later routing.
+For Email Routing, `email()` writes straight to the final key when routing resolved (the normal case);
+the dated staging key is used only when the directory lookup fails transiently and the message is accepted
+for later routing. Every message received through SES is staged, because its recipients are resolved in
+the consumer, not at receipt: the consumer copies `in/{key}` from S3 to `inbound-staging/ses/{key}`, then
+to each recipient's final key ([Inbound › The SES source](inbound.md#the-ses-source)).
 
 The metadata on `out/{msg}.eml` lets a point-in-time restore of a mailbox rebuild the idempotency
 ledger for sends made after the restore point ([Observability › Restore from PITR](observability.md#restore-from-pitr)).
@@ -1154,8 +1185,11 @@ Retention and erasure delete each key from both buckets. See [Privacy › R2 bac
 ## 5. Vectorize
 
 ```text
-index:       pm-mail-chunks           (one per deployment; staging has its own)
-dimensions:  1024                      (@cf/baai/bge-m3)
+index:       pm-mail-chunks for generation 1, then pm-mail-chunks-g{N} for generation N ≥ 2, one per
+             embedding model (Search § 7.3); one generation in use per deployment, two during a re-embed;
+             staging has its own
+dimensions:  1024 for generation 1 (@cf/baai/bge-m3); a later generation's are probed from its model by
+             embedding a test string before the index is created (CLI and setup § 8.7)
 metric:      cosine
 namespace:   tenant id (ten_…, ≤ 64 bytes)
 vector id:   {message_id}:{n}  or  {message_id}:a{k}:{n}   (≤ 64 bytes)
