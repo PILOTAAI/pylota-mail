@@ -2,8 +2,9 @@
 
 Binding design for keyword, semantic, hybrid and agentic search, the indexing pipeline behind them,
 contacts and related-message lookup, and the quality gates. It implements FR-SRCH-1 to FR-SRCH-11,
-NFR-PERF-3 to NFR-PERF-6 and NFR-QUAL-1/2, and the edge-case rows F1–F15, B12, E1 and E4 in the
-[edge-case register](../edge-cases.md).
+NFR-PERF-3 to NFR-PERF-6 and NFR-QUAL-1/2, and the edge-case rows F1–F15, B12 and E1 in the
+[edge-case register](../edge-cases.md). The `wait` long-poll (E4) is specified in
+[Inbound › The `wait` handler](inbound.md#the-wait-handler-e4).
 
 The public contract (request and response shapes, permissions, errors) is in the
 [REST API reference](../../reference/api.md#search) and [Errors](../../reference/errors.md). Tables
@@ -60,12 +61,14 @@ These steps run in the front Worker (`handlers/search.rs`) for every mode, in th
    `403 scope_denied` ([F3]). Scope is never read from the body (FR-KEY-3).
 3. **Rate limit.** `RL_SEARCH` (120 per minute, keyed by API key ID) for keyword, semantic and hybrid.
    Agentic uses `RL_AGENTIC` (20 per minute) and the tenant's daily cap
-   (`policy.search.agentic_daily_cap`, counted in `TenantQuota` metric `agentic`); a spent cap returns
+   (`policy.search.agentic_daily_cap`, counted by `QuotaRequest::CountAgentic` in `TenantQuota` metric
+   `agentic` for the day in the tenant's time zone); a spent cap returns
    `429 agentic_budget_exhausted`. `policy.search.agentic_enabled = false` returns
    `422 agentic_disabled`.
 4. **Validate the body** into `SearchRequest` (below). Out-of-range values return `400 invalid_request`
-   with `details.errors[]`. `include_quarantined: true` without `quarantine:review` returns
-   `403 permission_denied` with `details.required = "quarantine:review"` ([F7]).
+   with `details.errors[]`. `include_quarantined: true` from a key without `quarantine:review` is
+   filtered silently: the request runs as if it were `false`, and quarantined mail stays out of the
+   results ([F7]; the contract in `openapi.yaml` wins on this wire behaviour, [Design › Precedence](index.md#precedence)).
 5. **Decode the cursor** if present ([§5.8](#58-cursors-and-as_of-pinning)). From here on, `now` is the
    cursor's `as_of`, so relative dates stay fixed across pages.
 6. **Parse** `q` into the typed tree ([§3](#3-query-language)). A parse error returns
@@ -76,7 +79,9 @@ These steps run in the front Worker (`handlers/search.rs`) for every mode, in th
    ([§10](#10-tenant-scope-fan-out)).
 9. **Assemble** hits, snippets, `why`, facets, `semantic_coverage`, `degraded`, `as_of` and
    `next_cursor`, then apply the byte cap ([§5.9](#59-response-byte-cap)).
-10. **Account**: increment `usage_daily` metric `search` (or `agentic`). Log mode, latency, hit count
+10. **Account**: `QuotaRequest::RecordUsage { metric: Search, n: 1 }` for keyword, semantic and hybrid
+    searches (an agentic search was already counted by `CountAgentic` at step 3; the roll-up flushes both to
+    `usage_daily`, [Outbound › TenantQuota](outbound.md#tenantquota)). Log mode, latency, hit count
     and `query_hash = hex(HMAC-SHA256(PM_HASH_KEY, q))[..16]`. The query text is never logged
     (FR-PRV-6).
 
@@ -289,7 +294,7 @@ found there (at most 32 characters), or `null` at the end of input.
 | Dangling `OR` or `-` | offset of the operator | `term` |
 | Too long, too many leaves, too deep | offset where the limit is crossed | `shorter query (max 1024 characters, 32 terms, depth 8)` |
 | `mode: "semantic"` with no free text | `0` | `free text for semantic search` |
-| `is:quarantined` without `quarantine:review` | returns `403 permission_denied`, not `invalid_query` | – |
+| `is:quarantined` without `quarantine:review` | not an error: the leaf parses, the quarantine filter still applies, so it matches nothing | – |
 
 `query.parsed` in the response is the canonical serialisation of the tree: operator names in lower
 case, normalised values, phrases in double quotes, `OR` explicit, parentheses only where needed.
@@ -372,7 +377,7 @@ Filter SQL (`?` is a bound parameter; `msg_date` is the expression in [§4](#4-d
 | `Thread(t)` | `m.thread_seq = (SELECT seq FROM threads WHERE id = ?)` |
 | `IsUnread` | `m.read = 0` |
 | `IsNeedsReply` | `m.direction = 'inbound' AND json_extract(m.triage_json,'$.needs_reply') >= 0.5 AND NOT EXISTS (SELECT 1 FROM messages o WHERE o.thread_seq = m.thread_seq AND o.direction = 'outbound' AND o.status NOT IN ('canceled','rejected','failed','suppressed') AND o.received_at > m.received_at)` |
-| `IsQuarantined` | `m.status = 'quarantined'` (and forces `include_quarantined`) |
+| `IsQuarantined` | `m.status = 'quarantined'` (and forces `include_quarantined` when the key holds `quarantine:review`; otherwise it matches nothing) |
 | `Category(c)` | `json_extract(m.triage_json,'$.category') = ?` |
 
 `filters.direction`, `filters.labels`, `filters.after` and `filters.before` from the body are added
@@ -454,6 +459,13 @@ m.status NOT IN ('hidden','throttled')
 AND (m.status <> 'quarantined' OR :include_quarantined = 1)
 AND m.received_at <= :as_of
 ```
+
+`:include_quarantined` is 1 only when the request set `include_quarantined` (or used `is:quarantined`)
+**and** the key holds `quarantine:review`. Search therefore never returns `hidden` or `throttled` mail.
+Message lists follow their own rule ([Security §5.3](security.md#53-cross-level-read-access)): they show
+`quarantined`, `hidden` and `throttled` mail only for an explicit `status` filter from a key holding
+`quarantine:review`. The two rules agree: neither shows such mail by default, both need
+`quarantine:review`, and neither answers `403` when it is missing.
 
 **Text query** (when `fts_match` is set):
 
@@ -715,11 +727,12 @@ retries, DLQ `pm-index-dlq`).
 // crates/api-types/src/internal/index_job.rs
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum IndexJob {
-    AttachmentText { tenant_id: String, identity_id: String, message_id: String },   // inbound.md
+    AttachmentText { tenant_id: String, identity_id: String, message_id: String,
+                     #[serde(default)] attempt: u32 },                               // inbound.md
     Embed          { tenant_id: String, identity_id: String, message_id: String,
-                     #[serde(default)] reason: EmbedReason },
+                     #[serde(default)] reason: EmbedReason, #[serde(default)] attempt: u32 },
     Triage         { tenant_id: String, identity_id: String, message_id: String,
-                     #[serde(default)] reason: TriageReason },                       // triage.md
+                     #[serde(default)] reason: TriageReason, #[serde(default)] attempt: u32 }, // triage.md
     DeleteVectors  { tenant_id: String, vector_ids: Vec<String> /* ≤ 500 */, #[serde(default)] also_next: bool },
     Reconcile      { tenant_id: String, identity_id: String },
 }
@@ -729,6 +742,17 @@ pub enum EmbedReason { #[default] New, AttachmentText, Release, Reembed, Reconci
 
 The consumer resolves the mailbox's Durable Object ID from `identities.mailbox_do_id` in D1 (cached per
 isolate for 10 minutes); jobs never carry it.
+
+**Retries count in the body, never from the queue** ([Design conventions §7](index.md#7-idempotent-queue-consumers),
+the re-enqueue form). `AttachmentText`, `Embed` and `Triage` carry `attempt` (0 for a new job). On a known
+transient failure the consumer sends the same job with `attempt + 1` to `Q_INDEX` with a delay, then
+acks the current message: `Embed` and `Triage` use `delay_seconds = min(30 · 2^attempt, 3600)` and stop
+at `attempt = 9` (the tenth try); `AttachmentText` uses 60 s, then 300 s, and stops at `attempt = 2`
+([Inbound › Attachment text extraction](inbound.md#attachment-text-extraction)). The consumer never
+reads the queue's own attempt count (`workers-rs` 0.8.7 does not expose it). The last try does not
+re-enqueue: it records its final outcome, as each job's table says. Only an
+unexpected error (a bug, a panic) is left to the queue's `retry()` and, after 10 deliveries, the
+dead-letter queue.
 
 ### 6.1 When jobs are created
 
@@ -827,10 +851,10 @@ bytes, under the 64-byte limit.
 6. `index.mark(vector_ids, 'embedded', model_tag)` for the upserted rows; `failed` for rows whose
    embedding or upsert failed.
 7. `deleteByIds` for the `deleting` IDs, then `index.drop_deleting(ids)`.
-8. If any row is `failed`, the consumer retries the queue message with delay
-   `min(30 · 2^attempts, 3600)` seconds. A retry re-runs the whole job; embedded rows are skipped, so
-   it is idempotent. After the last retry the message goes to `pm-index-dlq`; its rows stay `failed`
-   and the nightly reconciliation picks them up ([F14]).
+8. If any row is `failed`, the consumer re-enqueues the job with `attempt + 1` and
+   `delay_seconds = min(30 · 2^attempt, 3600)`, then acks. A retry re-runs the whole job; embedded rows
+   are skipped, so it is idempotent. At `attempt = 9` it acks without re-enqueuing; its rows stay
+   `failed` and the nightly reconciliation picks them up ([F14]).
 
 Vectorize writes are asynchronous: they return a mutation ID and become queryable after a few
 seconds (Vectorize client API). `embedded` therefore means "accepted by Vectorize".
@@ -1102,14 +1126,16 @@ re-embed costs roughly that rate times the token volume of the indexed text.
 
 Agentic search (FR-SRCH-8/9, [ADR 0007](../adr/0007-agentic-search.md)) answers a question with
 cited evidence. The planner model only chooses read-only tool calls; code executes them in the
-caller's scope, and code verifies every citation.
+caller's scope, and code verifies every citation. Like the other modes it runs at either scope: one
+identity (`POST /v1/identities/{identity_id}/search`) or the whole tenant
+(`POST /v1/tenants/{tenant_id}/search`, tenant and platform keys, [§10](#10-tenant-scope-fan-out)).
 
 ### 11.1 Budgets and limits
 
 | Limit | Default | Bounds |
 |---|---|---|
-| Steps (model calls, including the final answer call) | `policy.search.agentic_max_steps` (6) | request may lower it, 2–10 |
-| Wall time | `policy.search.agentic_max_seconds` (8 s) | request may lower it, 3–30 s |
+| Steps (model calls, including the final answer call) | `policy.search.agentic_max_steps` (6) | 2–10 for both the policy and `budget.max_steps`. The request may lower the policy value; a higher request value is lowered to it, not refused. A value outside 2–10 is `400 invalid_request` |
+| Wall time | `policy.search.agentic_max_seconds` (8 s) | 3–30 s for both the policy and `budget.max_seconds`, with the same lowering rule |
 | Tool calls per step | 4 | – |
 | Tool calls in total | 16 | – |
 | Evidence items | 40 (first seen) | – |
@@ -1279,7 +1305,7 @@ synchronous schemas define a Chat Completions shape (read 2026-10-09):
 
 The generic [function calling page](https://developers.cloudflare.com/workers-ai/features/function-calling/)
 (last updated 21 April 2026) shows an older shape (`tools` without the `type` wrapper, `tool_calls` at
-the top level). The adapter uses the model's own schema above, and spike S1 confirms it from Rust.
+the top level). The adapter uses the model's own schema above, and spike S6 confirms it from Rust.
 
 Planning call:
 
@@ -1695,7 +1721,7 @@ written there.
 | `it::search::f3_tenant_scope_denied` | An identity key on the tenant route gets `403 scope_denied` | FR-SRCH-10, [F3] |
 | `it::search::f4_coverage` | Coverage formula with pending, failed, deleting and stale-model rows | FR-SRCH-7, [F4] |
 | `it::erasure::f6_probe_empty` | FTS rows, refs and vectors deleted; both probes return 0 | FR-SRCH-11, [F6] |
-| `it::search::f7_quarantine_hidden` | Quarantined mail is absent unless `include_quarantined` and `quarantine:review`; semantic read-back also hides it | FR-IN-5, [F7] |
+| `it::search::f7_quarantine_hidden` | Quarantined mail is absent unless `include_quarantined` and `quarantine:review`; without `quarantine:review`, `include_quarantined: true` and `is:quarantined` are filtered silently (`200`, no quarantined hits, never `403`); semantic read-back also hides it | FR-IN-5, [F7] |
 | `it::search::f8_budget` | `limit` ≤ 50, `snippet_chars`, `group_by=thread`, 256 KB cap sets `truncated` and a continuing cursor | FR-SRCH-5, [F8] |
 | `it::index::f14_retry_and_reconcile` | Failed upserts retried; nightly reconciliation re-enqueues missing and failed rows | [F14] |
 | `it::search::f15_partial` | A slow mailbox misses the 900 ms deadline; `partial: true`, `failed_identities` set | NFR-PERF-5, [F15] |
@@ -1724,7 +1750,7 @@ written there.
 | `it::search::related_excludes_thread` | Same thread excluded, shared refs boost, keyword fallback | [PRD §5](../prd.md#5-scope-and-priorities) Search P1 (find-related) |
 | `xtask eval-search` (nightly) | recall@10 ≥ 0.90 hybrid, regression ≤ 0.01 | NFR-QUAL-1 |
 | `xtask eval-agentic` (nightly) | citation precision ≥ 0.98 | NFR-QUAL-2 |
-| Benchmark in M10 | Keyword p95 ≤ 200 ms on 50,000 messages in workerd | NFR-PERF-3 |
+| `it::bench::keyword_p95` (benchmark, M10) | Keyword p95 ≤ 200 ms on 50,000 messages in workerd; reports the figure, CI warns above | NFR-PERF-3 |
 
 [B10]: ../edge-cases.md
 [B11]: ../edge-cases.md

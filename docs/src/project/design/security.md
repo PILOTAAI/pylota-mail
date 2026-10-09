@@ -7,9 +7,9 @@ the thread token in [Threading](threading.md)), this page states the security pr
 
 | | |
 |---|---|
-| Requirements | FR-KEY-1, FR-KEY-2, FR-KEY-3, FR-TEN-1, FR-TEN-2, FR-TEN-3, FR-IN-4, FR-IN-5, FR-IN-9, FR-WH-2, FR-WH-5, FR-TRI-3, FR-TRI-4, FR-SRCH-3, FR-SRCH-8, FR-SRCH-10, FR-MCP-1, FR-PRV-6, FR-DOM-9, FR-DOM-11, FR-CON-3, FR-CON-9, FR-CON-10, FR-CON-13, NFR-SEC-1, NFR-SEC-2 |
-| Edge cases | [A2](../edge-cases.md), [A4](../edge-cases.md), [A6](../edge-cases.md), [B7](../edge-cases.md), [B10](../edge-cases.md), [B11](../edge-cases.md), [D2](../edge-cases.md), [D5](../edge-cases.md), [D9](../edge-cases.md), [D10](../edge-cases.md), [E1](../edge-cases.md), [E2](../edge-cases.md), [F1](../edge-cases.md), [F3](../edge-cases.md), [F10](../edge-cases.md), [I5](../edge-cases.md), [J6](../edge-cases.md), [L4](../edge-cases.md), [M15](../edge-cases.md)–[M18](../edge-cases.md), [M20](../edge-cases.md)–[M22](../edge-cases.md), [M27](../edge-cases.md), [M28](../edge-cases.md), [M31](../edge-cases.md), [N1](../edge-cases.md)–[N3](../edge-cases.md), [N14](../edge-cases.md), [N16](../edge-cases.md), [N18](../edge-cases.md), [N28](../edge-cases.md) |
-| Code | `crates/worker/src/auth/` (keys, router table, scope), `crates/core/src/ssrf.rs`, `crates/core/src/injection.rs`, `crates/core/src/sanitize.rs`, `crates/core/src/crypto.rs` (sealing, pure; nonces passed in), `crates/worker/src/net.rs` (guarded HTTP), `crates/worker/src/log.rs` |
+| Requirements | FR-KEY-1, FR-KEY-2, FR-KEY-3, FR-TEN-1, FR-TEN-2, FR-TEN-3, FR-IN-4, FR-IN-5, FR-IN-9, FR-IDN-6, FR-IDN-7, FR-IDN-8, FR-IDN-9, FR-WH-2, FR-WH-5, FR-TRI-3, FR-TRI-4, FR-SRCH-3, FR-SRCH-8, FR-SRCH-10, FR-MCP-1, FR-PRV-6, FR-DOM-9, FR-DOM-11, FR-CON-3, FR-CON-9, FR-CON-10, FR-CON-13, FR-CON-14, NFR-SEC-1, NFR-SEC-2 |
+| Edge cases | [A2](../edge-cases.md), [A4](../edge-cases.md), [A6](../edge-cases.md), [B7](../edge-cases.md), [B10](../edge-cases.md), [B11](../edge-cases.md), [D2](../edge-cases.md), [D5](../edge-cases.md), [D9](../edge-cases.md), [D10](../edge-cases.md), [E1](../edge-cases.md), [E2](../edge-cases.md), [F1](../edge-cases.md), [F3](../edge-cases.md), [F7](../edge-cases.md), [F10](../edge-cases.md), [I5](../edge-cases.md), [J6](../edge-cases.md), [L4](../edge-cases.md), [W15](../edge-cases.md)–[W18](../edge-cases.md), [W20](../edge-cases.md)–[W22](../edge-cases.md), [W27](../edge-cases.md), [W28](../edge-cases.md), [W31](../edge-cases.md), [N1](../edge-cases.md)–[N3](../edge-cases.md), [N14](../edge-cases.md), [N16](../edge-cases.md), [N18](../edge-cases.md), [N28](../edge-cases.md), [O1](../edge-cases.md), [O3](../edge-cases.md), [O7](../edge-cases.md), [O8](../edge-cases.md), [O12](../edge-cases.md), [O13](../edge-cases.md), [O15](../edge-cases.md), [O18](../edge-cases.md), [O24](../edge-cases.md) |
+| Code | `crates/worker/src/auth/` (keys, router table, scope), `crates/core/src/ssrf.rs`, `crates/core/src/injection.rs`, `crates/core/src/sanitize.rs`, `crates/core/src/crypto.rs` (sealing, pure; nonces passed in), `crates/core/src/{jwk.rs, jwt.rs, httpsig.rs}` (agent signing, pure), `crates/worker/src/net.rs` (guarded HTTP), `crates/worker/src/log.rs` |
 | Reporting | [SECURITY.md](https://github.com/PILOTAAI/pylota-mail/blob/main/SECURITY.md) |
 
 ## 1. Assets and invariants
@@ -20,9 +20,10 @@ the thread token in [Threading](threading.md)), this page states the security pr
 | Addresses and contact history | `IdentityMailbox` (`contacts`, `messages`), D1 (`addresses`) | Personal data; address enumeration |
 | API key secrets | Shown once; stored as HMAC in `api_keys.hash` | Full access within a key's scope |
 | Webhook endpoint secrets (`whsec_…`) | `webhook_endpoints.secret_enc` (AES-256-GCM) | Forged events to integrators |
-| Identity signing keys (P1) | `identity_keys.private_enc` (AES-256-GCM) | Impersonation of an agent identity |
+| Identity signing keys | `identity_keys.private_enc`: the 32-byte Ed25519 seed in the pm1 envelope, sealed under `PM_MASTER_KEY` ([Agent signing keys](agent-keys.md#8-data-model)) | Forged agent assertions: impersonation of an agent identity towards third-party services |
+| The Web Bot Auth key | D1 `signing_keys` purpose `web_bot_auth`: the seed sealed in `ciphertext` under `PM_MASTER_KEY`, the public JWK in `public_jwk` | Forged signed HTTP requests attributed to this deployment and, through the signed `From`, to any of its identities |
 | Deployment secrets `PM_*` | Worker secrets | See [section 6](#6-secrets) |
-| Thread, link and cursor keys | D1 `signing_keys`, sealed under `PM_MASTER_KEY` | Forged thread tokens, download links, console tokens or search cursors ([section 6](#6-secrets)) |
+| Thread, link and cursor keys | D1 `signing_keys`, sealed under `PM_MASTER_KEY` | Forged thread tokens, download links, console tokens, notification unsubscribe tokens or search cursors ([section 6](#6-secrets)) |
 | SMTP relay credentials (`smtp_relay` domains) | `domains.smtp_sealed`, sealed under `PM_MASTER_KEY` | Sending as the customer through their own provider |
 | Console second factors | `users.totp_sealed`, `users.recovery_codes_sealed`, sealed under `PM_MASTER_KEY` | Bypassing two-step verification for that person |
 | Raw inbound mail on SES domains | The deployer's S3 bucket `{prefix}-inbound`, until ingested | Personal data of counterparties, outside Cloudflare |
@@ -44,6 +45,8 @@ Each invariant below is enforced in code and covered by a named test (section 13
 | SEC-8 | Logs never contain message bodies, subjects, attachment content, filenames, display names, clear-text addresses or secrets (FR-PRV-6, [I5](../edge-cases.md)) |
 | SEC-9 | Every outbound HTTP request or TCP connection to a host chosen by a tenant passes the SSRF guard (FR-WH-5, FR-DOM-11) |
 | SEC-10 | Erasure never reports success while data remains: the receipt carries probe results ([Privacy](privacy.md)) |
+| SEC-11 | Private signing keys (identity keys and the Web Bot Auth key) are generated, sealed, used and zeroised inside the Worker. No API, log or export returns one, and a minted assertion or signature is never stored (FR-IDN-6) |
+| SEC-12 | A notification email never contains content from mail: no subject, sender, snippet or attachment name (FR-CON-14) |
 
 ## 2. Trust boundaries
 
@@ -64,6 +67,8 @@ Each invariant below is enforced in code and covered by a named test (section 13
                                                  Google, GitHub                     notifications)
  TB6: people and systems that operate the deployment (Cloudflare account members, platform-key holders,
       the CLI machine, the release pipeline)
+ TB8: third-party services and sites that receive agent assertions and signed HTTP requests, and anyone
+      who fetches the public JWKS and key directory (GET /.well-known/* on the API host)
 ```
 
 | Boundary | Untrusted side | Trusted side |
@@ -74,7 +79,8 @@ Each invariant below is enforced in code and covered by a named test (section 13
 | TB4 Worker → webhook endpoints | The endpoint URL, its DNS, its responses | The webhook consumer |
 | TB5 Worker ↔ Cloudflare APIs, SES, S3, SNS, SQS, SMTP relays, OAuth providers, DoH, RDAP, scanner | Responses, notifications and relay replies | The Worker |
 | TB6 Operators of the deployment | — (trusted, but limited and audited) | — |
-| TB7 People → console | The browser and everything it sends until a session is verified; form fields always | The console router, its route table and the same services as the API |
+| TB7 People → console | The browser and everything it sends until a session is verified; form fields always; the token of an unsubscribe link | The console router, its route table and the same services as the API |
+| TB8 Agent proofs → third parties | Verifiers and sites that receive assertions and signed requests; anyone reading the JWKS or the key directory | The signing handlers and the sealed keys, which never leave the Worker |
 
 ## 3. STRIDE threat model
 
@@ -104,19 +110,20 @@ reused; the others are defined in section 13.
 | S | Stolen or guessed key | 256-bit secret, HMAC lookup with constant-time comparison, expiry, revocation, rotation with overlap (section 4) | `it::auth::unknown_key_uniform`, `it::keys::j6_revoke_rotate` |
 | S | Probing a key's status with only its lookup prefix | `key_revoked` and `key_expired` are returned only after the secret matched; otherwise `unauthenticated` | `it::auth::status_after_secret_match` |
 | T | Replayed or altered send | Idempotency fingerprint; a changed body under the same key is `409 idempotency_conflict` (FR-OUT-1) | `it::send::g1_*` |
-| R | A key holder denies an administrative action | `audit_log` row with `actor_key_id` and `request_id` for every key, tenant, identity-status, quarantine, hold, suppression-removal, erasure, resolve and platform-operation action (signing-key rotation, transport change, jobs, redrive); `GET /v1/audit-events?actor_key_id=` lists one key's actions; every request log line carries `key_id`. Sends are not audit rows: the message, its events and the delivery log record them | `it::keys::j6_revoke_rotate` |
+| R | A key holder denies an administrative action | `audit_log` row with `actor_key_id` and `request_id` for every key, identity-key (`identity_key.*`), tenant, identity-status, quarantine, hold, suppression-removal, erasure, resolve and platform-operation action (signing-key rotation, `web_bot_auth` included, transport change, jobs, redrive); `GET /v1/audit-events?actor_key_id=` lists one key's actions; every request log line carries `key_id`. Sends are not audit rows: the message, its events and the delivery log record them. Signing calls are not audit rows either: each is logged as `signature_minted` with `key_id` and `identity_id` and counted in `usage_daily` ([Observability §2.2](observability.md#22-event-names)) | `it::keys::j6_revoke_rotate` |
 | I | Reading another tenant's or identity's data (IDOR) | Section 5: scope check against D1 before any Durable Object call, owner re-check inside the object, `*_not_found` for out-of-scope IDs | `it::security::cross_tenant_matrix` |
-| I | Quarantined, hidden or throttled mail reaching agents | Filtered inside the mailbox query layer unless the key holds `quarantine:review` (FR-IN-5, [F7](../edge-cases.md)) | `it::search::f7_quarantine_hidden` |
+| I | Quarantined, hidden or throttled mail reaching agents | Filtered inside the mailbox query layer: lists show it only for an explicit `status` filter from a key holding `quarantine:review`, and search never shows hidden or throttled mail and shows quarantined mail only with `include_quarantined` and `quarantine:review` (section 5.3, FR-IN-5, [F7](../edge-cases.md)) | `it::messages::list_hides_review_statuses`, `it::search::f7_quarantine_hidden` |
+| E | A key signing as an identity it should not, or a platform key signing at all | `identities:sign` is held only by tenant keys and by identity keys for their own identity; a platform key cannot hold it (section 4.6); the identity path is scope-checked like every route (section 5.2) | `it::keys::permission_level_rules`, `it::security::cross_tenant_matrix` |
 | D | Request floods, expensive searches | Rate-limit bindings per key and per identity, exact daily caps in `TenantQuota`, 7 MiB body cap, search and fan-out caps (section 10) | `it::auth::rate_limited`, `it::search::f8_budget` |
 | E | Minting a wider key | Section 4.6 subset rule, `403 key_scope_exceeded` | `it::keys::scope_exceeded` |
-| E | Test key acting on a live tenant, or the reverse | A key's mode follows its tenant; platform keys act on both and every such action is audit-logged ([L4](../edge-cases.md)) | `it::testmode::l4_mode_binding` |
+| E | Test key acting on a live tenant, or the reverse | A key's mode follows its tenant; platform keys act on both, and every state-changing action they take is audit-logged except sends, which are recorded as messages ([L4](../edge-cases.md)) | `it::testmode::l4_mode_binding` |
 
 ### 3.3 TB3: agent → MCP
 
 | STRIDE | Threat | Mitigation | Test |
 |---|---|---|---|
 | S | Unauthenticated MCP use, DNS rebinding from a browser | `Authorization: Bearer pmk_…` on every request, through the REST authentication code; an `Origin` header other than `https://{PM_API_HOST}` gets `403`; no CORS grant ([MCP › Request handling](mcp.md#21-request-handling)) | `it::security::mcp_requires_key` |
-| E | A steered agent calls a send tool | Send tools require `idempotency_key`; `send_policy.require_known_recipient` can refuse new recipients ([E2](../edge-cases.md)); tools the key lacks permission for are not listed and refused if called | `it::send::e2_require_known_recipient`, `it::security::mcp_tools_follow_key` |
+| E | A steered agent calls a send tool | Send tools require `idempotency_key`; `send_policy.require_known_recipient` suppresses deliveries to new recipients ([E2](../edge-cases.md)); tools the key lacks permission for are not listed and refused if called | `it::send::e2_require_known_recipient`, `it::security::mcp_tools_follow_key` |
 | I | Tool results leaking across scope | Each tool dispatches to the same handler and router entry as its REST equivalent; there is no MCP-only data path | `it::security::cross_tenant_matrix` (MCP column) |
 | D | Long polls tying up the endpoint | `mail_wait` timeout ≤ 60 s; requests count against `RL_API` | `it::wait::e4_*` |
 
@@ -157,7 +164,7 @@ reused; the others are defined in section 13.
 | Threat | Mitigation |
 |---|---|
 | A Cloudflare account member reads D1, R2 or Durable Object data | Out of scope for the software (SECURITY.md). Deployers keep account membership minimal and use Cloudflare's own audit logs. Secrets are Worker secrets and are never written to disk unless `pmail setup --print-secrets` is used |
-| A platform key is misused | Platform keys reach every tenant: issue few, set `expires_at`, store them in a secrets manager (`key_command` in the CLI profile). Every platform-key action on a tenant is audit-logged |
+| A platform key is misused | Platform keys reach every tenant: issue few, set `expires_at`, store them in a secrets manager (`key_command` in the CLI profile). Every state-changing platform-key action on a tenant is audit-logged; sends are not audit rows: each is a stored message, and the request's structured log carries `key_id` ([Observability §2.1](observability.md#21-schema)). A platform key cannot sign as an identity: `identities:sign` is not allowed at that level (section 4.6) |
 | The CLI machine leaks a key | `~/.config/pylota-mail/config.toml` is created `0600` and refused when group- or world-readable ([Configuration](../../reference/configuration.md#cli-configuration)) |
 | The release pipeline is compromised | Section 11: pinned dependencies and actions, signed `SHA256SUMS`, build provenance attestations, protected tags and environments |
 
@@ -168,16 +175,35 @@ section 4.9 states the security properties.
 
 | STRIDE | Threat | Mitigation | Test |
 |---|---|---|---|
-| S | Guessing a six-digit code; sign-in mail used to flood an address | 3 link or code requests per 10 minutes per address; 10 attempts per code, then the token is burned; `RL_SIGNIN` 10 requests per 60 s per client IP ([M15](../edge-cases.md)) | `it::console::m15_signin_limits` |
-| S | Login CSRF or a stolen OAuth `code` replayed in another browser | `state` hashed under the link keyring and bound to the `__Host-pm_oauth` cookie, single use, 10 minutes; PKCE S256; `nonce` for Google; exact redirect URI ([M20](../edge-cases.md)) | `it::oauth::state_cookie_binding` |
-| S | Taking over an account through a provider account with an unverified address | Only a verified email is accepted, and accounts are linked only by that verified email ([M21](../edge-cases.md), [M22](../edge-cases.md)) | `it::oauth::unverified_email_refused`, `it::oauth::link_by_verified_email` |
-| S | A stolen first factor (mailbox access, provider account) | Two-step verification (TOTP), optional per person and required by a workspace with `require_two_factor`; attempt limits and replay refusal ([M27](../edge-cases.md), [M28](../edge-cases.md)) | `core::totp::rfc6238_vectors`, `it::totp::workspace_requirement` |
-| T | Cross-site form posts | CSRF token, `Origin` equal to `https://{PM_CONSOLE_HOST}`, `SameSite=Lax` ([M16](../edge-cases.md), [Console › CSRF](console.md#csrf)) | `it::console::m16_csrf` |
+| S | Guessing a six-digit code; sign-in mail used to flood an address | 3 link or code requests per 10 minutes per address; 10 attempts per code, then the token is burned; `RL_SIGNIN` 10 requests per 60 s per client IP ([W15](../edge-cases.md)) | `it::console::w15_signin_limits` |
+| S | Login CSRF or a stolen OAuth `code` replayed in another browser | `state` hashed under the link keyring and bound to the `__Host-pm_oauth` cookie, single use, 10 minutes; PKCE S256; `nonce` for Google; exact redirect URI ([W20](../edge-cases.md)) | `it::oauth::state_cookie_binding` |
+| S | Taking over an account through a provider account with an unverified address | Only a verified email is accepted, and accounts are linked only by that verified email ([W21](../edge-cases.md), [W22](../edge-cases.md)) | `it::oauth::unverified_email_refused`, `it::oauth::link_by_verified_email` |
+| S | A stolen first factor (mailbox access, provider account) | Two-step verification (TOTP), optional per person and required by a workspace with `require_two_factor`; attempt limits and replay refusal ([W27](../edge-cases.md), [W28](../edge-cases.md)) | `core::totp::rfc6238_vectors`, `it::totp::workspace_requirement`, `it::totp::recovery_code_single_use` |
+| T | Cross-site form posts | CSRF token, `Origin` equal to `https://{PM_CONSOLE_HOST}`, `SameSite=Lax` ([W16](../edge-cases.md), [Console › CSRF](console.md#csrf)) | `it::console::w16_csrf` |
 | I | Session cookies reaching the API, or API keys reaching browser history | Host split: with two hosts, console paths answer only on `PM_CONSOLE_HOST` and API paths only on `PM_API_HOST`; no cookie is set or read on the API host | `it::hosts::console_api_split` |
-| I | Open redirect through `next` | Only a relative path under `/console/`, with no `//`, no backslash and no scheme ([M31](../edge-cases.md)) | `it::landing::routing_table` |
-| I | Hostile HTML in mail acting inside the console | Text view by default; sanitised HTML in a token-less `sandbox` `srcdoc` frame; no script source in the CSP ([M17](../edge-cases.md)) | `it::console::m17_hostile_html` |
-| E | A viewer acting beyond its role, or an ID from another workspace | The console route table registers each route with its permission, like the API's ([M18](../edge-cases.md)) | `it::console::m18_role_and_scope` |
-| D | Free workspaces created to send spam | New-workspace send ramp, disposable-domain block, `RL_SIGNIN` ([M29](../edge-cases.md), [M30](../edge-cases.md), [Cloud sign-up §10](cloud-signup.md#10-abuse-and-safety-on-cloud)) | `it::abuse::free_ramp` |
+| I | Open redirect through `next` | Only a relative path under `/console/`, with no `//`, no backslash and no scheme ([W31](../edge-cases.md)) | `it::landing::routing_table` |
+| I | Hostile HTML in mail acting inside the console | Text view by default; sanitised HTML in a token-less `sandbox` `srcdoc` frame; no script source in the CSP ([W17](../edge-cases.md)) | `it::console::w17_hostile_html` |
+| E | A viewer acting beyond its role, or an ID from another workspace | The console route table registers each route with its permission, like the API's ([W18](../edge-cases.md)) | `it::console::w18_role_and_scope` |
+| S/T | A forged unsubscribe token, or a real one replayed for another person, workspace or kind | The token is a MAC under a `link` key, with that key's kid, over the person, the workspace and the kind (section 4.9); it is compared in constant time, lives 90 days and verifies only while its link key is current or inside the 7-day window after a rotation. It can only set that one kind to `off` for that person in that workspace: it reads nothing and never touches `account`. An altered, foreign or expired token changes nothing and gets the same page linking to settings ([O18](../edge-cases.md)) | `it::notify::one_click_unsubscribe` |
+| I | Notification content read on a lock screen, or by the person's mail provider | Notifications carry counts, inbox addresses, the workspace name and links only: never a subject, sender, snippet or attachment name from any message, and only mail visible in the inbox is counted ([Notifications §1](notifications.md#1-kinds), [O15](../edge-cases.md)) | `core::notify::no_content_in_body`, `it::notify::invisible_mail_never_notifies` |
+| D | Notification mail used to flood a person | At most 50 notification emails per person and 200 per workspace a day, `account` excepted, the rest going into the next daily digest ([O24](../edge-cases.md)); a hard bounce or complaint pauses that person's preferences ([O17](../edge-cases.md)) | `it::notify::daily_caps`, `it::notify::bounce_pauses_prefs` |
+| D | Free workspaces created to send spam | New-workspace send ramp, disposable-domain block, `RL_SIGNIN` ([W29](../edge-cases.md), [W30](../edge-cases.md), [Cloud sign-up §10](cloud-signup.md#10-abuse-and-safety-on-cloud)) | `it::abuse::free_ramp` |
+
+### 3.8 TB8: agent proofs → third parties
+
+How assertions and signed requests are built is in [Agent signing keys](agent-keys.md); these are the
+security properties.
+
+| STRIDE | Threat | Mitigation | Test |
+|---|---|---|---|
+| S | A forged agent assertion: a token this deployment did not mint | Ed25519 signature under the identity's own key. Verifiers accept only `alg: EdDSA` with `typ: agent-assertion+jwt`, take keys only from `{trusted iss}/.well-known/jwks/{sub}.json` (never from a URL the token supplies) and pick the key by `kid` ([Agent signing keys §4.3](agent-keys.md#43-how-a-verifier-checks-it)); the Rust SDK's `verify_assertion` and `pmail assertions verify` do exactly this | `core::jwt::eddsa_rfc8037_vector`, `it::assertions::sdk_verifies` |
+| S/T | A replayed assertion or signed request | Assertions carry `jti` (a new ULID), `aud`, `exp` at most 600 s after `iat` (default 300 s) and the verifier's optional `nonce`. HTTP signatures carry a 64-byte random `nonce`, `created` and `expires` (30–300 s, default 60 s) in the signed parameters, and always cover `@authority`. The service mints both and stores neither, so replay detection belongs to the verifier: it keeps each `jti` until `exp`, and each signature nonce until `expires` ([Agent signing keys §10](agent-keys.md#10-security-and-privacy)) | `it::assertions::claims_and_limits`, `it::http_signatures::expiry_bounds` |
+| I | Exfiltration of a private key: an identity's seed or the deployment's `web_bot_auth` seed | Generated from `platform::Rng`, sealed at once (section 7.2), unsealed only in memory for one signing call and zeroised after it (`zeroize`). No API returns, logs or exports a private key; a minted token or signature is returned once to its caller and never stored or logged. Reading a sealed seed needs both D1 access and `PM_MASTER_KEY`. After a suspected leak: revoke the identity key (`POST /v1/identities/{identity_id}/keys/{kid}/revoke` removes it from the JWKS at once, cached at most 5 minutes, [O3](../edge-cases.md)), or rotate `web_bot_auth` with `revoke_previous=true`; then rotate `PM_MASTER_KEY`, which re-seals every key without changing a public key ([O8](../edge-cases.md)) | `it::identity_keys::revoke_removes_from_jwks`, `it::secrets::rotate_master_reseals_identity_keys` |
+| S | A mirrored key directory: someone serves a copy of `/.well-known/http-message-signatures-directory` and registers it as theirs | The response is signed once per listed key with `("@authority";req)`, `tag="http-message-signatures-directory"`, a fresh nonce, `created` and `expires` = `created` + 300 s, so a copy served from another authority fails verification. At most three keys are listed ([O12](../edge-cases.md)) | `it::well_known::directory_signed_per_key` |
+| I | Probing the JWKS for which identities exist, are paused or were deleted | An unknown, deleted, paused or suspended identity gets the same `404 identity_not_found`; identity IDs are ULIDs, never derived from addresses ([Agent signing keys §3.1](agent-keys.md#31-identity-jwks)) | `it::identity_keys::paused_withdraws_jwks` |
+| E | A misbehaving agent keeps proving who it is after it was stopped | The kill switch (FR-IDN-9): pausing an identity, or suspending its tenant (which pauses every identity), stops signing at once (`409 identity_paused`) and withdraws its JWKS (`404`), so a verifier that refetches stops accepting it within the 5-minute cache ([O1](../edge-cases.md)). Erasure deletes the keys and writes each kid to `key_tombstones`, so a deleted kid is never published again ([O7](../edge-cases.md)) | `it::identity_keys::paused_withdraws_jwks`, `it::assertions::erasure_tombstones_kid` |
+| E | Signed HTTP requests from a tenant that never chose them | `PM_WEB_BOT_AUTH` is `off` by default and stays off until spike S13 passes (`422 web_bot_auth_disabled`, [O9](../edge-cases.md)); a tenant must opt in with `policy.web_bot_auth.allowed` (`403 policy_denied`, [O13](../edge-cases.md)) | `it::http_signatures::disabled_and_policy` |
+| D | Signing calls used to exhaust the Worker | `RL_SIGN`: 600 signing calls per 60 s per identity, assertions and HTTP signatures together (section 10) | `it::auth::rate_limited` |
 
 ## 4. Authentication
 
@@ -218,7 +244,8 @@ Every authenticated request (REST and MCP) runs `auth::authenticate` once, befor
 7. Only now: `revoked_at` set → `401 key_revoked`; `expires_at ≤ now` → `401 key_expired`.
 8. The `mode` in the token must equal the row's `mode`; otherwise `401 unauthenticated`.
 9. Resolve `Scope { key_id, level, tenant_id, identity_id, mode, permissions }`. For tenant and
-   identity keys, load the tenant row; a tenant in status `erasing` or `erased` gives
+   identity keys, `permissions` is the key's list plus the implicit `usage:read` (section 4.6), and the
+   tenant row is loaded; a tenant in status `erasing` or `erased` gives
    `401 key_revoked` (its keys were revoked by the erasure job; this covers the window before that
    step commits). A `suspended` tenant still authenticates: suspension is enforced by policy
    (`403 tenant_suspended` on sends, FR-TEN-3).
@@ -254,16 +281,36 @@ are ever valid. Revocation (`DELETE /v1/keys/{key_id}`) sets `revoked_at` and cl
 
 ### 4.6 Creating keys (FR-KEY-1)
 
-`POST /v1/keys` succeeds only if every condition holds; otherwise `403 key_scope_exceeded`:
+`POST /v1/keys` checks, in this order:
 
-| Caller level | New key's level | Tenant | Identity |
-|---|---|---|---|
-| platform | any | any existing tenant (tenant, identity levels) | any identity of that tenant (identity level) |
-| tenant | tenant or identity | must equal the caller's tenant | any identity of the caller's tenant |
-| identity | identity | must equal the caller's tenant | must equal the caller's identity |
+1. **The request.** `permissions` is required and non-empty at every level, `level: platform` included:
+   there is no implicit full set (`400 invalid_request` when it is missing or empty).
+   `pmail keys create` without `--permissions` exits 2 with a message ([CLI and setup](cli.md)).
+2. **Permissions allowed at the new key's level.** Some permissions can never be held at some levels,
+   whoever the caller is. Listing one is `400 invalid_request` with
+   `details.reason = "permission_not_allowed_for_level"`:
 
-- `permissions` must be a subset of the caller's permissions. `tenants:manage` and `platform:ops` can
-  only be held by platform keys.
+   | Permission | Platform key | Tenant key | Identity key |
+   |---|---|---|---|
+   | `tenants:manage`, `platform:ops` (platform-only) | yes | no | no |
+   | `members:read`, `members:manage`, `suppressions:manage`, `audit:read`, `usage:read` (tenant-only) | yes | yes | no |
+   | `identities:sign` | no | yes | yes, for its own identity |
+   | Every other permission | yes | yes | yes |
+
+3. **Scope.** Every condition below holds; otherwise `403 key_scope_exceeded`:
+
+   | Caller level | New key's level | Tenant | Identity |
+   |---|---|---|---|
+   | platform | any | any existing tenant (tenant, identity levels) | any identity of that tenant (identity level) |
+   | tenant | tenant or identity | must equal the caller's tenant | any identity of the caller's tenant |
+   | identity | identity | must equal the caller's tenant | must equal the caller's identity |
+
+   and `permissions` is a subset of the caller's permissions.
+
+- **Implicit `usage:read`.** Every tenant and identity key holds `usage:read` for its own workspace
+  without listing it: authentication adds it to the resolved permissions (section 4.2, step 9). A key
+  reaches only its own workspace, so the grant never reaches another one. An identity key still cannot
+  list it (step 2), and a platform key holds it only when listed.
 - The caller needs `keys:manage`. The new key's `mode` is its tenant's mode; platform keys are `live`.
 - `created_by_key_id` records the lineage. Revoking a key does not revoke its children; the
   compromised-key runbook ([Observability](observability.md#compromised-key)) revokes descendants
@@ -272,14 +319,19 @@ are ever valid. Revocation (`DELETE /v1/keys/{key_id}`) sets `revoked_at` and cl
 ### 4.7 Unauthenticated routes
 
 Only these routes skip authentication, and they are listed explicitly in the router table:
-`GET /health`, `GET /openapi.json`, `GET /v1/plans`, `GET /.well-known/security.txt`,
-`GET /.well-known/jwks/{identity_id}.json` (P1), the SNS notification endpoints `POST /hooks/ses`
-(SES delivery events) and `POST /hooks/ses/inbound` (SES inbound notifications), both authenticated by
-the SNS signature (section 3.5), and signed links `GET /v1/links/{token}` (authenticated by their MAC,
-section 7.3). The console (`/console/*`, including the sign-up, waitlist and OAuth start and callback
-routes) and the Stripe webhook (`/billing/stripe/webhook`) are separate route tables with session and
-signature checks of their own. Which host answers which path is in section 4.9. The
-Worker does not serve an MTA-STS policy: the operator publishes one as the self-hosting guide describes.
+`GET /health`, `GET /openapi.json`, `GET /v1/plans`, `GET /.well-known/security.txt`, the identity
+JWKS `GET /.well-known/jwks/{identity_id}.json` and the Web Bot Auth key directory
+`GET /.well-known/http-message-signatures-directory` (`404 key_not_found` while `PM_WEB_BOT_AUTH=off`;
+both serve public keys only, [Agent signing keys §3](agent-keys.md#3-publication)), the SNS
+notification endpoints `POST /hooks/ses` (SES delivery events) and `POST /hooks/ses/inbound` (SES
+inbound notifications), both authenticated by the SNS signature (section 3.5), and signed links
+`GET /v1/links/{token}` (authenticated by their MAC, section 7.3). The console (`/console/*`) and the
+Stripe webhook (`/billing/stripe/webhook`) are separate route tables with session and signature checks
+of their own. In the console table, the routes that need no session are the sign-in, sign-up, waitlist,
+OAuth start and callback, and invitation-accept routes, and the unsubscribe pair
+(`GET` and `POST /console/notifications/unsubscribe`), which is authenticated by its token alone
+(section 4.9). Which host answers which path is in section 4.9. The Worker does not serve an MTA-STS
+policy: the operator publishes one as the self-hosting guide describes.
 
 ### 4.8 The first platform key
 
@@ -290,7 +342,8 @@ holds in memory ([CLI and setup › The bootstrap key](cli.md#65-the-bootstrap-k
 1. `pmail setup` generates the pepper, uploads it with `wrangler secret put`, computes the hash of a new
    platform key with it, and inserts the `api_keys` row and a `key.create` audit row through the
    Cloudflare D1 query API with the operator's `CLOUDFLARE_API_TOKEN`. This **bootstrap key** expires
-   after 24 hours; `pmail keys create --level platform` then creates the long-lived key through
+   after 24 hours; `pmail keys create --level platform --permissions …` (an explicit list: a platform key
+   has no implicit permission set, [§4.6](#46-creating-keys-fr-key-1)) then creates the long-lived key through
    `POST /v1/keys` like any other.
 2. A re-run of setup that finds the pepper already set and keys in `api_keys` stops: the CLI cannot know
    the old pepper. Only `pmail setup --rotate-pepper` replaces it, which invalidates every key (the
@@ -304,12 +357,13 @@ The security properties:
 
 | Mechanism | Rules |
 |---|---|
-| Email link and code | Link tokens, codes, invitation tokens and session cookies are stored only as `HMAC-SHA256(link key {kid}, value)` with the kid in `key_kid`. 3 requests per 10 minutes per address; 10 attempts per code, then the token is burned; 10-minute lifetime, single use; `RL_SIGNIN` (section 10). Responses are identical for known and unknown addresses ([M15](../edge-cases.md)) |
-| Google and GitHub | `GET /console/oauth/{provider}/start` writes an `oauth_states` row valid for 10 minutes. Its `state_hash` and `cookie_hash` are keyed hashes under the current link key, whose kid is stored in `key_kid`, and the PKCE verifier is sealed in `pkce_sealed`. The cookie `__Host-pm_oauth` (HttpOnly, Secure, SameSite=Lax, Path=/, 10 minutes) binds the flow to the browser. The redirect carries PKCE `S256`, a `nonce` (Google) and the exact redirect URI `https://{PM_CONSOLE_HOST}/console/oauth/{provider}/callback`. The callback requires the row to exist, be unexpired and unused, and match the cookie, and marks it used before exchanging the code ([M20](../edge-cases.md)). Google: `iss`, `aud`, `exp`, `nonce` and `email_verified = true` are checked. GitHub: the primary address must be marked verified. Without a verified address the flow is refused ([M21](../edge-cases.md)). A provider identity links to an existing person only through that verified email ([M22](../edge-cases.md)). Scopes: `openid email profile` (Google), `read:user user:email` (GitHub) |
+| Email link and code | Link tokens, codes, invitation tokens and session cookies are stored only as `HMAC-SHA256(link key {kid}, value)` with the kid in `key_kid`. 3 requests per 10 minutes per address; 10 attempts per code, then the token is burned; 10-minute lifetime, single use; `RL_SIGNIN` (section 10). Responses are identical for known and unknown addresses ([W15](../edge-cases.md)) |
+| Google and GitHub | `GET /console/oauth/{provider}/start` writes an `oauth_states` row valid for 10 minutes. Its `state_hash` and `cookie_hash` are keyed hashes under the current link key, whose kid is stored in `key_kid`, and the PKCE verifier is sealed in `pkce_sealed`. The cookie `__Host-pm_oauth` (HttpOnly, Secure, SameSite=Lax, Path=/, 10 minutes) binds the flow to the browser. The redirect carries PKCE `S256`, a `nonce` (Google) and the exact redirect URI `https://{PM_CONSOLE_HOST}/console/oauth/{provider}/callback`. The callback requires the row to exist, be unexpired and unused, and match the cookie, and marks it used before exchanging the code ([W20](../edge-cases.md)). Google: `iss`, `aud`, `exp`, `nonce` and `email_verified = true` are checked. GitHub: the primary address must be marked verified. Without a verified address the flow is refused ([W21](../edge-cases.md)). A provider identity links to an existing person only through that verified email ([W22](../edge-cases.md)). Scopes: `openid email profile` (Google), `read:user user:email` (GitHub) |
 | Two-step verification | TOTP per RFC 6238: HMAC-SHA1, 30-second step, six digits, one step of drift either way. The 20-byte secret is sealed in `users.totp_sealed`. A code already used in its step is refused (`users.totp_last_step`). 5 attempts a minute per person; 10 failures in a row lock two-step sign-in for 15 minutes. It is asked for after every first factor and at re-authentication. Turning it off needs re-authentication with a current code, emails the person and writes an audit row |
-| Recovery codes | Ten codes of 10 Crockford base32 characters, shown once. Stored in `users.recovery_codes_sealed`, a pm1 envelope (section 7.2) of `[{ "hash": SHA-256(code), "used_at": null }]`. Each works once; generating new codes replaces the old ones ([M28](../edge-cases.md)). They are sealed rather than hashed under the link keyring because link keys are deleted 7 days after a rotation and recovery codes live for months |
+| Recovery codes | Ten codes of 10 Crockford base32 characters, shown once. Stored in `users.recovery_codes_sealed`, a pm1 envelope (section 7.2) of `[{ "hash": SHA-256(code), "used_at": null }]`. Each works once; generating new codes replaces the old ones ([W28](../edge-cases.md)). They are sealed rather than hashed under the link keyring because link keys are deleted 7 days after a rotation and recovery codes live for months |
 | Sessions | `__Host-pm_session` (`Secure`, `HttpOnly`, `SameSite=Lax`); 7 days rolling, 30 days absolute; sensitive actions need a sign-in within the last 10 minutes ([Console › Sessions](console.md#sessions)) |
-| Hosts | `PM_CONSOLE_HOST` defaults to `PM_API_HOST`. When the two differ, console paths answer only on `PM_CONSOLE_HOST`, and API paths (REST, MCP, `/hooks/*`, `/billing/stripe/webhook`, `/health`, `/v1/links/*`) only on `PM_API_HOST`; anything else gets `404`. No cookie is set or read on the API host. This keeps session cookies off the API and API keys out of browser history ([Cloud sign-up §2](cloud-signup.md#2-hostnames)) |
+| Notification unsubscribe links | `https://{PM_CONSOLE_HOST}/console/notifications/unsubscribe?t={token}`, in the `List-Unsubscribe` header of every `usage`, `new_mail` and `needs_person` email. The token is a MAC under the current link key, carrying that key's kid, over the person, the workspace and the kind; it is valid for 90 days, and only while its link key is current or inside its 7-day verify window. `GET` changes nothing (a confirmation page with a one-click form); `POST` sets that one kind to `off` for that person and workspace. Neither needs a session, and both are exempt from the console's CSRF token and `Origin` check, because a mail provider sends the RFC 8058 `POST` without either: the token is their only authority, and the most it can do is turn one kind off. They are served even with `PM_CONSOLE=off` ([Notifications §5](notifications.md#5-the-emails), [O18](../edge-cases.md)) |
+| Hosts | `PM_CONSOLE_HOST` defaults to `PM_API_HOST`. When the two differ, console paths answer only on `PM_CONSOLE_HOST`, and API paths only on `PM_API_HOST`: REST `/v1/*` (signed links `/v1/links/*` included), MCP `/mcp`, `/openapi.json`, `/health`, `/.well-known/*` (the security contact, the identity JWKS and the Web Bot Auth key directory), `/hooks/*` and `/billing/stripe/webhook`. Anything else gets `404`. No cookie is set or read on the API host. This keeps session cookies off the API and API keys out of browser history ([Cloud sign-up §2](cloud-signup.md#2-hostnames)) |
 
 ## 5. Authorisation and tenant isolation
 
@@ -317,9 +371,15 @@ The security properties:
 
 Every route is registered with its method, path pattern, required permission(s), scope rule and
 idempotency rule. The router is built from that table only; a request matching no entry gets
-`404` with the standard envelope. A route cannot be registered without a permission and a scope rule
-(the registration function takes them as non-optional arguments), and public routes use the explicit
-`Scope::Public` variant.
+`404` with the standard envelope. A route cannot be registered without a permission list and a scope
+rule (the registration function takes them as non-optional arguments), and public routes use the
+explicit `Scope::Public` variant. The permission list may be empty only for `Scope::Public` and for
+the two routes that every key may call on its own workspace: `GET /v1/me` and
+`GET /v1/tenants/{tenant_id}`. For the second, `foreign_permissions` (`tenants:manage`) is required as
+well when the target is not the key's own tenant, and always for a platform key. A unit test fails when
+any other route has an empty list. `GET /v1/usage` is not one of them: it is registered with
+`usage:read`, which every tenant and identity key holds implicitly for its own workspace (section 4.6),
+while a platform key needs it listed and must pass `tenant_id` (`400 invalid_request` without it).
 
 ```rust
 // crates/worker/src/auth/routes.rs
@@ -337,6 +397,7 @@ pub struct RouteSpec {
     pub method: Method,
     pub pattern: &'static str,
     pub permissions: &'static [Permission],  // all required
+    pub foreign_permissions: &'static [Permission], // also required when the target is not the key's own tenant
     pub scope: Scope,
     pub idempotency: Idempotency,            // Required | Optional
     pub min_level: Option<Level>,            // e.g. Tenant for tenant search (FR-SRCH-10)
@@ -355,8 +416,9 @@ For each request, before any Durable Object or R2 call:
    `403 permission_denied` with `details.required`. This check does not depend on the target, so it
    leaks nothing.
 3. **Level.** If the route is above the key's level and the target is the key's own tenant (an identity
-   key on `POST /v1/tenants/{own}/search`, a tenant key on `GET /v1/tenants`), the result is
-   `403 scope_denied` ([F3](../edge-cases.md)). This also reveals nothing, because the target is the
+   key holding `search:read` on `POST /v1/tenants/{own}/search`), the result is `403 scope_denied`
+   ([F3](../edge-cases.md)). A route that needs a permission the key's level can never hold (a tenant key
+   on `GET /v1/tenants`, which needs `tenants:manage`) already failed step 2 with `permission_denied`. This also reveals nothing, because the target is the
    key's own tenant.
 4. **Resolve the target's owner** from D1 with the key's scope as a mandatory parameter of the data-access
    function (`tenant_id` is a required argument of every tenant-data query):
@@ -371,14 +433,16 @@ For each request, before any Durable Object or R2 call:
    `POST /v1/erasure-requests`, `POST /v1/exports`, `identity_ids` filters, `tenant_id` filters):
    for non-platform keys, a value outside the key's scope returns `404 tenant_not_found` or
    `404 identity_not_found` (for `POST /v1/keys`, `403 key_scope_exceeded`, as api.md states). A value
-   equal to the key's own scope is accepted. Missing values default to the key's scope.
+   equal to the key's own scope is accepted. Missing values default to the key's scope; a platform key
+   has no default tenant, so on `GET /v1/usage` it must pass `tenant_id` (`400 invalid_request`).
 6. **Call the Durable Object** with an `RpcEnvelope` carrying `tenant_id`, `identity_id`,
    `actor_key_id` and `request_id` taken from the resolved scope, never from the request. The object
    compares them with the owner in its `meta` and refuses a mismatch with `internal_error`, logging
    `rpc_owner_mismatch` and incrementing `rpc_owner_mismatch_total`, which alerts at 1
-   ([Design conventions](index.md#5-internal-durable-object-rpc)). `TenantQuota` has no `meta` table
-   in the data model; it keeps its owner under the storage key `tenant_id` (key-value API of the
-   SQLite-backed object) and applies the same check.
+   ([Design conventions](index.md#5-internal-durable-object-rpc)). `TenantQuota` and `Notifier` keep
+   their owner in their `meta` table under `tenant_id`, written by `QuotaRequest::Init` and
+   `NotifierRequest::Init` when the tenant is created, like the other objects
+   ([Data model §3](data-model.md#3-other-durable-objects)).
 
 ### 5.3 Cross-level read access
 
@@ -387,8 +451,22 @@ For each request, before any Durable Object or R2 call:
   identity key return `403 scope_denied`.
 - `webhooks:manage` includes `webhooks:read`. `platform:ops` can only be held by platform keys, like
   `tenants:manage`.
-- Messages with status `hidden` or `throttled` are returned only to keys holding `quarantine:review`
-  and only when the request filters on that status. `quarantined` messages follow FR-IN-5.
+- **Quarantined, hidden and throttled mail in lists** (FR-IN-5). This rule is the reference the API,
+  MCP and console pages follow. A mail list (`GET /v1/identities/{identity_id}/messages`, and every
+  MCP tool and console view built on it) excludes messages with status `quarantined`, `hidden` or
+  `throttled` by default, whatever the key holds. One of them appears only when **both** hold: the
+  request filters on that status (`status=quarantined`, `status=hidden` or `status=throttled`), and the
+  key holds `quarantine:review`. A key without `quarantine:review` that sends such a filter gets `200`
+  with none of those messages, never `403`, as search treats `include_quarantined`. A thread list has no
+  `status` filter, so it never shows them. The dedicated quarantine list
+  (`GET /v1/identities/{identity_id}/quarantine`) requires `quarantine:review` and lists only
+  `quarantined` messages. Reading a `quarantined`, `hidden` or `throttled` message by ID (the message itself, its attachments,
+  its raw MIME or its thread view) requires `quarantine:review` too; otherwise `404 message_not_found`,
+  the same answer as for a message that does not exist, so its presence is not revealed.
+- **Search** keeps its own explicit flag and does not contradict the list rule: it never returns
+  `hidden` or `throttled` mail, and returns `quarantined` mail only when the request sets
+  `include_quarantined` (or uses `is:quarantined`) and the key holds `quarantine:review`; without
+  `quarantine:review` the flag is ignored, never refused ([Search § 2](search.md#2-request-handling)).
 - Attachments with a `risk` require `quarantine:review` (api.md).
 - Resuming an identity paused for `abuse_threshold` requires a tenant or platform key and is
   audit-logged (api.md).
@@ -416,21 +494,25 @@ another ([Threading](threading.md)).
 
 | Secret | Single purpose | Generated by | Leak impact |
 |---|---|---|---|
-| `PM_MASTER_KEY` | AES-256-GCM encryption at rest of webhook secrets, identity signing keys, the `signing_keys` keyring, SMTP relay credentials, TOTP secrets, recovery-code hashes and OAuth PKCE verifiers (section 7.2) | `pmail setup`: 32 bytes from the OS CSPRNG, base64 | Decrypts stolen D1 ciphertexts (needs D1 access too) |
+| `PM_MASTER_KEY` | AES-256-GCM encryption at rest of webhook secrets, identity signing keys, the `signing_keys` keyring (the `web_bot_auth` seed included), SMTP relay credentials, TOTP secrets, recovery-code hashes and OAuth PKCE verifiers (section 7.2) | `pmail setup`: 32 bytes from the OS CSPRNG, base64 | Decrypts stolen D1 ciphertexts (needs D1 access too) |
 | `PM_MASTER_KEY_NEXT` (rotation only) | The new master key while `pmail secrets rotate-master` runs | `pmail secrets rotate-master` | As `PM_MASTER_KEY` |
 | `PM_KEY_PEPPER` | HMAC-SHA256 of API key strings | `pmail setup` (section 4.8) | Offline guessing of stolen hashes is still infeasible (256-bit secrets); rotate as break-glass |
 | Thread keys (`signing_keys`, purpose `thread`) | HMAC of thread tokens | The Worker: 32 bytes from `platform::Rng`, sealed under `PM_MASTER_KEY` | Forged thread tokens (still rate-limited, still no data access) |
-| Link keys (`signing_keys`, purpose `link`) | MACs and keyed hashes on tokens the service issues and later verifies: signed download links, console sign-in, invitation and session tokens, and OAuth state hashes | The Worker, as above | Forged download links; console tokens matched against stolen hashes |
+| Link keys (`signing_keys`, purpose `link`) | MACs and keyed hashes on tokens the service issues and later verifies: signed download links, console sign-in, invitation and session tokens, OAuth state hashes, and notification unsubscribe tokens | The Worker, as above | Forged download links; console tokens matched against stolen hashes; forged unsubscribe tokens, which can only turn a notification kind off |
 | Cursor keys (`signing_keys`, purpose `cursor`) | MACs on search cursors ([Search › Cursors](search.md#58-cursors-and-as_of-pinning)) | The Worker, as above | Forged cursor positions or `as_of`; scope still comes from the key (SEC-1) |
+| The Web Bot Auth key (`signing_keys`, purpose `web_bot_auth`) | Ed25519 signatures on Web Bot Auth HTTP requests and on the key directory | The Worker: a 32-byte seed from `platform::Rng`, sealed under `PM_MASTER_KEY`, created on first use while `PM_WEB_BOT_AUTH=on` | Requests signed as this deployment, naming any of its identities in `From`, until it is rotated with `revoke_previous=true` |
+| Identity signing keys (`identity_keys.private_enc`) | Ed25519 signatures on one identity's agent assertions | The Worker: a 32-byte seed from `platform::Rng`, sealed under `PM_MASTER_KEY`, created on the identity's first signing request or by `POST /v1/identities/{identity_id}/keys` | Assertions forged for that one identity until its key is revoked |
 | `PM_HASH_KEY` | Pseudonymisation: address tombstones, suppression hashes, counterparty hashes, log pseudonyms | `pmail setup` | Dictionary tests of which addresses are tombstoned, suppressed or erased |
 | `PM_CF_API_TOKEN` (optional) | Runtime automation of tenant domains, event subscriptions, REST fallbacks of spike S6 | The operator, in the Cloudflare dashboard | Changes to the account's routing and sending configuration within the token's permissions |
 | `PM_SES_ACCESS_KEY_ID`, `PM_SES_SECRET_ACCESS_KEY` (optional) | The SES integration: sending, identities, receipt-rule updates, reading and deleting inbound objects, draining the backstop queue | The operator, in AWS IAM (`pmail setup ses` creates the user with one policy) | Sending through the deployer's SES account; reading inbound mail still in S3 (at most 14 days); nothing outside that one policy |
 | `PM_OAUTH_GOOGLE_CLIENT_SECRET`, `PM_OAUTH_GITHUB_CLIENT_SECRET` (optional) | Exchanging an authorization code at that provider's token endpoint | The operator, in the provider's developer console | Acting as the deployment's OAuth client. Signing in as a person still needs that person's code, the PKCE verifier and the browser-bound state |
+| `PM_STRIPE_SECRET_KEY` (only with `PM_BILLING=stripe`) | Stripe API calls: Checkout sessions, Customer Portal sessions, subscription reads ([Billing › Stripe integration](billing.md#stripe-integration)) | The operator, in the Stripe dashboard, as a restricted key (`rk_live_…`) with only those permissions | Creating Checkout and Portal sessions and reading subscriptions in the deployer's Stripe account, within the restricted key's permissions; no access to Pylota Mail data |
+| `PM_STRIPE_WEBHOOK_SECRET` (only with `PM_BILLING=stripe`) | Verifying `Stripe-Signature` on `/billing/stripe/webhook` ([Billing › Webhook endpoint](billing.md#webhook-endpoint)) | Stripe, when the webhook endpoint is created (`whsec_…`) | Forged Stripe events. Every event only triggers a re-read of the subscription from the Stripe API ([Billing › Events handled](billing.md#events-handled)), so a forger can cause extra Stripe reads but cannot change a plan or a top-up |
 | SMTP relay credentials (`domains.smtp_sealed`) | Authenticating to one customer's relay | The customer, through the API or console | Sending as that customer through their own provider |
 | TOTP secrets and recovery codes (`users.totp_sealed`, `users.recovery_codes_sealed`) | One person's second factor | The Worker: 20 bytes from `platform::Rng`; ten codes | Bypassing two-step verification for that person; a first factor is still needed |
 | Webhook secrets `whsec_…` | Signing deliveries to one endpoint | The Worker: 32 bytes from `platform::Rng`, `whsec_` + base64 | Forged events to that endpoint |
 | API keys `pmk_…` | Authenticating one caller | The Worker (section 4.1) | Access within the key's scope |
-| `CLOUDFLARE_API_TOKEN` | CLI only (`setup`, `deploy`, `doctor`) | The operator | Never uploaded to the Worker; never stored in the CLI config file |
+| `CLOUDFLARE_API_TOKEN` | CLI only: the commands in [CLI › Commands that use your Cloudflare token](../../reference/cli.md#commands-that-use-your-cloudflare-token), with the permissions in [Deploy › step 2](../../self-hosting.md#2-create-a-cloudflare-api-token) | The operator | Never uploaded to the Worker; never stored in the CLI config file |
 
 Rules:
 
@@ -440,10 +522,11 @@ Rules:
   write them anywhere unless `--print-secrets` is passed.
 - **Never read back.** Worker secrets are write-only and the `signing_keys` keyring has no read API. The
   CLI only ever knows a secret it has just generated. Sealed values that the Worker must use again (SMTP
-  passwords, TOTP secrets, PKCE verifiers) are never returned by any API, logged or included in exports;
-  the domain object shows `smtp.host`, `port`, `username` and `probe_from`, never the password.
-- **Never logged.** Secrets, tokens, `Authorization` headers, signatures and signed-link tokens are
-  never logged at any level (section 12).
+  passwords, TOTP secrets, PKCE verifiers, identity and `web_bot_auth` seeds) are never returned by any
+  API, logged or included in exports; the domain object shows `smtp.host`, `port`, `username` and
+  `probe_from`, never the password, and an identity key shows only its public JWK.
+- **Never logged.** Secrets, tokens, `Authorization` headers, signatures, signed-link tokens, minted
+  agent assertions and unsubscribe tokens are never logged at any level (section 12).
 - **Read once per isolate**, through `platform::Secrets`, and held only in memory. The opened keyring is
   cached per isolate for 5 minutes ([Data model › Notes](data-model.md#notes)).
 
@@ -457,6 +540,8 @@ Rules:
 | Thread key | `POST /v1/platform/keys/thread/rotate` (`platform:ops`) | New tokens carry the new kid at once; tokens with the old kid keep verifying for 90 days ([Threading](threading.md#24-key-rotation)). With `?revoke_previous=true` they stop verifying at once, and replies to them fall back to header threading. No secret value is ever handled by a person |
 | Link key | `POST /v1/platform/keys/link/rotate` (`platform:ops`) | Download links, console sign-in tokens, invitations, sessions and OAuth flows with the old kid keep verifying for 7 days (the longest link lifetime), then fail; active console sessions are re-hashed under the new key on their next request. Export links are minted on each `GET /v1/exports/{id}`, so callers fetch a new one. With `?revoke_previous=true` everything under the old kid fails at once: open links, sign-in tokens, invitations and OAuth flows fail, and the sessions hashed under it end (normally all of them, because active sessions are re-hashed under the current key). Reading a link key needs both D1 access and `PM_MASTER_KEY`. Without `revoke_previous`, a leaked key keeps verifying for its 7-day window, so after a suspected leak rotate with `revoke_previous=true`, then rotate `PM_MASTER_KEY` |
 | Cursor key | `POST /v1/platform/keys/cursor/rotate` (`platform:ops`) | New cursors carry the new kid; cursors with the old kid keep working for 24 hours (the cursor lifetime). With `?revoke_previous=true` open cursors fail at once with `400 invalid_request` (path `cursor`), and callers repeat the search without a cursor |
+| Web Bot Auth key | `POST /v1/platform/keys/web_bot_auth/rotate` (`platform:ops`; `422 web_bot_auth_disabled` while `PM_WEB_BOT_AUTH=off`) | New signatures use the new key at once; the previous key stays in the key directory for 7 days, so requests signed shortly before the rotation still verify. With `?revoke_previous=true` it leaves the directory at once |
+| Identity signing key | `POST /v1/identities/{identity_id}/keys/rotate` (`identities:write`; tenant, identity or platform key; or the identity page in the console) | The new key signs at once; the previous one is `retiring` and stays in the JWKS until `verify_until` = now + `PM_IDENTITY_KEY_OVERLAP_DAYS` (default 7) ([O2](../edge-cases.md)). After a suspected leak, `POST …/keys/{kid}/revoke` moves the key to `retired` and removes it from the JWKS at once ([O3](../edge-cases.md)). Key management stays available while the identity is paused |
 | OAuth client secrets | Create a new client secret in the provider's console, `wrangler secret put PM_OAUTH_GOOGLE_CLIENT_SECRET` (or `…_GITHUB_…`), then delete the old secret at the provider | Sign-ins that are mid-flow during the switch may fail and are retried by the person. Whether a provider keeps two secrets valid at once: verify at build time |
 | SMTP relay credentials | `PATCH /v1/domains/{domain_id}` with `smtp` (tenant or platform key with `domains:write`) | The new values are kept pending until a probe passes; the old ones are used until then |
 | TOTP secret, recovery codes | At `/console/settings/security`, with re-authentication: turn two-step verification off and enrol again, or generate new recovery codes | The old secret or codes stop working at once |
@@ -464,6 +549,8 @@ Rules:
 | `PM_HASH_KEY` | Not rotatable in v1.0 | Tombstones, suppressions and erasure records would stop matching, which would let an erased address be reassigned (A5). A rotation needs a re-keying migration and an ADR |
 | `PM_CF_API_TOKEN` | Create a new token with the same permissions, `wrangler secret put PM_CF_API_TOKEN`, revoke the old token | No downtime |
 | SES keys | Create a second IAM access key, put both secrets, deactivate then delete the old key | No downtime |
+| `PM_STRIPE_SECRET_KEY` | In the Stripe dashboard, **Rotate key** with an expiration (both keys work for up to 7 days), `wrangler secret put PM_STRIPE_SECRET_KEY`, then let the old key expire ([API keys › Rotate an API key](https://docs.stripe.com/keys#rolling-keys), read 2026-10-09) | No downtime |
+| `PM_STRIPE_WEBHOOK_SECRET` | In the Stripe dashboard, **Roll secret** on the endpoint and keep the old secret for up to 24 hours, then `wrangler secret put PM_STRIPE_WEBHOOK_SECRET` inside that window. Stripe signs with every active secret, and the verifier accepts any matching `v1` ([Webhooks › Roll endpoint signing secrets](https://docs.stripe.com/webhooks#roll-endpoint-secrets), read 2026-10-09) | No downtime; no event is rejected |
 
 **`pmail secrets rotate-master`.** Worker secrets are write-only, so the rotation never needs the old
 value:
@@ -484,7 +571,7 @@ value:
 `pmail doctor` warns while it is set, because a rotation is unfinished.
 
 **Rotating the signing keys.** `POST /v1/platform/keys/{purpose}/rotate` (`purpose` is `thread`,
-`link` or `cursor`, permission `platform:ops`, audit-logged as `signing_key.rotate` with
+`link`, `cursor` or `web_bot_auth`, permission `platform:ops`, audit-logged as `signing_key.rotate` with
 `details.revoke_previous`) runs one D1 batch: set `verify_until` on the current key (now + 90 days for
 `thread`, now + 7 days for `link`, now + 24 hours for `cursor`), and insert a new key with the next kid.
 Kids are single Crockford base32 characters assigned in alphabet order and wrapping after `z`. Any
@@ -494,7 +581,13 @@ key still inside it. With the query `?revoke_previous=true`, the previous kid is
 batch instead of getting a verify window, so everything it signed stops verifying at once. The response
 carries the purpose, the new kid, `created_at` and the previous kid with its `verify_until` (equal to
 the rotation time, with `previous.revoked: true`, when revoked), never key material. CLI:
-`pmail keys rotate thread|link|cursor [--revoke-previous]`.
+`pmail keys rotate thread|link|cursor|web_bot_auth [--revoke-previous]`.
+
+The purpose `web_bot_auth` follows the same batch with three differences: its kid is the 43-character
+RFC 7638 thumbprint of the new key's public JWK (stored with it in `public_jwk`), not the next letter;
+the previous key's `verify_until` is now + 7 days, during which it stays in the key directory; and the
+call is refused with `422 web_bot_auth_disabled` while `PM_WEB_BOT_AUTH=off`
+([Agent signing keys §2](agent-keys.md#2-keys)).
 
 Residual risk: without `revoke_previous`, a leaked signing key keeps verifying for its window (90 days,
 7 days or 24 hours). After a suspected leak, rotate that purpose with `revoke_previous=true`, then rotate
@@ -510,7 +603,8 @@ Residual risk: without `revoke_previous`, a leaked signing key keeps verifying f
 | Console TOTP codes (RFC 6238) | HMAC-SHA1, as the RFC and authenticator apps require | `hmac =0.13.0`, `sha1` (RustCrypto, pin at build time) |
 | OAuth PKCE code challenge, recovery-code hashes | SHA-256 (`S256`); recovery-code hashes are stored only inside a sealed envelope | `sha2 =0.11.0` |
 | Secrets at rest | AES-256-GCM, random 96-bit nonce, associated data binding the row | `aes-gcm` (RustCrypto), pin at build time |
-| Identity signing keys (P1, JWKS `alg: EdDSA`) | Ed25519 | `ed25519-dalek`, pin at build time |
+| Agent assertions (compact JWS, `alg: EdDSA`, RFC 8037) and Web Bot Auth HTTP message signatures (RFC 9421, `alg="ed25519"`), the key directory's own signatures | Ed25519 | `ed25519-dalek =3.0.0` (`default-features = false, features = ["zeroize"]`), `zeroize =1.9.0` for the unsealed seed ([Agent signing keys](agent-keys.md)) |
+| Key IDs of identity and Web Bot Auth keys | RFC 7638 JWK thumbprint (SHA-256), base64url | `sha2 =0.11.0` |
 | Fingerprints, dedupe, request fingerprints | SHA-256 | `sha2 =0.11.0` |
 | DKIM, ARC, DMARC verification | As specified by the RFCs | `mail-auth =0.13.3` (feature `rust-crypto`) |
 | SES request signing | AWS SigV4 (HMAC-SHA256) | `hmac`, `sha2` (spike S8) |
@@ -532,11 +626,13 @@ kid         first 8 bytes of SHA-256(key bytes), lower-case hex (16 chars); iden
 nonce       12 random bytes, base64url without padding
 ciphertext  AES-256-GCM ciphertext with its 16-byte tag, base64url without padding
 aad         "pm1|{table}|{column}|{row id}", e.g. "pm1|webhook_endpoints|secret_enc|whk_01J9…"
-            (signing_keys use "{purpose}:{kid}" as the row id, e.g. "pm1|signing_keys|ciphertext|thread:3")
+            (signing_keys use "{purpose}:{kid}" as the row id, e.g. "pm1|signing_keys|ciphertext|thread:3",
+            and "web_bot_auth:{thumbprint}" for the Web Bot Auth seed; identity keys use their
+            thumbprint, e.g. "pm1|identity_keys|private_enc|kPrK_qmx…")
 ```
 
-Sealed columns: `webhook_endpoints.secret_enc` and `prev_secret_enc`, `identity_keys.private_enc`,
-`signing_keys.ciphertext`, `domains.smtp_sealed` (aad `pm1|domains|smtp_sealed|{domain_id}`) and
+Sealed columns: `webhook_endpoints.secret_enc` and `prev_secret_enc`, `identity_keys.private_enc` (the
+32-byte Ed25519 seed), `signing_keys.ciphertext` (the `web_bot_auth` seed included), `domains.smtp_sealed` (aad `pm1|domains|smtp_sealed|{domain_id}`) and
 `domains.smtp_pending_sealed`, `users.totp_sealed`, `users.recovery_codes_sealed` and `oauth_states.pkce_sealed`. The master-key
 rotation re-seals every one of them (section 6.2).
 
@@ -631,7 +727,9 @@ Triage and the agentic planner receive mail content only inside fences, in the f
 The service never fetches a URL found in mail: no link previews, no image proxy, no automatic
 `List-Unsubscribe` calls for inbound mail, no fetching of verification links (they are returned by
 `wait`, never followed). Sends accept attachment content only as `content_base64`; there is no
-"attach from URL".
+"attach from URL". `POST /v1/identities/{identity_id}/http-signatures` signs a URL the caller names and
+returns headers; the Worker never requests that URL, so it is not an SSRF path
+([Agent signing keys §5.1](agent-keys.md#51-request)).
 
 ### 8.5 Serving attachments and raw MIME
 
@@ -728,6 +826,8 @@ fails. At delivery time a failure is recorded as a failed attempt with error `ss
 | Search per key | 120 / 60 s | `RL_SEARCH` | `429 rate_limited` |
 | Agentic search | 20 / 60 s per key; tenant daily cap (default 500) | `RL_AGENTIC`; exact count in `TenantQuota` | `429 rate_limited`, `429 agentic_budget_exhausted` |
 | Sends per identity | 120 / 60 s; daily caps from policy | `RL_SEND`; exact daily counters in `TenantQuota` | `429 rate_limited`, `429 daily_cap_reached` |
+| Signing per identity (agent assertions and HTTP signatures together) | 600 / 60 s | `RL_SIGN`, keyed by identity ID. Signing is not metered against any plan allowance | `429 rate_limited` |
+| Notification emails | 50 per person and 200 per workspace a day, every kind except `account` | The tenant's `Notifier` (`sent` counters, [Notifications §3](notifications.md#3-how-notifications-are-produced)) | Not an error: the overflow goes into the next daily digest ([O24](../edge-cases.md)) |
 | Inbound per sender per identity | `inbound.per_sender_per_hour` (default 60) | Mailbox `rate_windows` ([D5](../edge-cases.md)) | Excess stored `throttled` |
 | Failed thread-token verifications | 10 per sender per hour, 100 per mailbox per hour | Mailbox `rate_windows` ([Threading](threading.md), [D10](../edge-cases.md)) | Tokens not verified for the rest of the window |
 | Domain verification | 1 per minute per domain | `DomainMonitor` | `429 rate_limited` |
@@ -736,7 +836,7 @@ fails. At delivery time a failure is recorded as a failed attempt with error `ss
 | Sign-in code attempts | 10 per code; the token is burned after 10 failures | `login_tokens.attempts` | Code refused |
 | Console sign-in, sign-up and waitlist requests per client IP | 10 / 60 s on `POST /console/sign-in`, `/console/sign-in/link`, `/console/sign-in/code`, `/console/sign-up` and `/console/waitlist` | `RL_SIGNIN`, keyed by `CF-Connecting-IP`; the IP is never logged | `429` page |
 | Two-step verification codes | 5 attempts a minute per person; 10 failures in a row lock two-step sign-in for 15 minutes | A per-person failure counter ([Cloud sign-up §5](cloud-signup.md#5-two-step-verification)) | Code refused; lock page |
-| Sends from a new Free workspace | `tenant_daily_send_cap` 50 for the first 7 days; lifts on day 7 if bounce and complaint rates are under the auto-pause thresholds, or at once on a paid plan | `TenantQuota` ([M30](../edge-cases.md)) | `429 daily_cap_reached` |
+| Sends from a new Free workspace | `tenant_daily_send_cap` 50 for the first 7 days; lifts on day 7 if bounce and complaint rates are under the auto-pause thresholds, or at once on a paid plan | `TenantQuota` ([W30](../edge-cases.md)) | `429 daily_cap_reached` |
 
 - The rate-limiting bindings are approximate and per location. Anything that must be exact (daily send
   caps, the agentic budget, abuse windows) is counted in `TenantQuota`.
@@ -745,9 +845,14 @@ fails. At delivery time a failure is recorded as a failed attempt with error `ss
   the bounce rate over the last 200 exceeds `abuse.bounce_rate_pause` (default 0.05), the identity is
   paused with reason `abuse_threshold` and `identity.paused` is emitted with the metrics.
 - **Kill switches.** Revoke a key (`DELETE /v1/keys/{id}`, immediate). Pause an identity
-  (`PATCH … {"status": "paused"}`). Suspend a tenant (`PATCH /v1/tenants/{id} {"status": "suspended"}`):
-  every send is refused at once and inbound gets a temporary failure. For a platform-wide stop, suspend every
-  tenant or roll back the Worker version with `npx --yes wrangler@4.139.0 rollback`.
+  (`PATCH … {"status": "paused"}`): besides stopping its sends, this stops it signing at once
+  (`409 identity_paused`) and withdraws its JWKS (`404 identity_not_found`), so verifiers stop accepting
+  its assertions within the 5-minute JWKS cache (FR-IDN-9, [O1](../edge-cases.md)). Revoke one identity
+  key (`POST /v1/identities/{identity_id}/keys/{kid}/revoke`) to withdraw that key alone. Suspend a
+  tenant (`PATCH /v1/tenants/{id} {"status": "suspended"}`): every send is refused at once, inbound gets
+  a temporary failure, and every identity of the tenant is paused, so the same signing stop applies.
+  Stop signed HTTP requests for the whole deployment with `PM_WEB_BOT_AUTH=off`. For a platform-wide
+  stop, suspend every tenant or roll back the Worker version with `npx --yes wrangler@4.139.0 rollback`.
 - **Platform domain reputation.** Per-identity caps, complaint and bounce auto-pause, a DMARC policy
   ramped from `p=none` to `p=reject` on the platform domain, and custom domains encouraged (PRD risk
   table).
@@ -777,7 +882,9 @@ fails. At delivery time a failure is recorded as a failed attempt with error `ss
   `Authorization` headers, API key strings, webhook secrets, signed-link tokens, provider `smtpResponse`
   text, DNS TXT values, SMTP relay credentials and relay reply text, SNS message bodies (an SES inbound
   notification carries the message's headers), OAuth codes, `state` and tokens, TOTP and recovery codes,
-  cookie values.
+  cookie values, private keys and seeds, minted agent assertions, their `audience`, `nonce` and `ext`,
+  the URL and headers of a signed HTTP request (`Signature`, `Signature-Input`, `From`), notification
+  unsubscribe tokens and the bodies of notification emails.
 - **Logged instead:** IDs (`ten_`, `idn_`, `msg_`, `key_` …), the matched route pattern, error codes,
   SMTP status codes, counts, sizes, durations, and pseudonyms.
 - **Pseudonyms:** `ph_` + the first 16 hex characters of `HMAC-SHA256(PM_HASH_KEY, normalised address)`
@@ -804,10 +911,12 @@ address used by the integration suite, captures all Worker output, and fails if 
 | `it::auth::status_after_secret_match` | `key_revoked` / `key_expired` appear only when the secret matches | FR-KEY-2 |
 | `it::auth::rotation_overlap` | Both secrets work during the overlap; only the new one after; overlap 0 cuts over at once; a second rotation keeps at most two | FR-KEY-2 |
 | `it::auth::last_used_throttle` | Twenty requests within a minute produce one `last_used_at` write | data model |
-| `it::auth::rate_limited` | `429 rate_limited` with `Retry-After`; failed authentications are limited per client without logging the IP | section 10 |
-| `it::keys::scope_exceeded` | Every row of section 4.6 plus wider permissions and `tenants:manage` on a tenant key → `403 key_scope_exceeded` | FR-KEY-1, SEC-2 |
+| `it::auth::rate_limited` | `429 rate_limited` with `Retry-After`, including the 601st signing call in a minute for one identity (`RL_SIGN`); failed authentications are limited per client without logging the IP | section 10 |
+| `it::keys::scope_exceeded` | Every row of the scope table in section 4.6 (step 3), plus permissions wider than the caller's → `403 key_scope_exceeded` | FR-KEY-1, SEC-2 |
+| `it::keys::permission_level_rules` | Section 4.6, steps 1 and 2: `permissions` missing or empty (every level, `platform` included) → `400 invalid_request`; `identities:sign` on a platform key, a tenant-only permission on an identity key, and `tenants:manage` or `platform:ops` on a tenant or identity key → `400 invalid_request` with `details.reason = "permission_not_allowed_for_level"`, even from a caller that holds the permission; a tenant or identity key holds `usage:read` implicitly and reads its own `GET /v1/usage`; a platform key needs `usage:read` listed and `tenant_id` passed | FR-KEY-1, SEC-2 |
+| `it::messages::list_hides_review_statuses` | A message list never shows `quarantined`, `hidden` or `throttled` mail without a `status` filter, also to a key holding `quarantine:review`; with the filter, only a key holding `quarantine:review` sees them, and any other key gets `200` without them; a thread list never shows them | section 5.3, FR-IN-5 |
 | `it::keys::j6_revoke_rotate` | Revocation is immediate; rotation overlaps; audit rows name the actor | [J6](../edge-cases.md) |
-| `it::security::cross_tenant_matrix` | Section 5 matrix: every route × every foreign key class → `*_not_found` or `scope_denied`, identical to a missing ID, no side effects; REST and MCP | NFR-SEC-1, FR-KEY-3 |
+| `it::security::cross_tenant_matrix` | Section 5 matrix: every route × every foreign key class → `*_not_found` or `scope_denied`, identical to a missing ID, no side effects; REST and MCP | NFR-SEC-1, FR-KEY-3, FR-TEN-1 |
 | `it::security::route_table_complete` | Every entry of `GET /__test/routes` appears in the matrix; every route has a permission and scope | SEC-1 |
 | `it::security::body_scope_ignored` | `tenant_id` / `identity_id` / `identity_ids` naming another scope in bodies and queries never widen access | FR-KEY-3 |
 | `it::security::rpc_owner_mismatch` | A forged envelope (test hook) is refused with `internal_error`, logs `rpc_owner_mismatch`, increments the metric | SEC-1 |
@@ -822,15 +931,21 @@ address used by the integration suite, captures all Worker output, and fails if 
 | `core::sns::verify_v2_vectors`, `it::ses::sns_tampered_rejected` | Real version 2 notifications verify; version 1, a changed byte, a wrong certificate host, a wrong topic and a stale timestamp are refused with `403 invalid_signature`, on both `/hooks/ses` and `/hooks/ses/inbound` ([Outbound](outbound.md), [Domains on any DNS host](domain-connections.md#14-tests)) | spike S8, [N1](../edge-cases.md), [N2](../edge-cases.md) |
 | `it::ses::push_and_backstop_once`, `it::ses::cross_tenant_recipients`, `it::ses::verdict_mapping` | One message per object and recipient whichever path delivers it; no leakage between tenants in one object; SES verdicts used only as section 3.5 states | FR-DOM-9, [N3](../edge-cases.md), [N28](../edge-cases.md) |
 | `core::smtp::state_machine`, `it::smtp::probe_unaligned_falls_back` | No credentials without TLS; `535` is an auth failure; an unaligned relay goes to `failing` and sends fall back | FR-DOM-11, SEC-4, [N14](../edge-cases.md), [N16](../edge-cases.md), [N18](../edge-cases.md) |
-| `it::oauth::state_cookie_binding`, `it::oauth::unverified_email_refused`, `it::oauth::link_by_verified_email` | Missing, reused, expired or other-browser state refused; unverified addresses refused; linking only by verified email | FR-CON-9, [M20](../edge-cases.md)–[M22](../edge-cases.md) |
-| `core::totp::rfc6238_vectors`, `it::totp::workspace_requirement` | RFC 6238 vectors, drift, replay refused; attempt limits and lock; recovery code works once | FR-CON-10, [M27](../edge-cases.md), [M28](../edge-cases.md) |
+| `it::oauth::state_cookie_binding`, `it::oauth::unverified_email_refused`, `it::oauth::link_by_verified_email` | Missing, reused, expired or other-browser state refused; unverified addresses refused; linking only by verified email | FR-CON-9, [W20](../edge-cases.md)–[W22](../edge-cases.md) |
+| `core::totp::rfc6238_vectors`, `it::totp::workspace_requirement`, `it::totp::recovery_code_single_use` | RFC 6238 vectors, drift, replay refused; attempt limits and lock; the workspace requirement; recovery code works once | FR-CON-10, [W27](../edge-cases.md), [W28](../edge-cases.md) |
 | `it::hosts::console_api_split` | With two hosts, console paths `404` on the API host and API paths `404` on the console host; no `Set-Cookie` on the API host | section 4.9 |
 | `core::injection::e1_*` (includes a fence property test) | No content, including content containing the nonce or marker-like runs, can close a fence | SEC-5, [E1](../edge-cases.md) |
 | `it::ai::gateway_options_no_log` | With `PM_AI_GATEWAY` set, content-bearing model calls disable log collection and caching | section 3.5 |
 | `it::attachments::serving_headers` | Section 8.5 headers on attachments and raw MIME; `text/html` and SVG served as `application/octet-stream` | [B10](../edge-cases.md) |
 | `it::security::response_headers` | Global headers present; no CORS headers; no `Set-Cookie` | section 8.5 |
 | `core::crypto::envelope_round_trip` | Seal/open round trip; wrong AAD, wrong key or flipped bit fails | SEC-3 |
-| `it::secrets::master_key_rotation` | With `PM_MASTER_KEY_NEXT` set, old and new ciphertexts open, new ones use the new kid, the sweep re-seals every sealed column of section 7.2, including `signing_keys`, `domains.smtp_sealed` and the `users` second factors | section 6.2 |
+| `it::secrets::master_key_rotation` | With `PM_MASTER_KEY_NEXT` set, old and new ciphertexts open, new ones use the new kid, the sweep re-seals every sealed column of section 7.2, including `signing_keys` (the `web_bot_auth` seed too), `identity_keys`, `domains.smtp_sealed` and the `users` second factors | section 6.2 |
+| `it::secrets::rotate_master_reseals_identity_keys` | Assertions signed before and after a master-key rotation verify with the same public key and kid | [O8](../edge-cases.md) |
+| `core::jwk::thumbprint_rfc8037_vector`, `core::jwt::eddsa_rfc8037_vector`, `core::httpsig::signature_base_rfc9421` | The RFC 8037 thumbprint and signing vectors; RFC 9421 signature bases, an IDN host as its A-label, non-ASCII components refused | section 7.1, [O10](../edge-cases.md) |
+| `it::assertions::sdk_verifies` | The SDK verifier accepts a fresh assertion and rejects a wrong audience, an expired token, an unknown kid and `alg: none` | section 3.8 |
+| `it::identity_keys::paused_withdraws_jwks`, `it::identity_keys::revoke_removes_from_jwks`, `it::assertions::erasure_tombstones_kid` | Kill switch: a paused identity gets `409` on signing and `404` on its JWKS; a revoked key leaves the JWKS at once; an erased identity's kid is never published again | FR-IDN-9, [O1](../edge-cases.md), [O3](../edge-cases.md), [O7](../edge-cases.md) |
+| `it::http_signatures::disabled_and_policy`, `it::well_known::directory_signed_per_key` | `PM_WEB_BOT_AUTH=off` → `422`; a tenant not opted in → `403 policy_denied`; the directory carries one signature per listed key | [O9](../edge-cases.md), [O12](../edge-cases.md), [O13](../edge-cases.md) |
+| `it::notify::one_click_unsubscribe`, `core::notify::no_content_in_body` | An unsubscribe token turns off exactly one kind for one person and workspace, with no session, CSRF token or `Origin`; an altered, foreign or expired token changes nothing; a rendered notification holds no content from the source message | section 3.7, [O18](../edge-cases.md) |
 | `it::secrets::signing_key_rotation` | For `thread`, `link` and `cursor`: after `POST /v1/platform/keys/{purpose}/rotate`, new tokens, links and cursors carry the new kid; old ones verify until `verify_until` and fail after it; with `?revoke_previous=true` they fail at once and the response has `previous.revoked: true`; the response holds no key material; the 33rd rotation inside the window retires the oldest kid | section 6.2, [Threading](threading.md#24-key-rotation) |
 | `cli::setup::bootstrap_key` ([CLI and setup](cli.md)) | The bootstrap key authenticates and expires after 24 hours; a re-run with keys present refuses without `--rotate-pepper` | section 4.8 |
 | `it::security::well_known_security_txt` | `security.txt` fields and the 404 when `PM_SECURITY_CONTACT` is unset | section 14 |
@@ -886,6 +1001,8 @@ Before v1.0 (PRD release criterion 5) and before every minor release:
 - [ ] `security.txt` served on staging; `SECURITY.md` current.
 - [ ] Signing-key rotation (`thread`, `link` and `cursor`) rehearsed on staging; old tokens verify until
       `verify_until`, and stop at once with `revoke_previous=true`.
+- [ ] Identity-key rotation and revocation rehearsed on staging: a revoked key leaves the JWKS, and
+      pausing an identity withdraws its JWKS. `PM_WEB_BOT_AUTH` is `on` only where spike S13 passed.
 - [ ] With SES configured: both SNS topics have `SignatureVersion=2`, the inbound bucket blocks public
       access, and the IAM policy matches [Domains on any DNS host §4.2](domain-connections.md#42-deployment-set-up-for-ses).
 - [ ] Release bundle checked for `/__test/` and the `itest-hooks` feature.

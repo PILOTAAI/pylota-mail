@@ -11,6 +11,7 @@ Deployment (platform) ── platform keys, the platform mail domain, platform w
        ├─ API key (key_)     tenant or identity level
        └─ Identity (idn_)    one mailbox (Durable Object)
             ├─ Address (adr_)      primary | alias · pending | active | retiring | retired
+            ├─ Signing key (kid)   active | retiring | retired
             └─ Thread (thr_)
                  └─ Message (msg_) inbound | outbound
                       └─ Attachment (att_)
@@ -49,13 +50,21 @@ contends with another and can be deleted in one step.
 | `purpose`, `metadata`, `signature` | Free tags, your own key-value data, and the signature appended to sends |
 | `client_id` | Your own unique name for the identity, such as `acme:bookings`. A repeated create with the same `client_id` returns the existing identity |
 | `send_policy` | Per-identity daily cap, auto-reply setting and `require_known_recipient` |
-| `status` | `active` or `paused`. A paused identity still receives and stores mail, and refuses every send with `409 identity_paused`. `pause_reason` is `manual`, `abuse_threshold` or `tenant_suspended` |
+| `status` | `active` or `paused`. A paused identity still receives and stores mail, and refuses every send with `409 identity_paused`. `pause_reason` is `manual`, `abuse_threshold` or `tenant_suspended`; while the tenant is suspended, sends get `403 tenant_suspended` instead |
 
 Deleting an identity runs an identity-scope erasure and **tombstones its addresses permanently**:
 they can never be given to another identity ([FR-IDN-4](project/prd.md#62-identities-and-addresses)).
 
+An identity can also have a **signing key** (Ed25519), created on first use and sealed inside the
+Worker, which never exports it. With it the identity signs **agent assertions**: short-lived tokens
+that tell another service which agent it is dealing with, checked against the identity's published key
+set. A paused identity cannot sign, and its key set is withdrawn. Keys rotate with an overlap (7 days
+by default), and a deleted identity's key IDs are tombstoned like its addresses. Guide:
+[Using it from an agent › Agent assertions](guides/agents.md#agent-assertions).
+
 Reference: [REST API › Identities](reference/api.md#identities) · Design:
-[Identities, addresses and domains](project/design/identity-domains.md).
+[Identities, addresses and domains](project/design/identity-domains.md),
+[Agent signing keys](project/design/agent-keys.md).
 
 ## Addresses
 
@@ -71,7 +80,7 @@ An identity has one or more **addresses** over time. Exactly one is the `primary
 Each address has a status:
 
 ```text
-           domain becomes healthy         another address promoted,        retire_at reached
+    domain healthy or degraded          another address promoted,        retire_at reached
  pending ─────────────────────────▶ active ──── or retire called ────▶ retiring ─────────────▶ retired
                                       ▲                                    │
                                       └──────── promote it again ──────────┘
@@ -80,7 +89,7 @@ Each address has a status:
 
 | Status | Receives mail | Sends |
 |---|---|---|
-| `pending` | No. Waiting for its domain to be healthy | No (`domain_not_ready`) |
+| `pending` | No. Waiting for its domain to be `healthy` or `degraded` | No (`domain_not_ready`) |
 | `active` | Yes | Yes |
 | `retiring` | Yes, into the same identity | Only on threads that already use it ([G7](project/edge-cases.md)) |
 | `retired` | No: `550 5.1.6` | No |
@@ -148,9 +157,11 @@ Reference: [REST API › Domains](reference/api.md#domains) · Guide:
 A **thread** is a conversation in one identity's mailbox. An inbound message joins a thread by, in
 order ([FR-THR-1](project/prd.md#67-threading)):
 
-1. a valid **thread token** in the recipient address. Every outbound message carries one in its
-   `Reply-To` sub-address, for example `bookings.acme+t03k.9f2mq7xa@agents.example`. The token is an
-   HMAC, so a forged one is ignored ([A2](project/edge-cases.md));
+1. a valid **thread token** in the recipient address. Outbound messages carry one in their
+   `Reply-To` sub-address, for example `bookings.acme+t03k.9f2mq7xa@agents.example`, except from domains
+   whose inbound mail arrives by forwarding (`send_only`, and `smtp_relay` with `inbound: forward`):
+   their own mail system may drop sub-addresses, so those messages have no `Reply-To` and replies thread
+   by headers. The token is an HMAC, so a forged one is ignored ([A2](project/edge-cases.md));
 2. `In-Reply-To` or `References` matching a stored message;
 3. otherwise it starts a new thread. **The subject alone never joins a thread.**
 
@@ -167,7 +178,7 @@ What an inbound message carries:
 |---|---|
 | `extracted_text` | The new content, with quoted history and signatures removed. Returned by default, and what an agent should read first |
 | `text`, `html` | The full plain text (derived from HTML when the mail is HTML-only) and sanitised HTML. Returned on request (`include=quoted`, `include=html`). The service never renders HTML |
-| `trust` | The authentication verdict (`pass`, `fail`, `softfail`, `none` or `unaligned`) with SPF, DKIM, DMARC and ARC results, `known_sender`, `spam_score`, `automated`, `quarantined` and flags such as `display_name_spoof`, `lookalike_domain`, `reply_to_mismatch` and `hidden_text` |
+| `trust` | The authentication verdict (`pass`, `fail`, `softfail`, `none`, `unaligned` or `unverified`) with SPF, DKIM, DMARC and ARC results, `known_sender`, `spam_score`, `automated`, `quarantined` and flags such as `display_name_spoof`, `lookalike_domain`, `reply_to_mismatch` and `hidden_text` |
 | `kind` | `normal`, `automated`, `dsn`, `list`, `calendar` or `mdn`. Automated mail is marked so agents never auto-reply to it |
 | `attachments` | Metadata, `text_status` for extracted text, and `risk` for unsafe files |
 | `refs` | Exact references found in the mail: plates, PCNs, invoice and order numbers, amounts, phone numbers and your own patterns |
@@ -244,7 +255,8 @@ The permissions are listed in [REST API › Permissions](reference/api.md#permis
 
 Send, reply, reply-all and forward require an **`Idempotency-Key`** header. The same key with the same
 body returns the original result (`deduplicated: true`), so a retry never sends a second email. The
-same key with a different body is refused (`409 idempotency_conflict`). Keys are kept for 30 days.
+same key with a different body is refused (`409 idempotency_conflict`). A key is 1–255 printable ASCII
+characters, and keys are kept for 30 days.
 
 When the transport's answer is lost (a timeout, or a connection that drops after the request was
 written), nobody can know whether the email left. The message becomes **`uncertain`**, and Pylota Mail
@@ -265,7 +277,9 @@ Guide: [Sending › Safe retries](guides/sending.md#safe-retries).
 **Quarantine** holds inbound mail that should not reach an agent: mail that failed authentication,
 scored above the spam threshold, carries a risky attachment, or is an unsolicited one-time code.
 Quarantined mail is stored but hidden from every key without `quarantine:review`, and is released only
-by a person with that permission. Released mail is then triaged like any other.
+by a person with that permission. Lists and search leave quarantined, `hidden` and `throttled` mail out
+by default; it appears only when a request asks for it explicitly and the key holds
+`quarantine:review`. Released mail is then triaged like any other.
 
 Guide: [Receiving › Quarantine](guides/receiving.md#quarantine).
 

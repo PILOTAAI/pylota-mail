@@ -41,7 +41,7 @@ pipeline; this page adds what they must contain.
 
 | Layer | Prefix | Location | Runs with | Covers |
 |---|---|---|---|---|
-| Unit | `core::` | `#[cfg(test)]` modules in `crates/core` | `cargo test --workspace` | Every pure rule: parsing, caps, sanitising, classification, verdicts, threading, tokens, addresses, query parser, fusion, citation verifier, triage rules, policy, DNS parsing, domain state machine, SSRF classification, fencing, crypto envelope, receipt builder, SLO rules |
+| Unit | `core::` | `#[cfg(test)]` modules in `crates/core` | `cargo test --workspace` | Every pure rule: parsing, caps, sanitising, classification, verdicts, threading, tokens, addresses, query parser, fusion, citation verifier, triage rules, policy, DNS parsing, domain state machine, SSRF classification, fencing, crypto envelope, receipt builder, SLO rules, JWK thumbprints (`core::jwk::`), JWT signing (`core::jwt::`), HTTP message signature bases (`core::httpsig::`), notification rendering (`core::notify::`) |
 | Property | `core::` | same modules, `proptest` | `cargo test --workspace` | Section 4 |
 | Worker logic | `worker::`, `platform::` | `#[cfg(test)]` modules in `crates/worker` and `crates/platform` | `cargo test --workspace` | Handlers, Durable Object logic modules (`mailbox::Mailbox<P>` and the others) over `platform::fakes` with `rusqlite` standing in for Durable Object SQLite ([Rust workspace](rust-workspace.md#63-durable-object-classes)) |
 | Conformance | `conf::` | `crates/conformance` | `cargo test --workspace` | The MIME corpus (section 5) |
@@ -157,14 +157,16 @@ As defined in [Rust workspace](rust-workspace.md#9-xtask), plus the details belo
 2. Render `deploy/wrangler.itest.toml`: the production bindings, local resources, `PM_ENV = "local"`,
    `PM_PLATFORM_DOMAIN = "agents.example"`, `PM_API_HOST = "localhost"`,
    `PM_CONSOLE_HOST = "console.localhost"` (the test client sends that `Host` header on console paths),
-   `PM_SIGNUP = "open"`, the SES variables (`PM_SES_REGION = "eu-west-2"`, `PM_SES_INBOUND_*`) and the
+   `PM_SIGNUP = "open"`, `PM_WEB_BOT_AUTH = "on"` (local only: the S13 gate applies to real deployments), the SES variables (`PM_SES_REGION = "eu-west-2"`, `PM_SES_INBOUND_*`) and the
    Google, GitHub and Stripe client settings naming resources on the fake server, random test secrets
    written to `.dev.vars` in a temporary directory, `PM_ITEST_FAKES_URL = "http://127.0.0.1:8798"`, a random
    `PM_ITEST_TOKEN`, queue consumers with `max_batch_timeout = 1`, and no `AI` or `VECTORS` binding (both
    are served by fakes). Tests inject provider events through the production `Q_DELIVERY` producer
    binding, which exists for dead-letter redrive.
 3. Apply D1 migrations: `npx --yes wrangler@4.139.0 d1 migrations apply pylota-mail --local
-   --persist-to target/itest/state` (a fresh directory per run).
+   --persist-to target/itest/state --config deploy/wrangler.itest.toml` (a fresh directory per run). The
+   rendered file sets `migrations_dir = "../migrations/d1"`, because Wrangler resolves it against the
+   file's own directory, `deploy/`. Until v1.0 there is one file, `0001_init.sql`.
 4. Start `npx --yes wrangler@4.139.0 dev --local --port 8799 --persist-to target/itest/state
    --test-scheduled --config deploy/wrangler.itest.toml`, write its PID to `target/itest/wrangler.pid`, and
    capture stdout and stderr to `target/itest/worker.log`. Wait for `GET /health`.
@@ -186,7 +188,7 @@ the release bundle contains `/__test/`.
 |---|---|
 | Invocation sync | At the start of every `fetch`, `email`, `queue`, `scheduled`, `alarm` and Durable Object request, read `GET {fakes}/state` (clock offset and fault-plan version) into isolate state |
 | `POST /__test/inbound` | Runs the `email()` handler code with a synthetic message (`mail_from`, `rcpt_to`, `raw_base64`) and returns `{ "outcome": "accepted" \| "rejected" \| "tempfail", "smtp": "550 5.1.1 …" }`. Used for cases the local endpoint cannot carry (no `Message-ID`, [B3](../edge-cases.md)) and to observe reject and temporary-failure outcomes ([A6](../edge-cases.md), [J1](../edge-cases.md)) |
-| `POST /__test/alarm` | `{ "class": "mailbox" \| "domain" \| "job" \| "quota", "object_id" }`: runs the object's alarm handler now, executing every purpose due at the fake clock |
+| `POST /__test/alarm` | `{ "class": "mailbox" \| "domain" \| "job" \| "quota" \| "notifier", "object_id" }`: runs the object's alarm handler now, executing every purpose due at the fake clock |
 | `GET /__test/routes` | The router table (method, pattern, permissions, scope, idempotency) for the attack suite |
 | `POST /__test/rpc` | Sends a raw `RpcEnvelope` to an object, for owner-mismatch tests |
 | `POST /__test/delivery-event` | Publishes a provider event payload to `pm-delivery-events` through `Q_DELIVERY` |
@@ -225,8 +227,21 @@ traits that call it:
   SMTP server fake), `it::forwarding::*` (the mail sender fake plus inbound injection at the platform
   address), `it::domains::*` (DNS, Cloudflare API and SES fakes), `it::oauth::*` (OAuth fakes and one cookie
   jar per simulated browser), `it::checkout::*` and `it::signup::*` (Stripe fake), `it::totp::*`,
-  `it::landing::*`, `it::onboarding::*` and `it::abuse::*` (fake clock), and `it::hosts::*` (the two
-  `Host` values).
+  `it::landing::*`, `it::onboarding::*` and `it::abuse::*` (fake clock), `it::hosts::*` (the two
+  `Host` values), `it::identity_keys::*`, `it::assertions::*`, `it::http_signatures::*` and
+  `it::well_known::*` (fake clock for overlap windows and expiry; the Rust SDK's `verify_assertion`
+  runs natively in the test process against the JWKS that workerd serves), and `it::notify::*` (fake
+  clock for holds, windows, the 09:00 run, time zones and cooldowns; `/__test/alarm` with class
+  `notifier`; notification emails are observed the same way as console sign-in mail, which the system
+  identity also sends ([Console › Requesting a link or code](console.md#requesting-a-link-or-code));
+  `/__test/delivery-event` for a hard bounce on a notification; the DNS fake to make the platform domain
+  `failing`).
+- **Another value of a deployment variable or secret.** A test that needs one (`PM_CONSOLE=off` for
+  `it::console::disabled`, `PM_WEB_BOT_AUTH=off` for `it::http_signatures::disabled_and_policy`,
+  `PM_BILLING=off` for `it::notify::billing_off_quotas`, `PM_NOTIFICATIONS=off`, or the secret
+  `PM_MASTER_KEY_NEXT` for the master-key rotation tests) calls `restart_runtime_with(&[(name, value)])`,
+  which restarts wrangler like `restart_runtime()` (section 6.6) with the value overridden in the
+  rendered `wrangler.itest.toml` or `.dev.vars`, and restores the original on exit.
 
 ### 6.4 Injecting inbound mail
 
@@ -292,22 +307,32 @@ Proves NFR-SEC-1 (zero cross-tenant access) and FR-KEY-3. Rules are in
 
 **Fixture.** Two tenants, A (victim) and B (attacker), each with two identities, a domain, a webhook, a
 key of each level holding every permission valid at that level, threads with messages and attachments,
-a held thread, an erasure request and an export. Tenant A's mail contains a unique canary term. A third
-tenant C is a test tenant.
+a held thread, an erasure request, an export, an identity signing key on each identity (one rotated, so a
+`retiring` key exists too) and `policy.web_bot_auth.allowed = true`. Tenant A's mail contains a unique
+canary term. A third tenant C is a test tenant.
+
+"Every permission valid at that level" follows [Security §4.6](security.md#46-creating-keys-fr-key-1):
+a tenant key holds every permission except `tenants:manage` and `platform:ops`, so it holds
+`identities:sign`; an identity key holds the same set without the tenant-only permissions
+(`members:read`, `members:manage`, `suppressions:manage`, `audit:read`, `usage:read`), plus
+`usage:read` implicitly for its own workspace.
 
 **Attacker key classes** (each with full permissions for its level):
 
 | Class | Key |
 |---|---|
-| `foreign_tenant` | Tenant key of B |
-| `foreign_identity` | Identity key of B's first identity |
+| `foreign_tenant` | Tenant key of B (with `identities:sign`) |
+| `foreign_identity` | Identity key of B's first identity (with `identities:sign` for that identity) |
 | `sibling_identity` | Identity key of A's second identity, attacking A's first identity |
 | `mode_mismatch` | Test-mode key of C, attacking live tenant A ([L4](../edge-cases.md)) |
 | `revoked`, `expired` | A's own tenant key, revoked or expired |
 
 **Matrix.** `it::security::cross_tenant_matrix` reads `GET /__test/routes` and, for every route with a
 path parameter and every attacker class, calls the route with A's resource IDs (and, for `POST`/`PATCH`,
-a valid body). For each call it also makes a control call with the same key and a random non-existent
+a valid body). The enumeration includes the identity-key routes (`…/keys`, `…/keys/rotate`,
+`…/keys/{kid}/revoke` with A's kid), `POST …/assertions` and `POST …/http-signatures` on A's
+identities; the scope check answers before any signing rule, so they give the same
+`404 identity_not_found` as a missing identity. For each call it also makes a control call with the same key and a random non-existent
 ID of the same type. It asserts:
 
 1. The status is `404` with the route's `*_not_found` code, or `403 scope_denied` for a route above the
@@ -322,14 +347,16 @@ ID of the same type. It asserts:
 
 | Test | Attack |
 |---|---|
-| `it::security::route_table_complete` | Every route in `/__test/routes` appears in the matrix, has permissions and a scope rule; a route added without either fails this test |
+| `it::security::route_table_complete` | Every route in `/__test/routes` appears in the matrix, has a scope rule and a non-empty permission list (except `Scope::Public`, `GET /v1/me` and `GET /v1/tenants/{tenant_id}`, which carries `foreign_permissions` instead; `GET /v1/usage` needs `usage:read`, which tenant and identity keys hold implicitly); a route added without them fails this test. The `Scope::Public` set is exactly the list of [Security §4.7](security.md#47-unauthenticated-routes), the two `/.well-known/` key routes included |
 | `it::security::body_scope_ignored` | For every `POST`, `PATCH` and list route: `tenant_id`, `identity_id` and `identity_ids` naming A in bodies and query strings, sent with B's keys |
 | `it::security::search_canary_isolation` | B searches for A's canary in every mode, including agentic with a question that asks for "all tenants"; zero hits and no evidence from A |
 | `it::security::vector_foreign_id_dropped` | The Vectorize fake returns one of A's vector IDs to B's semantic query; the mailbox read-back drops it and `rpc_owner_mismatch_total` does not move (the ID is simply not found in B's mailbox) |
 | `it::security::rpc_owner_mismatch` | `/__test/rpc` sends an envelope with B's IDs to A's mailbox; `internal_error`, `rpc_owner_mismatch` logged, metric incremented, alert fired |
 | `it::inbound::a2_forged_token_ignored` | Mail to B's address with a token minted for A's thread files into B's mailbox only |
 | `it::security::webhook_filter_scope` | B creating a webhook with `identity_ids` of A gets `404 identity_not_found` |
-| `it::security::mcp_tools_follow_key` | Tools listed and callable only with their permission |
+| `it::security::mcp_tools_follow_key` | Tools listed and callable only with their permission; `mail_sign_assertion` and `mail_sign_http_request` are never listed to a platform key |
+| `it::identity_keys::paused_withdraws_jwks`, `it::assertions::erasure_tombstones_kid` | Without a key: a paused identity's JWKS answers the same `404 identity_not_found` as an unknown ID; an erased identity's kid is never published again ([O1](../edge-cases.md), [O7](../edge-cases.md)) |
+| `it::notify::one_click_unsubscribe` | An unsubscribe token for a person of B, altered to name A's workspace or another kind, changes nothing and gets the same page as an expired token ([O18](../edge-cases.md)) |
 
 The suite is part of `cargo xtask itest` and therefore a required check on every pull request. Timing is
 not asserted in CI (too noisy); both code paths do the same D1 read by construction.
@@ -399,9 +426,9 @@ is synthetic, on reserved domains, under the repository's licence (FSL-1.1-ALv2)
 
 | Suite | Gate | Source |
 |---|---|---|
-| search | Hybrid recall@10 ≥ 0.90 and no drop of more than 0.01 against the baseline (NFR-QUAL-1); keyword zero-result rate 0 on exact-reference queries | [Search §13.2](search.md#132-labelled-queries-and-metrics) |
-| agentic | Citation precision after verification ≥ 0.98 (NFR-QUAL-2); steering failures 0; no `answered` status on unanswerable questions (FR-SRCH-9) | [Search §13.3](search.md#133-agentic-evaluation) |
-| triage | Category accuracy ≥ 0.85 (NFR-QUAL-3) and no drop of more than 0.01 against the baseline | [Triage §13](triage.md#13-evaluation-set-and-nfr-qual-3) |
+| search (`eval::search`) | Hybrid recall@10 ≥ 0.90 and no drop of more than 0.01 against the baseline (NFR-QUAL-1); keyword zero-result rate 0 on exact-reference queries | [Search §13.2](search.md#132-labelled-queries-and-metrics) |
+| agentic (`eval::agentic`) | Citation precision after verification ≥ 0.98 (NFR-QUAL-2); steering failures 0; no `answered` status on unanswerable questions (FR-SRCH-9) | [Search §13.3](search.md#133-agentic-evaluation) |
+| triage (`eval::triage`) | Category accuracy ≥ 0.85 (NFR-QUAL-3) and no drop of more than 0.01 against the baseline | [Triage §13](triage.md#13-evaluation-set-and-nfr-qual-3) |
 
 Pull requests run the same pipelines with the scripted fake model, so prompts, fencing, budgets, the
 verifier and schema validation are checked without network access. In addition,
@@ -432,13 +459,15 @@ deployment (its own zone, platform domain, D1, R2, Vectorize and queues, [Archit
 | `live::erasure::counterparty_live` | Counterparty erasure of the Gmail test address with one held thread: the receipt lists the hold, probes are zero, and no object is left under the erased keys (checked through the Cloudflare R2 API) |
 | `live::mcp::client_round_trip` | An MCP client built on `rmcp` (the `conformance` dev-dependency) connects to `/mcp` with a staging key, lists tools, searches, and sends with an `idempotency_key`; a repeat call returns the original result |
 | `live::ops::metrics_reach_analytics_engine`, `live::ops::restore_drill` | [Observability](observability.md#10-tests) |
+| `live::ops::fresh_deploy_rehearsal` | NFR-OPS-1: a person who did not build the service deploys a fresh Cloudflare account from `self-hosting.md` alone; the hands-on time is recorded and must be at most 15 minutes ([Build plan › M20](../build-plan.md), step 12) |
 
 **Secrets.** Live tests read credentials only from the GitHub Environment `staging`, which requires a
 reviewer and is limited to `main` and release tags; forks never receive them. The environment holds: a
 Cloudflare API token scoped to the staging account, a staging platform key with a 90-day expiry, OAuth
 credentials limited to the two dedicated test mailboxes (Google Workspace and Microsoft 365, holding only
 synthetic mail), AWS credentials for the staging SES resources, and an API token for the external DNS
-provider that hosts the `dns_records` test domain. The harness never prints secrets,
+provider that hosts the `dns_records` test domain. The secret names are listed in
+[Build plan › Human prerequisites](../build-plan.md#human-prerequisites) (`STAGING_*`). The harness never prints secrets,
 redacts them from failure output, deletes test messages from the mailboxes after each run, and the
 credentials are rotated every quarter.
 
@@ -455,6 +484,10 @@ credentials are rotated every quarter.
 | `it::<area>::<row>_<name>` | Integration test against workerd | `it::inbound::a6_reject_codes` |
 | `live::<area>::<row>_<name>` | Live test against staging | `live::transport::j5_ses_failover` |
 | `cli::<module>::<name>` | Native test in `crates/cli` | `cli::setup::ses_region_check` |
+| `platform::<module>::<name>` | Native test in `crates/platform` | `platform::config::startup_rules` |
+| `sdk::<module>::<name>` | Native test in `crates/sdk` | `sdk::coverage::every_operation` |
+| `xtask::<name>` | A check run by `cargo xtask` over the workspace, the docs or the built bundle | `xtask::size_budget` |
+| `eval::<suite>` | An evaluation run (section 9): its `Covers:` line names the quality requirement | `eval::search` |
 
 - The row ID (`a6`, `j7`) starts the last segment, so `cargo test a6_` finds every test for a row. A test
   that covers several rows, or a requirement rather than one row, may omit it (for example
@@ -494,16 +527,18 @@ It prints the traceability matrix as Markdown into the CI summary.
 | J8 | Forced dead-letter delivery (a consumer fault beyond `max_retries`); fake clock for the 15-minute alert |
 | J9 | `/__test/mailbox-schema` |
 | L1–L4 | Test tenants with the real simulator and loopback paths |
-| B1, C7, J5 | Live only (B1 and J5 also need real providers; C7 has an `it::` part too) |
+| B1, C7, J5 | Live (B1 and J5 also need real providers). C7 has an `it::` part too, and J5's API part is `it::domains::transport_patch` |
 | N1–N7, N10, N11, N26–N29 | SNS push and SQS fakes; S3 fake with `NoSuchKey`; SES fake identity, account and receipt-rule state; a generated 39 MB message for N5; seeded domain rows for the identity count |
 | N8, N9, N17, N21–N25 | DNS fake per resolver (MX hosts, doubled names, parent NS); Cloudflare API fake zone errors and zone deletion; `/__test/alarm` for checks |
 | N12, N13 | Forwarding simulated by injecting the outbound copy at the identity's platform address |
 | N14–N16, N18–N20 | SMTP server fake scripts; probe and DSN messages handed to the inbound path |
 | N30 | `cli::` with a recorded AWS API fake |
-| M20–M23 | OAuth fakes; a separate cookie jar per simulated browser |
-| M24–M26 | Stripe fake and signed webhook payloads; the return page's refresh loop |
-| M27, M28, M30 | Fake clock (TOTP steps, key rotation plus 8 days, the 7-day ramp) |
-| M29, M31–M34 | Plain requests; M33 sends two concurrent creates |
+| W20–W23 | OAuth fakes; a separate cookie jar per simulated browser |
+| W24–W26 | Stripe fake and signed webhook payloads; the return page's refresh loop |
+| W27, W28, W30 | Fake clock (TOTP steps, key rotation plus 8 days, the 7-day ramp) |
+| W29, W31–W34 | Plain requests; W33 sends two concurrent creates |
+| O1–O13 | Fake clock for `verify_until` and signature expiry; the Rust SDK verifier run against the JWKS served by workerd; tenant policy per test; `restart_runtime_with` for `PM_WEB_BOT_AUTH=off` (O9); `restart_runtime_with` setting the secret `PM_MASTER_KEY_NEXT` for O8 |
+| O14–O26 | Fake clock for the 2-minute hold, the 10-minute windows, the hourly and 09:00 runs, time-zone changes and the 24-hour cooldowns; `/__test/alarm` with class `notifier`; notification emails observed like console sign-in mail; `/__test/delivery-event` for a hard bounce on one (O17); the DNS fake for a `failing` platform domain (O25); `restart_runtime_with` for `PM_BILLING=off` (O23) |
 
 ### 11.4 Coverage
 

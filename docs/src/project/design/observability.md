@@ -7,8 +7,8 @@ mail content or clear-text addresses ([Security › Logging rules](security.md#1
 
 | | |
 |---|---|
-| Requirements | FR-OPS-3, FR-OPS-4, FR-PRV-6, FR-DLV-3, FR-DLV-5, FR-DOM-9, NFR-REL-1…4, NFR-PERF-1…6, NFR-PRV-1, NFR-OPS-2 |
-| Edge cases | [D4](../edge-cases.md), [D5](../edge-cases.md), [G3](../edge-cases.md), [G8](../edge-cases.md), [I5](../edge-cases.md), [J4](../edge-cases.md), [J5](../edge-cases.md), [J6](../edge-cases.md), [J8](../edge-cases.md), [N1](../edge-cases.md), [N4](../edge-cases.md), [N10](../edge-cases.md) |
+| Requirements | FR-OPS-3, FR-OPS-4, FR-PRV-6, FR-DLV-3, FR-DLV-5, FR-DOM-9, FR-IDN-6…8, FR-CON-14, FR-CON-15, FR-BILL-13, NFR-REL-1…4, NFR-PERF-1…6, NFR-PRV-1, NFR-OPS-2 |
+| Edge cases | [D4](../edge-cases.md), [D5](../edge-cases.md), [G3](../edge-cases.md), [G8](../edge-cases.md), [I5](../edge-cases.md), [J4](../edge-cases.md), [J5](../edge-cases.md), [J6](../edge-cases.md), [J8](../edge-cases.md), [N1](../edge-cases.md), [N4](../edge-cases.md), [N10](../edge-cases.md), [O24](../edge-cases.md), [O25](../edge-cases.md) |
 | Code | `crates/worker/src/log.rs`, `crates/worker/src/metrics.rs`, `crates/worker/src/ops/` (alert evaluator, DLQ consumer), `crates/core/src/slo.rs` (alert rule evaluation, pure) |
 
 ## 1. Signals
@@ -79,7 +79,7 @@ template in [Rust workspace](rust-workspace.md#8-generated-wranglertoml).
 | `route`, `method`, `status` | pattern, verb, int | `fetch` | The matched route **pattern**, never the raw path or query |
 | `code` | error or reason code | on failure | `ErrorCode` or a reason from [Errors](../../reference/errors.md) |
 | `queue`, `attempt` | name, int | queue handlers | |
-| `message_id`, `thread_id`, `job_id`, `domain_id`, `event_id`, `delivery_id`, `export_id`, `erasure_id` | opaque IDs | when relevant | |
+| `message_id`, `thread_id`, `job_id`, `domain_id`, `event_id`, `delivery_id`, `export_id`, `erasure_id`, `user_id` | opaque IDs | when relevant | `user_id` is the person's `usr_` ID (console requests, notifications), never their address |
 | `address_ph` | `ph_` + 16 hex | when an address must be correlated | Pseudonym of the address the event concerns (counterparty or envelope recipient): `HMAC-SHA256(PM_HASH_KEY, address)` truncated |
 | `transport`, `provider_code`, `smtp_code` | short codes | outbound and delivery | `E_RATE_LIMIT_EXCEEDED`, `550`, `5.1.1`; never `smtpResponse` text |
 | `mcp_method`, `tool` | JSON-RPC method, MCP tool name | MCP requests | Never the arguments ([MCP](mcp.md#7-limits-logging-and-safety)) |
@@ -112,6 +112,12 @@ template in [Rust workspace](rust-workspace.md#8-generated-wranglertoml).
 | `rpc_owner_mismatch` | error | Durable Object owner check failed ([Design conventions](index.md#5-internal-durable-object-rpc)) |
 | `config_invalid` | error | Required variable or secret missing or malformed |
 | `secrets_reseal_progress` | info | Master-key rotation sweep ([Security](security.md#62-rotation-procedures)) |
+| `identity_key_changed` | info | An identity key was created (explicitly or on first signing), rotated or revoked: `identity_id`, `key_id` or `user_id` of the actor, `detail` = `create`, `rotate` or `revoke`; never key material ([Agent signing keys](agent-keys.md)) |
+| `signature_minted` | info | An agent assertion or HTTP signature was minted: `identity_id`, `key_id`, `detail` = `assertion` or `http_signature`. Never the token, the signature, the audience, `ext`, the URL or the headers ([Security › Logging rules](security.md#12-logging-rules)) |
+| `notification_sent`, `notification_failed`, `notification_deferred` | info / warn / info | The `Notifier` submitted a notification email, had it refused or saw it fail, or held an item back: `tenant_id`, `user_id`, `message_id` once known, `code` on failure, `detail` = the kind (`usage`, `new_mail`, `needs_person`, `account`) or the deferral reason. Never an address or the email's text ([Notifications](notifications.md)) |
+| `notifier_handoff_failed` | warn | The `pm-webhooks` consumer could not hand a new-mail event to the tenant's Notifier; the delivery work is unaffected: `tenant_id`, `event_id`, `code` ([Webhooks](webhooks.md#handing-new-mail-to-the-notifier)) |
+| `notification_unsubscribe` | info | `POST /console/notifications/unsubscribe`: `tenant_id` and `user_id` when the token verified, `detail` = the kind, `code` = `expired` or `invalid` otherwise; never the token |
+| `usage_alert` | info | `TenantQuota` asked the Notifier for a usage alert: `tenant_id`, `detail` = `{feature}:{threshold}` |
 | `panic` | error | Panic hook; source location only |
 | `metric` | debug | `PM_ENV = "local"` only: a metrics data point |
 
@@ -195,6 +201,14 @@ GROUP BY domain_id
 | `webhook_disabled_total` | counter | reason | `pm-webhooks` |
 | `outbox_undispatched_age_ms` | observation | owner (`mailbox`, `domain`, `job`) | outbox dispatch |
 | `webhook_ssrf_blocked_total` | counter | – | `pm-webhooks`, webhook create and update |
+| `identity_keys_total` | counter | op (`create`, `rotate`, `revoke`) | `fetch` and console: the identity-key handlers; a key created lazily by a first signing request counts as `create` ([Agent signing keys](agent-keys.md#2-keys)) |
+| `signatures_total` | counter | kind (`assertion`, `http_signature`), result (`ok`, or the error code, for example `rate_limited`, `identity_paused`, `policy_denied`, `web_bot_auth_disabled`) | `fetch`: `POST …/assertions` and `POST …/http-signatures` |
+| `well_known_requests_total` | counter | endpoint (`identity_jwks`, `directory`), status_class | `fetch`: `GET /.well-known/jwks/{identity_id}.json` and `GET /.well-known/http-message-signatures-directory` |
+| `notifications_sent_total` | counter | kind (`usage`, `new_mail`, `needs_person`, `account`) | `Notifier`: an email accepted by the outbound pipeline (`202`) ([Notifications](notifications.md#8-notifier-object)) |
+| `notifications_failed_total` | counter | kind, reason (the error code of a refused or unfinished submit, for example `unavailable` or `timeout`; or the message's `reason` when an accepted notification ends `failed` or `rejected`, for example `domain_failing_no_fallback`) | `Notifier`, for submits; the system identity's mailbox, for accepted notifications that end `failed` or `rejected`. A bounce or complaint is not counted here: it pauses the person's preferences ([O17](../edge-cases.md)) |
+| `notifications_deferred_total` | counter | reason (`cap_person`, `cap_workspace`, `paused`, `platform_domain`) | `Notifier`: an item held back by a daily cap (into the next digest, [O24](../edge-cases.md)), skipped while the person's preferences are paused, or kept for the hourly retry while the platform domain is `failing` ([O25](../edge-cases.md)) |
+| `notification_unsubscribes_total` | counter | kind (empty when the token cannot be read), result (`ok`, `expired`, `invalid`) | `fetch`: `POST /console/notifications/unsubscribe` ([O18](../edge-cases.md)) |
+| `usage_alerts_total` | counter | feature (`inboxes`, `sends`, `triage`, `custom_domains`, `storage_gb`, `seats`), threshold (`80`, `100`) | `TenantQuota`: a `NotifierRequest::UsageThreshold` sent, once per threshold per period, or after the 24-hour cooldown for counts ([Notifications §4](notifications.md#4-usage-alerts)) |
 | `search_requests_total` | counter | mode, scope, result (`ok`, `degraded`, `partial`, code) | `fetch` |
 | `search_ms` | observation | mode, scope, fanout (`1`, `2-10`, `11-100`) | `fetch` |
 | `agentic_requests_total` | counter | status | `fetch` |
@@ -291,7 +305,9 @@ the window (the Custom Alert "minimum event count").
 | `provider_quota_80` | B | Only when `PM_DAILY_SEND_QUOTA` is set: today's (UTC) `sends` in `usage_daily`, summed over live tenants, reach 80% of it ([G3](../edge-cases.md)) | ticket | [Quota exhausted](#quota-exhausted) |
 | `quota_warning` | C | `quota.warning` at 80% and 100% of a tenant or identity cap | – (tenant-facing) | [Quota exhausted](#quota-exhausted) |
 | `domain_failing:{domain_id}` | B + C | Domain enters `failing` or `suspended` (`domain.failing`, `domain.suspended`) | ticket | [Domain failing](#domain-failing) |
-| `mailbox_size:{identity_id}` | B | Mailbox SQLite size > 70% of 10 GB (7,516,192,768 bytes), reported by the mailbox's hourly size check | ticket | [Abusive identity](#abusive-identity) (archive or split) |
+| `inbound_throttled` | A | `inbound_throttled_total` > 100 over 1 h: one or more senders exceed `inbound.per_sender_per_hour` and their excess is stored `throttled` ([D5](../edge-cases.md)) | ticket | [Abusive identity](#abusive-identity) (the affected mailbox's `rate_windows` rows name the sender; add a receive-block if it is abuse) |
+| `stripe_webhook_errors` | B | Only with `PM_BILLING=stripe`: at least one `billing_events` row with `outcome` starting `error:` received in the last hour (the detail lists each `type` and code) | ticket | [Billing design › Stripe webhook](billing.md#stripe-integration) (fix the endpoint's event list, or the customer mismatch) |
+| `mailbox_size:{identity_id}` | B | Mailbox SQLite size > 70% of 10 GB (7,516,192,768 bytes), reported by the mailbox's size check (at most hourly, after a write; [Data model › Mailbox notes](data-model.md#mailbox-notes)) | ticket | [Abusive identity](#abusive-identity) (archive or split) |
 | `abuse_pause:{identity_id}` | B + C | An identity paused with `abuse_threshold` (`identity.paused`) | ticket | [Abusive identity](#abusive-identity) |
 | `erasure_failed:{erasure_id}` | B + C | Erasure request `failed` (`erasure.failed`) | page | [Erasure failure](#erasure-failure) |
 | `erasure_overdue:{erasure_id}` | B | Erasure still `running` 20 h after creation | page | [Erasure failure](#erasure-failure) |
@@ -302,6 +318,7 @@ the window (the Custom Alert "minimum event count").
 | `config_invalid` | A | `config_invalid_total` > 0 | page | `pmail doctor` |
 | `webhook_secret_unavailable` | A | `webhook_attempts_total{result=secret_unavailable}` > 0 over 15 minutes (a sealed secret no longer opens: wrong or rotated `PM_MASTER_KEY`, [Webhooks](webhooks.md#secrets)) | page | [Security › Rotation procedures](security.md#62-rotation-procedures) (`PM_MASTER_KEY`) |
 | `webhook_ssrf_blocked` | A | `webhook_ssrf_blocked_total` > 20 over 1 h | ticket | [Integrator API down](#integrator-api-down) (an endpoint's DNS now points at a blocked range) |
+| `notification_send_failures` | A | `notifications_failed_total` > 0 in each of 3 consecutive hours, or > 20 in one hour | ticket | [Domain failing](#domain-failing) for the platform domain first (system mail has no fallback, [Notifications §7](notifications.md#7-when-the-platform-domain-is-failing)), then [Email Sending outage](#email-sending-outage) |
 | SLO burn rules | A | Section 5.2 | page / ticket | The runbook of the failing path |
 
 ### 5.4 The state alert evaluator
@@ -346,6 +363,7 @@ API, so it works from any tool that can call that API.
 | Inbound | Accepted, staged, rejected and temp-failed per hour; quarantine reasons; verdict mix; `inbound_ingest_ms` and `webhook_delivery_latency_ms{event_class=inbound}` p50/p95/p99 by `first_attempt`; backscatter and throttling; drops by reason and source; SES: SNS rejections, auth disagreements, lost objects |
 | Outbound and delivery | Sends by transport and outcome; bounce and complaint rate per domain; uncertain and reconciled; fallback sends per domain; provider quota errors; delivery orphans |
 | Webhooks | Attempts by result and error code; dead deliveries; endpoints over 10 consecutive failures; attempt latency |
+| Identity and notifications | Signing calls by kind and result; identity-key operations; JWKS and directory requests by status class; notifications sent, failed and deferred by kind and reason; unsubscribes by result; usage alerts by feature and threshold |
 | Search and AI | Latency per mode and scope; degraded and partial share; agentic status mix; AI call failures by purpose; index job failures |
 | Jobs and privacy | Erasure durations and status; retention purges per store; DLQ open items per queue |
 | Domains | Domains per state and per method; transitions; check outcomes per resolver; SES identities against the 10,000 per Region |
@@ -360,8 +378,14 @@ API, so it works from any tool that can call that API.
   says is shown here. When SES is configured, the body also has `"ses_region": "eu-west-2"` (the value
   of `PM_SES_REGION`), so anyone can see where AWS processes mail
   ([Domains on any DNS host §11](domain-connections.md#11-privacy-and-jurisdiction)).
+- `200 {"status": "degraded", …}` when the Worker runs with a feature off because its configuration is
+  incomplete: `"ses": "sns_topic_missing"` (SES credentials and region set, `PM_SES_SNS_TOPIC_ARN`
+  missing: the SES transport is off) or `"billing": "stripe_secrets_missing"` (`PM_BILLING=stripe`
+  without its secrets: billing is not started) ([Rust workspace › Startup rules](rust-workspace.md#61-errors-and-configuration)).
 - `503` with the error envelope (`unavailable`) when the configuration is invalid (a required variable
-  or secret is missing or malformed; `config_invalid` is logged). Every other handler returns the same.
+  or secret is missing or malformed, or an optional variable is malformed; `config_invalid` is logged
+  with the variable's name, and the body's `details.config_invalid` names it). Every other handler
+  returns the same.
 - It is a liveness check. Dependency health is `pmail doctor`'s job.
 
 ### 7.2 `pmail doctor`
@@ -374,16 +398,17 @@ failure (FR-OPS-3). Output format and exit codes are defined in [CLI and setup](
 | `dns.platform` | MX, SPF, DKIM or DMARC for the platform domain missing or different from the provider API's expected records, on either resolver | The exact record to add |
 | `routing.catch_all` | The platform domain's catch-all rule does not target the Worker | The API call or dashboard step |
 | `sending.domains` | A sending domain is not onboarded, or has `preview_enabled = true` ([Privacy](privacy.md#3-jurisdiction-and-residency)) | Onboarding step; `PATCH … {"preview_enabled": false}` |
-| `sending.event_subscriptions` | A sending domain has no event subscription to `pm-delivery-events` | `pmail domains verify <domain>` |
-| `bindings` | A resource in the generated `wrangler.toml` is missing; D1 or R2 jurisdiction differs from `PM_JURISDICTION`; a queue lacks its dead-letter consumer; the Vectorize index is not 1024-d cosine with eight metadata indexes; `METRICS` missing | The resource to create or `pmail setup` |
+| `sending.event_subscriptions` | A sending domain has no event subscription to `pm-delivery-events` (`delivery_events: "manual"`, the spike S9 fallback), or a subscription is left over from a removed domain | `pmail domains subscribe <domain>`; for a left-over one, `wrangler queues subscription delete <id>` |
+| `bindings` | A resource in the generated `wrangler.toml` is missing; D1 or R2 jurisdiction differs from `PM_JURISDICTION`; a queue lacks its dead-letter consumer; a bound Vectorize index (`VECTORS`, and `VECTORS_NEXT` during a re-embed) is not cosine with the eight metadata indexes, or its dimensions differ from those of the model named in its description (`embed_model=…`): 1,024 for `@cf/baai/bge-m3`, otherwise the length of a probe embedding from that model, as the re-embed step does ( [Search §7.3](search.md#73-re-embed-job-embedding-model-change)); `METRICS` missing | The resource to create or `pmail setup` |
 | `secrets` | A required secret is missing (names only; values are never read). `warn` when `PM_MASTER_KEY_NEXT` is present (an unfinished master-key rotation) | The secret to set, or the rotation step to finish |
 | `observability` | `invocation_logs` is not `false`, or traces are enabled with `PM_ENV = production` | The `wrangler.toml` lines |
 | `worker.version` | The deployed version differs from the CLI's | `pmail upgrade` |
-| `health` | `GET /health` is not `200` | Section 7.1 |
+| `health` | `GET /health` is not `200`, or reports `degraded` (a `warn` that names the feature that is off) | Section 7.1; the missing variable or secret |
 | `alerts` | Any state alert is firing (`GET /v1/audit-events?action=alert.fired`, minus later `alert.resolved`) | The alert's runbook |
 | `dlq` | Open `dlq_items` exist | `pmail dlq list` (`GET /v1/platform/dlq`) |
-| `quota` | Provider quota errors in the last 24 hours; `warn` when `PM_DAILY_SEND_QUOTA` is unset | [Quota exhausted](#quota-exhausted) |
-| `ses` (when `PM_SES_REGION` is set) | `GetAccount`: production access not enabled, or account sending paused; with SES receiving configured, the active receipt rule set is not `PM_SES_RULE_SET` or lacks `pm-deliver`; `PM_SES_REGION` cannot receive mail; the region holds 10,000 identities (new SES domains are refused with `ses_identity_limit`). `warn` at 9,000 or more identities (`ses_identities_90pct`), and when the region is outside the EU under `PM_JURISDICTION=eu` ([CLI › Doctor](cli.md#10-doctor)) | [SES account and receiving](#ses-account-and-receiving) |
+| `quota` | Provider quota errors in the last 24 hours (Analytics Engine SQL API); `warn` when `PM_DAILY_SEND_QUOTA` is unset, and `warn` (never `fail`) when the operator's token lacks Account Analytics · Read, so the errors cannot be counted | [Quota exhausted](#quota-exhausted); the permission in [Deploy › step 2](../../self-hosting.md#2-create-a-cloudflare-api-token) |
+| `web_bot_auth` (when `PM_WEB_BOT_AUTH = "on"`; otherwise `skip`) | `GET /.well-known/http-message-signatures-directory` does not answer `200` with `Content-Type: application/http-message-signatures-directory+json`, lists no key or more than three, or lacks a valid `http-message-signatures-directory` signature for each listed key ([Agent signing keys §3.2](agent-keys.md#32-web-bot-auth-key-directory)) | `pmail keys rotate web_bot_auth`; [Deploy › Signed HTTP requests](../../self-hosting.md#signed-http-requests-web-bot-auth) |
+| `ses` (when `PM_SES_REGION` is set) | `GetAccount`: production access not enabled, or account sending paused; with SES receiving configured, the active receipt rule set is not `PM_SES_RULE_SET` or lacks `pm-deliver`; `PM_SES_REGION` cannot receive mail; the region holds 10,000 identities (new SES domains are refused with `ses_identity_limit`). `warn` at 9,000 or more identities (`ses_identities_90pct`), and when the region is outside the EU and the UK under `PM_JURISDICTION=eu` ([CLI › Doctor](cli.md#10-doctor)) | [SES account and receiving](#ses-account-and-receiving) |
 | `cloudflare.zones` | Never fails. Prints the account's zone count, and `warn`s above 1,000, because the zone limit of a non-Enterprise account is not documented ([Domains on any DNS host §3.2](domain-connections.md#32-nameservers)) | Ask Cloudflare to confirm the account's zone limit |
 | `security_txt` | `PM_SECURITY_CONTACT` unset (`warn`), or `Expires` within 30 days | Set the variable; upgrade |
 | `mail_test` (`--mail-test`) | A message from the platform domain to a platform address does not arrive within 120 s with `verdict: pass` | Prints the observed authserv-id for `PM_TRUSTED_AUTHSERV_ID` |
@@ -424,7 +449,9 @@ wraps it as `pmail dlq list` and `pmail dlq redrive` ([CLI and setup](cli.md)).
 
 - `GET /v1/platform/dlq` lists items (filters `queue`, `status`, `tenant_id`). It returns the queue,
   kind, tenant and timestamps, never the stored body: pointers can carry envelope addresses.
-- `POST /v1/platform/dlq/{dlq_id}/redrive` publishes the stored body back to its source queue through the
+- `POST /v1/platform/dlq/{dlq_id}/redrive` first checks that SHA-256 of `body_json` still equals
+  `body_sha256`. A mismatch (the row was edited or damaged) is refused with `500 internal_error`, logged
+  as `dlq_body_mismatch` and nothing is published. Otherwise it publishes the stored body back to its source queue through the
   Worker's own producer binding (`Q_INBOUND`, `Q_OUTBOUND`, `Q_DELIVERY`, `Q_WEBHOOKS` or `Q_INDEX`), then
   sets `redriven_at` and increments `redrive_count` in the same request, and writes an `audit_log` row
   (`dlq.redrive`). No Cloudflare API token is involved. Every consumer is idempotent
@@ -437,8 +464,8 @@ wraps it as `pmail dlq list` and `pmail dlq redrive` ([CLI and setup](cli.md)).
 | [Bounce spike](#bounce-spike) | `bounce_rate:{domain_id}` |
 | [Complaint spike](#complaint-spike) | `complaint_rate:{domain_id}` |
 | [Quota exhausted](#quota-exhausted) | `provider_quota`, `provider_quota_80`, `quota_warning` |
-| [Email Sending outage](#email-sending-outage) | `uncertain_spike`, `delivery_orphaned`, outbound burn rules |
-| [Domain failing](#domain-failing) | `domain_failing:{domain_id}`, `inbound_reject_spike` |
+| [Email Sending outage](#email-sending-outage) | `uncertain_spike`, `delivery_orphaned`, outbound burn rules, `notification_send_failures` |
+| [Domain failing](#domain-failing) | `domain_failing:{domain_id}`, `inbound_reject_spike`, `notification_send_failures` |
 | [SES account and receiving](#ses-account-and-receiving) | `ses_object_lost`, `ses_sending_paused`, `ses_rule_missing`, `ses_identities_90pct` |
 | [DLQ growth](#dlq-growth) | `dlq:{queue}`, `inbound_tempfail` |
 | [Integrator API down](#integrator-api-down) | `webhook_failing`, `webhook_disabled` |
@@ -520,6 +547,12 @@ Every runbook ends by recording what was done in the incident log and checking t
    TXT or registration changed), issue a new ownership value with `POST /v1/domains/{id}/reprove`.
    For `inbound_reject_spike`, check whether a domain's routing points elsewhere or a sender is guessing
    addresses (dictionary attack); both are visible in `inbound_received_total` by result.
+   For `notification_send_failures`, check the platform domain first: system mail (sign-in,
+   invitations, notifications) has no fallback, so while it is `failing` notification sends fail
+   (`reason` `domain_failing_no_fallback`) or are held back
+   (`notifications_deferred_total{reason=platform_domain}`). The Notifier keeps the items and retries
+   hourly for 24 hours ([O25](../edge-cases.md)); fixing the platform domain within that time loses nothing. If
+   the platform domain is `healthy`, follow [Email Sending outage](#email-sending-outage).
 3. **Verify.** `POST /v1/domains/{id}/verify` twice, a minute apart; the state returns to `healthy` and
    `domain.recovered` is emitted.
 
@@ -574,7 +607,8 @@ Every runbook ends by recording what was done in the incident log and checking t
      -d '{"since": "2026-10-08T00:00:00Z", "until": "2026-10-09T00:00:00Z", "status": "dead"}'
    ```
 
-   Events older than 30 days cannot be replayed (or older than `events_days`, if lower).
+   Replay reaches back 30 days from each event's `occurred_at` (or the tenant's
+   `retention.events_days`, if shorter); older events cannot be replayed.
 3. **Verify.** Replayed deliveries succeed; consumers deduplicate on `webhook-id`.
 
 ### Parser bug
@@ -600,7 +634,10 @@ Every runbook ends by recording what was done in the incident log and checking t
    Sends are not audit rows (each is recorded by its message, events and delivery log): list the
    outbound messages of the identities the key reaches, and query Workers Logs for `key_id = <key>`
    over the last 7 days (route, status, `message_id`). Check webhooks created by the key (URLs pointing
-   somewhere unexpected) and keys it created.
+   somewhere unexpected) and keys it created. If the key held `identities:sign`, its `signature_minted`
+   lines name the identities it signed as; an assertion lives at most 10 minutes and a signed request at
+   most 5, and the identity's private key was never exposed, so no identity key needs rotating for this
+   alone.
 3. **Remediate.** Rotate integrator secrets that may have been read through the key (webhook secrets
    with `rotate-secret`). Cancel queued sends made by the key (`POST …/cancel`). If the key was a
    platform key, review every tenant. For `rpc_owner_mismatch`, treat it as a possible isolation bug:
@@ -690,10 +727,20 @@ set, the nightly copy limits the loss to objects created since the last run (RPO
 | `it::ops::ses_alerts` | `ses_identities_90pct` fires at 9,000 counted identities; `ses_sending_paused` and `ses_rule_missing` fire from a fake `GetAccount` and rule set; the `ses` doctor check reports the same | section 5.3 |
 | `it::ses::object_lost` | A lifecycle-deleted object sets the ledger row to `lost`, increments `ses_object_lost_total` and fires `ses_object_lost` | [N4](../edge-cases.md), NFR-REL-1 |
 | `it::inbound::d4_backscatter_dropped` | `backscatter_total` increments | [D4](../edge-cases.md) |
-| `it::inbound::d5_sender_throttle` | `inbound_throttled_total` increments | [D5](../edge-cases.md) |
+| `it::inbound::d5_sender_throttle` | `inbound_throttled_total` increments, and 101 throttled messages in an hour meet the `inbound_throttled` alert condition | [D5](../edge-cases.md) |
 | `it::send::g3_quota_backoff` | `provider_quota_errors_total` increments and the alert condition is met | [G3](../edge-cases.md) |
 | `it::delivery::g8_race` | `delivery_orphaned_total` increments after the retry schedule | [G8](../edge-cases.md) |
+| `it::notify::platform_domain_failing_retries` | With the platform domain `failing`, notification items are kept and retried hourly for 24 hours, `notifications_deferred_total{reason=platform_domain}` or `notifications_failed_total` increments, and `domain_failing:{domain_id}` fires for the platform domain | [O25](../edge-cases.md) |
+| `it::notify::daily_caps` | The 51st notification for a person in a day goes to the digest and increments `notifications_deferred_total{reason=cap_person}` | [O24](../edge-cases.md) |
 | `core::slo::burn_rate_targets` | The Custom Alert targets in section 5.2 follow from the formula | section 5.2 |
 | `core::slo::alert_state_machine` | Transition rules are pure and deterministic | section 5.4 |
 | `live::ops::metrics_reach_analytics_engine` | On staging, metrics written by a send are queryable through the SQL API | section 3 |
 | `live::ops::restore_drill` | Staging drill: D1 Time Travel restore and a mailbox PITR restore complete within 4 hours with the reconcile steps | NFR-OPS-2 |
+| `it::ops::slo_from_metrics` | Each SLO row of section 4 (NFR-REL-1 to NFR-REL-4, NFR-PERF-1 to NFR-PERF-6, NFR-PRV-1) is computed by the SLO evaluator from metric lines that a scripted flow emitted, with the expected good and total counts | section 4 |
+| `it::bench::send_api_p95` | 1,000 sends through the simulator in workerd: `send_api_ms` p95 ≤ 500 ms; reports the figure, CI warns above | NFR-PERF-1 |
+| `it::bench::queue_to_transport_p95` | 1,000 queued sends: `outbound_queue_to_transport_ms` p95 ≤ 60 s | NFR-PERF-2 |
+| `it::bench::hybrid_p95` | Hybrid search on the 50,000-message mailbox with the fake AI at the recorded Workers AI latencies: p95 ≤ 800 ms (the real figure comes from staging in M20) | NFR-PERF-4 |
+| `it::bench::tenant_fanout_p95` | Tenant search over 10 identities: p95 ≤ 1 s | NFR-PERF-5 |
+| `it::bench::agentic_p95` | Agentic search with the scripted model at recorded latencies: p95 ≤ 8 s, first evidence ≤ 1.5 s | NFR-PERF-6 |
+| `live::slo::inbound_to_webhook` | On staging, Gmail and Outlook mail to a webhook endpoint over the live run: p95 ≤ 30 s, p99 ≤ 120 s | NFR-REL-3 |
+| `live::ops::idle_cost_review` | After a week of idling on staging, the Cloudflare usage report shows no compute beyond the cron and alarm invocations; recorded in the release notes | NFR-COST-1 |

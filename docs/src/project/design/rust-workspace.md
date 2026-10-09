@@ -6,9 +6,9 @@ exact dependency pins, the build profile, the wasm32 rules, the `platform` trait
 
 | | |
 |---|---|
-| Requirements | NFR-SEC-2, NFR-COST-1, FR-OPS-2, FR-PRV-1, FR-API-1 |
+| Requirements | NFR-SEC-2, NFR-COST-1, FR-OPS-2, FR-PRV-1, FR-API-1, FR-SDK-1 (§11) |
 | ADRs | [0001 Rust on Workers](../adr/0001-rust-on-workers.md), [0002 Storage layout](../adr/0002-storage.md), [0005 State machines](../adr/0005-state-machines.md) |
-| Build plan | M0 (skeleton), M4 (platform), M19 (release) |
+| Build plan | M0 (skeleton), M4 (platform), M16 (SDK), M19 (release) |
 
 Facts about external crates and Cloudflare on this page were read on 2026-10-09 from the crates'
 published sources on crates.io/docs.rs, the `workers-rs` repository at tag `v0.8.7`, and
@@ -48,11 +48,11 @@ All crates use edition 2024, `rust-version` equal to the toolchain pin, and
 
 | Crate | Responsibility | May depend on | Must not depend on |
 |---|---|---|---|
-| `core` | Pure logic: MIME parsing and caps, sanitising, text derivation, quote stripping, references, classification, authentication verdicts, trust, attachment sniffing, thread tokens and threading rules, subject normalisation, address validation and confusables, query parser, fusion, citation verifier, triage rules, policy evaluation, DNS record parsing, the domain state machine, the connection-method matrix (`core::connect`), the SMTP client state machine (`core::smtp`), SNS message verification (`core::sns`), SigV4 and SES notification parsing (`core::ses`), TOTP codes (`core::totp`) | `api-types`; pure crates (`mail-parser`, `mail-auth`, `mail-builder`, `ammonia`, `html5ever`, `regex`, `sha2`, `hmac`, `base64`, `serde`, `serde_json`, `idna`, `psl`, `unicode-normalization`) | `worker`, `wasm-bindgen`, `js-sys`, `web-sys`, `platform`, `reqwest`, `tokio`, anything doing I/O, reading the clock or reading randomness |
+| `core` | Pure logic: MIME parsing and caps, sanitising, text derivation, quote stripping, references, classification, authentication verdicts, trust, attachment sniffing, thread tokens and threading rules, subject normalisation, address validation and confusables, query parser, fusion, citation verifier, triage rules, policy evaluation, DNS record parsing, the domain state machine, the connection-method matrix (`core::connect`), the SMTP client state machine (`core::smtp`), SNS message verification (`core::sns`), SigV4 and SES notification parsing (`core::ses`), TOTP codes (`core::totp`), Ed25519 JWKs and RFC 7638 thumbprints (`core::jwk`), JWS signing and verification (`core::jwt`), RFC 9421 signature bases (`core::httpsig`), notification windows, caps and content-free rendering (`core::notify`) | `api-types`; pure crates (`mail-parser`, `mail-auth`, `mail-builder`, `ammonia`, `html5ever`, `regex`, `sha2`, `hmac`, `sha1`, `rsa`, `x509-cert`, `aes-gcm`, `ed25519-dalek`, `zeroize`, `base64`, `serde`, `serde_json`, `idna`, `psl`, `unicode-normalization`, `whatlang`, `chrono`, `chrono-tz`) | `worker`, `wasm-bindgen`, `js-sys`, `web-sys`, `platform`, `reqwest`, `tokio`, anything doing I/O, reading the clock or reading randomness |
 | `platform` | Traits for every Cloudflare capability, their Cloudflare implementations (wasm32 only), and in-memory fakes (`platform::fakes`, native) | `worker`, `wasm-bindgen`, `wasm-bindgen-futures`, `js-sys`, `web-sys`, `getrandom`, `serde`, `serde_json`, `api-types` | `core` business rules (it is a capability layer), `tokio`, `reqwest` |
 | `api-types` | Request, response, object and event types; `ErrorCode`; OpenAPI generation | `serde`, `serde_json`, `utoipa` | everything else |
-| `worker` | HTTP router and handlers, `email`/`queue`/`scheduled` handlers, the four Durable Object classes, consumers, transports, MCP endpoint, agentic loop | `core`, `api-types`, `platform`, pure crates | `worker` (the dependency), `wasm-bindgen`, `js-sys`, `web-sys` directly; `tokio`, `reqwest` |
-| `sdk` | Rust client for the REST API | `api-types`, `reqwest`, `serde`, `serde_json` | `worker`, `platform`, `core` |
+| `worker` | HTTP router and handlers, `email`/`queue`/`scheduled` handlers, the six Durable Object classes, consumers, transports, MCP endpoint, agentic loop | `core`, `api-types`, `platform`, pure crates | `worker` (the dependency), `wasm-bindgen`, `js-sys`, `web-sys` directly; `tokio`, `reqwest` |
+| `sdk` | Rust client for the REST API, and the agent-assertion verifier ([§11](#11-the-rust-sdk-fr-sdk-1)) | `api-types`, `reqwest`, `serde`, `serde_json`, `ed25519-dalek`, `base64` | `worker`, `platform`, `core` |
 | `cli` | `pmail` | `sdk`, `api-types`, `core` (address validation, DNS record parsing for `doctor`), `clap`, `reqwest` | `worker`, `platform` |
 | `conformance` | MIME corpus, expected outputs, RFC conformance runner, golden-set generators | `core`, `api-types`, `sdk`; dev: `rmcp` (native) | `worker` (the dependency) |
 | `xtask` | Build, size budget, layering check, itest, fuzz, release, OpenAPI, evals, Unicode table generation | anything native | – |
@@ -86,12 +86,14 @@ pylota_mail_platform::export_worker! {
         DomainMonitor   => crate::domains::MonitorObject,
         JobRunner       => crate::jobs::RunnerObject,
         TenantQuota     => crate::quota::QuotaObject,
+        SesControl      => crate::domains::SesControlObject,
+        Notifier        => crate::notify::NotifierObject,
     }
 }
 ```
 
 The expansion contains only `#[wasm_bindgen(…, wasm_bindgen = $crate::cf::glue::wasm_bindgen)]` exports
-(the `fetch`, `email`, `queue` and `scheduled` functions and the four classes with their constructor,
+(the `fetch`, `email`, `queue` and `scheduled` functions and the six classes with their constructor,
 `fetch` and `alarm` methods), each a one-line call into an ordinary function in
 `pylota_mail_platform::cf::glue` that converts the JS values and invokes the trait. The glue mirrors what
 `worker-macros` 0.8.7 generates, including its `Result`-to-exception behaviour. Spike S1 proves it
@@ -136,18 +138,57 @@ reqwest = { version = "=0.13.5", default-features = false, features = ["json", "
 # Console (worker): server-rendered HTML, no JavaScript
 maud   = "=0.27.0"                                                     # templates: console/layout.rs, pages/*.rs
 qrcode = { version = "=0.14.1", default-features = false, features = ["svg"] }   # TOTP enrolment QR code, inline SVG
+
+# Pure crates for core (crates.io sparse index, read 2026-10-09; each release file predates 28 June 2026,
+# so all are more than two weeks old)
+sha1      = { version = "=0.11.0", default-features = false }  # core::totp: HMAC-SHA1 with hmac 0.13 (digest 0.11)
+rsa       = { version = "=0.9.10", default-features = false }  # core::sns: SHA256withRSA verification only
+x509-cert = { version = "=0.2.5", default-features = false }   # core::sns: parse the SNS signing certificate
+whatlang  = "=0.18.0"                                           # core::triage: language of extracted_text
+chrono    = { version = "=0.4.45", default-features = false, features = ["alloc"] }  # local dates; no clock
+chrono-tz = { version = "=0.10.4", default-features = false }  # IANA zones for tenants.timezone
+
+# Signing keys (core::jwk, core::jwt, core::httpsig, and the SDK verifier; crates.io sparse index, read
+# 2026-10-09: ed25519-dalek 3.0.0 published 2026-07-06, zeroize 1.9.0 published 2026-06-12)
+ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["zeroize"] }
+zeroize       = "=1.9.0"                                        # unsealed seed buffers (Zeroizing)
 ```
 
 Crates used without a verified version in this document are added with an exact pin chosen **at build
 time** (the newest release at least two weeks old), and recorded in `Cargo.toml`: `html5ever` and
 `markup5ever_rcdom` (DOM walk for hidden-text removal and text derivation; same versions `ammonia`
 resolves), `regex` (custom references; `default-features = false`, features `std`, `unicode-perl`),
-`idna`, `psl`, `unicode-normalization`, `aes-gcm` (webhook secrets at rest), `rsa` and `x509-cert` (SNS
-signature verification, SHA256withRSA), `sha1` (TOTP's HMAC-SHA1), `thiserror`, `futures-util`, and for
+`idna`, `psl`, `unicode-normalization`, `aes-gcm` (secrets at rest, `core::crypto`), `thiserror`, `futures-util`, and for
 native code only: `rusqlite` with a bundled SQLite that has FTS5 (fakes), `proptest`, `libfuzzer-sys`,
 `tar`, `flate2`, `toml`.
 
 Notes on specific crates (all read 2026-10-09):
+
+- **`rsa` 0.9.10, `x509-cert` 0.2.5, `sha1` 0.11.0.** The `rsa` line that uses `sha2` 0.11 is still a
+  release candidate (`0.10.0-rc.19` on the sparse index), so v1 uses 0.9.10, whose `sha2` and `sha1`
+  dependencies are optional and stay off. `core::sns` hashes the string to sign with `sha2` 0.11 and
+  calls `RsaPublicKey::verify` with a `Pkcs1v15Sign` holding the fixed SHA-256 DigestInfo prefix, so no
+  second `sha2` enters the graph (the duplicate ban in [Security](security.md) stays satisfied). That
+  `Pkcs1v15Sign` can be built from a prefix without a 0.10 `Digest` type: verify at build time; if it
+  cannot, allow `sha2` 0.10 inside `rsa` only, with a `deny.toml` skip entry. `x509-cert` 0.2.5 uses the
+  same `der` 0.7 and `spki` 0.7 as `rsa` 0.9. RustSec advisory RUSTSEC-2023-0071 (Marvin attack, no
+  patched version as of 2026-09-12, [advisory](https://rustsec.org/advisories/RUSTSEC-2023-0071.html),
+  read 2026-10-09) concerns private-key operations. The Worker holds no RSA private key and only
+  verifies public signatures, so `deny.toml` ignores that advisory with this reason. Move to `rsa` 0.10
+  when it is stable.
+- **`ed25519-dalek` 3.0.0 and `zeroize` 1.9.0.** `mail-auth` 0.13.3 already depends on `ed25519-dalek`
+  `^3` through its `rust-crypto` feature, with the crate's default features (`fast`, `zeroize`) and
+  `pkcs8`, `alloc`. Cargo unifies features, so although the workspace declares
+  `default-features = false, features = ["zeroize"]`, the Worker build also has `fast` (the precomputed
+  basepoint tables); spike S4 measures the bundle with them, and nothing is gained by fighting the
+  unification. `SigningKey` zeroises itself on drop (`zeroize`), and the unsealed 32-byte seed is held in
+  `zeroize::Zeroizing` until the key is built. `zeroize` 1.9.1 (2026-10-06) is newer than two weeks, so
+  1.9.0 is pinned ([Agent signing keys](agent-keys.md)).
+- **`whatlang` 0.18.0.** No dependencies. `detect(text)` returns the language (ISO 639-3), the script and
+  a confidence; [Triage](triage.md) maps the language to a BCP 47 primary tag through a compiled table.
+- **`chrono` 0.4.45 and `chrono-tz` 0.10.4.** Without default features neither reads the clock: `core`
+  receives `now` and converts it with `chrono_tz::Tz` parsed from `tenants.timezone`. An unknown zone
+  name is refused when the tenant is created or updated (`400 invalid_request`, path `timezone`).
 
 - **`mail-auth` 0.13.3.** `dns-hickory` and `dns-doh` are mutually exclusive and `dns-hickory` is a
   default feature, so default features must be off. The crate README documents
@@ -258,7 +299,14 @@ pub type PResult<T> = Result<T, PlatformError>;
 /// makes every handler return 503 `unavailable` and logs `config_invalid` with the variable name.
 pub struct Config {
     pub platform_domain: String, pub api_host: String, pub jurisdiction: Jurisdiction,
+    pub console_host: String,              // PM_CONSOLE_HOST, default api_host; used by invitation and
+                                           // sign-in links, so it is set even when PM_CONSOLE = off
+    pub system_from: SystemFrom,           // PM_SYSTEM_FROM: display name and address of the system
+                                           // identity (identity-domains.md › The system identity)
     pub env: DeployEnv, pub embed_model: String, pub rerank_model: Option<String>,
+    pub embed_model_previous: Option<String>, // PM_EMBED_MODEL_PREVIOUS: set only during a re-embed
+                                           // (search.md § 7.3); semantic reads use it until the new
+                                           // index is complete
     pub agent_model: String, pub triage_model: String, pub ai_gateway: Option<String>,
     pub trusted_authserv_id: Option<String>, pub doh_resolvers: [String; 2],
     pub ses_region: Option<String>, pub ses_sns_topic_arn: Option<String>, pub scanner_url: Option<String>,
@@ -268,8 +316,12 @@ pub struct Config {
     pub ses_inbound: Option<SesInbound>,   // PM_SES_INBOUND_{BUCKET,TOPIC_ARN,QUEUE_URL}; Some only when all three are set
     pub ses_rule_set: String,              // PM_SES_RULE_SET
     pub cf_subdomain_setup: bool,          // PM_CF_SUBDOMAIN_SETUP = "on"
-    pub console: Option<ConsoleConfig>,    // None when PM_CONSOLE = off. PM_CONSOLE_HOST, PM_SIGNUP, PM_SYSTEM_FROM,
-                                           // PM_TERMS_*, PM_PRIVACY_URL, PM_DPA_URL, PM_SIGNUP_BLOCKED_DOMAINS,
+    pub web_bot_auth: bool,                // PM_WEB_BOT_AUTH = "on" (agent-keys.md § 5); default off
+    pub identity_key_overlap_days: u32,    // PM_IDENTITY_KEY_OVERLAP_DAYS, default 7 (agent-keys.md § 2)
+    pub notifications: bool,               // PM_NOTIFICATIONS = "on" (default); off sends only account
+                                           // emails (notifications.md § 9); read even when PM_CONSOLE = off
+    pub console: Option<ConsoleConfig>,    // None when PM_CONSOLE = off. PM_SIGNUP, PM_TERMS_*, PM_PRIVACY_URL,
+                                           // PM_DPA_URL, PM_SIGNUP_BLOCKED_DOMAINS,
                                            // PM_OAUTH_{GOOGLE,GITHUB}_CLIENT_ID, PM_QUARANTINE_KEY_RELEASE
     pub billing: BillingConfig,            // PM_BILLING, PM_PLAN_CATALOG, PM_BILLING_GRACE_DAYS
     pub secrets: Secrets,
@@ -292,10 +344,25 @@ are listed in [Configuration › Variables](../../reference/configuration.md#var
 than `closed` without `PM_TERMS_URL`, `PM_PRIVACY_URL`, `PM_DPA_URL` and `PM_TERMS_VERSION` is
 `config_invalid`, because those four are then required.
 
-The thread, link and cursor keys are not secrets of the Worker: they live sealed in D1 `signing_keys`
+**Startup rules.** `Config` is read once per isolate; each case below has one outcome:
+
+| Condition | Outcome |
+|---|---|
+| A required variable is missing, or a required secret is missing or of the wrong length | Every handler answers `503 unavailable`; the log line `config_invalid` names the variable; `/health` answers `503 unavailable` with `details.config_invalid = "<NAME>"` |
+| An optional variable is set but malformed (not one of its allowed values, not a number where one is required, an unparsable `PM_SYSTEM_FROM`, `PM_DOH_RESOLVERS` without exactly two `https://` URLs, invalid JSON in `PM_DEFAULT_POLICY` or `PM_PLAN_CATALOG`) | The same as a missing required variable: a startup error naming the variable (`config_invalid`). An optional value is never silently ignored or replaced by its default |
+| SES credentials and `PM_SES_REGION` are set, but `PM_SES_SNS_TOPIC_ARN` is missing | The Worker starts. The SES transport is off: `ses` is `None`, so domains needing it get `422 transport_unavailable` (`ses_not_configured`) and `PATCH` to `ses` is refused. `/health` reports `"status": "degraded"` with `"ses": "sns_topic_missing"`, and `pmail doctor` fails `ses` |
+| `PM_BILLING=stripe` without `PM_STRIPE_SECRET_KEY` or `PM_STRIPE_WEBHOOK_SECRET` | The Worker starts with billing not started: every workspace behaves as `disabled` (no plan checks; holds still run), Checkout, Portal and `/billing/stripe/webhook` answer `503 unavailable`, `/health` reports `"status": "degraded"` with `"billing": "stripe_secrets_missing"`, and `pmail doctor` fails `secrets` |
+| `PM_SIGNUP` is not `closed` and a `PM_TERMS_*`, `PM_PRIVACY_URL` or `PM_DPA_URL` value is missing | `config_invalid`, as above |
+| `PM_WEB_BOT_AUTH=on` in a release built without signed HTTP requests (spike S13 failed, so its fallback was taken) | `config_invalid` naming `PM_WEB_BOT_AUTH`: the variable cannot be turned on, and is never silently ignored |
+
+Test: `platform::config::startup_rules` covers each row.
+
+The thread, link, cursor and `web_bot_auth` keys are not secrets of the Worker: they live sealed in D1 `signing_keys`
 ([Data model](data-model.md#1-d1-control-plane)). `worker::keyring` loads and opens them with
 `master_key` (or `master_key_next`, by the envelope's kid), caches the opened ring per isolate for
-5 minutes, and creates the first key of a purpose on first use with `Rng`.
+5 minutes, and creates the first key of a purpose on first use with `Rng` (`web_bot_auth` only while
+`PM_WEB_BOT_AUTH=on`). Identity signing keys live in `identity_keys`, one ring per identity, opened the
+same way when the identity signs ([Agent signing keys](agent-keys.md#2-keys)).
 
 ### 6.2 Trait set
 
@@ -321,8 +388,8 @@ pub trait ControlDb {
     async fn batch(&self, stmts: Vec<Stmt>) -> PResult<Vec<ExecMeta>>;  // one SQL transaction
 }
 
-// Durable Objects: calling them (bindings MAILBOX, DOMAINS, JOBS, QUOTA) ---------------
-#[derive(Clone, Copy)] pub enum DoClass { Mailbox, Domain, Job, Quota }
+// Durable Objects: calling them (bindings MAILBOX, DOMAINS, JOBS, QUOTA, SES_CONTROL, NOTIFY) ---
+#[derive(Clone, Copy)] pub enum DoClass { Mailbox, Domain, Job, Quota, SesControl, Notifier }
 pub trait ObjectClient {
     fn new_object_id(&self, class: DoClass) -> PResult<String>;        // section 6.4
     async fn call<Req: Serialize, Resp: DeserializeOwned>(
@@ -420,7 +487,8 @@ pub trait MailSender {
 }
 
 // Rate limiting (bindings RL_*) ---------------------------------------------------------
-#[derive(Clone, Copy)] pub enum RlBucket { Api, Search, Agentic, Send, SignIn }   // SignIn: RL_SIGNIN, keyed by client IP
+#[derive(Clone, Copy)] pub enum RlBucket { Api, Search, Agentic, Send, SignIn, Sign }
+// SignIn: RL_SIGNIN, keyed by client IP. Sign: RL_SIGN, keyed by identity ID (assertions and HTTP signatures)
 pub trait RateLimiter { async fn allow(&self, bucket: RlBucket, key: &str) -> PResult<bool>; }
 
 // DNS over HTTPS ------------------------------------------------------------------------
@@ -499,7 +567,7 @@ Implementation notes:
 
 ### 6.3 Durable Object classes
 
-`worker` defines four classes, each a thin shell around a logic module that only sees platform traits:
+`worker` defines six classes, each a thin shell around a logic module that only sees platform traits:
 
 ```rust
 // crates/platform/src/cf/glue.rs
@@ -509,8 +577,10 @@ pub trait ObjectApp: Sized + 'static {
                                                                     // dispatches the request enum, encodes RpcResult
     async fn alarm(&self);                                          // runs the due purposes (Design conventions, rule 5)
 }
-// crates/worker: MailboxObject, MonitorObject, RunnerObject, QuotaObject implement ObjectApp and wrap
-// mailbox::Mailbox<CfPlatform>, domains::Monitor<CfPlatform>, jobs::Runner<CfPlatform>, quota::Quota<CfPlatform>.
+// crates/worker: MailboxObject, MonitorObject, RunnerObject, QuotaObject, SesControlObject and NotifierObject
+// implement ObjectApp and wrap mailbox::Mailbox<CfPlatform>, domains::Monitor<CfPlatform>,
+// jobs::Runner<CfPlatform>, quota::Quota<CfPlatform>, domains::SesControl<CfPlatform> and
+// notify::Notifier<CfPlatform>.
 ```
 
 The logic modules (`mailbox::Mailbox<P>`, `domains::Monitor<P>`, …) are generic over a `P: Platform`
@@ -522,7 +592,7 @@ standing in for DO SQLite) and against Cloudflare in workerd.
 - `new_object_id(class)` calls `unique_id_with_jurisdiction("eu")` on the class's namespace when
   `PM_JURISDICTION = eu`, otherwise `unique_id()`, and returns `ObjectId::to_string()` (hex).
 - The string is stored in D1 when the owning row is created, in the same `INSERT`: `tenants.quota_do_id`,
-  `identities.mailbox_do_id`, `domains.monitor_do_id`, `jobs.runner_do_id`. The first RPC to the object
+  `tenants.notify_do_id`, `identities.mailbox_do_id`, `domains.monitor_do_id`, `jobs.runner_do_id`. The first RPC to the object
   is `Init`, which writes the owner into `meta`.
 - Objects are always addressed with `id_from_string(stored)`. Cloudflare preserves the jurisdiction on
   every ID-construction path, including `idFromString`
@@ -606,6 +676,12 @@ extern "C" {
 | Vectorize delete | `POST …/vectorize/v2/indexes/pm-mail-chunks/delete_by_ids` with `{ "ids": [...] }` |
 | Vectorize get | `POST …/vectorize/v2/indexes/pm-mail-chunks/get_by_ids` with `{ "ids": [...] }` |
 | toMarkdown | `POST https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/tomarkdown`, multipart, one `files` part per document (the REST response spells the field `mimeType`) |
+| `AI.run` (if the binding cannot pass the `gateway` option or a model's input) | `POST https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{model}` with the same JSON input; through AI Gateway when `PM_AI_GATEWAY` is set (`https://gateway.ai.cloudflare.com/v1/{account_id}/{gateway_id}/workers-ai/{model}`, with the `cf-aig-collect-log: false` and `cf-aig-skip-cache: true` headers on content-bearing calls; header names from the AI Gateway logging and caching docs, read 2026-10-09). Endpoint shapes: verify at build time (S6) |
+
+Once any REST fallback is taken, `PM_CF_API_TOKEN` (with Vectorize Write and Workers AI Read) becomes
+required on every deployment, not only for some domain methods: `/health` reports `degraded` and
+`pmail doctor` fails `secrets` without it. [Configuration](../../reference/configuration.md#secrets)
+and [Deploy](../../self-hosting.md#tenant-domains) are updated in the same change as the spike result.
 
 ## 8. Generated `wrangler.toml`
 
@@ -639,6 +715,9 @@ PM_LOG_LEVEL           = "info"
 PM_DEFAULT_POLICY      = "{}"
 PM_CONSOLE_HOST        = "{mail.example.com}"  # always written; the API host unless --console-host
 PM_SIGNUP              = "closed"              # always written
+PM_WEB_BOT_AUTH        = "off"                 # always written; "on" only after spike S13 passed
+PM_IDENTITY_KEY_OVERLAP_DAYS = "7"             # always written
+PM_NOTIFICATIONS       = "on"                  # always written
 # optional, written only when set: PM_AI_GATEWAY, PM_SCANNER_URL, PM_SECURITY_CONTACT, PM_DAILY_SEND_QUOTA,
 # PM_BACKUP_BUCKET,
 #   SES (both directions): PM_SES_REGION, PM_SES_SNS_TOPIC_ARN, PM_SES_INBOUND_BUCKET, PM_SES_INBOUND_TOPIC_ARN,
@@ -651,6 +730,10 @@ PM_SIGNUP              = "closed"              # always written
 binding       = "DB"
 database_name = "pylota-mail"
 database_id   = "{d1-id}"                      # jurisdiction is fixed when the database is created
+migrations_dir = "migrations/d1"               # Wrangler resolves it against this file's directory and uses
+                                               # it only for `wrangler d1 migrations` (the itest harness, whose
+                                               # file in deploy/ gets "../migrations/d1"); pmail deploy applies
+                                               # the bundle's files itself (cli.md §8.5)
 
 [[r2_buckets]]
 binding      = "BLOBS"
@@ -675,10 +758,16 @@ class_name = "JobRunner"
 [[durable_objects.bindings]]
 name = "QUOTA"
 class_name = "TenantQuota"
+[[durable_objects.bindings]]
+name = "SES_CONTROL"
+class_name = "SesControl"
+[[durable_objects.bindings]]
+name = "NOTIFY"
+class_name = "Notifier"
 
 [[migrations]]
-tag                = "v1"
-new_sqlite_classes = ["IdentityMailbox", "DomainMonitor", "JobRunner", "TenantQuota"]
+tag                = "v1"                      # one tag until v1.0 (no deployment exists before M20)
+new_sqlite_classes = ["IdentityMailbox", "DomainMonitor", "JobRunner", "TenantQuota", "SesControl", "Notifier"]
 
 [[queues.producers]]
 binding = "Q_INBOUND"
@@ -704,7 +793,7 @@ dead_letter_queue = "pm-inbound-dlq"
 [[queues.consumers]]
 queue = "pm-outbound"
 max_batch_size = 10
-max_retries = 100
+max_retries = 100                              # unexpected errors only; back-offs re-enqueue (outbound.md)
 dead_letter_queue = "pm-outbound-dlq"
 [[queues.consumers]]
 queue = "pm-delivery-events"
@@ -758,6 +847,10 @@ simple = { limit = 120, period = 60 }
 name = "RL_SIGNIN"                             # keyed by client IP (CF-Connecting-IP); console sign-in routes
 namespace_id = "{1005}"
 simple = { limit = 10, period = 60 }
+[[ratelimits]]
+name = "RL_SIGN"                               # keyed by identity ID; assertions and HTTP signatures
+namespace_id = "{1006}"
+simple = { limit = 600, period = 60 }
 
 [triggers]
 crons = ["* * * * *", "*/15 * * * *"]
@@ -772,8 +865,8 @@ head_sampling_rate = 1
 [observability.logs]
 invocation_logs = false                        # invocation logs carry URLs and recipients (FR-PRV-6)
 
-[observability.traces]
-enabled = false                                # staging: true, head_sampling_rate = 0.1
+[observability.traces]                         # preserved across re-renders (CLI and setup § 7)
+enabled = false                                # staging sets enabled = true, head_sampling_rate = 0.1
 
 [[analytics_engine_datasets]]                  # METRICS (Configuration › Bindings)
 binding = "METRICS"
@@ -784,8 +877,8 @@ dataset = "pylota_mail_metrics"
   (during a master-key rotation only), `PM_CF_API_TOKEN`, `PM_SES_ACCESS_KEY_ID`,
   `PM_SES_SECRET_ACCESS_KEY`, `PM_STRIPE_SECRET_KEY`, `PM_STRIPE_WEBHOOK_SECRET`,
   `PM_OAUTH_GOOGLE_CLIENT_SECRET`, `PM_OAUTH_GITHUB_CLIENT_SECRET`) are uploaded with `wrangler secret`,
-  never written to the file. Thread, link and cursor keys are not secrets: the Worker generates them into
-  D1 `signing_keys`.
+  never written to the file. Thread, link, cursor and `web_bot_auth` keys are not secrets: the Worker
+  generates them into D1 `signing_keys`, and identity signing keys into `identity_keys`.
 - `pm-delivery-events` is fed by Email Sending event subscriptions. Its `Q_DELIVERY` producer binding
   exists only so `POST /v1/platform/dlq/{dlq_id}/redrive` can republish dead-lettered delivery events.
 - Durable Object classes use the `[[migrations]]` form named in the configuration reference. Cloudflare
@@ -797,7 +890,7 @@ dataset = "pylota_mail_metrics"
   runs `cargo install worker-build --version 0.8.7 --locked` and `worker-build --release` in
   `crates/worker` before `wrangler deploy`.
 - The rate-limiting `namespace_id` values are positive integers unique within the account; setup picks
-  five unused ones and keeps them across re-runs. Rate-limit bindings need Wrangler 4.36.0 or later.
+  six unused ones and keeps them across re-runs. Rate-limit bindings need Wrangler 4.36.0 or later.
 
 ## 9. `xtask`
 
@@ -869,11 +962,76 @@ the CLI (`cargo cyclonedx --format json`); signed `SHA256SUMS` and build provena
 the SBOMs, `SHA256SUMS` and `SHA256SUMS.sig`; then `cargo publish` for `pylota-mail` and
 `pylota-mail-cli` (and the crates they depend on).
 
-## 11. Tests
+## 11. The Rust SDK (FR-SDK-1)
+
+`crates/sdk` is the published crate `pylota-mail` (lib `pylota_mail`): the Rust client the CLI is built
+on (build plan M16). It is native only (never compiled to wasm) and depends only on `api-types`,
+`reqwest` (rustls), `serde` and `serde_json` (section 2).
+
+- **Coverage.** One async method per REST operation in `openapi.yaml`, named after the operation's
+  `operationId` in snake case (`listIdentities` → `list_identities`, `sendMessage` → `send_message`). Path
+  parameters are arguments; bodies and query parameters are the `api-types` request structs; results
+  are the `api-types` objects. A constant table `OPERATIONS: &[(Method, &str /* path */, &str /* operationId */)]`
+  lists them, and `sdk::coverage::every_operation` compares it with the operations of `openapi.yaml`:
+  a missing or extra operation fails CI. That test is what "covers the whole REST API" means.
+- **Client.** `Client::builder().base_url(url).api_key(key).user_agent(ua).build()`, with timeouts of
+  10 s to connect and 30 s per request; `wait_for_message` uses its `timeout` plus 15 s, and the agentic
+  stream aborts after 30 s without a byte (the server sends a keep-alive every 10 s of silence).
+- **Errors.** `Error::Api { status, code: ErrorCode, message, fix, details, request_id, retryable }`
+  from the error envelope, `Error::Transport` (connect, TLS, timeout) and `Error::Decode`. `retryable`
+  is the envelope's, never decided by the SDK.
+- **Idempotency.** `send_message`, `reply`, `reply_all` and `forward` take a required
+  `IdempotencyKey` (validated against `^[\x20-\x7E]{1,255}$`). Other `POST` methods take an optional
+  one and generate a ULID-based key when it is absent, so the SDK's own retries are safe.
+- **Retries.** Off by default. `RetryPolicy::standard()` follows
+  [Errors › How a client should retry](../../reference/errors.md#how-a-client-should-retry): at most 3
+  retries of retryable errors with backoff 0.5 s, 1 s, 2 s plus up to 250 ms jitter, `Retry-After` honoured
+  up to 60 s, always with the same idempotency key. The CLI turns it on ([CLI and setup §4](cli.md#4-http-behaviour-against-the-api)).
+- **Pagination and streams.** Each list method has a `*_stream` variant that follows `next_cursor` and
+  ends with the error on `410 cursor_expired`. The agentic search has `search_agentic_stream`, which
+  yields the typed server-sent events of [Search §11.11](search.md#1111-streaming).
+- **Webhooks.** `pylota_mail::webhooks::verify(secret, headers, body, now)` checks a Standard Webhooks
+  signature as [Webhooks and events](webhooks.md) specifies; `pmail webhooks verify` uses it.
+- **Agent assertions.** `pylota_mail::assertions::Verifier` checks an agent assertion for a service that
+  receives one, exactly as [Agent signing keys §4.3](agent-keys.md#43-how-a-verifier-checks-it)
+  specifies. It needs no API key and is not an `openapi.yaml` operation, so the coverage table does not
+  list it:
+
+  ```rust
+  pub struct VerifierConfig {
+      pub trusted_issuers: Vec<String>,   // e.g. ["https://api.pylotamail.com"]; never taken from the token
+      pub audience: String,               // must equal the token's aud
+      pub leeway: Duration,               // clock skew for nbf and exp, default 60 s
+  }
+  impl Verifier {
+      pub fn new(config: VerifierConfig) -> Self;                 // in-memory JWKS and jti caches
+      pub fn with_replay_store(self, store: Box<dyn ReplayStore>) -> Self;  // share jti across processes
+      pub async fn verify_assertion(&self, token: &str) -> Result<AgentAssertion, AssertionError>;
+  }
+  pub enum AssertionError { Malformed, Algorithm, UntrustedIssuer, UnknownKey, BadSignature,
+                            Audience, NotYetValid, Expired, Replayed, Jwks(Error) }
+  ```
+
+  `verify_assertion` (1) decodes the header and accepts only `alg: "EdDSA"` with
+  `typ: "agent-assertion+jwt"`; (2) requires `iss` to be one of `trusted_issuers`; (3) fetches
+  `{iss}/.well-known/jwks/{sub}.json` (cached for at most 5 minutes, refetched once on an unknown `kid`)
+  and picks the key whose `kid` matches; (4) verifies the Ed25519 signature over the JWS signing input;
+  (5) checks `aud`, `nbf` and `exp` with the leeway; (6) records `jti` until `exp` and rejects a repeat.
+  `AgentAssertion` holds the claims of [§4.2](agent-keys.md#42-token). `pmail assertions verify` uses it.
+
+Tests: `sdk::coverage::every_operation` (above), `sdk::errors::envelope_round_trip` (every `ErrorCode`
+of [Errors](../../reference/errors.md) decodes with its `retryable` flag), `it::assertions::sdk_verifies`
+(the verifier accepts a fresh token and rejects a wrong audience, an expired token, an unknown kid and
+`alg: none`), and the M16 integration tests that call every method against the workerd harness.
+
+## 12. Tests
 
 | Test | Covers |
 |---|---|
+| `sdk::coverage::every_operation` | The SDK has exactly one method per `openapi.yaml` operation (FR-SDK-1) |
+| `xtask::openapi_matches_contract` | `cargo xtask openapi`: the generated `openapi.json` (OpenAPI 3.1, every path under `/v1`) equals `docs/src/reference/openapi.yaml` semantically (FR-API-1) |
 | `xtask::check_layering_rejects_worker_dep` | A fixture crate depending on `worker` fails the check (AGENTS.md rule) |
+| `platform::config::startup_rules` | Each row of the startup rules in §6.1: a malformed optional variable is `config_invalid` naming it; SES without `PM_SES_SNS_TOPIC_ARN` and `PM_BILLING=stripe` without its secrets start with `/health` `degraded` and the feature off; `PM_WEB_BOT_AUTH=on` in a release without signed requests is `config_invalid`; `PM_CONSOLE_HOST`, `PM_SYSTEM_FROM` and `PM_NOTIFICATIONS` are read with `PM_CONSOLE=off` |
 | `platform::ids::monotonic_within_ms` | IDs generated in one millisecond sort strictly; random overflow moves to the next millisecond |
 | `platform::cf::sql::transaction_rolls_back` (itest) | An `Err` from the closure leaves no rows (S1) |
 | `platform::cf::queues::timestamp_stable_across_retry` (itest) | `Message::timestamp()` is unchanged after `retry_with_options` (S1) |
@@ -882,5 +1040,6 @@ the SBOMs, `SHA256SUMS` and `SHA256SUMS.sig`; then `cargo publish` for `pylota-m
 | `core::compose::no_system_time_on_wasm` | The MIME composer never calls `SystemTime::now()` (explicit Date, Message-ID, boundaries) |
 | `core::sanitize::builder_does_not_panic` | The ammonia builder's `clean("")` succeeds |
 | `xtask::size_budget` (CI `wasm` job) | NFR-SEC-2 |
+| `xtask::template_no_idle_compute` | `deploy/wrangler.toml.tmpl` declares only the Worker, Durable Objects, D1, R2, Queues, Vectorize, Workers AI, Email Sending (`send_email`), rate limits, Analytics Engine and cron triggers: no Containers and nothing that bills while idle beyond storage (NFR-COST-1) |
 | `it::mailbox::j9_migration_on_wake` | Schema-on-wake under `schema_version` ([J9](../edge-cases.md)) |
 | `it::platform::eu_jurisdiction_ids` (S6, staging) | Objects created with `unique_id_with_jurisdiction("eu")` report `eu` (FR-PRV-1) |

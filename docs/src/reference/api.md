@@ -29,7 +29,11 @@ List endpoints take `limit` (default 25, max 100) and `cursor`. They return:
 - **Required** on `POST …/messages`, `…/reply`, `…/reply-all` and `…/forward`. A missing key returns
   `400 idempotency_key_required`. The one exception is a dry run (`?dry_run=true`), where the key is
   optional and never recorded ([Sending](#sending)).
-- **Optional** on every other `POST`.
+- **Optional** on every other `POST`, except the two signing endpoints
+  ([`…/assertions`](#post-v1identitiesidentity_idassertions--tenant-or-identity-key-identitiessign) and
+  [`…/http-signatures`](#post-v1identitiesidentity_idhttp-signatures--tenant-or-identity-key-identitiessign)),
+  which ignore the header and never record it: each call signs anew, and a replay record would have to
+  store what was signed.
 - The header is `Idempotency-Key: <1–255 printable ASCII characters>`. Keys are kept for 30 days, scoped
   per identity for mail and per tenant for everything else.
 - The same key with the same request returns the original response, with `"deduplicated": true` in
@@ -45,9 +49,10 @@ See [Sending and safe retries](../guides/sending.md#safe-retries).
 | Bucket | Default | Scope |
 |---|---|---|
 | All requests | 600 per minute | per API key |
-| Search (`keyword`, `semantic`, `hybrid`) | 120 per minute | per API key |
+| Search (`keyword`, `semantic`, `hybrid`, related messages, contacts) | 120 per minute | per API key |
 | Agentic search | 20 per minute | per API key, plus a daily tenant cap |
 | Send (accepted into queue) | 120 per minute | per identity, plus daily caps from policy |
+| Signing (agent assertions and HTTP signatures together, binding `RL_SIGN`) | 600 per minute | per identity |
 
 Responses include `RateLimit-Limit`, `RateLimit-Remaining` and `RateLimit-Reset`. A `429` includes
 `Retry-After` (seconds) and `error.code = rate_limited`.
@@ -58,8 +63,9 @@ A key holds a list of permissions. Every endpoint below names the one it needs.
 
 | Permission | Allows |
 |---|---|
-| `tenants:manage` | Create, update and suspend tenants (platform keys only) |
-| `identities:read`, `identities:write` | Read, and create, update, pause or delete identities and addresses, and test forwarding |
+| `tenants:manage` | Create, update and suspend tenants, and their billing accounts (platform keys only) |
+| `identities:read`, `identities:write` | Read, and create, update, pause or delete identities and addresses, and test forwarding; read, and create, rotate or revoke [identity signing keys](#identity-keys-and-signatures). Deleting an identity also needs `erasure:manage`, because it starts an identity-scope erasure |
+| `identities:sign` | Mint agent assertions and Web Bot Auth HTTP signatures as an identity. Tenant and identity keys (an identity key only for its own identity); platform keys cannot hold it |
 | `domains:read`, `domains:write` | Read, and add, update, verify, probe or remove domains |
 | `messages:read` | Threads, messages, raw MIME, deliveries |
 | `messages:send` | Send, reply, reply-all, forward, cancel |
@@ -73,9 +79,10 @@ A key holds a list of permissions. Every endpoint below names the one it needs.
 | `keys:manage` | API keys within the caller's scope |
 | `erasure:manage` | Erasure requests, legal holds, exports |
 | `suppressions:manage` | Suppressions and allow or block lists |
-| `usage:read` | Plan, allowances and usage figures (also granted implicitly to every key for its own workspace's `GET /v1/usage`) |
+| `usage:read` | Plan, allowances and usage figures. Every tenant and identity key holds it implicitly for its own workspace, without listing it. Platform keys must hold it explicitly and pass `tenant_id` |
 | `audit:read` | Audit log |
-| `members:manage` | Console members and invitations (tenant and platform keys) |
+| `members:read` | List console members and pending invitations (tenant and platform keys; every console role holds it) |
+| `members:manage` | Invite, revoke, change roles and remove console members (tenant and platform keys). Includes `members:read` |
 | `platform:ops` | Platform operations: signing-key rotation, the dead-letter queue, maintenance jobs, waitlist invitations (platform keys only) |
 
 Key levels limit which resources a key can reach, whatever its permissions:
@@ -87,22 +94,47 @@ Key levels limit which resources a key can reach, whatever its permissions:
 
 A route or field that needs a higher key level than the caller's returns `403 scope_denied`.
 
+Some permissions can be held only at some levels. [`POST /v1/keys`](#post-v1keys) refuses a key that
+lists one its level cannot hold with `400 invalid_request` and
+`details.reason = "permission_not_allowed_for_level"`:
+
+| Permissions | Key levels that can hold them |
+|---|---|
+| `tenants:manage`, `platform:ops` | platform |
+| `members:read`, `members:manage`, `suppressions:manage`, `audit:read`, `usage:read` | platform, tenant (an identity key holds `usage:read` implicitly for its own workspace, but cannot list it) |
+| `identities:sign` | tenant, identity |
+| Every other permission | platform, tenant, identity |
+
+There are no wildcard permissions and no implicit full set: every key, a platform key included, holds the
+permissions listed when it was created, plus the implicit `usage:read` of tenant and identity keys. A
+`POST /v1/keys` without `permissions`, or with an empty list, returns `400 invalid_request`.
+
 ### The console and billing routes
 
 These routes are served by the same Worker but are not part of the developer API. None takes an API key:
-they use session cookies, OAuth state, or Stripe, SNS and link signatures instead.
+they use session cookies, OAuth state, unsubscribe tokens, or Stripe, SNS and link signatures instead.
 
 | Route | What it is | In `openapi.yaml` | Design |
 |---|---|---|---|
-| `/console/*`: the server-rendered console, including `/console/sign-in…` (link and code), `/console/sign-up`, `/console/waitlist`, `/console/workspaces/new`, `/console/oauth/{provider}/start`, `/console/oauth/{provider}/callback`, `/console/settings/security`, `/console/plan/return` and `/console/connect` | Console pages, sign-up and sign-in (session cookies) | No | [Console design](../project/design/console.md), [Cloud sign-up and sign-in](../project/design/cloud-signup.md) |
+| `/console/*`: the server-rendered console, including `/console/sign-in…` (link and code), `/console/sign-up`, `/console/waitlist`, `/console/workspaces/new`, `/console/oauth/{provider}/start`, `/console/oauth/{provider}/callback`, `/console/settings/security`, `/console/settings/notifications`, `/console/plan/return` and `/console/connect` | Console pages, sign-up and sign-in (session cookies) | No | [Console design](../project/design/console.md), [Cloud sign-up and sign-in](../project/design/cloud-signup.md) |
+| `GET /console/notifications/unsubscribe?t={token}`, `POST /console/notifications/unsubscribe?t={token}` | Unsubscribe from a kind of notification email. `GET` shows a confirmation page with a one-click form; `POST` is the RFC 8058 one-click unsubscribe and turns that kind off for that person and workspace. The token `t` is the only authority: no session, no CSRF token or `Origin` check, served even with `PM_CONSOLE=off`. An expired or foreign token changes nothing | No | [Notifications](../project/design/notifications.md#5-the-emails) |
 | `/billing/stripe/webhook` | Stripe events (Stripe signature) | No | [Billing design](../project/design/billing.md) |
 | `POST /hooks/ses`, `POST /hooks/ses/inbound` | Amazon SES delivery events and inbound mail, through SNS (SNS signature) | Yes | [Signed links and provider hooks](#signed-links-and-provider-hooks) |
 | `GET /v1/links/{token}` | Signed downloads (link signature) | Yes | [Signed links and provider hooks](#get-v1linkstoken) |
 
 **Two hosts.** `PM_CONSOLE_HOST` names the console's host and defaults to `PM_API_HOST`, so a deployment
-can keep one hostname. When the two differ, console paths answer only on `PM_CONSOLE_HOST`, and API paths
-(REST, MCP, `/hooks/*`, `/billing/stripe/webhook`, `/health`, `/v1/links/*`) only on `PM_API_HOST`; anything else returns `404`. No
-cookie is set or read on the API host ([Cloud sign-up › Hostnames](../project/design/cloud-signup.md#2-hostnames)).
+can keep one hostname. When the two differ, console paths (`/console/*`, the unsubscribe pair included)
+answer only on `PM_CONSOLE_HOST`, and the API host `PM_API_HOST` serves exactly:
+
+- the REST API, `/v1/*`;
+- MCP, `/mcp`;
+- `/openapi.json` and `/health`;
+- `/.well-known/*` (the security contact, identity JWK Sets and the Web Bot Auth key directory);
+- signed links, `/v1/links/*`;
+- the provider hooks, `/hooks/*`, and `/billing/stripe/webhook`.
+
+Anything else returns `404`. No cookie is set or read on the API host
+([Cloud sign-up › Hostnames](../project/design/cloud-signup.md#2-hostnames)).
 
 ### Errors
 
@@ -153,7 +185,8 @@ Any key. Describes the calling key.
 
 ## Tenants
 
-Platform keys with `tenants:manage`. A tenant key can `GET` its own tenant.
+Platform keys with `tenants:manage`. A tenant key can `GET /v1/tenants/{tenant_id}` for its own tenant;
+it cannot list tenants.
 
 ### `POST /v1/tenants`
 
@@ -182,7 +215,7 @@ Returns `201` with a [Tenant](#tenant-object).
 
 ### `GET /v1/tenants` · `GET /v1/tenants/{tenant_id}`
 
-List (filters: `status`, `mode`) and get.
+List (filters: `status`, `mode`; platform keys only) and get.
 
 ### `PATCH /v1/tenants/{tenant_id}`
 
@@ -227,7 +260,7 @@ Tenants are deleted through an erasure request with `scope: "tenant"`.
   platform domain, that is, for the default tenant, whose suffix is empty
   ([Identities and domains](../project/design/identity-domains.md#username-validation)).
 - The primary address is `{username}{tenant.address_suffix}@{platform domain}`, or
-  `{username}@{domain}` when `domain_id` names a healthy tenant domain. The full local part must be at
+  `{username}@{domain}` when `domain_id` names a tenant domain that is `healthy` or `degraded`. The full local part must be at
   most 64 characters with room for a thread token: the combined username and suffix can be at most 40.
 - `client_id` makes the create idempotent: the same `client_id` with the same body returns `200` and
   the existing identity, and with a different body returns `409 client_id_conflict`.
@@ -244,7 +277,9 @@ Filters: `status`, `purpose`, `client_id`.
 
 ### `GET /v1/identities` — `identities:read`
 
-Identities the key can reach. Platform keys can filter by `tenant_id`.
+Identities the key can reach. Filters: `status` (`active`, `paused`, `deleting` or `deleted`), `purpose`,
+and for platform keys `tenant_id`; `status` and `purpose` work as on the tenant's list above. The system
+identity that sends `PM_SYSTEM_FROM` mail is never listed.
 
 ### `GET /v1/identities/lookup?address=bookings@acme.example.com` — `identities:read`
 
@@ -262,7 +297,10 @@ platform or tenant key and is audit-logged.
 ### `DELETE /v1/identities/{identity_id}` — `identities:write` and `erasure:manage`
 
 Returns `202` with an [Erasure request](#erasure-request-object) of scope `identity`. The identity's
-addresses are tombstoned and can never be assigned to another identity.
+addresses are tombstoned and can never be assigned to another identity. Its
+[signing keys](#identity-keys-and-signatures) are deleted and their key IDs tombstoned, so a deleted key ID
+is never published again ([O7](../project/edge-cases.md)). While the identity is `deleting` or `deleted`,
+signing and its JWK Set return `404 identity_not_found`.
 
 #### Identity object
 
@@ -296,7 +334,7 @@ addresses are tombstoned and can never be assigned to another identity.
 
 Creates an `alias`. `local_part` follows the username rules for a tenant domain: role names such as
 `support@` are allowed, `postmaster` and `abuse` are not. The status is `pending` until the domain is
-healthy, then `active`. Only one pending
+`healthy` or `degraded`, then `active`. Only one pending
 address per identity and domain is allowed; a newer request replaces an older pending one
 ([A11](../project/edge-cases.md)).
 
@@ -361,6 +399,209 @@ webhook event is sent.
 
 ---
 
+## Identity keys and signatures
+
+An identity can prove who it is outside email: with an **agent assertion**, a short-lived JWT signed by
+the identity's own Ed25519 key that any service can check against the identity's JWK Set, and with a
+**signed HTTP request** (Web Bot Auth), whose headers let a website tell which agent made the request. The
+design is in [Agent signing keys](../project/design/agent-keys.md); the integrator's view is in
+[Agents › Agent assertions](../guides/agents.md#agent-assertions).
+
+- Each identity has at most one `active` key, which signs and is published, plus `retiring` keys during
+  an overlap after a rotation. A key is created on the identity's first signing request, or with
+  `POST …/keys`. Private keys are generated, sealed and used inside the Worker; no endpoint returns them.
+- Key management (`…/keys`, rotate, revoke) stays available while the identity is paused, so a suspected
+  leak can be handled before it resumes. Signing does not: a paused identity, including every identity
+  of a suspended tenant, gets `409 identity_paused`, and its JWK Set answers `404 identity_not_found`
+  until it resumes ([O1](../project/edge-cases.md)). A `deleting` or `deleted` identity gets
+  `404 identity_not_found` on every route here.
+- Creating, rotating and revoking keys is audit-logged (`identity_key.create`, `identity_key.rotate`,
+  `identity_key.revoke`) and emits `identity.key_created`, `identity.key_rotated` or
+  `identity.key_revoked` ([Webhook events](events.md#identities-and-addresses)).
+- Signing needs `identities:sign`, which platform keys cannot hold. Both signing endpoints count against
+  the signing rate limit (600 a minute per identity, `429 rate_limited` over it), ignore
+  `Idempotency-Key`, and store nothing but a daily count (`assertions` and `http_signatures` in
+  [`GET /v1/usage/daily`](#get-v1usagedaily--usageread-platform-or-tenant-key)). Signing is not metered
+  against any plan allowance.
+
+### `GET /v1/identities/{identity_id}/keys` — `identities:read`
+
+Every key the identity has, `retired` ones included, newest first. Filter: `status` (`active`,
+`retiring` or `retired`). Paginated.
+
+```json
+{
+  "data": [
+    { "kid": "zMkUmAQOlq9JtFPzTK1XINZdWd7gmhXxgA8Ph7cNKHo", "identity_id": "idn_01J9Z3K8V4…",
+      "status": "active", "alg": "EdDSA",
+      "public_jwk": { "kty": "OKP", "crv": "Ed25519", "x": "NjwMjIq2mTA1VpuDzRvkMIfQ0sCSHWavo0KT_4FcKO0",
+                      "kid": "zMkUmAQOlq9JtFPzTK1XINZdWd7gmhXxgA8Ph7cNKHo", "alg": "EdDSA", "use": "sig" },
+      "created_at": "2026-10-09T09:00:00Z", "verify_until": null, "retired_at": null },
+    { "kid": "kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k", "identity_id": "idn_01J9Z3K8V4…",
+      "status": "retiring", "alg": "EdDSA",
+      "public_jwk": { "kty": "OKP", "crv": "Ed25519", "x": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+                      "kid": "kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k", "alg": "EdDSA", "use": "sig" },
+      "created_at": "2026-10-02T09:00:00Z", "verify_until": "2026-10-16T09:00:00Z", "retired_at": null }
+  ],
+  "next_cursor": null
+}
+```
+
+### `POST /v1/identities/{identity_id}/keys` — `identities:write`
+
+No body (an empty `{}` is accepted). Creates the identity's first key and returns it with `201` when it
+has no `active` key; otherwise returns the existing active key with `200` and changes nothing. A created
+key emits `identity.key_created`, as does a key created lazily by a signing request; the `200` case emits
+nothing. A thumbprint found among the key tombstones is never reused: a new seed is drawn instead.
+`Idempotency-Key` is optional.
+
+### `POST /v1/identities/{identity_id}/keys/rotate` — `identities:write`
+
+No body. Makes a new key `active` at once and moves the previous active key to `retiring`, with
+`verify_until` set to now plus `PM_IDENTITY_KEY_OVERLAP_DAYS` (default 7 days). The retiring key stays
+in the JWK Set and no longer signs, so an assertion signed just before the rotation still verifies until
+then ([O2](../project/edge-cases.md)). With no active key, it creates the first one and `previous` is
+`null`. Emits `identity.key_rotated`. Returns `200`:
+
+```json
+{
+  "key": { "kid": "zMkUmAQOlq9JtFPzTK1XINZdWd7gmhXxgA8Ph7cNKHo", "status": "active",
+           "created_at": "2026-10-09T09:00:00Z", "verify_until": null, "retired_at": null,
+           "...": "the rest of the Identity key object" },
+  "previous": { "kid": "kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k", "status": "retiring",
+                "created_at": "2026-10-02T09:00:00Z", "verify_until": "2026-10-16T09:00:00Z",
+                "retired_at": null, "...": "the rest of the Identity key object" }
+}
+```
+
+### `POST /v1/identities/{identity_id}/keys/{kid}/revoke` — `identities:write`
+
+No body. Moves the key straight to `retired`, whatever its state, for a suspected compromise. It is gone
+from the next JWK Set response, and verifiers cache the set for at most 5 minutes
+([O3](../project/edge-cases.md)). Returns `200` with the key (`status: "retired"`, `retired_at` set) and
+emits `identity.key_revoked`. A key that is already `retired` is returned unchanged with `200`, and no
+event is emitted. An unknown `kid` returns `404 key_not_found`. The row is kept until the identity is
+deleted, so its thumbprint is never reused.
+
+#### Identity key object
+
+```json
+{
+  "kid": "kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k", "identity_id": "idn_01J9Z3K8V4…",
+  "status": "retiring", "alg": "EdDSA",
+  "public_jwk": { "kty": "OKP", "crv": "Ed25519", "x": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+                  "kid": "kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k", "alg": "EdDSA", "use": "sig" },
+  "created_at": "2026-10-02T09:00:00Z", "verify_until": "2026-10-16T09:00:00Z", "retired_at": null
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `kid` | The key ID: the base64url RFC 7638 thumbprint of the public JWK (43 characters). It is also the JWS `kid` of every assertion the key signs |
+| `status` | `active` (signs and is published; at most one), `retiring` (published, does not sign, until `verify_until`) or `retired` (not published) |
+| `alg` | Always `EdDSA` (Ed25519) |
+| `public_jwk` | The public key exactly as published in the identity's JWK Set |
+| `verify_until` | Set when the key becomes `retiring`: the rotation time plus `PM_IDENTITY_KEY_OVERLAP_DAYS`. Until then the key stays in the JWK Set, unless it is revoked. `null` while `active` |
+| `retired_at` | When the key became `retired`, or `null` |
+
+### `POST /v1/identities/{identity_id}/assertions` — tenant or identity key, `identities:sign`
+
+Mints an agent assertion: a JWT signed with the identity's active key. Each call mints a new token, so
+`Idempotency-Key` is ignored and never recorded.
+
+```json
+{ "audience": "https://portal.supplier.example",
+  "expires_in": 300,
+  "nonce": "b3f1c2d47a9e",
+  "ext": { "booking_ref": "BK-2291" } }
+```
+
+| Field | Rules |
+|---|---|
+| `audience` | Required. 1–256 characters of printable ASCII: a URL or an identifier the verifier expects. Becomes `aud` ([O4](../project/edge-cases.md)) |
+| `expires_in` | 60–600 seconds, default 300 ([O5](../project/edge-cases.md)) |
+| `nonce` | Optional, 1–128 characters of printable ASCII, copied into the token for the verifier's own challenge |
+| `ext` | Optional object, at most 2 KB as JSON, placed under the `ext` claim. Its members cannot use a registered or Pylota claim name (`iss`, `sub`, `aud`, `iat`, `nbf`, `exp`, `jti`, `email`, `email_verified`, `name`, `org`, `accountable_human`, `ai_agent`, `nonce`, `ext`) ([O6](../project/edge-cases.md)) |
+
+Returns `201`:
+
+```json
+{ "assertion": "eyJhbGciOiJFZERTQSIsInR5cCI6ImFnZW50LWFzc2VydGlvbitqd3QiLCJraWQiOiJ6TWtVbUFRT2xx…",
+  "kid": "zMkUmAQOlq9JtFPzTK1XINZdWd7gmhXxgA8Ph7cNKHo",
+  "expires_at": "2026-10-09T12:05:00Z",
+  "jwks_uri": "https://mail.example.com/.well-known/jwks/idn_01J9Z3K8V4QW7X2M5N6P8R0T1Y.json" }
+```
+
+The token's header is `{"alg":"EdDSA","typ":"agent-assertion+jwt","kid":"<thumbprint>"}`. Its claims:
+
+```json
+{ "iss": "https://mail.example.com", "sub": "idn_01J9Z3K8V4QW7X2M5N6P8R0T1Y",
+  "aud": "https://portal.supplier.example", "iat": 1791547200, "nbf": 1791547200, "exp": 1791547500,
+  "jti": "01M4G8HMG0Z6G25EVAN36PQG0H", "email": "bookings.acme@agents.example", "email_verified": true,
+  "name": "Acme Car Hire", "org": "Acme Car Hire", "accountable_human": true, "ai_agent": true,
+  "nonce": "b3f1c2d47a9e", "ext": { "booking_ref": "BK-2291" } }
+```
+
+- `iss` is `https://{PM_API_HOST}`, `sub` the identity ID, `jti` a new ULID, `email` the identity's
+  primary address, `name` its display name and `org` the workspace name.
+- `accountable_human` is `true` when the identity has an accountable owner. The owner's name and address
+  are never in the token.
+- The token is never stored or logged. A verifier checks it as in
+  [Agents › Verifying an assertion](../guides/agents.md#verifying-an-assertion): `alg` and `typ`, an
+  issuer it trusts, the key from `{iss}/.well-known/jwks/{sub}.json` (cached for at most 5 minutes), the
+  signature, `aud`, `nbf` and `exp` with 60 seconds of skew, and `jti` against replays
+  ([Agent signing keys § 4.3](../project/design/agent-keys.md#43-how-a-verifier-checks-it)).
+
+Errors: `400 invalid_request` ([O4–O6](../project/edge-cases.md)), `403 permission_denied`,
+`403 scope_denied`, `404 identity_not_found`, `409 identity_paused` and `429 rate_limited`.
+
+### `POST /v1/identities/{identity_id}/http-signatures` — tenant or identity key, `identities:sign`
+
+Returns the headers that make an HTTP request a Web Bot Auth signed request (RFC 9421), signed with the
+deployment's `web_bot_auth` key, with the identity's address in a signed `From` header. The Worker never
+makes the request itself, and nothing is created or stored. `Idempotency-Key` is ignored and never
+recorded.
+
+```json
+{ "url": "https://www.brightwell.example/fleet/availability?from=2026-10-12",
+  "method": "GET",
+  "expires_in": 60,
+  "components": ["@authority", "signature-agent", "from"] }
+```
+
+| Field | Rules |
+|---|---|
+| `url` | Required, `https` only, at most 2,048 characters. An internationalised host is converted to its A-label for `@authority` ([O10](../project/edge-cases.md)) |
+| `method` | Optional, an upper-case token. Signed only if `@method` is in `components`, and then required (`400 invalid_request` without it) |
+| `expires_in` | 30–300 seconds, default 60. Too short an expiry fails in transit ([O11](../project/edge-cases.md)) |
+| `components` | Optional. Always includes `@authority`, `signature-agent` and `from`; may add `@method`, `@path` and `@query`. Any other component, or one whose value is not ASCII, returns `400 invalid_request` |
+
+Returns `200`:
+
+```json
+{ "headers": {
+    "Signature-Agent": "\"https://mail.example.com\"",
+    "From": "bookings.acme@agents.example",
+    "Signature-Input": "sig1=(\"@authority\" \"signature-agent\" \"from\");created=1791547200;expires=1791547260;keyid=\"poqkLGiymh_W0uP6PZFw-dvez3QJT5SolqXBCW38r0U\";alg=\"ed25519\";nonce=\"e8N7S2MF…\";tag=\"web-bot-auth\"",
+    "Signature": "sig1=:jdq0SqOwHdyHr9+r5jw3iYZH6aNGKijYp/EstF4RQTQdi5N5YYKrD+mCT1HA1nZDsi6nJKuHxUi/5Syp3rLWBA==:" },
+  "expires_at": "2026-10-09T12:01:00Z" }
+```
+
+- `Signature-Agent` names the deployment's origin; its key directory is at
+  [`/.well-known/http-message-signatures-directory`](#well-known).
+- `From` is the identity's primary address (RFC 9110: whoever is responsible for the request).
+- `keyid` is the deployment key's JWK thumbprint, `nonce` 64 random bytes (base64), and `tag` is
+  `web-bot-auth`.
+
+Signed HTTP requests are off unless the operator sets `PM_WEB_BOT_AUTH=on` (allowed once spike S13 has
+passed) and the tenant opts in. While `PM_WEB_BOT_AUTH=off`, this returns `422 web_bot_auth_disabled`
+([O9](../project/edge-cases.md)); while tenant policy `web_bot_auth.allowed` is `false`, the default,
+`403 policy_denied` ([O13](../project/edge-cases.md);
+[Configuration › Tenant policy](configuration.md#tenant-policy)). Other errors as for assertions. The
+operator side is in [Self-hosting › Signed HTTP requests](../self-hosting.md#signed-http-requests-web-bot-auth).
+
+---
+
 ## Domains
 
 ### `POST /v1/tenants/{tenant_id}/domains` — `domains:write`
@@ -396,11 +637,12 @@ What each method checks before the domain is created:
 
 - **`cloudflare_zone`, `nameservers` and `delegated_subdomain`** need `PM_CF_API_TOKEN` on the Worker;
   without it the request fails with `422 cf_token_required`. For an apex `cloudflare_zone`,
-  `pmail domains add` with your local Cloudflare token works instead (catch-all, no literal rules).
+  `pmail domains add --local-token` with your own Cloudflare token works instead (catch-all, no literal
+  rules).
 - **`nameservers`** creates the zone in this account. Platform keys may always use it; tenant keys only
   when the tenant's policy has `domains.allow_create_zone: true` (otherwise `422 transport_unavailable`,
   `details.reason: "zone_creation_not_allowed"`). Moving the nameservers hands the whole domain to this
-  deployment, so when the name has A, AAAA or MX records, or `www` has a CNAME or A record, the request
+  deployment, so when the name has A, AAAA or MX records, or `www` has a CNAME, A or AAAA record, the request
   needs `"confirm_dedicated": true`; otherwise it fails with `409 domain_not_dedicated` and
   `details.records` lists what was found ([N21](../project/edge-cases.md)). The response's `records` are
   the zone's nameservers, as `NS` records to set at the registrar. Cloudflare deletes a zone that is not
@@ -557,6 +799,7 @@ an SES identity, the SES identity and the domain's addresses in the retired-addr
   "ses_region": "eu-west-2", "mail_from_domain": "pm-bounce.agents.brightwell.example",
   "smtp": null, "probe": null,
   "state": "healthy", "state_reason": null, "state_changed_at": "…",
+  "delivery_events": "active", "details": null,
   "records": [ "...as in /records..." ], "created_at": "…"
 }
 ```
@@ -573,6 +816,8 @@ an SES identity, the SES identity and the domain's addresses in the retired-addr
 | `smtp` | `smtp_relay` only, otherwise `null`: `{ "host", "port", "username", "probe_from" }`. Never the password |
 | `probe` | `smtp` transport only, otherwise `null`: `{ "last_at", "result" }`. `result` is `pass` or the issue code of the failure (`smtp_unaligned`, `smtp_from_rewritten`, `smtp_probe_timeout`, `smtp_auth_failed`, `smtp_tls_required`); both are `null` before the first probe |
 | `state_reason` | The first issue code, or `zone_expired` on a `nameservers` domain whose zone Cloudflare deleted |
+| `delivery_events` | `active` (provider delivery events reach the service), `manual` (a Cloudflare-transport domain created without an event subscription: run `pmail domains subscribe <domain>`; until then statuses stop at `sent`), or `none` (`sending: false`). See [Identities and domains › Kind `zone`](../project/design/identity-domains.md#kind-zone) |
+| `details` | `null`, or `{ "action": "run pmail domains subscribe <domain>" }` while `delivery_events` is `manual`: the operator step that remains |
 
 ---
 
@@ -583,6 +828,11 @@ an SES identity, the SES identity and the domain's addresses in the retired-addr
 Filters: `label`, `category`, `needs_reply_gte` (0–1; the search operator `is:needs_reply` uses 0.5),
 `is_unread`, `direction` (of the last message), `after`, `before`, `archived` (default `false`). Sorted
 by `last_at` descending.
+
+Threads are built from visible mail only: quarantined, hidden and throttled messages are never listed or
+counted here, whatever the key's permissions. A key with `quarantine:review` reaches them through the
+message list with an explicit `status` filter (below), or the [quarantine list](#quarantine)
+(quarantined messages only).
 
 ```json
 {
@@ -618,15 +868,25 @@ carries `extracted_text` (quotes stripped) rather than the full `text`.
 { "reason": "PCN dispute WM12345678", "until": "2027-10-09T00:00:00Z" }
 ```
 
-`DELETE …/hold` removes it. Both are audit-logged.
+`DELETE /v1/identities/{identity_id}/threads/{thread_id}/hold` (`erasure:manage`) removes it. Both are
+audit-logged.
 
 ### `GET /v1/identities/{identity_id}/messages` — `messages:read`
 
 Filters: `thread_id`, `direction`, `status`, `label`, `after`, `before`. Sorted newest first.
 
+Quarantined, hidden and throttled messages are left out by default, whatever the key's permissions. They
+are listed only when the request filters on that status explicitly (`status=quarantined`, `hidden` or
+`throttled`) and the key holds `quarantine:review`. A key without it that sends such a filter gets
+`200` with none of those messages, never `403`, as search treats `include_quarantined`
+([Security design § 5.3](../project/design/security.md#53-cross-level-read-access)).
+
 ### `GET /v1/identities/{identity_id}/messages/{message_id}` — `messages:read`
 
-`include` takes `html`, `headers` and `quoted`.
+`include` takes `html`, `headers` and `quoted`. A `quarantined`, `hidden` or `throttled` message is
+returned only to a key that holds `quarantine:review`; any other key gets `404 message_not_found`, as for
+a message that does not exist ([Security](../project/design/security.md)). The same rule applies to its
+attachments and raw MIME.
 
 #### Message object
 
@@ -677,10 +937,11 @@ Filters: `thread_id`, `direction`, `status`, `label`, `after`, `before`. Sorted 
   `model_unavailable`, `input_unavailable`) ([Triage design](../project/design/triage.md)). For example,
   mail that arrives after the workspace's `triage` allowance is spent is still stored, and its triage is
   skipped with reason `allowance`; the built-in rules' risk flags are kept and the model does not run
-  ([M7](../project/edge-cases.md)):
+  ([W7](../project/edge-cases.md)):
   `{ "status": "skipped", "reason": "allowance", "category": null, "needs_reply": null, "urgency": null, "summary": null, "language": null, "risk_flags": ["unknown_sender"], "model": null, "version": 3 }`.
 - `deliveries` is set on outbound messages:
-  `[{ "address", "field", "status", "smtp_code", "bounce_type", "updated_at" }]`.
+  `[{ "address", "field", "status", "smtp_code", "enhanced_code", "bounce_type", "updated_at" }]`
+  (`enhanced_code` is the RFC 3463 code, for example `5.1.1`, when the provider or relay gave one).
 - Message-level `flags` include `sent_via_fallback`, `parse_degraded`, `encrypted`,
   `message_id_conflict`, `reprocessed`, `reconciled`, `bcc`, `loopback` (delivered inside the deployment
   for a test tenant, [L3](../project/edge-cases.md)) and `body_truncated` (a stored body was cut at its
@@ -731,7 +992,9 @@ the release has to be done by a person in the console (FR-CON-6).
 
 ### `DELETE /v1/identities/{identity_id}/messages/{message_id}` — `erasure:manage`
 
-Returns `202` with an erasure request of scope `message`.
+Returns `202` with an erasure request of scope `message`. If the message's thread is under a legal hold,
+it returns `423 legal_hold` and creates nothing (an erasure request of a wider scope skips held threads
+instead).
 
 ---
 
@@ -826,7 +1089,8 @@ recipients of the original are never included ([A10](../project/edge-cases.md)).
 
 ### `POST /v1/identities/{identity_id}/messages/{message_id}/cancel` — `messages:send`
 
-Only while the message is `queued`. Returns the message with `status: "canceled"`. Otherwise
+Only while the message is `queued`, no transport attempt is in progress, and no recipient has been sent
+to yet. Returns the message with `status: "canceled"`. Otherwise
 `409 not_cancelable`.
 
 ### `POST /v1/identities/{identity_id}/messages/{message_id}/resolve` — `messages:write`
@@ -847,7 +1111,7 @@ marks the message `failed` with reason `resolved_not_sent`, after which you may 
 | `deferred` | At least one recipient has a temporary failure and the provider is still retrying | no |
 | `bounced` | At least one recipient bounced and none remains in flight | yes |
 | `complained` | A recipient reported spam (can follow `delivered`) | yes |
-| `rejected` | The transport refused it before sending (validation, policy) | yes |
+| `rejected` | The transport refused it, at submission or, for some recipients, when the recipient's server rejected it after submission (validation, policy, a definitive recipient-server rejection) | yes |
 | `failed` | It could not be sent (quota exhausted after retries, or resolved as not sent) | yes |
 | `uncertain` | The outcome is unknown. It is **never resent automatically** | until resolved |
 | `suppressed` | Every recipient is suppressed. Nothing was sent | yes |
@@ -941,7 +1205,7 @@ request sets `facets: false`.
   this endpoint and on tenant search.
 - With `stream: true` and `Accept: text/event-stream`, the response is a server-sent event stream:
   `event: step` (each trace entry), `event: evidence` (hits as they are found), `event: answer` and
-  `event: done`. A keep-alive comment is sent every 10 seconds.
+  `event: done`. A keep-alive comment is sent after every 10 seconds of silence.
 
 ### `POST /v1/tenants/{tenant_id}/search` — tenant or platform key, `search:read`
 
@@ -994,7 +1258,9 @@ Query parameters:
 ```
 
 A verification code or link is released only when `from` names the expected sender domain and the
-message passed authentication (`verdict: pass`). See [E4](../project/edge-cases.md).
+message passed authentication (`verdict: pass`). See [E4](../project/edge-cases.md). The handler polls
+the mailbox every second and keeps the sender domain registered for unsolicited-OTP detection while it
+waits; the full behaviour is in [Inbound › The `wait` handler](../project/design/inbound.md#the-wait-handler-e4).
 
 ---
 
@@ -1057,7 +1323,9 @@ or
 { "since": "2026-10-08T00:00:00Z", "until": "2026-10-09T00:00:00Z", "status": "dead" }
 ```
 
-Events older than 30 days cannot be replayed. Returns `202` with `{ "queued": 42 }`.
+An event can be replayed for 30 days from its `occurred_at` (or `retention.events_days`, if shorter,
+because its payload is gone after that). The window never starts from when a delivery went `dead`, and
+older events are not queued. Returns `202` with `{ "queued": 42 }`.
 
 ---
 
@@ -1084,8 +1352,10 @@ suppression needs `"confirm_complaint_removal": true` in the body and is audit-l
 
 - **Receive-block**: mail is stored hidden and never shown to agents.
 - **Receive-allow**: mail skips spam quarantine. It does not skip authentication quarantine.
-- **Send-block**: refused per recipient.
-- **Send-allow**: with `policy.send_allowlist_only`, only listed recipients are allowed.
+- **Send-block**: a listed recipient is not sent to. The send is accepted and that recipient's delivery
+  is `suppressed` with `policy: send_block`; a dry run reports `422 recipient_blocked`.
+- **Send-allow**: with `policy.send_allowlist_only`, only listed recipients are sent to; the others are
+  `suppressed` with `policy: not_on_allowlist`.
 
 ---
 
@@ -1095,13 +1365,21 @@ suppression needs `"confirm_complaint_removal": true` in the body and is audit-l
 
 ```json
 { "name": "bookings-agent", "level": "identity", "tenant_id": "ten_01J9…", "identity_id": "idn_01J9…",
-  "permissions": ["messages:read", "messages:send", "search:read", "attachments:read"],
+  "permissions": ["messages:read", "messages:send", "search:read", "attachments:read", "identities:sign"],
   "expires_at": "2027-10-09T00:00:00Z" }
 ```
 
 The new key's level, tenant, identity and permissions must all lie within the caller's own, otherwise
 `403 key_scope_exceeded`. A tenant key's `mode` follows its tenant. Returns `201` with
 `"secret": "pmk_live_…"`, shown only once.
+
+- `permissions` is required at every level, `platform` included. There is no implicit full set: a
+  missing or empty list returns `400 invalid_request`.
+- Each permission must be one the new key's level can hold ([Permissions](#permissions)), whoever the
+  caller is, otherwise `400 invalid_request` with `details.reason = "permission_not_allowed_for_level"`: `tenants:manage` and
+  `platform:ops` only on platform keys; `members:read`, `members:manage`, `suppressions:manage`,
+  `audit:read` and `usage:read` never on identity keys; `identities:sign` never on platform keys.
+- Both checks come before the scope check, so a refused permission is `400`, not `403`.
 
 ### `GET /v1/keys` · `GET /v1/keys/{key_id}` · `DELETE /v1/keys/{key_id}`
 
@@ -1127,19 +1405,20 @@ The new key's level, tenant, identity and permissions must all lie within the ca
 | `message` | `identity_id`, `message_id` | One message, its attachments, text, index rows, vectors, raw copies |
 | `thread` | `identity_id`, `thread_id` | Every message in the thread |
 | `counterparty` | `counterparty_address` | Every message to or from that address, in every identity of the tenant |
-| `identity` | `identity_id` | The whole mailbox. Its addresses are tombstoned |
-| `tenant` | none | Everything in the tenant. Then the tenant is marked `erased` |
+| `identity` | `identity_id` | The whole mailbox and the identity's signing keys. Its addresses and key IDs are tombstoned |
+| `tenant` | none | Everything in the tenant, every identity's signing keys included (their key IDs are tombstoned). Then the tenant is marked `erased` |
 
-Held threads are skipped and listed in the receipt (FR-PRV-4). The request's `status` is `queued`,
-`running`, `completed`, `completed_with_holds` (finished, but at least one held thread was skipped) or
-`failed`. Returns `202` with:
+Held threads are skipped and listed in the receipt (FR-PRV-4): an erasure request is never refused
+because of a hold (it never returns `423 legal_hold`). The request's `status` is `queued`, `running`,
+`completed`, `completed_with_holds` (finished, but at least one held thread was skipped), `failed`, or
+`canceled` (a tenant erasure superseded it). Returns `202` with:
 
 #### Erasure request object
 
 ```json
 {
   "id": "era_01J9…", "tenant_id": "ten_01J9…", "scope": "counterparty", "status": "completed",
-  "created_at": "…", "completed_at": "…",
+  "created_at": "…", "completed_at": "…", "created_by_key_id": "key_01J9…",
   "receipt": {
     "messages_deleted": 14, "attachments_deleted": 9, "r2_objects_deleted": 38,
     "fts_rows_deleted": 14, "refs_deleted": 51, "vectors_deleted": 63,
@@ -1169,7 +1448,8 @@ identities) or `identity` (with `identity_id`: the whole mailbox). Returns `202`
   "download_url": "https://mail.example.com/v1/links/bDE6Mz…" }
 ```
 
-`status` is `queued`, `running`, `completed`, `failed` or `expired`. The finished export has
+`status` is `queued`, `running`, `completed`, `failed`, `canceled` (a tenant erasure superseded it) or
+`expired`. The finished export has
 `download_url`: a [signed link](#get-v1linkstoken) valid until `expires_at` (7 days) to a ZIP holding
 one `.eml` per message plus `messages.json`. The link is minted again on each `GET`. An
 `export.completed` event is emitted.
@@ -1178,10 +1458,13 @@ one `.eml` per message plus `messages.json`. The link is minted again on each `G
 
 ## Usage and audit
 
-### `GET /v1/usage` — any key (its own workspace); `usage:read` for other workspaces
+### `GET /v1/usage` — `usage:read` (implicit for tenant and identity keys on their own workspace)
 
 The workspace's plan and the state of every allowance in the current period. Agents read it to know their
-limits before they hit `402 billing_limit`. Platform keys pass `tenant_id`.
+limits before they hit `402 billing_limit`. Every tenant and identity key holds `usage:read` implicitly
+for its own workspace, so it can always call this. A platform key must hold `usage:read` explicitly and
+must pass `tenant_id`; without `tenant_id` it gets `400 invalid_request`. The MCP tool `mail_get_usage`
+is hidden from platform keys.
 
 ```json
 {
@@ -1210,12 +1493,17 @@ limits before they hit `402 billing_limit`. Platform keys pass `tenant_id`.
 
 ### `GET /v1/usage/daily` — `usage:read`, platform or tenant key
 
-Query: `tenant_id` (platform keys), `from`, `to` (dates, at most 92 days apart).
+Query: `tenant_id` (platform keys), `from`, `to` (dates, at most 92 days apart). A tenant key holds
+`usage:read` implicitly for its own tenant; a platform key needs it explicitly.
 
 ```json
 { "data": [ { "day": "2026-10-08", "inbound": 312, "outbound": 128, "sends": 141, "triage": 298,
-  "search": 940, "agentic": 41, "ai_neurons": 18233, "storage_bytes": 2147483648 } ] }
+  "search": 940, "agentic": 41, "assertions": 57, "http_signatures": 0, "ai_neurons": 18233,
+  "storage_bytes": 2147483648 } ] }
 ```
+
+`assertions` and `http_signatures` count the agent assertions and HTTP signatures made that day. They
+are counts only: signing is not metered against any plan allowance.
 
 ### `GET /v1/plans` — no auth
 
@@ -1241,11 +1529,12 @@ Filters: `tenant_id`, `actor_key_id`, `action`, `target_id`, `after`, `before`. 
 
 ```json
 { "data": [ { "id": "aud_01JA…", "tenant_id": "ten_01J9…", "actor_key_id": "key_01J9…",
-  "action": "quarantine.release", "target_type": "message", "target_id": "msg_01JA…",
+  "actor_user_id": null, "action": "quarantine.release", "target_type": "message", "target_id": "msg_01JA…",
   "details": {}, "request_id": "req_01JA…", "created_at": "…" } ], "next_cursor": null }
 ```
 
-Audit rows cover administrative actions: keys, tenants, identity status, quarantine releases, holds,
+Audit rows cover administrative actions: keys, tenants, identity status, identity signing keys
+(`identity_key.create`, `identity_key.rotate`, `identity_key.revoke`), quarantine releases, holds,
 suppression removals, erasure, resolve, members, billing, and platform operations. **Sends are not
 audit rows**: each send is recorded by its message, its events (`message.sent` and the delivery events)
 and its per-recipient delivery log. To review what a key sent, list the outbound messages of the
@@ -1258,20 +1547,21 @@ identities it reaches for the period; request logs also carry the key ID for 7 d
 Console users of a workspace. The console is the main way to manage them; these endpoints let an
 integrator provision people (for example, the owner of each customer workspace).
 
-### `GET /v1/tenants/{tenant_id}/members` — `members:manage`
+### `GET /v1/tenants/{tenant_id}/members` — `members:read`
 
 Not paginated: a workspace's members and pending invitations are bounded by its seats.
 
 ```json
 { "data": [ { "user_id": "usr_01JA…", "email": "sam@acmecarhire.example", "name": "Sam Patel",
-  "role": "owner", "created_at": "…" } ], "invitations": [ { "id": "inv_01JA…", "email": "kim@acmecarhire.example",
-  "role": "member", "expires_at": "…" } ], "seats": { "granted": 2, "used": 2 } }
+  "role": "owner", "last_login_at": "…", "created_at": "…" } ], "invitations": [ { "id": "inv_01JA…",
+  "email": "kim@acmecarhire.example", "role": "member", "invited_by": "usr_01JA…", "expires_at": "…" } ],
+  "seats": { "granted": 2, "used": 2 } }
 ```
 
 ### `POST /v1/tenants/{tenant_id}/invitations` — `members:manage`
 
 `{ "email": "kim@acmecarhire.example", "role": "member" }`. Sends an invitation email from the deployment's
-platform identity. A pending invitation uses a seat; with no seat left the request fails with
+system identity (`PM_SYSTEM_FROM`), also when the console is off (`PM_CONSOLE=off`). A pending invitation uses a seat; with no seat left the request fails with
 `402 billing_limit` (`details.feature: "seats"`). Roles: `admin`, `member`, `viewer`. The owner is set at
 workspace creation (`owner` in `POST /v1/tenants`) or by an ownership transfer in the console. Returns
 `201` with the invitation (`id`, `email`, `role`, `expires_at`).
@@ -1296,21 +1586,26 @@ Platform keys with `platform:ops`. Every call is audit-logged.
 | `thread` | Thread tokens | 90 days |
 | `link` | Download links, console sign-in, invitation and session tokens, and OAuth state hashes | 7 days |
 | `cursor` | Search cursors (the cursor lifetime) | 24 hours |
+| `web_bot_auth` | Web Bot Auth HTTP signatures and the [key directory](#well-known). Its `kid` is the key's 43-character JWK thumbprint, not one character | 7 days, during which it stays in the key directory |
 
-Generates a new key inside the Worker and makes it current. No body. Returns `200`:
+Generates a new key inside the Worker and makes it current. No body. Rotating `web_bot_auth` while
+`PM_WEB_BOT_AUTH=off` returns `422 web_bot_auth_disabled` ([O9](../project/edge-cases.md)). Returns `200`:
 
 ```json
 { "purpose": "thread", "kid": "4", "created_at": "2026-10-09T10:00:00Z",
   "previous": { "kid": "3", "verify_until": "2027-01-07T10:00:00Z", "revoked": false } }
 ```
 
+`previous` is `null` when the purpose had no key yet; the rotation then creates the first one.
+
 **`?revoke_previous=true`** deletes the previous key in the same D1 batch, so what it signed stops
 verifying at once: thread tokens fall back to header threading; open links, console sign-in tokens,
-invitations, sessions and OAuth flows under it fail; open search cursors fail with `400 invalid_request`.
-The response then has `previous.verify_until` equal to the rotation time and `previous.revoked: true`.
+invitations, sessions and OAuth flows under it fail; open search cursors fail with `400 invalid_request`;
+a previous `web_bot_auth` key leaves the key directory. The response then has `previous.verify_until`
+equal to the rotation time and `previous.revoked: true`.
 Without it, a leaked key keeps verifying for its window. After a suspected leak, rotate with
-`revoke_previous=true`, then rotate `PM_MASTER_KEY`. The audit action is `signing_key.rotate`, with
-`details.revoke_previous`.
+`revoke_previous=true`, then rotate `PM_MASTER_KEY`. The audit action is `signing_key.rotate` for every
+purpose, `web_bot_auth` included, with `details.revoke_previous`.
 
 Key material is never returned, by this or any other endpoint. See
 [Configuration › Thread and link keys](configuration.md#thread-and-link-keys).
@@ -1429,7 +1724,26 @@ Anything else gets `403 invalid_signature`.
 
 ## Well-known
 
+Served on the API host, with no API key.
+
 | Path | Content |
 |---|---|
 | `/.well-known/security.txt` | Security contact (from `PM_SECURITY_CONTACT`) |
-| `/.well-known/jwks/{identity_id}.json` | P1: public signing keys of an identity |
+| `/.well-known/jwks/{identity_id}.json` | The identity's JWK Set: its `active` and `retiring` signing keys, which verify its [agent assertions](#post-v1identitiesidentity_idassertions--tenant-or-identity-key-identitiessign). `Content-Type: application/jwk-set+json`, `Cache-Control: public, max-age=300`. An unknown, `deleting`, `deleted`, paused or suspended identity gets `404 identity_not_found` ([O1](../project/edge-cases.md)) |
+| `/.well-known/http-message-signatures-directory` | The Web Bot Auth key directory: the deployment's `active` and `retiring` keys (at most three) as a JWK Set. `Content-Type: application/http-message-signatures-directory+json`, `Cache-Control: max-age=86400`. The response is signed once per listed key (`Signature-Input` and `Signature`, tag `http-message-signatures-directory`, component `("@authority";req)`), so a copy served elsewhere does not verify ([O12](../project/edge-cases.md)). `404 key_not_found` while `PM_WEB_BOT_AUTH=off` |
+
+An identity's JWK Set during the overlap after a rotation (the first key is `active`, the second
+`retiring`):
+
+```json
+{ "keys": [
+  { "kty": "OKP", "crv": "Ed25519", "x": "NjwMjIq2mTA1VpuDzRvkMIfQ0sCSHWavo0KT_4FcKO0",
+    "kid": "zMkUmAQOlq9JtFPzTK1XINZdWd7gmhXxgA8Ph7cNKHo", "alg": "EdDSA", "use": "sig" },
+  { "kty": "OKP", "crv": "Ed25519", "x": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+    "kid": "kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k", "alg": "EdDSA", "use": "sig" } ] }
+```
+
+Identity IDs are ULIDs, never derived from addresses, so the JWK Set path cannot be used to test
+whether an address exists. Registering the key directory with Cloudflare's verified-bot programme is an
+optional operator step ([Self-hosting › Signed HTTP requests](../self-hosting.md#signed-http-requests-web-bot-auth));
+signatures verify for any Web Bot Auth verifier without it.

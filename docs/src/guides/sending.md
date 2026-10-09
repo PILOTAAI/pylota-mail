@@ -79,10 +79,12 @@ the thread lock, then fails with `409 thread_busy` (retryable, after `details.re
   49). More fails with `400 too_many_recipients`.
 - Addresses must be valid RFC 5321 addresses (`400 address_invalid`). Non-ASCII local parts are refused
   (`400 address_unsupported`).
-- Recipients on the tenant's **send-block** list are refused per recipient. With
-  `policy.send_allowlist_only: true`, only recipients on the **send-allow** list are allowed.
-- With the identity's `send_policy.require_known_recipient: true`, the identity can only write to
-  addresses it has already exchanged mail with. Use it for agents that could be talked into sending
+- Recipients on the tenant's **send-block** list are not sent to: the send is accepted and their
+  deliveries end `suppressed`. With `policy.send_allowlist_only: true`, only recipients on the
+  **send-allow** list are sent to; the others are `suppressed` the same way.
+- With the identity's `send_policy.require_known_recipient: true`, the identity only delivers to
+  addresses it has already exchanged mail with; other recipients are `suppressed`
+  (`policy: unknown_recipient`), not refused with an error. Use it for agents that could be talked into sending
   data to a new address ([E2](../project/edge-cases.md)).
 - Suppressed recipients are skipped and the rest are delivered. See
   [Bounces, complaints and suppressions](#bounces-complaints-and-suppressions).
@@ -104,8 +106,8 @@ Reference an inline image from the HTML as `<img src="cid:logo">`.
 
 **The 5 MiB limit.** The whole composed message, after encoding, must fit Cloudflare Email Sending's
 5 MiB limit. The same limit applies on every transport, including Amazon SES and SMTP relays. Attachments are base64-encoded inside the message, which makes them about a third
-larger, so in practice the attachments' original sizes must add up to roughly 3.7 MiB, less the size
-of the body. A larger message fails with `413 message_too_large`. The request body itself can be at
+larger (plus a line break every 76 characters), so in practice the attachments' original sizes must add
+up to about 3.6 MiB, less the size of the body. A larger message fails with `413 message_too_large`. The request body itself can be at
 most 7 MiB (`413 payload_too_large`).
 
 **Signed links for large files.** If the tenant's policy sets `large_attachments: "link"`, attachments
@@ -121,8 +123,9 @@ original message's headers blindly.
 **The recipient** ([D3](../project/edge-cases.md)):
 
 1. By default, a reply goes to the original message's `From` address.
-2. It goes to the `Reply-To` address instead only when that address shares the `From` address's
-   organisational domain, or is already a known contact of the identity.
+2. It goes to the `Reply-To` address instead only when the sender is a known sender of the identity,
+   or the `Reply-To` address shares the `From` address's organisational domain, or the identity has
+   already written to that address.
 3. Otherwise the reply goes to `From`, and the inbound message carries the trust flag
    `reply_to_mismatch`. This stops a stranger from steering replies to an address of their choosing
    with a forged `Reply-To`.
@@ -137,9 +140,12 @@ original message's headers blindly.
 | A new message | The primary address, or `from_address` if you set it. A retiring address can only be used on threads that already use it ([G7](../project/edge-cases.md)) |
 | The address's domain is `failing` | The identity's platform address, as described in [When a domain fails](#when-a-domain-fails) |
 
-The display name is always the identity's. Every outbound message has a `Reply-To` sub-address with
+The display name is always the identity's. Outbound messages have a `Reply-To` sub-address with
 the thread token, for example `bookings+t03k.9f2mq7xa@acme.example.com`, so the answer threads
-correctly even if the other party's client drops the headers.
+correctly even if the other party's client drops the headers. The exception is a domain whose inbound
+mail arrives by forwarding (`send_only`, or `smtp_relay` with `inbound: forward`): its own mail system
+may not keep sub-addresses, so its messages carry no `Reply-To`, and replies thread by
+`In-Reply-To` and `References`.
 
 ## Kinds of mail
 
@@ -195,7 +201,9 @@ confirmations, or two payment reminders. Pylota Mail makes retries safe instead.
 
 - `Idempotency-Key` is **required** on `POST …/messages`, `…/reply`, `…/reply-all` and `…/forward`.
   Without it the request fails with `400 idempotency_key_required`.
-- The key is 1–255 printable ASCII characters, scoped to the identity, and kept for **30 days**.
+- The key is 1–255 printable ASCII characters, spaces included (`^[\x20-\x7E]{1,255}$`), scoped to
+  the identity, and kept for **30 days**. Any other key fails with `400 invalid_idempotency_key`. The
+  MCP send tools apply the same rule to their `idempotency_key` argument.
 - **Same key, same request:** you get the original response, with `"deduplicated": true` and the
   header `Idempotent-Replayed: true`. No second email.
 - **Same key, different request:** `409 idempotency_conflict`, with `details.original_message_id`
@@ -323,7 +331,7 @@ The message `status` is a roll-up of its recipients. Each recipient's own outcom
 | `deferred` | A temporary failure; the provider is retrying | `message.deferred` |
 | `bounced` | At least one recipient bounced and none remains in flight | `message.bounced` (`bounce_type` `hard` or `soft`, `suppressed`) |
 | `complained` | A recipient reported spam (can follow `delivered`) | `message.complained` |
-| `rejected` | The transport refused it before sending | `message.rejected` (`reason`, `detail`) |
+| `rejected` | The transport refused it, at submission or, for some recipients, when the recipient's server rejected it after submission | `message.rejected` (`reason`, `detail`) |
 | `failed` | It could not be sent | `message.failed` (`reason`) |
 | `uncertain` | The outcome is unknown | `message.uncertain` |
 | `suppressed` | Every recipient is suppressed; nothing was sent | `message.suppressed` |
@@ -378,7 +386,9 @@ curl "https://mail.example.com/v1/tenants/ten_01J9…/suppressions?address=jo@ex
 Listings show a masked `address_hint` (for example `j***@example.net`), never the address. You can
 remove `manual`, `unsubscribe`, `hard_bounce` and `provider` suppressions. Removing a `complaint`
 suppression needs `"confirm_complaint_removal": true` and is audit-logged: only do it when the person
-has asked to receive mail again. Each new suppression emits `suppression.created`.
+has asked to receive mail again. A suppression created by mail you sent (a hard bounce, a complaint, an
+unsubscribe or the provider's list) emits `suppression.created`. Suppressions you add through the API do
+not, because you made them.
 
 ## Caps and automatic pausing
 

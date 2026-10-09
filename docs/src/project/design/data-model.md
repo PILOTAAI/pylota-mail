@@ -30,6 +30,11 @@ of truth for both.
 - **JSON columns** end in `_json` and hold values validated by `crates/api-types` before writing.
 - **Enumerations** are `TEXT` with a `CHECK` constraint, so an invalid state fails at write time.
 - D1 runs with `PRAGMA foreign_keys = ON`. Durable Object SQLite enables it in each migration.
+- **Every column has a writer and a reader** named in a design. The only exception is bookkeeping time:
+  `created_at`, `updated_at` and `schema_migrations.applied_at` are written on every insert (and
+  `updated_at` on every update), as is the mailbox's `meta.created_at`, and kept for support and incident work even where no design reads them.
+- **Every Durable Object** keeps `meta.schema_version`, written by its first migration and checked on
+  wake ([Design conventions §4, rule 6](index.md#4-durable-object-transactions)).
 
 ## 1. D1 control plane
 
@@ -48,10 +53,14 @@ CREATE TABLE tenants (
   address_suffix   TEXT NOT NULL,                          -- '' (default tenant) or '.' || slug
   timezone         TEXT NOT NULL DEFAULT 'UTC',            -- IANA name
   policy_json      TEXT NOT NULL,                          -- TenantPolicy (see configuration.md)
-  quota_do_id      TEXT NOT NULL,                          -- TenantQuota Durable Object id
+  quota_do_id      TEXT NOT NULL,                          -- TenantQuota Durable Object id; minted with the row,
+                                                           -- then QuotaRequest::Init { tenant_id }
+  notify_do_id     TEXT NOT NULL,                          -- Notifier Durable Object id; minted with the row,
+                                                           -- then NotifierRequest::Init { tenant_id } (Notifications § 8)
   require_two_factor      INTEGER NOT NULL DEFAULT 0       -- members need two-step verification (console)
                           CHECK (require_two_factor IN (0,1)),
-  onboarding_dismissed_at INTEGER,                         -- first-run checklist dismissed (Cloud sign-up § 8)
+  onboarding_dismissed_at INTEGER,                         -- first-run checklist dismissed: written by the dismiss
+                                                           -- action, read by the Overview render (Cloud sign-up § 8)
   created_at       INTEGER NOT NULL,
   updated_at       INTEGER NOT NULL
 );
@@ -82,7 +91,9 @@ CREATE TABLE domains (
   ownership_verified_at INTEGER,
   expected_ns_json      TEXT,                              -- nameservers seen at verification
   rdap_fingerprint      TEXT,                              -- hash of registrar + registrant handle + created
-  event_subscription_id TEXT,                              -- Email Sending → pm-delivery-events
+  event_subscription_id TEXT,                              -- Email Sending → pm-delivery-events; NULL on a
+                                                           -- cloudflare-transport domain = delivery_events
+                                                           -- "manual" (S9 fallback, identity-domains.md)
   ses_identity          TEXT,                              -- SES email identity name, if inbound or transport = ses
   ses_region            TEXT,                              -- set when inbound or transport is ses
   mail_from_domain      TEXT,                              -- pm-bounce.{domain}, the custom MAIL FROM (SES transport)
@@ -90,8 +101,10 @@ CREATE TABLE domains (
                                                            -- password, probe_from}
   smtp_pending_sealed   BLOB,                              -- values from PATCH waiting for a passing probe
                                                            -- (pm1 envelope, aad column smtp_pending_sealed)
-  probe_last_at         INTEGER,                           -- transport = smtp: last alignment probe
-  probe_last_json       TEXT,                              -- {result, dkim_d, dmarc, from_unchanged, at}
+  probe_last_at         INTEGER,                           -- transport = smtp: last alignment probe; written by
+  probe_last_json       TEXT,                              -- DomainMonitor, read by the health check and GET domain
+                                                           -- {result, dkim_d, dmarc, from_unchanged, at,
+                                                           --  failures_in_row, pending}
   records_json          TEXT NOT NULL DEFAULT '[]',        -- records to publish, with their last observed state;
                                                            -- each carries name (FQDN), host (relative to the
                                                            -- registrable domain), purpose and required
@@ -119,10 +132,14 @@ CREATE TABLE identities (
   pause_reason       TEXT CHECK (pause_reason IN ('manual','abuse_threshold','tenant_suspended')),
   send_policy_json   TEXT NOT NULL DEFAULT '{}',
   metadata_json      TEXT NOT NULL DEFAULT '{}',           -- ≤ 16 string keys, ≤ 512 bytes each
-  mailbox_do_id      TEXT NOT NULL,                        -- IdentityMailbox Durable Object id
+  mailbox_do_id      TEXT NOT NULL,                        -- IdentityMailbox Durable Object id; '' until the
+                                                           -- every-minute cron mints it (the system identity)
+  is_system          INTEGER NOT NULL DEFAULT 0            -- 1 only for the system identity (PM_SYSTEM_FROM):
+                     CHECK (is_system IN (0,1)),           -- never listed to tenants, username not validated
   created_at         INTEGER NOT NULL,
   updated_at         INTEGER NOT NULL
 );
+CREATE UNIQUE INDEX identities_system   ON identities(is_system) WHERE is_system = 1;
 CREATE UNIQUE INDEX identities_client   ON identities(tenant_id, client_id) WHERE client_id IS NOT NULL;
 CREATE UNIQUE INDEX identities_username ON identities(tenant_id, username) WHERE status <> 'deleted';
 CREATE INDEX identities_tenant ON identities(tenant_id, status);
@@ -157,8 +174,7 @@ CREATE INDEX addresses_retiring ON addresses(status, retire_at) WHERE status = '
 CREATE TABLE address_tombstones (
   address_hash TEXT PRIMARY KEY,                           -- hex HMAC-SHA256(PM_HASH_KEY, address)
   identity_id  TEXT,                                       -- the only identity allowed to reclaim it
-  reason       TEXT NOT NULL CHECK (reason IN ('deleted','erased')),
-  created_at   INTEGER NOT NULL
+  reason       TEXT NOT NULL CHECK (reason IN ('deleted','erased'))
 );
 
 CREATE TABLE api_keys (
@@ -192,7 +208,8 @@ CREATE TABLE webhook_endpoints (
   event_types_json       TEXT NOT NULL,                    -- ["*"] or explicit list
   identity_ids_json      TEXT,                             -- optional filter
   enabled                INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
-  disabled_reason        TEXT,                             -- manual | failing
+  disabled_reason        TEXT                              -- manual | failing (a 410 is 'failing'; the event says gone)
+                         CHECK (disabled_reason IN ('manual','failing')),
   secret_enc             TEXT NOT NULL,                    -- AES-256-GCM(PM_MASTER_KEY), base64
   prev_secret_enc        TEXT,
   prev_secret_expires_at INTEGER,
@@ -228,7 +245,9 @@ CREATE TABLE event_index (
   owner_kind   TEXT NOT NULL CHECK (owner_kind IN ('mailbox','domain','job','platform')),
   owner_id     TEXT NOT NULL,                              -- Durable Object id, or 'platform'
   payload_json TEXT,                                       -- only for owner_kind = 'platform'
-  occurred_at  INTEGER NOT NULL
+  occurred_at  INTEGER NOT NULL,
+  fanned_out_at INTEGER                                    -- platform events only: set by the Fanout consumer,
+                                                           -- read by the outbox sweep (Webhooks § Platform events)
 );
 CREATE INDEX event_index_tenant_time ON event_index(tenant_id, occurred_at);
 
@@ -283,7 +302,8 @@ CREATE TABLE erasure_requests (
   counterparty_hash    TEXT,                               -- HMAC of the counterparty address
   reason               TEXT NOT NULL,
   status               TEXT NOT NULL
-                       CHECK (status IN ('queued','running','completed','completed_with_holds','failed')),
+                       CHECK (status IN ('queued','running','completed','completed_with_holds','failed',
+                                         'canceled')),
   receipt_json         TEXT,
   created_by_key_id    TEXT,
   created_at           INTEGER NOT NULL,
@@ -295,7 +315,7 @@ CREATE TABLE exports (
   tenant_id     TEXT NOT NULL,
   job_id        TEXT NOT NULL REFERENCES jobs(id),
   scope         TEXT NOT NULL CHECK (scope IN ('counterparty','identity')),
-  status        TEXT NOT NULL CHECK (status IN ('queued','running','completed','failed','expired')),
+  status        TEXT NOT NULL CHECK (status IN ('queued','running','completed','failed','canceled','expired')),
   r2_key        TEXT,
   size          INTEGER,
   expires_at    INTEGER,                                   -- download available for 7 days
@@ -316,24 +336,45 @@ CREATE TABLE idempotency_records (
   expires_at      INTEGER NOT NULL,                        -- created_at + 30 days
   PRIMARY KEY (scope, idem_key)
 );
+-- Every non-mail POST with an Idempotency-Key (metered ones as in Billing › What the Worker meters):
+--   1. SELECT by (scope, idem_key). completed: same method, path and fingerprint → replay
+--      response_status and response_body with Idempotent-Replayed: true; different → 409 idempotency_conflict.
+--      in_progress and created_at within 60 s → 409 request_in_progress; older (the first request died)
+--      → take it over: UPDATE … SET created_at = now WHERE status = 'in_progress' AND created_at = ?old.
+--   2. Otherwise INSERT (status 'in_progress'); a primary-key conflict → 409 request_in_progress.
+--   3. Run the action, then UPDATE status = 'completed', response_status, response_body (≤ 64 KB; a
+--      larger body stores the resource ID and the replay re-reads it).
+--   A 4xx or 5xx before the action changed anything deletes the row, so the same key can be retried.
 
-CREATE TABLE identity_keys (                               -- P1: agent signing keys (JWKS)
-  id          TEXT PRIMARY KEY,                            -- kid
-  identity_id TEXT NOT NULL REFERENCES identities(id),
-  tenant_id   TEXT NOT NULL,
-  alg         TEXT NOT NULL CHECK (alg = 'EdDSA'),
-  public_jwk  TEXT NOT NULL,
-  private_enc TEXT NOT NULL,                               -- AES-256-GCM(PM_MASTER_KEY)
-  status      TEXT NOT NULL CHECK (status IN ('active','retired')),
-  created_at  INTEGER NOT NULL,
-  retired_at  INTEGER
+-- Agent signing keys (Agent signing keys § 2 and § 8). Generated, sealed and used only inside the Worker.
+CREATE TABLE identity_keys (
+  id           TEXT PRIMARY KEY,                           -- RFC 7638 thumbprint of the public JWK, base64url (the kid)
+  identity_id  TEXT NOT NULL REFERENCES identities(id),
+  tenant_id    TEXT NOT NULL,
+  alg          TEXT NOT NULL CHECK (alg = 'EdDSA'),
+  public_jwk   TEXT NOT NULL,                              -- {kty: OKP, crv: Ed25519, x, kid, alg, use}
+  private_enc  BLOB NOT NULL,                              -- pm1 envelope of the 32-byte Ed25519 seed
+  status       TEXT NOT NULL CHECK (status IN ('active','retiring','retired')),
+  created_at   INTEGER NOT NULL,
+  verify_until INTEGER,                                    -- set when retiring: now + PM_IDENTITY_KEY_OVERLAP_DAYS
+  retired_at   INTEGER
+);
+CREATE UNIQUE INDEX identity_keys_one_active ON identity_keys (identity_id) WHERE status = 'active';
+
+-- Thumbprints of deleted identity keys, never published again (O7). Written by identity- and tenant-scope
+-- erasure in the step that deletes identity_keys; read by key generation, which draws a new seed when the
+-- thumbprint of a new key is found here. Key IDs are not personal data and are never deleted.
+CREATE TABLE key_tombstones (
+  kid        TEXT PRIMARY KEY,                             -- RFC 7638 thumbprint, base64url
+  deleted_at INTEGER NOT NULL
 );
 
 CREATE TABLE usage_daily (
   tenant_id TEXT NOT NULL,
   day       TEXT NOT NULL,                                 -- YYYY-MM-DD in UTC
-  metric    TEXT NOT NULL,                                 -- inbound, outbound, sends, triage, search, agentic,
-                                                           -- ai_neurons, storage_bytes
+  metric    TEXT NOT NULL
+            CHECK (metric IN ('inbound','outbound','sends','triage','search','agentic','ai_neurons',
+                              'storage_bytes','assertions','http_signatures')),
   value     INTEGER NOT NULL,
   PRIMARY KEY (tenant_id, day, metric)
 );
@@ -353,16 +394,22 @@ CREATE TABLE audit_log (
 CREATE INDEX audit_log_tenant ON audit_log(tenant_id, created_at DESC);
 CREATE INDEX audit_log_actor  ON audit_log(actor_key_id, created_at DESC);   -- ?actor_key_id= filter (J6)
 
--- Thread-token, signed-link and search-cursor keys. Generated by the Worker (32 bytes from platform::Rng),
--- never by the operator and never readable through any API or the CLI. Sealed under PM_MASTER_KEY in the
--- encryption envelope of Security § 7.2 with associated data "pm1|signing_keys|ciphertext|{purpose}:{kid}".
+-- Thread-token, signed-link and search-cursor keys, and the Web Bot Auth deployment key. Generated by the
+-- Worker (32 bytes from platform::Rng), never by the operator, and never readable through any API or the
+-- CLI. Sealed under PM_MASTER_KEY in the encryption envelope of Security § 7.2 with associated data
+-- "pm1|signing_keys|ciphertext|{purpose}:{kid}".
 CREATE TABLE signing_keys (
-  purpose      TEXT NOT NULL CHECK (purpose IN ('thread','link','cursor')),
-  kid          TEXT NOT NULL CHECK (length(kid) = 1),      -- one Crockford base32 character, lower case
+  purpose      TEXT NOT NULL CHECK (purpose IN ('thread','link','cursor','web_bot_auth')),
+  kid          TEXT NOT NULL,                              -- thread, link, cursor: one Crockford base32 character,
+                                                           -- lower case; web_bot_auth: the RFC 7638 thumbprint
   ciphertext   BLOB NOT NULL,                              -- pm1.{kid}.{nonce}.{ciphertext} as UTF-8 bytes
+                                                           -- (web_bot_auth: the sealed 32-byte Ed25519 seed)
+  public_jwk   TEXT,                                       -- web_bot_auth only: the public JWK the directory lists
   created_at   INTEGER NOT NULL,
   verify_until INTEGER,                                    -- NULL for the current key of its purpose
-  PRIMARY KEY (purpose, kid)
+  PRIMARY KEY (purpose, kid),
+  CHECK ((purpose = 'web_bot_auth' AND length(kid) = 43 AND public_jwk IS NOT NULL)
+      OR (purpose <> 'web_bot_auth' AND length(kid) = 1 AND public_jwk IS NULL))
 );
 CREATE UNIQUE INDEX signing_keys_current ON signing_keys(purpose) WHERE verify_until IS NULL;
 
@@ -391,8 +438,10 @@ CREATE TABLE ses_ingest (
   recipient   TEXT NOT NULL,                               -- normalised envelope recipient
   received_at INTEGER NOT NULL,
   status      TEXT NOT NULL CHECK (status IN ('queued','held','done','dropped','lost')),
-  done_at     INTEGER,
-  PRIMARY KEY (object_key, recipient)
+  done_at     INTEGER,                                     -- set with any terminal status (done, dropped, lost);
+                                                           -- read by the global retention job (30 days after)
+  PRIMARY KEY (object_key, recipient),
+  CHECK ((status IN ('queued','held')) = (done_at IS NULL))
 );
 CREATE INDEX ses_ingest_pending ON ses_ingest(status, received_at) WHERE status IN ('queued','held');
 
@@ -403,8 +452,8 @@ CREATE TABLE users (
   name                  TEXT,
   status                TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','disabled')),
   last_tenant_id        TEXT,                              -- workspace used last (Cloud sign-up § 7)
-  terms_version         TEXT,                              -- PM_TERMS_VERSION accepted at sign-up
-  terms_accepted_at     INTEGER,
+  terms_version         TEXT,                              -- PM_TERMS_VERSION accepted at sign-up; shown on
+  terms_accepted_at     INTEGER,                           -- /console/settings (Console § Screens)
   totp_sealed           BLOB,                              -- pm1 envelope of the 20-byte TOTP secret
   totp_enabled_at       INTEGER,
   totp_last_step        INTEGER,                           -- last accepted time step, against replay
@@ -434,7 +483,8 @@ CREATE TABLE invitations (
   role        TEXT NOT NULL CHECK (role IN ('admin','member','viewer')),
   token_hash  TEXT NOT NULL UNIQUE,                        -- HMAC(link key {key_kid}, token)
   key_kid     TEXT NOT NULL,                               -- signing_keys kid (purpose 'link') of token_hash
-  invited_by  TEXT NOT NULL REFERENCES users(id),
+  invited_by  TEXT REFERENCES users(id),                   -- the console user who invited; NULL for an API key.
+                                                           -- Read by GET …/members and the invitation email
   status      TEXT NOT NULL CHECK (status IN ('pending','accepted','revoked','expired')),
   expires_at  INTEGER NOT NULL,                            -- created + 7 days
   created_at  INTEGER NOT NULL
@@ -485,7 +535,7 @@ CREATE TABLE oauth_states (                                -- one row per starte
   cookie_hash TEXT NOT NULL,                               -- HMAC(link key {key_kid}, __Host-pm_oauth value)
   key_kid     TEXT NOT NULL,                               -- signing_keys kid (purpose 'link') of both hashes
   provider    TEXT NOT NULL CHECK (provider IN ('google','github')),
-  intent      TEXT NOT NULL CHECK (intent IN ('sign_in','sign_up','reauth')),
+  intent      TEXT NOT NULL CHECK (intent IN ('sign_in','sign_up')),  -- read by the callback (§ 4 step 5)
   pkce_sealed BLOB NOT NULL,                               -- pm1 envelope of the PKCE verifier
   nonce       TEXT,                                        -- Google only
   next_path   TEXT,                                        -- validated next (Cloud sign-up § 7)
@@ -499,11 +549,32 @@ CREATE TABLE waitlist (                                    -- PM_SIGNUP = waitli
   email        TEXT PRIMARY KEY,                           -- needed to send the invitation; deleted as in the notes
   plan         TEXT,                                       -- plan of interest
   created_at   INTEGER NOT NULL,
-  confirmed_at INTEGER,                                    -- double opt-in link used
+  confirmed_at INTEGER NOT NULL,                           -- double opt-in link used: rows exist only once
+                                                           -- confirmed; invites go oldest confirmed_at first
   invited_at   INTEGER,                                    -- sign-up link sent, valid 7 days
   invite_token_hash TEXT UNIQUE,                           -- HMAC(link key {key_kid}, sign-up link token)
   key_kid      TEXT                                        -- signing_keys kid (purpose 'link') of invite_token_hash
 );
+
+-- Notification preferences of a person in one workspace (Notifications § 2). A missing row means the default:
+-- usage = instant and needs_person = daily for owners and admins, off for members and viewers; new_mail = off.
+-- Written only by the console settings page, the one-click unsubscribe and the bounce handling; read by the
+-- Notifier (cached, meta.prefs_cache_at) and by the webhook dispatcher's "any new_mail preference" check.
+CREATE TABLE notification_prefs (
+  user_id       TEXT NOT NULL REFERENCES users(id),
+  tenant_id     TEXT NOT NULL,
+  kind          TEXT NOT NULL CHECK (kind IN ('usage','new_mail','needs_person')),
+  mode          TEXT NOT NULL CHECK (mode IN ('off','instant','hourly','daily')),  -- usage: off|instant;
+                                                                                   -- needs_person: off|daily
+  filter        TEXT NOT NULL DEFAULT 'all' CHECK (filter IN ('all','needs_reply')), -- new_mail only
+  identity_ids  TEXT,                                      -- JSON array; NULL = every inbox (new_mail only)
+  paused_reason TEXT CHECK (paused_reason IN ('bounce','complaint')),  -- set on every row of the person by a
+                                                           -- hard bounce or complaint on a notification; cleared
+                                                           -- when they confirm their address in the console
+  updated_at    INTEGER NOT NULL,
+  PRIMARY KEY (user_id, tenant_id, kind)
+);
+CREATE INDEX notification_prefs_tenant ON notification_prefs(tenant_id, kind);
 
 -- ---------- Plans and billing ----------
 CREATE TABLE billing_accounts (
@@ -517,7 +588,8 @@ CREATE TABLE billing_accounts (
   period_end           INTEGER NOT NULL,
   grace_until          INTEGER,                            -- past_due grace end (7 days)
   stripe_customer_id   TEXT UNIQUE,
-  stripe_subscription_id TEXT UNIQUE,
+  stripe_subscription_id TEXT UNIQUE,                     -- the plan subscription; written by Applying state,
+                                                           -- read by the plan_managed_by_stripe check (Billing)
   cancel_at_period_end INTEGER NOT NULL DEFAULT 0,
   updated_at           INTEGER NOT NULL
 );
@@ -529,9 +601,17 @@ CREATE TABLE billing_events (                              -- Stripe webhook ded
   received_at  INTEGER NOT NULL,
   processed_at INTEGER,
   outcome      TEXT                                        -- applied | ignored_stale | error:<code>
+               CHECK (outcome IN ('applied','ignored_stale') OR outcome LIKE 'error:%')
 );
 
 CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);
+
+-- Deployment-wide Durable Objects whose IDs must be minted inside the Worker (jurisdiction).
+CREATE TABLE platform_objects (
+  name       TEXT PRIMARY KEY CHECK (name IN ('ses_control')),
+  do_id      TEXT NOT NULL,                                -- minted by the every-minute cron
+  created_at INTEGER NOT NULL
+);
 ```
 
 ### Notes
@@ -564,6 +644,22 @@ CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER 
   old row is deleted in the same D1 batch instead, so what it signed stops verifying at once. Rows past
   `verify_until` are deleted by the global retention job. Isolates cache the opened keyring for 5 minutes
   and re-read it at once when a token names an unknown kid (at most once a minute per isolate).
+  Notification unsubscribe tokens ([Notifications § 5](notifications.md#5-the-emails)) are MACs under a
+  `link` key too. They claim 90 days but verify only while their key is inside its window, so after a
+  `link` rotation an older token fails (and gets the expired-token page) once its key's 7 days are over.
+- **Web Bot Auth key.** The `web_bot_auth` purpose holds the deployment key of
+  [Agent signing keys](agent-keys.md#2-keys): its kid is the 43-character RFC 7638 thumbprint and
+  `public_jwk` holds the public key the directory lists. The Worker creates it on first use (the first
+  signing request or directory fetch while `PM_WEB_BOT_AUTH=on`), with the same `ON CONFLICT DO NOTHING`
+  and re-read. A rotation sets `verify_until` = now + 7 days on the old key; the directory lists the
+  current key and at most the two newest keys still inside `verify_until`.
+- **Identity keys.** `identity_keys` has at most one `active` row per identity
+  (`identity_keys_one_active`). The Worker writes the first row on the identity's first signing request
+  or on `POST …/keys`; a rotation inserts the new `active` row and sets the old one to `retiring` with
+  `verify_until` in one D1 batch; a revocation, or the global retention job once `verify_until` has
+  passed, sets `retired` and `retired_at`. The JWKS lists `active` rows and the `retiring` rows whose
+  `verify_until` has not passed, so it never depends on that job's timing; `retired` rows are
+  kept until the identity is erased, so a thumbprint is never reused, and then move to `key_tombstones`.
 - **Sealed values.** These columns hold the pm1 envelope of
   [Security § 7.2](security.md#72-encryption-envelope) under `PM_MASTER_KEY`, with associated data
   `pm1|{table}|{column}|{row id}` (for example `pm1|domains|smtp_sealed|{domain_id}`):
@@ -572,6 +668,22 @@ CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER 
   `users.recovery_codes_sealed` and `oauth_states.pkce_sealed`. The re-seal sweep of `pmail secrets rotate-master` covers every one of
   them. Recovery codes are sealed, not hashed under a `link` key, because link keys are deleted 7 days
   after a rotation and recovery codes live for months.
+- **Notification preferences.** `notification_prefs` rows exist only where a person changed a default.
+  Removing a member deletes their rows for that workspace ([O19](../edge-cases.md)); erasing a person
+  deletes all of theirs; tenant erasure deletes the workspace's rows. A bounce or complaint on a
+  notification writes `paused_reason` on all of a person's rows, inserting the default row for a kind that
+  has none ([Notifications § 5](notifications.md#5-the-emails)).
+- **Columns specified by the REST API.** These columns are written only by a REST endpoint and read
+  back by it or by its list filters, and no design page adds behaviour to them, so
+  [REST API](../../reference/api.md) and `openapi.yaml` are their specification: `identities.purpose`
+  (`POST …/identities`, `PATCH`; the `purpose` list filter), `addresses.local_part` (`POST …/addresses`;
+  the Address object), `webhook_deliveries.next_attempt_at` (written by
+  [Webhooks › Retry schedule](webhooks.md#retry-schedule-j4-fr-wh-3); read by
+  `GET /v1/webhooks/{webhook_id}/deliveries`), `sender_lists.tenant_id`, `direction`, `kind`, `entry`,
+  `note` and `created_at` (`PUT /v1/tenants/{tenant_id}/lists/{direction}/{kind}/{entry}`; read by the
+  list endpoints, and `entry` by the inbound and outbound list checks), `members.created_at` (the
+  Member object of `GET /v1/tenants/{tenant_id}/members`) and the mailbox's `threads.archived`
+  (`PATCH …/threads/{thread_id}`; the `archived` list filter).
 - **Who acted.** `audit_log.actor_key_id` names the API key and `actor_user_id` the person who acted in
   the console. Actions of the Worker itself (the Stripe webhook, crons) have neither. A quarantine
   release is not stored on the message, which goes back to `received`: its actor is in the
@@ -593,11 +705,12 @@ CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER 
   ([Domains on any DNS host § 4.5–4.6](domain-connections.md#45-inbound-through-ses)).
 - **Write volume.** D1 receives about four writes per inbound message: the event index, and webhook
   delivery rows per endpoint (plus one `ses_ingest` row per recipient for mail received through SES). The
-  per-message mailbox writes go to the Durable Object. Retention jobs prune `webhook_deliveries`,
-  `event_index`, `idempotency_records` and `ses_ingest` after 30 days.
+  per-message mailbox writes go to the Durable Object. Retention jobs prune `webhook_deliveries` and
+  `event_index` after the tenant's `policy.retention.events_days` (default 30; rows with
+  `tenant_id IS NULL` after 30 days), and `idempotency_records` and `ses_ingest` after 30 days.
 - **Console retention.** `oauth_states` rows expire 10 minutes after creation and are deleted 24 hours
-  after expiry, as `login_tokens` are. Unconfirmed `waitlist` entries are deleted after 7 days, and
-  confirmed ones 30 days after invitation (Cloud sign-up § 6.1). Erasure of a person deletes their
+  after expiry, as `login_tokens` are. `waitlist` entries exist only once confirmed and are deleted 30
+  days after invitation (Cloud sign-up § 6.1). Erasure of a person deletes their
   `oauth_identities` and any `waitlist` row.
 
 ## 2. `IdentityMailbox` Durable Object (SQLite)
@@ -611,12 +724,19 @@ PRAGMA foreign_keys = ON;
 
 CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 -- keys: schema_version, tenant_id, identity_id, created_at, erased ('0'|'1'),
---       event_seq, fts_analyzer_version, embed_model, parser_version, size_bytes,
+--       event_seq, fts_analyzer_version, embed_model,
+--       size_bytes, size_checked_at  pragma page_count * page_size, refreshed at most hourly after a write
+--                       and by the daily maintenance; the check reads the previous value and reports
+--                       mailbox_size when it crosses 70% of 10 GB (Mailbox notes)
 --       claim:{msg}     transport claim {token, claimed_at} (Outbound › The outbound consumer)
 --       backoff:{msg}   quota/rate back-off {n, first_at} while the message stays queued
 --       dispatch:{msg}  time the send pointer was (re)queued; read by the dispatch alarm
---       wait:{domain}   time of the latest active wait for that sender domain (Inbound › E5)
---       alarm:{purpose} pending wake-ups: outbox, lock, claim, dispatch, reconcile, maintenance (Design § 4)
+--       wait:{domain}   time until which a wait for that sender domain counts (RegisterWait: now + timeout
+--                       + 10 s, refreshed every 10 s; Inbound › The wait handler, E4; read by the
+--                       unsolicited-code check, E5)
+--       alarm:{purpose} pending wake-ups: outbox, claim, dispatch, maintenance (Design § 4). Thread locks
+--                       expire lazily and reconciliation is event-driven, so neither has an alarm.
+-- parser_version is a column of messages (and a core constant), not a meta key.
 
 CREATE TABLE threads (
   seq                INTEGER PRIMARY KEY,                  -- per mailbox; used in thread tokens
@@ -652,7 +772,8 @@ CREATE TABLE messages (
                         'rejected','failed','uncertain','suppressed','canceled')),         -- outbound
   rfc_message_id      TEXT,                                -- normalised, without angle brackets
   message_id_synthetic INTEGER NOT NULL DEFAULT 0,         -- B3: hash-derived when missing
-  provider            TEXT,                                -- cloudflare | ses | smtp | simulator | loopback
+  provider            TEXT                                 -- cloudflare | ses | smtp | simulator | loopback
+                      CHECK (provider IN ('cloudflare','ses','smtp','simulator','loopback')),
   provider_message_id TEXT,
   in_reply_to         TEXT,
   references_json     TEXT NOT NULL DEFAULT '[]',
@@ -680,10 +801,12 @@ CREATE TABLE messages (
                                                            -- outbound: transactional|marketing|auto_reply
   automated_json      TEXT,                                -- classification evidence
   auth_json           TEXT,                                -- spf, dkim[], dmarc, arc, authserv
-  verdict             TEXT CHECK (verdict IN ('pass','fail','softfail','none','unaligned')),
+  verdict             TEXT CHECK (verdict IN ('pass','fail','softfail','none','unaligned','unverified')),
   spam_score          REAL,
   known_sender        INTEGER,
-  quarantine_reason   TEXT,                                -- auth_failed | spam | risky_attachment | blocked_sender | otp_unsolicited
+  quarantine_reason   TEXT                                 -- NULL unless status is quarantined or hidden
+                      CHECK (quarantine_reason IN ('auth_failed','auth_unverified','spam','risky_attachment',
+                                                   'blocked_sender','otp_unsolicited')),
   flags_json          TEXT NOT NULL DEFAULT '[]',          -- parse_degraded, message_id_conflict, encrypted,
                                                            -- hidden_text, sent_via_fallback, reprocessed, bcc,
                                                            -- thread_join_unverified, reconciled, loopback,
@@ -695,8 +818,8 @@ CREATE TABLE messages (
   read                INTEGER NOT NULL DEFAULT 0,
   triage_status       TEXT CHECK (triage_status IN ('pending','done','skipped','failed')),
   triage_json         TEXT,
-  idempotency_key_hash TEXT,                               -- outbound: hex SHA-256 of the Idempotency-Key
-  operation           TEXT,                                -- send | reply | reply_all | forward
+  operation           TEXT                                 -- send | reply | reply_all | forward; NULL for inbound
+                      CHECK (operation IN ('send','reply','reply_all','forward')),
   parser_version      INTEGER,
   metadata_json       TEXT NOT NULL DEFAULT '{}'
 );
@@ -826,7 +949,7 @@ CREATE TABLE verifications (                               -- codes and links fo
   value         TEXT NOT NULL,
   sender_domain TEXT NOT NULL,
   expires_at    INTEGER NOT NULL,                          -- received + 24 h; purged after
-  consumed_at   INTEGER
+  consumed_at   INTEGER                                    -- first released by wait; purged 1 h later
 );
 
 CREATE TABLE rate_windows (                                -- inbound per-sender throttle (D5)
@@ -843,8 +966,12 @@ CREATE TABLE rate_windows (                                -- inbound per-sender
   verifications). It also deletes the FTS rows (`DELETE FROM fts WHERE rowid = ?`), and the R2 objects
   and vectors listed before the delete. An identity-scope erasure ends with `delete_all()` on the
   object. See [Privacy and erasure](privacy.md).
-- **Size watch.** The mailbox reports `pragma page_count * page_size` in `meta`. An alert fires at 70%
-  of 10 GB. Raw MIME and attachments are in R2, so mailboxes grow slowly.
+- **Size watch.** After a write transaction, when `meta.size_checked_at` is more than an hour old, and in
+  the daily maintenance, the mailbox computes `pragma page_count * page_size`, writes `meta.size_bytes`
+  and `size_checked_at`, and writes one `mailbox_size_bytes` point. When the previous `size_bytes` was at
+  or under 70% of 10 GB (7,516,192,768 bytes) and the new one is over it, it reports the `mailbox_size`
+  condition ([Observability › Alerts](observability.md#5-alerts)). A mailbox grows only on writes, so an
+  idle mailbox needs no hourly wake-up. Raw MIME and attachments are in R2, so mailboxes grow slowly.
 - **Fallback if `contentless_delete` is unavailable:** use an external-content table
   (`content='fts_docs'`) backed by a `fts_docs` table holding the same six columns. This is decided by
   spike S3 in the [build plan](../build-plan.md).
@@ -854,10 +981,23 @@ CREATE TABLE rate_windows (                                -- inbound per-sender
 ```sql
 -- DomainMonitor
 CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
--- domain_id, tenant_id, state, consecutive_pass, consecutive_fail, failing_since,
--- next_check_at, reminders_sent_json, last_ns_json, last_rdap_fingerprint,
+-- keys (every key the object reads or writes):
+--   schema_version   applied schema (Design § 4, rule 6)
+--   domain_id, tenant_id  owner, written by Init and checked on every request (Design § 4)
+--   state            the core::domain_fsm state; D1 domains.state is a copy written in the same step
+--   candidate, candidate_count  agreed outcome that would change the state, and how many cycles in a row
+--                    (Identities and domains › Outcome per resolver and agreement)
+--   failing_since    when the domain entered failing (suspension after 14 days)
+--   reminders_sent_json  reminders already sent for the current state; reset on every state change
+--   event_seq        outbox sequence (Webhooks › Outbox)
+--   rdap_pending     {fingerprint, seen_at}: an RDAP change seen once; confirmed by a second query at
+--                    least an hour later (alarm:ownership is set to seen_at + 1 hour), cleared otherwise
 --   probe:{token}    pending alignment probe {probe_id, sent_at}; dropped after 15 minutes (smtp_probe_timeout)
 --   forward:{token}  pending forwarding test {address_id, sent_at}; dropped after 10 minutes (forwarding = failed)
+--   alarm:check, alarm:ownership, alarm:ses_check, alarm:probe, alarm:outbox  pending wake-ups (Design § 4,
+--                    rule 5); alarm:probe only for transport = smtp (Domains on any DNS host § 5.3)
+-- The NS and RDAP checks compare with D1 (domains.expected_ns_json, domains.rdap_fingerprint), so the
+-- object keeps no copy of them.
 -- Probe and forwarding-test tokens live only here, never in D1; the result is written to
 -- domains.probe_last_at / probe_last_json or addresses.forwarding / forwarding_checked_at.
 CREATE TABLE checks (
@@ -871,7 +1011,15 @@ CREATE TABLE outbox (seq INTEGER PRIMARY KEY, event_id TEXT NOT NULL UNIQUE, typ
                      payload_json TEXT NOT NULL, occurred_at INTEGER NOT NULL, dispatched_at INTEGER);
 
 -- JobRunner
-CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);   -- job_id, kind, tenant_id, status, attempt
+CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+-- keys (every key the object reads or writes):
+--   schema_version   applied schema (Design § 4, rule 6)
+--   job_id, kind, tenant_id  written by Start; tenant_id is the owner checked on every request (Design § 4)
+--   event_seq        outbox sequence (Webhooks › Outbox)
+--   target_address   erasure by address only, from init to finalise (Privacy § 6.4)
+--   zip_cd:{n}       export ZIP central-directory entries of batch n, until finalise (Privacy § 9.1)
+--   alarm:step, alarm:outbox  pending wake-ups (Design § 4, rule 5)
+-- Job status lives in D1 jobs.status, and attempts are per step (steps.attempts).
 CREATE TABLE steps (
   name        TEXT PRIMARY KEY,                            -- e.g. list_r2, delete_vectors, wipe_mailbox
   status      TEXT NOT NULL CHECK (status IN ('pending','running','done','failed','skipped')),
@@ -884,11 +1032,32 @@ CREATE TABLE steps (
 CREATE TABLE outbox (seq INTEGER PRIMARY KEY, event_id TEXT NOT NULL UNIQUE, type TEXT NOT NULL,
                      payload_json TEXT NOT NULL, occurred_at INTEGER NOT NULL, dispatched_at INTEGER);
 
--- TenantQuota (no meta table: its owner is kept under the storage key 'tenant_id' of the
--- object's key-value API and checked on every request, Security § 5.2)
+-- TenantQuota
+CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+-- keys (every key the object reads or writes; nothing is kept in the key-value API):
+--   schema_version          applied schema (Design § 4, rule 6)
+--   tenant_id               owner, written by QuotaRequest::Init and checked on every request (Security § 5.2)
+--   catalog_hash            hash of the plan catalog the allowances came from (SetPlan)
+--   billing_mode            metered | exempt | disabled (SetPlan)
+--   period_start, period_end  the current billing period, Unix ms (SetPlan, monthly reset)
+--   stale:{feature}         '1' after a hold on a count feature expired; the next Hold recounts from D1
+--   limit_reached:{feature}:{period_start}  set the first time a Hold is denied in a period
+--                           (billing.limit_reached is emitted once per feature and period)
+--   alerted:{feature}:{threshold}:{period}  usage alert sent (Notifications § 4); threshold 80 | 100.
+--                           sends, triage: {period} = period_start, value '1' (once per period);
+--                           counts: {period} = 'count', value = Unix ms of the last alert (24-hour cooldown).
+--                           Written when a confirmed hold first crosses the threshold and
+--                           NotifierRequest::UsageThreshold is sent; read before sending the next one
+--   alarm:holds             earliest holds.expires_at (Billing › Settle, extend and expiry)
+--   alarm:reset             earliest allowances.resets_at (Billing › Monthly reset)
 CREATE TABLE counters (
-  metric TEXT NOT NULL,                                    -- sends, sends:idn_..., agentic, ai_neurons
-  window TEXT NOT NULL,                                    -- YYYY-MM-DD (tenant timezone) or minute bucket
+  metric TEXT NOT NULL,                                    -- daily caps: sends, sends:idn_..., agentic,
+                                                           --   warned:{metric}:{80|100};
+                                                           -- usage: usage:{inbound|outbound|sends|triage|
+                                                           --   search|agentic|ai_neurons|assertions|
+                                                           --   http_signatures}
+  window TEXT NOT NULL,                                    -- YYYY-MM-DD: the tenant's time zone for daily caps,
+                                                           -- UTC for usage:* (flushed to usage_daily)
   value  INTEGER NOT NULL,
   PRIMARY KEY (metric, window)
 );
@@ -914,6 +1083,50 @@ CREATE TABLE outcomes (                                    -- sliding windows fo
   at          INTEGER NOT NULL,
   PRIMARY KEY (identity_id, seq)
 );                                                         -- keeps the last 1,000 per identity
+
+-- SesControl (one per deployment, only with SES; Domains on any DNS host § 4.8)
+CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+-- keys: schema_version; next_free_ms (the earliest time the next SES control-plane call may start)
+
+-- Notifier (one per tenant; Notifications § 8). Holds user IDs, identity IDs and counts, never mail content.
+CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+-- keys (every key the object reads or writes):
+--   schema_version   applied schema (Design § 4, rule 6)
+--   tenant_id        owner, written by NotifierRequest::Init and checked on every request (Design § 5)
+--   alarm:send       earliest pending.due_at (Design § 4, rule 5)
+--   alarm:daily      the next 09:00 in the tenant's time zone (tenants.timezone): the needs_person digest,
+--                    daily new_mail emails and the digest of capped items
+--   prefs_cache_at   when the cached notification_prefs of the workspace were last read from D1
+CREATE TABLE pending (                                     -- items waiting for their window
+  user_id           TEXT NOT NULL,                         -- usr_
+  kind              TEXT NOT NULL CHECK (kind IN ('usage','new_mail','needs_person','account')),
+  ref               TEXT NOT NULL DEFAULT '-',             -- new_mail: the identity ID (inbox); usage:
+                                                           -- '{feature}:{threshold}'; account: the event; else '-'
+  count             INTEGER NOT NULL DEFAULT 0,            -- messages (new_mail) or items
+  needs_reply_count INTEGER NOT NULL DEFAULT 0,            -- new_mail: of which waiting for a reply
+  detail_json       TEXT,                                  -- usage: {feature, threshold, used, granted, period};
+                                                           -- account: {event}; never mail content
+  first_at          INTEGER NOT NULL,
+  due_at            INTEGER NOT NULL,                      -- when the window closes (or the next hourly retry)
+  attempts          INTEGER NOT NULL DEFAULT 0,            -- send attempts while the platform domain fails
+                                                           -- (hourly, for at most 24 hours)
+  PRIMARY KEY (user_id, kind, ref)
+);
+CREATE INDEX pending_due ON pending(due_at);
+CREATE TABLE windows (                                     -- last send, for the 10-minute rule of instant mode
+  user_id      TEXT NOT NULL,
+  kind         TEXT NOT NULL,
+  ref          TEXT NOT NULL DEFAULT '-',                  -- as pending.ref
+  last_sent_at INTEGER NOT NULL,                           -- written after each send; read by the 10-minute rule;
+                                                           -- rows older than 1 day are deleted by the daily alarm
+  PRIMARY KEY (user_id, kind, ref)
+);
+CREATE TABLE sent (                                        -- per-day counters for the caps (50 per person, 200 per
+  day     TEXT NOT NULL,                                   -- workspace); YYYY-MM-DD in the tenant's time zone
+  user_id TEXT NOT NULL,                                   -- usr_, or '*' for the workspace total
+  count   INTEGER NOT NULL,
+  PRIMARY KEY (day, user_id)
+);                                                         -- rows older than 2 days are deleted by the daily alarm
 ```
 
 ## 4. R2 objects

@@ -15,8 +15,9 @@ accept the claim" against "we are pleased to confirm…"). Semantic retrieval ne
 filters by identity, thread, date, sender domain, direction and verdict, isolates tenants, deletes by ID
 for erasure, and costs nothing when idle.
 
-Vectorize facts (the brief verified 2026-10-09; client API page read 2026-10-09): up to 1,536
-dimensions; 20,000,000 vectors and 50,000 namespaces per index; 10 metadata indexes with up to 64 bytes
+Vectorize facts ([limits](https://developers.cloudflare.com/vectorize/platform/limits/) and client API pages,
+both read 2026-10-09): up to 1,536
+dimensions; 20,000,000 vectors and 50,000 namespaces per index (1,000 on the Free plan); 10 metadata indexes with up to 64 bytes
 indexed each; `topK` up to 100 without values or metadata (50 with); vector IDs up to 64 bytes; upserts
 of up to 1,000 vectors per call from Workers; mutations are asynchronous and return a mutation ID, and the
 index reports `processedUpToMutation` and `processedUpToDatetime`; the binding offers `deleteByIds` but

@@ -2,8 +2,8 @@
 
 Pylota Mail stores other people's email, so it is built to keep data where you choose, for as long as
 you choose, and to delete it provably. This guide covers the jurisdiction, what is stored where,
-retention, erasure with receipts, legal holds, subject-access export, and the places where data
-remains after an erasure (and why). The design is in [Privacy and erasure](../project/design/privacy.md).
+retention, erasure with receipts, legal holds, subject-access export, what agent assertions and
+notification emails disclose, and the places where data remains after an erasure (and why). The design is in [Privacy and erasure](../project/design/privacy.md).
 
 You, as the operator of the deployment (and your integrators, for their tenants), remain responsible
 for your legal obligations. This guide describes what the software does.
@@ -30,8 +30,10 @@ AWS is involved only if you connect domains through Amazon SES: the `dns_records
 methods, `smtp_relay` with SES receiving, or a switch to SES as the backup sender
 ([Custom domains](custom-domains.md)). Then SES sends and receives that mail in the region you set in
 `PM_SES_REGION`, and AWS becomes a sub-processor you list in your records. With the `eu` jurisdiction,
-`pmail setup ses` refuses a region outside the EU unless you pass `--allow-non-eu`, and `/health` shows
-`ses_region` so anyone can check it. Without SES, nothing goes to AWS.
+`pmail setup ses` refuses a region outside the EU and the UK unless you pass `--allow-non-eu`, and
+`/health` shows `ses_region` so anyone can check it. For the SES region, `eu` means "EU or UK": the UK
+has an EU adequacy decision under the GDPR, so London (`eu-west-2`) is accepted. Cloudflare's `eu`
+jurisdiction for D1, R2 and Durable Objects means the European Union only. Without SES, nothing goes to AWS.
 
 A domain that sends through your own mail provider (`smtp_relay`) sends its messages to that provider,
 under your own agreement with them.
@@ -41,7 +43,7 @@ under your own agreement with them.
 | Store | Holds | Jurisdiction applies |
 |---|---|---|
 | Durable Object SQLite (one per identity) | Threads, messages (text, sanitised HTML, extracted text), recipients, attachment metadata, labels, the keyword index, references, contacts, triage results, the send ledger, idempotency records, the event outbox, verification codes | Yes |
-| D1 | The control plane: tenants, identities, the address directory, domains, hashed API keys, webhook endpoints and delivery logs, suppressions (hashed), allow and block lists, jobs, erasure requests, the audit log, usage counts, console accounts, memberships and sessions | Yes |
+| D1 | The control plane: tenants, identities, the address directory, domains, hashed API keys, identity signing keys (sealed) and tombstoned key IDs, webhook endpoints and delivery logs, suppressions (hashed), allow and block lists, jobs, erasure requests, the audit log, usage counts, console accounts, memberships, sessions and notification preferences | Yes |
 | R2 | Raw `.eml` files, attachments, extracted attachment text, composed outbound messages, subject-access exports | Yes |
 | Vectorize | One vector per chunk of message or attachment text, with filter fields: identity, thread, date, sender domain, direction, has-attachment, verdict and chunk kind. **Never text, subjects or addresses** | No documented option |
 | Queues | Pointers only, never content. Dead-letter queues keep items at most 14 days | – |
@@ -63,7 +65,7 @@ Each tenant's policy sets how long data is kept ([FR-PRV-2](../project/prd.md#61
 |---|---|---|
 | `raw_days` | 90 | Raw MIME (`raw.eml`) and composed outbound copies in R2. Afterwards `GET …/raw` returns `410 raw_expired`; the parsed message stays |
 | `message_days` | `null` (keep) | When set, messages older than this, with their attachments, extracted text, index rows, references and vectors |
-| `events_days` | 30 | Event and delivery logs |
+| `events_days` | 30 (1–365) | Event and delivery logs: webhook delivery rows, the event index in D1 and the event payloads kept for replay. Webhook replay reaches back 30 days from an event's `occurred_at`, or `events_days` if shorter |
 
 - Retention sweeps run on a schedule. Every purge writes an audit event
   ([I4](../project/edge-cases.md)).
@@ -81,7 +83,6 @@ Some data has a fixed lifetime regardless of policy:
 | "Mail arrived" notices in Amazon SQS (SES domains) | Deleted once handled, normally within a minute; never more than 14 days |
 | Subject-access export files | 7 days |
 | Idempotency records | 30 days |
-| Webhook delivery rows and the event index in D1 | 30 days |
 | Dead-letter queue items (pointers) | At most 14 days |
 
 ## Erasure
@@ -95,7 +96,7 @@ It needs `erasure:manage`.
 | `message` | `identity_id`, `message_id` | One message and everything derived from it |
 | `thread` | `identity_id`, `thread_id` | Every message in the thread |
 | `counterparty` | `counterparty_address` | Every message to or from that address, in every identity of the tenant, including sent copies and outbox events ([I1](../project/edge-cases.md)) |
-| `identity` | `identity_id` | The whole mailbox. Its addresses are tombstoned and can never be reassigned |
+| `identity` | `identity_id` | The whole mailbox and the identity's signing keys. Its addresses and key IDs are tombstoned: the addresses can never be reassigned, and the key IDs are never published again |
 | `tenant` | none | Everything in the tenant. The tenant is then marked `erased` |
 
 ```bash
@@ -153,16 +154,34 @@ your evidence that the request was carried out, and you need them after a restor
 ## Console accounts
 
 For each person who uses the console, Pylota Mail stores their sign-in address and name, the workspaces
-they belong to and their role, their sessions (with the browser family only), and when they accepted the
-terms. If they use Google or GitHub, it stores that provider's account ID and the address at the time of
-linking. A two-step verification secret and recovery codes are stored encrypted.
+they belong to and their role, their sessions (with the browser family only), their notification
+preferences in each workspace, and when they accepted the terms. If they use Google or GitHub, it stores
+that provider's account ID and the address at the time of linking. A two-step verification secret and
+recovery codes are stored encrypted.
 
 - A person can delete their own account under **Settings** once they own no workspace. That ends their
-  memberships and sessions and removes their Google and GitHub links and any waitlist entry.
+  memberships and sessions and removes their Google and GitHub links, their notification preferences and
+  any waitlist entry.
+- Removing a member from a workspace deletes their notification preferences there and drops any
+  notifications still waiting for them.
 - Deleting a workspace erases it like any tenant, and also removes its members, invitations and sessions.
   People left with no workspace are deleted too.
 - Waitlist entries that were never confirmed are deleted after 7 days, and confirmed ones 30 days after
   the person was invited.
+
+## What agents and notifications disclose
+
+**Agent assertions.** An [agent assertion](agents.md#agent-assertions) shows its audience, the service
+it was made for, the identity's address, display name and workspace name, and whether a person is
+accountable for the identity (`accountable_human`). That is its purpose. It never contains the owner's
+name, address or any other personal data of the owner. A
+[signed HTTP request](agents.md#signed-http-requests) shows the identity's address to the site, in its
+`From` header. Neither tokens nor signatures are stored or logged; only daily counts are kept.
+
+**Notification emails** go to a person's sign-in address and carry counts only: never a subject, a
+sender, a snippet or an attachment name from mail
+([Receiving › Notifications by email](receiving.md#notifications-by-email)). They are sent from the
+deployment's system address with no images and no tracking.
 
 ## Legal holds
 
@@ -248,4 +267,6 @@ other way, erasure must purge that copy too.
   ([I5](../project/edge-cases.md)).
 - The audit log records actions and targets, never message content or clear addresses.
 - If you set `PM_AI_GATEWAY`, model calls (which carry mail content) pass through that AI Gateway.
-  Review its logging and caching settings.
+  Pylota Mail turns off the gateway's log collection and caching on every call that carries mail
+  content, so the gateway keeps only request metadata (model, time, tokens) for those calls. Its rate
+  limits and other settings still apply.

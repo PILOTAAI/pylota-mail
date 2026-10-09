@@ -19,7 +19,7 @@ There is no separate CLA.
 rustup target add wasm32-unknown-unknown
 cargo install worker-build --version 0.8.7 --locked
 cargo install mdbook --version 0.5.4 --locked
-npm i -g wrangler@4.114.0      # local runtime and deploy tool (Node CLI); no JS is written in this repo
+npm i -g wrangler@4.139.0      # local runtime and deploy tool (Node CLI, needs Node.js 22+); no JS is written in this repo
 cargo test --workspace
 cargo xtask itest
 ```
