@@ -185,21 +185,19 @@ The `Fanout` consumer sees every outbox event, so it also feeds new-mail notific
 
 1. **Which events.** By the `event_type` in the `Fanout` message: `message.received`,
    `message.released` (a message released from quarantine counts when it is released), and
-   `message.triaged` when a `needs_reply` filter may be waiting (step 2). No other type is handed over.
+   `message.triaged`. No other type is handed over.
 2. **Whether anyone follows new mail.**
 
    ```sql
    SELECT EXISTS (SELECT 1 FROM notification_prefs
-                  WHERE tenant_id = ?1 AND kind = 'new_mail' AND mode <> 'off')   AS any_new_mail,
-          EXISTS (SELECT 1 FROM notification_prefs
-                  WHERE tenant_id = ?1 AND kind = 'new_mail' AND mode <> 'off'
-                    AND filter = 'needs_reply')                                AS any_needs_reply;
+                  WHERE tenant_id = ?1 AND kind = 'new_mail' AND mode <> 'off')   AS any_new_mail;
    ```
 
    The answer is cached in the isolate for 60 seconds per tenant, so a preference turned on starts
-   counting within a minute. `message.received` and `message.released` go on only with `any_new_mail`,
-   and `message.triaged` only with `any_needs_reply`. A tenant where nobody follows new mail never reaches the Notifier from
-   this path.
+   counting within a minute. All three types go on only with `any_new_mail`, whatever the preferences'
+   filter: `message.triaged` serves both a `needs_reply` filter and the `needs_reply_count` that every
+   `new_mail` email shows. A tenant where nobody follows new mail never reaches the Notifier from this
+   path.
 3. **The payload.** Read the event with `MailboxRequest::GetEvents` on its owner, as the `Deliver`
    consumer does (one call per owner for a queue batch). A `message.received` re-emitted by a re-parse
    (`data.reprocessed: true`, [Inbound › Re-parsing](inbound.md#re-parsing-j3)) is skipped: it is not
@@ -208,9 +206,10 @@ The `Fanout` consumer sees every outbox event, so it also feeds new-mail notific
    named by `tenants.notify_do_id`, with the event's tenant and identity in the RPC envelope. `flags` come
    from the payload: the message's flags for `message.received` and `message.released`, the triage verdict for
    `message.triaged`. The Notifier applies the visibility rule (only mail visible in
-   the inbox counts, [O15](../edge-cases.md)), the coalescing ([O14](../edge-cases.md)), and uses a
-   triage result only for a message it is holding for a `needs_reply` filter (up to 5 minutes,
-   [O16](../edge-cases.md)), ignoring the rest.
+   the inbox counts, [O15](../edge-cases.md)) and the coalescing ([O14](../edge-cases.md)). It uses a
+   triage result for a message it holds in `held` for a `needs_reply` filter (up to 5 minutes,
+   [O16](../edge-cases.md)), and to add to `needs_reply_count` of a `pending` row that already counts the
+   message; any other triage result is ignored ([Notifications §3](notifications.md#3-how-notifications-are-produced)).
 5. **Never blocking delivery.** The hand-off runs after the delivery work and cannot change it: a failed
    or timed-out step 3 or 4 (the standard RPC deadline, [Design § 5](index.md#5-internal-durable-object-rpc))
    is logged as `notifier_handoff_failed` with the event and tenant IDs, and the message is still acked.
@@ -456,7 +455,7 @@ event and endpoint IDs, status codes and durations, never payloads or URLs' quer
 | `it::webhooks::disable_on_410` | `410 Gone` disables at once and emits `webhook.disabled` to other platform endpoints |
 | `it::webhooks::disable_after_100_failures_24h` | 100 failures within 24 h do not disable; 100 spread over ≥ 24 h do |
 | `it::webhooks::replay_by_ids_and_window` | Replay by IDs and by window with `status: dead`; the limit is 30 days from `occurred_at` (an event that went `dead` on day 3 cannot be replayed after day 30), or `events_days` when shorter; erased events are not replayed |
-| `it::webhooks::notifier_handoff_never_blocks` | `message.received` reaches the tenant's Notifier only when a `new_mail` preference is on (after the 60-second cache), and never for a re-parse; `message.triaged` only with a `needs_reply` preference; a failing Notifier leaves every delivery queued and the event acked |
+| `it::webhooks::notifier_handoff_never_blocks` | `message.received` reaches the tenant's Notifier only when a `new_mail` preference is on (after the 60-second cache), and never for a re-parse; `message.triaged` reaches it under the same condition, with `filter = all` as with `needs_reply`; a failing Notifier leaves every delivery queued and the event acked |
 | `it::webhooks::identity_key_events` | Creating, rotating and revoking an identity key emits `identity.key_created`, `identity.key_rotated` (with `previous_kid`) and `identity.key_revoked` with the identity's `identity_id` and the next `sequence`; an existing active key returned by `POST …/keys` and a second revoke emit nothing |
 | `it::webhooks::filters` | Event-type and identity filters; `*` includes new types; platform endpoints see every tenant (FR-WH-1) |
 | `it::webhooks::payload_text_cap` | `extracted_text` capped at `webhook_text_bytes`, never above 64 KB; quarantined events carry none (FR-WH-4) |

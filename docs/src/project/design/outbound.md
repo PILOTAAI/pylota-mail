@@ -51,9 +51,10 @@ pm-delivery-events ─▶ delivery consumer ─▶ ApplyDeliveryEvent ─▶ per
    `details.errors[]`.
 5. **Fingerprint** (section below).
 6. **D1 context** in one `batch` (5-second deadline; `503 unavailable` on failure): the identity row
-   (`status`, `pause_reason`, `owner_*`, `display_name`, `signature_*`, `send_policy_json`), the tenant
-   (`status`, `mode`, `policy_json`, `timezone`), all of the identity's addresses with their domains
-   (`state`, `kind`, `transport`, `reply_token`, `sending`), the platform domain, suppressions for every
+   (`status`, `pause_reason`, `owner_*`, `display_name`, `signature_*`, `send_policy_json`, `is_system`),
+   the tenant (`status`, `mode`, `policy_json`, `timezone`, `created_at`, `ramp_lifted_at`) with its
+   `billing_accounts` `mode` and `plan_id` (for the send ramp of step 18), all of the identity's addresses
+   with their domains (`state`, `kind`, `transport`, `reply_token`, `sending`), the platform domain, suppressions for every
    requested recipient (`address_hash IN (…)`), send-list entries for each recipient address and
    `@domain`, and, for a test tenant, the directory rows of the recipients (policy step 8).
 7. **Call `MailboxRequest::Submit`** (30-second deadline). The handler does **not** apply policy
@@ -132,7 +133,7 @@ alarm; an expired key behaves as new.
 | 15 | Transport configured: `ses` without the SES secrets and region | `422 transport_unavailable`, `details.reason = "ses_not_configured"` |
 | 16 | Per recipient: suppression, send-block, `send_allowlist_only`, `require_known_recipient` ([Recipient filters](#recipient-filters)) | not an error: the recipient's delivery is `suppressed` (FR-OUT-4, [G4](../edge-cases.md), [E2](../edge-cases.md)) |
 | 17 | Size after composition ([Attachments and size](#attachments-and-size)) | `413 message_too_large`, unless `large_attachments: "link"` |
-| 18 | Plan allowance and daily caps, in one `TenantQuota` request and one transaction ([TenantQuota](#tenantquota)). First the **`sends` hold** (FR-BILL-4, FR-BILL-5): `units` = recipients left after step 16, `ref` = the new `msg_` ID, gate `storage_gb` when the message has attachments; a send whose recipients are all suppressed takes no hold. Then the **daily-cap reserve** (identity cap: `send_policy.daily_cap`, else `policy.identity_daily_send_cap`; tenant cap: `policy.tenant_daily_send_cap`), counted per accepted message in the tenant's time zone ([E3](../edge-cases.md)). If either fails, neither is kept | `402 billing_limit` (`details.feature` = `sends` or `storage_gb`); `429 daily_cap_reached`, `details.resets_at` |
+| 18 | Plan allowance and daily caps, in one `TenantQuota` request and one transaction ([TenantQuota](#tenantquota)). First the **`sends` hold** (FR-BILL-4, FR-BILL-5): `units` = recipients left after step 16, `ref` = the new `msg_` ID, gate `storage_gb` when the message has attachments; a send whose recipients are all suppressed takes no hold. Then the **daily-cap reserve** (identity cap: `send_policy.daily_cap`, else `policy.identity_daily_send_cap`; tenant cap: `policy.tenant_daily_send_cap`), counted per accepted message in the tenant's time zone ([E3](../edge-cases.md)). The tenant cap is min(`policy.tenant_daily_send_cap`, 50) while the **new-workspace send ramp** applies: `PM_BILLING=stripe`, the workspace `metered` on the catalog's `default_plan`, and `tenants.ramp_lifted_at IS NULL` ([Cloud sign-up › New-workspace send ramp](cloud-signup.md#101-new-workspace-send-ramp), [W30](../edge-cases.md)). The **system identity** (`is_system = 1`) is exempt from the tenant cap: its reserve is not counted against it, and only its own `send_policy.daily_cap` (50,000) applies ([Identities and domains › The system identity](identity-domains.md#the-system-identity)). If either check fails, neither is kept | `402 billing_limit` (`details.feature` = `sends` or `storage_gb`); `429 daily_cap_reached`, `details.resets_at` |
 | 19 | Thread lock ([C4](../edge-cases.md), FR-OUT-9) | `409 thread_busy`, `details.retry_after` |
 
 The allowance is checked before the daily caps, so a request that would fail both gets the `402`, which
@@ -795,6 +796,12 @@ and only when it changed a row: `EmitEvent identity.paused` with `reason: "abuse
 `metrics: { complaints, complaint_window: 1000, bounces, bounce_window: 200 }`, and an `audit_log` row
 (`identity.auto_pause`). Resuming needs a platform or tenant key ([API](../../reference/api.md#patch-v1identitiesidentity_id--identitieswrite)).
 
+**The system identity is exempt.** For the identity with `is_system = 1` the consumer still records each
+outcome but never runs the pause: pausing it would stop every sign-in, invitation and notification email
+of the deployment. Its bounces and complaints are handled per person instead (a notification bounce pauses
+that person's notification preferences, [O17](../edge-cases.md)), and suppressions apply to it as to any
+identity.
+
 ## Uncertain sends and reconciliation (FR-DLV-4)
 
 An `uncertain` message is **never resent automatically** (FR-OUT-2). Its deliveries are `uncertain`
@@ -1039,6 +1046,9 @@ pub enum QuotaRequest {
               hold: Option<SendsHold> },             // policy step 18: the sends hold, checked first
     Release { identity_id: String, day: String },
     RecordOutcome { identity_id: String, outcome: Outcome, at: i64 },
+    OutcomeRates { since: i64 },                     // the daily ramp evaluation (Cloud sign-up § 10.1): counts
+                                                     // the tenant's outcomes rows with at >= since
+                                                     // → { outcomes, bounced, complained }
     CountAgentic { day: String, cap: u32 },          // Search § 2 step 3: increments `agentic` for `day`
                                                      // (tenant time zone) and `usage:agentic`
                                                      // → Ok { used } | CapReached { resets_at }
@@ -1054,7 +1064,7 @@ pub enum QuotaRequest {
     Extend { feature: Feature, r#ref: String, until: i64 },     // a send waiting in transport back-off
     // … and Adjust, SetPlan, SetMeasured, Reconcile, GetUsage, used by billing only
 }
-pub enum UsageMetric { Inbound, Outbound, Search, AiNeurons }
+pub enum UsageMetric { Inbound, Outbound, Search, AiNeurons, Assertions, HttpSignatures }
 pub struct SendsHold { pub units: u32, pub r#ref: String, pub gates: Vec<Feature> }  // ref = msg_ ID
 // Reserve → Ok { identity_used, tenant_used, warnings: Vec<QuotaWarning>, held: Option<Held> }
 //         | Denied { feature, granted, used, resets_at, first_in_period }   → 402 billing_limit
@@ -1093,6 +1103,8 @@ excluded.value`), then deletes `usage:*` rows older than two days. Writers:
 | `search` | `RecordUsage { Search, 1 }` from the search handler ([Search § 2](search.md#2-request-handling), step 10) | A keyword, semantic or hybrid search returned |
 | `agentic` | `CountAgentic` | An agentic search was admitted |
 | `ai_neurons` | `RecordUsage { AiNeurons, n }` from the triage job and the agentic planner | After each model call that reports neurons ([Triage](triage.md)) |
+| `assertions` | `RecordUsage { Assertions, 1 }` from the assertion service behind `POST /v1/identities/{identity_id}/assertions` and `mail_sign_assertion` ([Agent signing keys](agent-keys.md)) | A token was signed and returned (once per token) |
+| `http_signatures` | `RecordUsage { HttpSignatures, 1 }` from the signing service behind `POST /v1/identities/{identity_id}/http-signatures` and `mail_sign_http_request` | A request was signed and returned (once per signature) |
 | `storage_bytes` | `SetMeasured`, by the roll-up itself | Hourly |
 
 The provider's own daily quota is per Cloudflare account and is not visible to the Worker
@@ -1162,6 +1174,7 @@ Agent        API handler      IdentityMailbox     pm-outbound consumer   Cloudfl
 | `it::send::g11_loopback` | Live tenant to a local address goes through the transport; test tenant through loopback ([G11](../edge-cases.md)) |
 | `it::delivery::uncertain_reconciled` | A later event reconciles an uncertain send and emits `message.reconciled` (FR-DLV-4) |
 | `it::delivery::abuse_auto_pause` | Four complaints in a 1,000 window or eleven bounces in a 200 window pause the identity once (FR-DLV-3) |
+| `it::send::system_identity_exemptions` | With the default tenant's `tenant_daily_send_cap` set to 2 and the system identity's `send_policy.daily_cap` to 4 (platform key), the system identity's third and fourth sends are accepted and the fifth gets `429 daily_cap_reached`; another identity of the default tenant is held to the tenant cap; eleven bounces in the system identity's 200 window are recorded but never pause it |
 | `it::send::k3_failure_reason` | `message.failed` / `message.rejected` carry the reason and detail ([K3](../edge-cases.md)) |
 | `it::testmode::l1_refuse_external` | `test_mode_recipient` ([L1](../edge-cases.md), FR-TEN-2) |
 | `it::testmode::l2_simulator_matrix` | Every simulator script ([L2](../edge-cases.md)) |

@@ -5026,7 +5026,7 @@ paths:
           workspace, so they can always call this without listing it. A platform key must hold `usage:read`
           explicitly and must pass `tenant_id`; without `tenant_id` it gets `400 invalid_request`.
         - `billing` is `metered`, `exempt` (no limits) or `disabled` (self-hosted without billing; `features`
-          show counts with `granted: null`, `unlimited: true`, plus any operator quota from tenant policy).
+          show the real `used` with `granted: null`, `remaining: null` and `unlimited: true`).
         - `used` for `storage_gb` is measured, rounded up, and refreshed at least hourly.
         - `granted` includes top-ups. `plans` is the catalog from `PM_PLAN_CATALOG`.
       x-required-permission: ['usage:read']
@@ -8627,7 +8627,10 @@ components:
           type: integer
           minimum: 0
           default: 5000
-          description: Sends per tenant per day (tenant time zone). Then `429 daily_cap_reached`.
+          description: >-
+            Sends per tenant per day (tenant time zone). Then `429 daily_cap_reached`. With billing on, a new
+            workspace on the Free plan has an effective cap of the lower of this value and 50 until its
+            new-workspace send ramp is lifted (at the earliest on day 7, or at once on a paid plan).
         max_recipients:
           type: integer
           minimum: 1
@@ -11675,7 +11678,7 @@ components:
       type: string
       description: >-
         `metered` (the plan's allowances plus top-ups), `exempt` (no limits) or `disabled` (self-hosted
-        without billing; only operator quotas from tenant policy apply).
+        without billing; only the daily caps in tenant policy apply).
       enum: [metered, exempt, disabled]
     UsageFeatureName:
       type: string

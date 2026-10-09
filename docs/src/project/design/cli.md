@@ -1500,7 +1500,7 @@ permission and is refused with `403`, exit 4):
 - Output: the response as indented JSON (`assertion`, `kid`, `expires_at`, `jwks_uri`); `--quiet` prints
   only the token, for `$(…)` in a script. The token is a short-lived credential for its audience: the
   CLI never writes it to a file or a log.
-- A paused identity, or one of a suspended tenant, is `409 identity_paused` (exit 6).
+- Suspended tenant → `403 tenant_suspended` (exit 4); paused identity → `409 identity_paused` (exit 6).
 
 **`assertions verify`** (no API key and no Cloudflare credentials):
 

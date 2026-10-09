@@ -394,7 +394,8 @@ names are allowed, except `postmaster` and `abuse`, whose mail goes to the tenan
   suppress the recipient permanently, and count towards automatic pausing
   ([Sending › Bounces, complaints and suppressions](guides/sending.md#bounces-complaints-and-suppressions)).
 - The system identity also sends people's notification emails from the platform domain: new-mail
-  counts, usage alerts and the daily "needs a person" email, as each person chooses in the console
+  counts, usage alerts (only with `PM_BILLING=stripe`; with billing off no allowance has a limit) and the
+  daily "needs a person" email, as each person chooses in the console
   ([Notifications](project/design/notifications.md)). `PM_NOTIFICATIONS = "on"` is the default; set it
   to `"off"` in `deploy/wrangler.toml` and run `pmail deploy` to send only `account` notifications
   (security and billing events, which cannot be turned off).

@@ -10,7 +10,7 @@ repository. Humans should read it too.
 3. `docs/src/project/design/*.md` — the detailed design for each subsystem. These are binding.
 4. `docs/src/reference/api.md` and `docs/src/reference/openapi.yaml` — the public contract.
 5. `docs/src/project/build-plan.md` — the order of work, file by file, with acceptance tests.
-6. `docs/src/project/edge-cases.md` — every row must end up covered by a named test.
+6. `docs/src/project/edge-cases.md` — every row the service owns (`S` or `S+I`) must end up covered by a named test.
 
 If the code and the design disagree, the design wins until a design change is written down in
 `docs/src/project/adr/`. Do not silently change a public contract (API, events, CLI, MCP tool names).

@@ -28,8 +28,8 @@ service, **Pylota Mail Cloud**, on the plans below.
    erasure returns a receipt with per-store counts and empty probe queries.
 7. **Real team seats.** Workspaces have members with roles, enforced seat counts and an audit log, on Cloud and
    when self-hosted.
-8. **Tested against the edge cases.** A public register of edge cases, each mapped to a named test, plus a MIME
-   conformance corpus and search-quality gates in CI.
+8. **Tested against the edge cases.** A public register of edge cases, each one the service owns mapped to a named
+   test, plus a MIME conformance corpus and search-quality gates in CI.
 
 ## What it does
 

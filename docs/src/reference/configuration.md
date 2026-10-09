@@ -53,8 +53,9 @@ Cron triggers:
   state-alert evaluator, and the SES inbound backstop (draining `PM_SES_INBOUND_QUEUE_URL`, when set).
   Retrying stuck sends, transport claims and uncertain-send bookkeeping run in each mailbox's own alarms,
   not in the cron.
-- `*/15 * * * *`: domain health scheduling, retention, usage roll-up, the master-key re-seal sweep, and
-  the nightly backup job once per UTC day when `PM_BACKUP_BUCKET` is set.
+- `*/15 * * * *`: domain health scheduling, retention, usage roll-up, the master-key re-seal sweep, the
+  nightly backup job once per UTC day when `PM_BACKUP_BUCKET` is set, and, with `PM_BILLING=stripe`, the
+  new-workspace send-ramp evaluation once per UTC day (`crons/signup_ramp.rs`).
 
 ## Variables
 
@@ -99,7 +100,7 @@ Cron triggers:
 | `PM_SIGNUP_BLOCKED_DOMAINS` | unset | Comma-separated domains refused at sign-up, before any mail is sent, in addition to the built-in list of disposable-mail domains that ships with each release |
 | `PM_OAUTH_GOOGLE_CLIENT_ID` | unset | With the secret `PM_OAUTH_GOOGLE_CLIENT_SECRET`, enables "Continue with Google" |
 | `PM_OAUTH_GITHUB_CLIENT_ID` | unset | With the secret `PM_OAUTH_GITHUB_CLIENT_SECRET`, enables "Continue with GitHub" |
-| `PM_BILLING` | `off` | `off` (no plan checks; operator quotas only) or `stripe` (plans, metering, Stripe checkout and portal) |
+| `PM_BILLING` | `off` | `off` (no plan checks and no usage alerts; only the daily caps in tenant policy apply) or `stripe` (plans, metering, Stripe checkout and portal) |
 | `PM_PLAN_CATALOG` | built-in Cloud catalog | JSON plan catalog (see [Billing design](../project/design/billing.md#plan-catalog)), including each plan's Stripe price IDs |
 | `PM_BILLING_GRACE_DAYS` | `7` | Days a `past_due` workspace keeps its plan before Free limits apply |
 
@@ -117,7 +118,7 @@ stdout, a file or a log; with it they are printed once to stdout.
 | `PM_HASH_KEY` | yes | Pseudonymisation: address tombstones, suppression hashes, log and query hashes |
 | `PM_CF_API_TOKEN` | for some domain methods (for every deployment if a spike S6 REST fallback is taken) | Runtime automation of tenant domains (zone onboarding and creation, literal routing rules, event subscriptions), and the REST fallbacks for Vectorize and Workers AI if spike S6 fails ([Rust workspace §7](../project/design/rust-workspace.md#7-wasm-bindgen-externs)). Required on the Worker for the `cloudflare_zone`, `nameservers` (a token that can create zones) and `delegated_subdomain` methods; without it they get `422 cf_token_required`. `pmail domains add --local-token` with your own token can then add an apex `cloudflare_zone` domain only (catch-all, no literal rules). `dns_records`, `send_only` and `smtp_relay` need no Cloudflare token. Its permissions are in [Deploy › Create a Cloudflare API token](../self-hosting.md#2-create-a-cloudflare-api-token) |
 | `PM_SES_ACCESS_KEY_ID`, `PM_SES_SECRET_ACCESS_KEY` | no | Amazon SES in both directions: sending (`dns_records`, `send_only`, failover), creating domain identities, and receiving (S3 objects, the SQS backstop, receipt-rule updates). `pmail setup ses` creates the IAM user with exactly one policy |
-| `PM_STRIPE_SECRET_KEY` | only with `PM_BILLING=stripe` | Stripe API calls (Checkout sessions, Customer Portal sessions, subscription reads). Use a restricted key with only those permissions |
+| `PM_STRIPE_SECRET_KEY` | only with `PM_BILLING=stripe` | Stripe API calls: create and retrieve Checkout Sessions, create Customer Portal sessions, read subscriptions, and cancel subscriptions when a workspace is deleted. Use a restricted key with exactly those permissions ([Billing › Stripe integration](../project/design/billing.md#stripe-integration)) |
 | `PM_STRIPE_WEBHOOK_SECRET` | only with `PM_BILLING=stripe` | Verifying the `Stripe-Signature` header on `/billing/stripe/webhook` |
 | `PM_OAUTH_GOOGLE_CLIENT_SECRET`, `PM_OAUTH_GITHUB_CLIENT_SECRET` | only with the matching client ID | The OAuth code exchange for Google and GitHub sign-in |
 
@@ -215,7 +216,7 @@ document with defaults:
 
 | Field | Notes |
 |---|---|
-| `tenant_daily_send_cap` | On Pylota Mail Cloud, a new workspace on the Free plan starts with a cap of 50 for its first 7 days. The ramp lifts on day 7 if its bounce and complaint rates are under the `abuse` thresholds, or at once on a paid plan ([Cloud sign-up › Abuse and safety](../project/design/cloud-signup.md#10-abuse-and-safety-on-cloud)) |
+| `tenant_daily_send_cap` | With `PM_BILLING=stripe`, a new workspace on the Free plan has an effective cap of min(this value, 50) until `tenants.ramp_lifted_at` is set: for its first 7 days, then until the daily evaluation (the `*/15` cron's `crons/signup_ramp.rs`) finds its bounce and complaint rates under the `abuse` thresholds. A paid plan lifts it at once. The system identity is never counted against this cap ([Cloud sign-up › New-workspace send ramp](../project/design/cloud-signup.md#101-new-workspace-send-ramp)) |
 | `max_recipients` | 1–49. Cloudflare allows 50 recipients per message, and one is kept for the hidden journal copy of Message-ID strategy B ([Outbound design](../project/design/outbound.md#message-id-of-outbound-mail-spike-s7)) |
 | `large_attachments` | `refuse`, or `link` (expiring signed links, `link_ttl_hours` 1–168) |
 | `ai_disclosure.mode` | `none`, `footer` (appended to text and HTML) or `header` (`X-AI-Generated: true`) |

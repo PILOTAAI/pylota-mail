@@ -97,7 +97,8 @@ an email link or code, or with Google or GitHub where enabled, plus optional two
 ([Cloud sign-up](design/cloud-signup.md)).
 
 With `PM_BILLING=stripe`, plan allowances are enforced by the workspace's `TenantQuota` object (atomic holds,
-settled when an outcome is known). Stripe is called only to open Checkout and Customer Portal sessions; its
+settled when an outcome is known). Stripe is called only to create and retrieve Checkout Sessions, to
+create Customer Portal sessions, to read subscriptions, and to cancel them when a workspace is deleted; its
 signed webhooks at `/billing/stripe/webhook` are the only writer of subscription state. No metered request
 waits on Stripe. See [Console design](design/console.md) and [Billing design](design/billing.md).
 
@@ -304,12 +305,12 @@ See [Agent signing keys](design/agent-keys.md).
 
 ### 4.7 Notifications
 
-1. **Sources.** The `pm-webhooks` consumer hands `message.received` (and `message.triaged` while a
-   `needs_reply` filter waits) to the tenant's `Notifier` object as `NotifierRequest::Event`, after its
-   delivery work and only when someone in the workspace follows new mail. `TenantQuota` sends
+1. **Sources.** The `pm-webhooks` consumer hands `message.received`, `message.released` and
+   `message.triaged` to the tenant's `Notifier` object as `NotifierRequest::Event`, after its delivery
+   work and only when someone in the workspace follows new mail. `TenantQuota` sends
    `NotifierRequest::UsageThreshold` when a hold first crosses 80% or 100% of an allowance. Console
    handlers send `NotifierRequest::Account` after their D1 batch (two-step verification turned off, a
-   sign-in method linked, ownership transferred).
+   sign-in method linked, ownership transferred), and the billing webhook does for a failed payment.
 2. **Coalescing.** The Notifier keeps pending counts per person and inbox, applies each person's
    preferences from D1 `notification_prefs`, the daily caps and the time zone, and arms its alarm for the
    next window or the daily 09:00 run.

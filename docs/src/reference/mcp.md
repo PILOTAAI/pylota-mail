@@ -424,7 +424,7 @@ error (HTTP 402) from a send tool means an allowance is spent.
 
 `features` lists `inboxes`, `sends`, `triage`, `custom_domains`, `storage_gb` and `seats`; `granted`
 includes top-ups. `billing` is `metered`, `exempt` (no limits) or `disabled` (a deployment without
-billing: every feature has `granted: null` and `unlimited: true`, plus any operator quota). The tool
+billing: every feature has `granted: null` and `unlimited: true`). The tool
 always reports the key's own workspace and takes no `tenant_id`. The fields are described under
 `GET /v1/usage` in [REST API › Usage and audit](api.md#usage-and-audit).
 
@@ -607,7 +607,8 @@ A tool that fails returns a normal result with `"isError": true`. Its text is th
 | `idempotency_key_required`, `invalid_idempotency_key` | A send tool without `idempotency_key`, or with one that is not 1–255 printable ASCII characters (the REST codes, not `invalid_request`) | Pass a valid key |
 | `invalid_query` | The `q` string does not parse (`details.position`, `details.expected`) | Fix the query |
 | `identity_not_found` | The identity does not exist, is being deleted, or the key cannot reach it | Call `mail_list_identities` |
-| `identity_paused` | The identity is paused (`details.reason`), so it cannot send or sign. A signing tool also gets it for every identity of a suspended workspace | Tell a person |
+| `tenant_suspended` | The workspace is suspended, so none of its identities can send or sign. Checked before `identity_paused`: suspended tenant → `tenant_suspended` (HTTP 403); paused identity → `identity_paused` | Tell a person |
+| `identity_paused` | The identity is paused (`details.reason`), so it cannot send or sign (HTTP 409) | Tell a person |
 | `scope_denied` | `scope: "tenant"` with an identity key | Search the identity instead |
 | `scope_too_large` | `scope: "tenant"` on a tenant with more than 100 identities, without `identity_ids` | Pass up to 100 `identity_ids` |
 | `idempotency_conflict` | The key was used for a different message | Use a new key for a new message |

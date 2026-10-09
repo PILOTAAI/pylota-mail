@@ -59,6 +59,14 @@ normal outbound pipeline.
   `inboxes`.
 - **Mail sent to it** is stored in its mailbox like any identity's (bounces and replies to sign-in mail),
   readable only with a platform key.
+- **Exempt from the tenant daily cap and from abuse auto-pause.** Its sends are not counted against the
+  default tenant's `tenant_daily_send_cap`; its own `send_policy.daily_cap` (50,000) still applies
+  ([Outbound › Policy pipeline](outbound.md#policy-pipeline), step 18). The delivery consumer records its
+  outcomes but never pauses it ([Outbound › Abuse auto-pause](outbound.md#abuse-auto-pause-fr-dlv-3)):
+  one person's bounce must not stop everyone's sign-in mail. When a notification send through it is still
+  refused (`429 daily_cap_reached`, `409 identity_paused` after a manual pause, or `409 domain_not_ready`),
+  the Notifier keeps the item, retries it and raises `system_mail_blocked`
+  ([Notifications § 7](notifications.md#7-when-system-mail-cannot-be-sent)).
 - **Fixed retention.** Its mailbox keeps messages 30 days and raw MIME 7 days, whatever the default
   tenant's `retention` policy says: the tenant retention job uses these cutoffs for the identity with
   `is_system = 1` ([Privacy §5.2](privacy.md#52-steps-of-a-tenant-retention-job)). Deleting a person also

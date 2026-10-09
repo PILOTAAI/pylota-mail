@@ -470,6 +470,10 @@ migration (the `domains` method columns, `ses_ingest`, `addresses.ses_bounce_rul
   resources, never deactivates an existing active rule set, and prints the IAM policy before applying it.
 - Every new error code and `transport_unavailable` reason in the design is returned by at least one test.
 - The cross-tenant suite covers `/hooks/ses/inbound` (no key) and the new routes.
+- Erasure extension, once M14 has landed (if M14 lands later, it writes this substep instead of a stub):
+  tenant erasure's `remove_domains` deletes each SES domain's identity and its addresses in the
+  `pm-retired-{n}` receipt rules ([Privacy §6.6](design/privacy.md#66-tenant-scope)).
+  `it::erasure::tenant_console_rows` gains its SES-fake assertions.
 
 **Gate:** each method ships only when its spike passed: S11 for `dns_records`, S12 for `smtp_relay`, S10
 for `delegated_subdomain` (which also stays behind `PM_CF_SUBDOMAIN_SETUP`). `smtp_relay` with `inbound: ses`
@@ -491,11 +495,27 @@ tenant scope also delete `identity_keys` and write `key_tombstones`; with M25 th
 optional backup copy (`it::retention::backup_copy`), and `it::logs::i5_no_content_in_logs`, which greps
 captured Worker logs for any test-message body string and any test address. NFR-PRV-1: in a
 time-controlled harness every erasure scope completes within 24 hours, and a step that keeps failing
-still produces a receipt (`it::erasure::step_retry_and_fail`).
+still produces a receipt (`it::erasure::step_retry_and_fail`). Tenant scope runs its steps in order
+(`it::erasure::tenant_scope_order`), and the global retention job runs every step of
+[Privacy §5.3](design/privacy.md#53-global-retention-job), including `identity_keys` and `billing_events`
+(`it::retention::global_job_steps`).
+
+**Stubs completed by later milestones.** Tenant erasure ([Privacy §6.6](design/privacy.md#66-tenant-scope))
+reaches tables and services that later milestones build. M14 writes every step, and leaves these substeps
+as named stub functions in `jobs/erasure.rs` that do nothing until their milestone fills them in, with the
+test it names:
+
+| Substep | Completed by | Test |
+|---|---|---|
+| Console rows: `members`, `invitations` and `sessions` in `delete_d1_rows` | M21 | `it::erasure::tenant_console_rows` (lands in M21) |
+| Billing: the `cancel_billing` step, and `billing_events` and `billing_accounts` in `delete_d1_rows` | M22 | `it::erasure::tenant_cancels_billing`; billing assertions in `it::erasure::tenant_console_rows` |
+| SES: the SES identity and the `pm-retired-{n}` entries in `remove_domains` | M23 | SES-fake assertions in `it::erasure::tenant_console_rows` |
+| Person rows: deleting every person left with no workspace ([Privacy §6.9](design/privacy.md#69-people-console-accounts)) | M24 | `it::erasure::person_scope`; assertions on people left with no workspace in `it::erasure::tenant_console_rows` |
+| Notifier: `notification_prefs` in `delete_d1_rows`, and `Notifier` `delete_all` | M26 | Notifier assertions in `it::erasure::tenant_console_rows` and `it::erasure::person_scope` |
 
 ---
 
-## M15 · MCP server (after M10, M11, M25)
+## M15 · MCP server (after M9, M10, M11, M22, M25)
 
 **Files:** `mcp/{mod.rs, transport.rs, tools.rs, schemas.rs, prompts.rs}`.
 
@@ -599,12 +619,21 @@ including identity-key management on the identity page ([Agent signing keys §6]
 **Acceptance:**
 
 - Edge rows W9, W10, W15–W18.
-- Every console route works with JavaScript disabled, checked by a Playwright run with `javaScriptEnabled: false`.
-- An axe accessibility scan with no serious violations on every page.
+- Every console route works with JavaScript disabled, checked by the browser suite
+  (`browser::console::no_js`, Playwright with `javaScriptEnabled: false`), which `cargo xtask itest` runs
+  from this milestone on ([Testing §2](design/testing.md#2-test-layers)).
+- An axe accessibility scan finds no violation of impact `serious` or `critical` on any page
+  (`browser::console::axe_scan`).
 - NFR-CON-1: `it::console::render_budget` keeps server render time p95 ≤ 300 ms on every page.
 - Sign-in and invitation emails are sent through the system identity that setup creates
   ([Identities and domains › The system identity](design/identity-domains.md#the-system-identity)), using the
-  simulator in tests; invitations also work with `PM_CONSOLE=off`.
+  simulator in tests; invitations also work with `PM_CONSOLE=off`. The system identity is exempt from the
+  tenant daily cap and from abuse auto-pause (`it::send::system_identity_exemptions`).
+- Erasure extension: the console-rows stub of tenant erasure (`members`, `invitations` and `sessions` in
+  `delete_d1_rows`, [Privacy §6.6](design/privacy.md#66-tenant-scope)) is filled in, and
+  `it::erasure::tenant_console_rows` lands here, asserting those rows; M22, M23, M24 and M26 add their
+  assertions to it. The global retention job's `console` step deletes expired and revoked invitations
+  30 days after `expires_at`.
 
 ---
 
@@ -627,6 +656,16 @@ console pages `plan.rs`. No migration: `billing_accounts` and `billing_events` a
 - NFR-BILL-1: `it::billing::w1_last_unit_race` and the hold property tests allow 0 actions beyond a
   granted allowance. NFR-BILL-2: `it::billing::w2_stripe_down_sends_ok` fails no metered action while
   Stripe is unreachable.
+- Erasure extension: the billing stub of tenant erasure, that is the `cancel_billing` step (the plan and
+  every top-up subscription cancelled at once, no proration, no refund) and `billing_events` and
+  `billing_accounts` in `delete_d1_rows` ([Privacy §6.6](design/privacy.md#66-tenant-scope)), with
+  `it::erasure::tenant_cancels_billing`; webhooks for an erased tenant are answered `200` and recorded
+  `ignored_erased`, except that a live subscription created after the deletion is cancelled
+  (`it::billing::late_subscription_after_erasure`). `it::erasure::tenant_console_rows` gains the billing assertions.
+
+**Gate:** every request pins `Stripe-Version: 2025-03-31.basil`, and each Stripe call matches the
+`Verified` line of [Billing](design/billing.md#tests) (read 2026-10-10; re-read and update it if it is more
+than 30 days old when the code is written).
 
 ---
 
@@ -636,19 +675,30 @@ console pages `plan.rs`. No migration: `billing_accounts` and `billing_events` a
 `crates/core/src/totp.rs` (RFC 6238 codes, pure; the console module only stores and checks them),
 `handlers/platform.rs` (`POST /v1/platform/waitlist/invite`), no migration (the `users` sign-in
 columns, `oauth_identities`, `oauth_states`, `waitlist` and `tenants.{require_two_factor,
-onboarding_dismissed_at}` are in `0001_init.sql`), the host split for `PM_CONSOLE_HOST` in `router.rs`, and CLI `pmail waitlist invite`.
+onboarding_dismissed_at, ramp_lifted_at}` and the `login_tokens` sign-up columns are in `0001_init.sql`),
+the host split for `PM_CONSOLE_HOST` in `router.rs`, CLI `pmail waitlist invite`, the new-workspace send
+ramp (`crons/signup_ramp.rs`, run once a day by the `*/15` cron; the ramp check in outbound policy
+step 18; the `ramp_lifted_at` update in `billing/webhook.rs`; `QuotaRequest::OutcomeRates`), and person
+deletion (`console/pages/settings.rs` and the person step of `jobs/erasure.rs`).
 
 **Implements:** FR-CON-8–13, [Cloud sign-up, sign-in and first run](design/cloud-signup.md).
 
 **Acceptance:**
 
 - Edge rows W20–W34, with the tests named in the register (`it::oauth::*`, `it::signup::*`, `it::totp::*`,
-  `it::landing::routing_table`, `it::checkout::*`, `it::abuse::free_ramp`,
+  `it::landing::routing_table`, `it::checkout::*`, `it::abuse::free_ramp`, `it::abuse::ramp_evaluator`,
   `it::console::delete_account_owner_required`).
+- Erasure extension: person deletion ([Privacy §6.9](design/privacy.md#69-people-console-accounts)) is
+  owned here. That covers account deletion at `/console/settings`, the person-rows stub of tenant
+  erasure (every person left with no workspace), the scrub of accepted invitations, and the
+  system-mail counterparty erasure restricted by the internal `identity_ids` param
+  ([Privacy §6.4](design/privacy.md#64-counterparty-scope-i1)). Tests: `it::erasure::person_scope`,
+  `it::privacy::system_mail_retention_and_person_delete` and `it::erasure::tenant_console_rows`'s
+  assertions on people left with no workspace.
 - `core::totp::rfc6238_vectors`, `it::signup::email_creates_account_only_on_use`,
   `it::onboarding::derived_steps` and `it::hosts::console_api_split`.
-- The new pages pass the M21 checks: they work with JavaScript disabled and have no serious axe
-  violations.
+- The new pages pass the M21 checks: they join `browser::console::no_js` and `browser::console::axe_scan`
+  (no JavaScript needed, no axe violation of impact `serious` or `critical`).
 - `pmail secrets rotate-master` re-seals `users.totp_sealed` and `users.recovery_codes_sealed`.
 
 **Gate:** Google's and GitHub's endpoints and claim names are re-read from their current documentation
@@ -698,8 +748,9 @@ and the cross-tenant suite's new routes (NFR-SEC-1).
   `it::assertions::sdk_verifies` (the SDK verifier accepts a fresh token and rejects a wrong audience, an
   expired token, an unknown kid and `alg: none`).
 - The cross-tenant suite covers the six new `/v1` routes; another tenant's key gets the same `404` as a
-  missing identity, and the two `/.well-known` routes give the same `404 identity_not_found` for unknown,
-  paused and deleted identities.
+  missing identity, and the identity JWKS route (`/.well-known/jwks/{identity_id}.json`) gives the same
+  `404 identity_not_found` for unknown, paused and deleted identities. The key directory is deployment-wide;
+  its only `404` is `key_not_found`, while `PM_WEB_BOT_AUTH` is `off`.
 - No response, log line, event or idempotency record contains a private key, a seed, an assertion or a
   signature (`it::logs::i5_no_content_in_logs` is extended with them).
 
@@ -714,12 +765,21 @@ assertion half of the milestone ships unchanged.
 **Files:** `crates/worker/src/notify/{mod.rs, notifier.rs (the Notifier Durable Object), compose.rs,
 prefs.rs, unsubscribe.rs}`, `crates/core/src/notify.rs` (windows, caps, schedules across time zones, and
 rendering that takes no mail content, pure), `crates/worker/src/console/pages/notifications.rs`
-(`/console/settings/notifications` and the unsubscribe pair), one hook each in `consumers/webhooks.rs`
-(M8's dispatcher: `NotifierRequest::Event`) and `quota/mod.rs` (M22's `TenantQuota`:
-`NotifierRequest::UsageThreshold`), the `NOTIFY` binding and the `Notifier` class in the `wrangler.toml`
-template and `export_worker!`, and `tenants.notify_do_id` minted with the tenant row; no migration
-(`notification_prefs` and the column are in `0001_init.sql`). The hooks in other tracks' files are
-reviewed by their owners.
+(`/console/settings/notifications` and the unsubscribe pair), the `NOTIFY` binding and the `Notifier`
+class in the `wrangler.toml` template and `export_worker!`, and `tenants.notify_do_id` minted with the
+tenant row; no migration (`notification_prefs` and the column are in `0001_init.sql`). Hooks in other
+milestones' files, each reviewed by that file's owner. M26 does not wait for M24: if M24 lands later, it
+adds its two hooks when it creates those files.
+
+| File | Hook |
+|---|---|
+| `consumers/webhooks.rs` (M8's dispatcher) | `NotifierRequest::Event` for `message.received`, `message.released` and `message.triaged` |
+| `quota/mod.rs` (M22's `TenantQuota`) | `NotifierRequest::UsageThreshold` |
+| `members/mod.rs` and `handlers/members.rs` (M21) | `NotifierRequest::MemberRemoved` on removal and leaving; `Account { event: ownership_transferred }` on a transfer |
+| `console/totp.rs` (M24) | `Account { event: two_factor_disabled }` |
+| `console/oauth.rs` (M24) | `Account { event: sign_in_method_linked }` |
+| `billing/webhook.rs` (M22) | `Account { event: payment_failed }` when the status becomes `past_due` |
+| `jobs/erasure.rs` (M14) | The Notifier stub of tenant erasure (`notification_prefs`, `Notifier` `delete_all`), and the `notification_prefs` rows of person deletion |
 
 **Implements:** FR-CON-14, FR-CON-15, FR-BILL-13 and edge rows O14–O26
 ([Notifications and usage alerts](design/notifications.md)).
@@ -728,15 +788,18 @@ reviewed by their owners.
 
 1. `core::notify` first: coalescing windows, caps, the 09:00 schedule per time zone, and the
    content-free renderer, each unit-tested.
-2. The `Notifier` object (`Init`, `pending`, `windows`, `sent`, `meta`, one alarm) and its three inputs:
-   the dispatcher hook for `new_mail`, `UsageThreshold` from `TenantQuota` (with the
-   `alerted:{feature}:{threshold}:{period}` keys), and `Account` from the handlers that change security or
-   billing state.
+2. The `Notifier` object (`Init`, `pending`, `held`, `windows`, `sent`, `meta`, one alarm) and its inputs:
+   the dispatcher hook for `new_mail` (with `held` for the `needs_reply` filter), `UsageThreshold` from
+   `TenantQuota` (with the `alerted:{feature}:{threshold}:{period}` keys), `Account` from the code that
+   changes security or billing state, and `MemberRemoved`; the daily `digest` of capped items.
 3. Sending through the system identity with the `notify:` idempotency key; bounces and complaints set
-   `paused_reason`; the platform-domain retry loop.
+   `paused_reason`; the hourly retry loop for a failing platform domain and for a refused system-identity
+   submit, with the `system_mail_blocked` alert.
 4. The console settings page, the bounce banner and its confirmation, and the unsubscribe pair (no
    session, CSRF-exempt, served with `PM_CONSOLE=off`).
-5. Member removal and person and tenant erasure delete preferences and pending items.
+5. Member removal and person and tenant erasure delete preferences and pending items: the erasure
+   extension fills the Notifier stub of tenant erasure ([Privacy §6.6](design/privacy.md#66-tenant-scope))
+   and adds the `notification_prefs` rows to person deletion (§6.9).
 
 **Acceptance:**
 
@@ -746,10 +809,16 @@ reviewed by their owners.
 - Notification emails go out through the system identity with the simulator in tests, as
   `transactional` sends carrying `List-Unsubscribe` and `List-Unsubscribe-Post`; a retried alarm never
   sends twice (the `notify:` idempotency key).
-- The new pages pass the M21 checks: they work with JavaScript disabled and have no serious axe
-  violations. The unsubscribe pair works without a session and with `PM_CONSOLE=off`.
+- The new pages pass the M21 checks: they join `browser::console::no_js` and `browser::console::axe_scan`
+  (no JavaScript needed, no axe violation of impact `serious` or `critical`). The unsubscribe pair works
+  without a session and with `PM_CONSOLE=off`.
 - The cross-tenant suite covers the unsubscribe route: a token never changes another person's or
   workspace's preferences (O18).
+- `it::notify::system_mail_blocked_retries`, and `it::console::account_emails` for all four `account`
+  events.
+- Erasure extension: `it::erasure::tenant_console_rows` and `it::erasure::person_scope` gain their
+  `notification_prefs` and `Notifier` assertions, and `it::notify::member_removed_drops_pending` covers
+  `held` rows.
 
 ---
 
@@ -759,7 +828,8 @@ reviewed by their owners.
 NFR-PERF-4, NFR-OPS-2 and NFR-COST-1 (step 13).
 
 Deploy to staging with `pmail setup` and `pmail deploy` from the docs alone, as if you were a new
-self-hoster. Then run `live::*`:
+self-hoster. Then run `live::*`. Each step names its tests in [Testing §10](design/testing.md#10-live-end-to-end-suite-live);
+the ones marked manual there need a person in a browser and run with `cargo xtask live --manual`:
 
 1. Inbound from Gmail and Outlook test mailboxes. The verdicts are correct, and HTML-only mail
    produces text.
@@ -775,11 +845,15 @@ self-hoster. Then run `live::*`:
 7. Erasure of a counterparty with a held thread. The receipt is correct and the probes are empty.
 8. An MCP client (Claude Code) connects, searches and sends with an idempotency key.
 9. Console: sign in with a magic link, invite a second member, release a quarantined message, and see it
-   in the audit log.
+   in the audit log (`live::console::magic_link_invite_release`).
 10. Cloud sign-up with Google (`PM_SIGNUP=open`): a new account and workspace, the Overview with its
-    first-run checklist, and Checkout from `?plan=developer`.
+    first-run checklist, and Checkout from `?plan=developer` (`live::signup::google_to_checkout`, manual).
 11. Billing in Stripe test mode: upgrade Free to Developer through Checkout, spend the send allowance to a
-    `402`, buy a top-up, and retry the same send successfully.
+    `402`, buy a top-up, and retry the same send successfully (`live::billing::upgrade_spend_topup_retry`,
+    manual for the two Checkout pages). Staging runs with a `PM_PLAN_CATALOG` whose plans keep their
+    names and use Stripe test-mode prices but have small allowances (Free 10 sends, Developer 20 sends, a
+    sends top-up of 5), so the allowance is spent in a few sends; the production catalog is never used
+    for this.
 12. NFR-OPS-1, a fresh-account rehearsal (`live::ops::fresh_deploy_rehearsal`): a person who did not
     build it deploys from `self-hosting.md` in under 15 minutes of hands-on time, timed and recorded.
 13. Measured on staging: NFR-REL-3 (`live::slo::inbound_to_webhook`), NFR-PERF-4 with the real models
@@ -787,11 +861,13 @@ self-hoster. Then run `live::*`:
     (`live::ops::restore_drill`) and NFR-COST-1 (`live::ops::idle_cost_review` after a week of idling).
     NFR-REL-2 and NFR-REL-4 are read from the SLO dashboard over the live run.
 14. Agent keys: an assertion minted on staging verifies with `pmail assertions verify` against staging's
-    JWKS, and stops verifying within 5 minutes of pausing the identity. With S13 passed and
-    `PM_WEB_BOT_AUTH=on`, a signed request to `https://crawltest.com/cdn-cgi/web-bot-auth` returns `401`
-    (the directory is not registered on staging).
-15. Notifications: in Stripe test mode, sends cross 80% and an alert arrives once; a `new_mail`
-    notification reaches the Gmail test mailbox with no content from the mail; Gmail's one-click
-    unsubscribe turns that kind off.
+    JWKS, and stops verifying within 5 minutes of pausing the identity (`live::assertions::verify_then_pause`).
+    With S13 passed and `PM_WEB_BOT_AUTH=on`, a signed request to
+    `https://crawltest.com/cdn-cgi/web-bot-auth` returns `401` (the directory is not registered on
+    staging; `live::http_signatures::crawltest_unregistered_401`).
+15. Notifications: in Stripe test mode, with the staging catalog of step 11, sends cross 80% and an alert
+    arrives once (`live::notify::usage_alert_once`); a `new_mail` notification reaches the Gmail test
+    mailbox with no content from the mail (`live::notify::new_mail_no_content`); Gmail's one-click
+    unsubscribe turns that kind off (`live::notify::gmail_one_click_unsubscribe`, manual).
 
 **v1.0 release criteria:** [PRD §9](prd.md#9-release-criteria-v10).

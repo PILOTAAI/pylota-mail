@@ -144,9 +144,9 @@ use the deployment's key instead, as above.
 - **Revocation.** If a key may have leaked, `POST …/keys/{kid}/revoke` retires it at once. It leaves the
   key set, and verifiers drop it within the 5-minute cache. Key routes keep working while the identity
   is paused, so you can deal with a leak before resuming it.
-- **The kill switch.** Pausing an identity, or suspending its tenant, stops new signatures
-  (`409 identity_paused`) and withdraws its key set (`404`), so a service that refetches it stops
-  accepting the identity's assertions within the cache time.
+- **The kill switch.** Pausing an identity, or suspending its tenant, stops new signatures (suspended
+  tenant → `403 tenant_suspended`; paused identity → `409 identity_paused`) and withdraws its key set
+  (`404`), so a service that refetches it stops accepting the identity's assertions within the cache time.
 - **Erasure.** Deleting an identity deletes its keys and tombstones their key IDs, which are never
   published again.
 - **Replay protection lies with verifiers.** Pylota Mail keeps no record of the tokens it mints, so it

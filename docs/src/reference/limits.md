@@ -107,15 +107,15 @@ From [Notifications and usage alerts](../project/design/notifications.md).
 
 | Limit | Value |
 |---|---|
-| Notification email per person | 50 a day (in the workspace's time zone), all kinds except `account`; further items wait for the next daily digest |
-| Notification email per workspace | 200 a day, all kinds except `account` |
+| Notification email per person | 50 a day (in the workspace's time zone), all kinds except `account` and `digest`; further items go into one `digest` email at the next 09:00 |
+| Notification email per workspace | 200 a day, all kinds except `account` and `digest` |
 | `new_mail`, `instant` | A 2-minute hold after the first message, then at most one email per person and inbox every 10 minutes |
 | `new_mail`, `hourly` and `daily` | One email at the top of each hour that had messages; one at 09:00 local time |
 | `needs_reply` filter | Waits up to 5 minutes for triage |
-| "Needs a person" digest | Daily at 09:00 in the workspace's time zone |
-| Usage alerts | 80% and 100% of each allowance; once per threshold per period for `sends` and `triage`; a 24-hour cooldown per feature and threshold for counts |
+| "Needs a person" email | Daily at 09:00 in the workspace's time zone |
+| Usage alerts | 80% and 100% of each allowance; once per threshold per period for `sends` and `triage`; a 24-hour cooldown per feature and threshold for counts. None with `PM_BILLING=off` |
 | Unsubscribe link | 90 days, or until its `link` key leaves its 7-day window after a rotation |
-| Retries while the platform domain is failing | Hourly, for 24 hours |
+| Retries while the platform domain is failing, or while the system identity's submit is refused | Hourly, for 24 hours |
 
 ## Storage
 
@@ -134,7 +134,8 @@ From [Notifications and usage alerts](../project/design/notifications.md).
 On a deployment with billing on (Pylota Mail Cloud), the plan sets allowances for inboxes, sends, triage
 analyses, custom domains, storage and seats. The table and the rules (holds, `402 billing_limit`, top-ups,
 resets) are in [Plans and billing](../guides/plans.md). Read your workspace's live numbers with
-`GET /v1/usage`. Self-hosted deployments have no plan limits unless the operator sets quotas in tenant policy.
+`GET /v1/usage`. Self-hosted deployments have no plan limits; only the daily caps in tenant policy apply
+(see [API](#api)).
 
 ## Console
 
@@ -147,8 +148,8 @@ resets) are in [Plans and billing](../guides/plans.md). Read your workspace's li
 | Two-step verification codes | 5 attempts a minute per person. 10 failures in a row lock two-step sign-in for 15 minutes |
 | Recovery codes | 10 per person, each single use. Generating new ones invalidates the old |
 | Google or GitHub sign-in | 10 minutes from start to callback, single use |
-| Waitlist | Unconfirmed entries are deleted after 7 days. An invitation's sign-up link is valid for 7 days |
-| New workspace on Free (Pylota Mail Cloud) | 50 messages a day (`tenant_daily_send_cap`) for the first 7 days. The ramp lifts on day 7 if bounce and complaint rates are under the auto-pause thresholds, or at once on a paid plan. Above it: `429 daily_cap_reached` |
+| Waitlist | An entry is written only when its confirmation link is used; an unused confirmation link expires after 10 minutes. An invite link (`/console/sign-up?invite=…`) is valid for 7 days, for the waitlisted address only. Entries are deleted 30 days after invitation |
+| New workspace on Free (Pylota Mail Cloud) | At most 50 messages a day (the effective `tenant_daily_send_cap` is the policy value or 50, whichever is lower) for the first 7 days. A daily evaluation lifts the ramp from day 7 if bounce and complaint rates are under the auto-pause thresholds; otherwise it stays and is evaluated again each day. A paid plan lifts it at once. Above it: `429 daily_cap_reached` |
 | Session lifetime | 7 days rolling, 30 days absolute |
 | Re-authentication for sensitive actions | signed in within the last 10 minutes |
 | Invitation lifetime | 7 days |

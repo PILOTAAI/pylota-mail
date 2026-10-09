@@ -61,6 +61,10 @@ CREATE TABLE tenants (
                           CHECK (require_two_factor IN (0,1)),
   onboarding_dismissed_at INTEGER,                         -- first-run checklist dismissed: written by the dismiss
                                                            -- action, read by the Overview render (Cloud sign-up § 8)
+  ramp_lifted_at   INTEGER,                                -- new-workspace send ramp ended (Cloud sign-up § 10.1):
+                                                           -- set by the daily evaluation (crons/signup_ramp.rs) or
+                                                           -- by the billing webhook on a paid plan; read at
+                                                           -- outbound policy step 18
   created_at       INTEGER NOT NULL,
   updated_at       INTEGER NOT NULL
 );
@@ -282,7 +286,8 @@ CREATE TABLE jobs (
                                     'backup')),
   status            TEXT NOT NULL CHECK (status IN ('queued','running','completed','failed','canceled')),
   runner_do_id      TEXT NOT NULL,                         -- JobRunner Durable Object id
-  params_json       TEXT NOT NULL,
+  params_json       TEXT NOT NULL,                         -- JobRequest::Start params; a counterparty erasure may
+                                                           -- carry internal-only identity_ids (Privacy § 6.4)
   result_json       TEXT,
   created_by_key_id TEXT,
   created_at        INTEGER NOT NULL,
@@ -494,6 +499,12 @@ CREATE UNIQUE INDEX invitations_pending ON invitations(tenant_id, email) WHERE s
 CREATE TABLE login_tokens (                                -- magic links and six-digit codes
   id          TEXT PRIMARY KEY,
   email       TEXT NOT NULL,
+  purpose     TEXT NOT NULL CHECK (purpose IN ('sign_in','sign_up','waitlist')),  -- what using it does
+                                                           -- (Cloud sign-up § 6); re-authentication is sign_in
+  plan        TEXT,                                        -- sign_up: plan intent; waitlist: plan of interest
+  next_path   TEXT,                                        -- sign_up: validated next (Cloud sign-up § 7)
+  terms_version TEXT,                                      -- sign_up: PM_TERMS_VERSION accepted; copied to users
+                                                           -- with terms_accepted_at = created_at
   token_hash  TEXT NOT NULL UNIQUE,                        -- HMAC(link key {key_kid}, link token)
   code_hash   TEXT NOT NULL,                               -- HMAC(link key {key_kid}, email || code)
   key_kid     TEXT NOT NULL,                               -- signing_keys kid (purpose 'link')
@@ -540,6 +551,8 @@ CREATE TABLE oauth_states (                                -- one row per starte
   nonce       TEXT,                                        -- Google only
   next_path   TEXT,                                        -- validated next (Cloud sign-up § 7)
   plan        TEXT,
+  terms_version TEXT,                                      -- intent sign_up: PM_TERMS_VERSION accepted at the start;
+                                                           -- copied to the new user by the callback
   created_at  INTEGER NOT NULL,
   expires_at  INTEGER NOT NULL,                            -- created + 10 minutes
   used_at     INTEGER
@@ -551,7 +564,8 @@ CREATE TABLE waitlist (                                    -- PM_SIGNUP = waitli
   created_at   INTEGER NOT NULL,
   confirmed_at INTEGER NOT NULL,                           -- double opt-in link used: rows exist only once
                                                            -- confirmed; invites go oldest confirmed_at first
-  invited_at   INTEGER,                                    -- sign-up link sent, valid 7 days
+  invited_at   INTEGER,                                    -- invite link sent (GET /console/sign-up?invite=…),
+                                                           -- valid 7 days while PM_SIGNUP = waitlist
   invite_token_hash TEXT UNIQUE,                           -- HMAC(link key {key_kid}, sign-up link token)
   key_kid      TEXT                                        -- signing_keys kid (purpose 'link') of invite_token_hash
 );
@@ -600,8 +614,8 @@ CREATE TABLE billing_events (                              -- Stripe webhook ded
   tenant_id    TEXT,
   received_at  INTEGER NOT NULL,
   processed_at INTEGER,
-  outcome      TEXT                                        -- applied | ignored_stale | error:<code>
-               CHECK (outcome IN ('applied','ignored_stale') OR outcome LIKE 'error:%')
+  outcome      TEXT                                        -- applied | ignored_stale | ignored_erased | cancelled_after_erasure | error:<code>
+               CHECK (outcome IN ('applied','ignored_stale','ignored_erased','cancelled_after_erasure') OR outcome LIKE 'error:%')
 );
 
 CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);
@@ -710,8 +724,12 @@ CREATE TABLE platform_objects (
   `tenant_id IS NULL` after 30 days), and `idempotency_records` and `ses_ingest` after 30 days.
 - **Console retention.** `oauth_states` rows expire 10 minutes after creation and are deleted 24 hours
   after expiry, as `login_tokens` are. `waitlist` entries exist only once confirmed and are deleted 30
-  days after invitation (Cloud sign-up § 6.1). Erasure of a person deletes their
-  `oauth_identities` and any `waitlist` row.
+  days after invitation (Cloud sign-up § 6.1). `invitations` with status `expired` or `revoked` are
+  deleted 30 days after `expires_at`; accepted ones stay with the workspace. Erasure of a person deletes
+  their `oauth_identities` and any `waitlist` row and scrubs the address of their accepted invitations
+  ([Privacy § 6.9](privacy.md#69-people-console-accounts)).
+- **Billing events retention.** `billing_events` rows are deleted 400 days after `received_at` by the
+  global retention job ([Privacy § 5.3](privacy.md#53-global-retention-job)).
 
 ## 2. `IdentityMailbox` Durable Object (SQLite)
 
@@ -1088,24 +1106,27 @@ CREATE TABLE outcomes (                                    -- sliding windows fo
 CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 -- keys: schema_version; next_free_ms (the earliest time the next SES control-plane call may start)
 
--- Notifier (one per tenant; Notifications § 8). Holds user IDs, identity IDs and counts, never mail content.
+-- Notifier (one per tenant; Notifications § 8). Holds user, identity and message IDs and counts, never mail content.
 CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 -- keys (every key the object reads or writes):
 --   schema_version   applied schema (Design § 4, rule 6)
 --   tenant_id        owner, written by NotifierRequest::Init and checked on every request (Design § 5)
 --   alarm:send       earliest pending.due_at (Design § 4, rule 5)
---   alarm:daily      the next 09:00 in the tenant's time zone (tenants.timezone): the needs_person digest,
---                    daily new_mail emails and the digest of capped items
+--   alarm:held       earliest held.until: a message waiting for triage is counted when it passes
+--   alarm:daily      the next 09:00 in the tenant's time zone (tenants.timezone): the needs_person email,
+--                    daily new_mail emails and the digest of capped items (kind digest)
 --   prefs_cache_at   when the cached notification_prefs of the workspace were last read from D1
 CREATE TABLE pending (                                     -- items waiting for their window
   user_id           TEXT NOT NULL,                         -- usr_
-  kind              TEXT NOT NULL CHECK (kind IN ('usage','new_mail','needs_person','account')),
+  kind              TEXT NOT NULL CHECK (kind IN ('usage','new_mail','needs_person','account','digest')),
   ref               TEXT NOT NULL DEFAULT '-',             -- new_mail: the identity ID (inbox); usage:
                                                            -- '{feature}:{threshold}'; account: the event; else '-'
+                                                           -- (digest: items held back by a cap, sent at 09:00)
   count             INTEGER NOT NULL DEFAULT 0,            -- messages (new_mail) or items
   needs_reply_count INTEGER NOT NULL DEFAULT 0,            -- new_mail: of which waiting for a reply
   detail_json       TEXT,                                  -- usage: {feature, threshold, used, granted, period};
-                                                           -- account: {event}; never mail content
+                                                           -- account: {event, tenant_id}; digest: counts per kind
+                                                           -- and inbox or threshold; never mail content
   first_at          INTEGER NOT NULL,
   due_at            INTEGER NOT NULL,                      -- when the window closes (or the next hourly retry)
   attempts          INTEGER NOT NULL DEFAULT 0,            -- send attempts while the platform domain fails
@@ -1113,6 +1134,15 @@ CREATE TABLE pending (                                     -- items waiting for 
   PRIMARY KEY (user_id, kind, ref)
 );
 CREATE INDEX pending_due ON pending(due_at);
+CREATE TABLE held (                                        -- new_mail with filter = needs_reply: waiting for triage
+  message_id  TEXT NOT NULL,                               -- msg_
+  identity_id TEXT NOT NULL,                               -- idn_ (the inbox)
+  user_id     TEXT NOT NULL,                               -- usr_ of a person with that filter following the inbox
+  until       INTEGER NOT NULL,                            -- arrival + 5 minutes; then the message is counted
+  PRIMARY KEY (message_id, user_id)
+);                                                         -- deleted on message.triaged (counted if needs_reply >= 0.5,
+                                                           -- else dropped), at until (counted), or on MemberRemoved
+CREATE INDEX held_until ON held(until);
 CREATE TABLE windows (                                     -- last send, for the 10-minute rule of instant mode
   user_id      TEXT NOT NULL,
   kind         TEXT NOT NULL,

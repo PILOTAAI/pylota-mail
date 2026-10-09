@@ -807,7 +807,7 @@ errors).
 | `RL_SEARCH`, `RL_AGENTIC`, `RL_SEND`, `RL_SIGN` exceeded | `rate_limited` with `details.retry_after` |
 | Agentic disabled by policy | `agentic_disabled` (HTTP 422 in `details.http_status`) |
 | A send tool on a workspace whose `sends` allowance is spent (FR-BILL-6) | `billing_limit` with `details.feature`, `granted`, `used`, `resets_at`, `upgrade_url`; nothing was stored, so the same `idempotency_key` succeeds after an upgrade or top-up |
-| A send or signing tool for a paused identity | `identity_paused` (HTTP 409), `details.reason`. A signing tool gets it for every identity of a suspended tenant too ([O1](../edge-cases.md)); a send there gets `tenant_suspended` first, as in REST |
+| A send or signing tool for a paused identity, or for an identity of a suspended tenant | Suspended tenant → `tenant_suspended` (HTTP 403), checked first, as in REST; paused identity → `identity_paused` (HTTP 409), `details.reason` ([O1](../edge-cases.md)) |
 | A signing rule the schema cannot express: `ext` over 2 KB or using a registered or Pylota claim name, a component value that is not ASCII ([O6](../edge-cases.md), [O10](../edge-cases.md)) | `invalid_request` with `details.errors[]` |
 | `mail_sign_http_request` while `PM_WEB_BOT_AUTH=off` ([O9](../edge-cases.md)) | `web_bot_auth_disabled` (HTTP 422) |
 | `mail_sign_http_request` while the tenant's `policy.web_bot_auth.allowed` is `false` ([O13](../edge-cases.md)) | `policy_denied` (HTTP 403) |
@@ -929,7 +929,7 @@ v1.1 needs an ADR and updates to [Configuration](../../reference/configuration.m
 | `it::mcp::error_mapping` | Schema failures, REST errors and rate limits become `isError` results with the envelope (a missing or malformed `idempotency_key` gives `idempotency_key_required` or `invalid_idempotency_key`); protocol errors use the codes and HTTP statuses in §2.4 | FR-API-2, M15 |
 | `it::mcp::modern_headers` | Missing or mismatched `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name` give `400`/`-32020`; base64-encoded `Mcp-Name` is decoded | §2.2 |
 | `it::mcp::unsupported_version` | An unknown `_meta` version, and an unknown `MCP-Protocol-Version` on a legacy request, give `400`/`-32022` with `supported`; a legacy `initialize` with `protocolVersion: "2024-11-05"` gets `200` with `protocolVersion: "2025-11-25"` | §2.2, §2.3 |
-| `it::mcp::legacy_session` | `initialize` works without minting `Mcp-Session-Id`; a sent session ID is ignored; `GET` and `DELETE` give `405` | §2.3, M15 "session handling" |
+| `it::mcp::legacy_session` | `initialize` works without minting `Mcp-Session-Id`; a sent session ID is ignored; `GET` and `DELETE` give `405` | §2.3, M15 ("Revision 2026-07-28 has no sessions: the server never mints `Mcp-Session-Id`, and `GET` and `DELETE` on `/mcp` answer `405`") |
 | `it::mcp::origin_403` | A foreign `Origin` gets `403` | §2.1 |
 | `it::mcp::auth_401` | Missing, expired and revoked keys give `401` with `WWW-Authenticate` | FR-MCP-1 |
 | `it::mcp::sse_deep_search_progress` | Progress notifications per step, keep-alive, final response; closing the stream stops the loop | §2.6 |
@@ -941,7 +941,7 @@ v1.1 needs an ADR and updates to [Configuration](../../reference/configuration.m
 | `it::auth::f2_permission` | A key without `search:read` cannot see or call search tools | [F2] |
 | `it::search::f3_tenant_scope_denied` | `scope: "tenant"` with an identity key is refused | [F3] |
 | `it::testmode::l4_mode_binding` | Test keys reach only test tenants through MCP too | [L4] |
-| `live::` M20 step 7 | Claude Code connects, searches and sends with an idempotency key | Build plan M20 |
+| `live::mcp::client_round_trip` (M20 step 8) | Claude Code connects, searches and sends with an idempotency key | Build plan M20 |
 
 [F2]: ../edge-cases.md
 [F3]: ../edge-cases.md

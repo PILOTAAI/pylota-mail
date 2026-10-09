@@ -411,9 +411,9 @@ design is in [Agent signing keys](../project/design/agent-keys.md); the integrat
   an overlap after a rotation. A key is created on the identity's first signing request, or with
   `POST …/keys`. Private keys are generated, sealed and used inside the Worker; no endpoint returns them.
 - Key management (`…/keys`, rotate, revoke) stays available while the identity is paused, so a suspected
-  leak can be handled before it resumes. Signing does not: a paused identity, including every identity
-  of a suspended tenant, gets `409 identity_paused`, and its JWK Set answers `404 identity_not_found`
-  until it resumes ([O1](../project/edge-cases.md)). A `deleting` or `deleted` identity gets
+  leak can be handled before it resumes. Signing does not: suspended tenant → `403 tenant_suspended`
+  (checked first, as on sends); paused identity → `409 identity_paused`. The JWK Set of either answers
+  `404 identity_not_found` until the identity resumes ([O1](../project/edge-cases.md)). A `deleting` or `deleted` identity gets
   `404 identity_not_found` on every route here.
 - Creating, rotating and revoking keys is audit-logged (`identity_key.create`, `identity_key.rotate`,
   `identity_key.revoke`) and emits `identity.key_created`, `identity.key_rotated` or
@@ -1487,7 +1487,7 @@ is hidden from platform keys.
 ```
 
 - `billing` is `metered`, `exempt` (no limits) or `disabled` (self-hosted without billing; `features` show
-  counts with `granted: null`, `unlimited: true`, plus any operator quota from tenant policy).
+  the real `used` with `granted: null`, `remaining: null` and `unlimited: true`).
 - `used` for `storage_gb` is measured, rounded up, and refreshed at least hourly.
 - `granted` includes top-ups. `plans` is the whole catalog from `PM_PLAN_CATALOG`.
 

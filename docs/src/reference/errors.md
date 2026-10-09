@@ -134,8 +134,8 @@ whether or not the first attempt reached the server.
 | 429 | `upstream_rate_limited` | yes | A provider's rate limit stopped the request before anything changed. Cloudflare refused to create a zone with error 1105 (too many attempts to add a domain), for `nameservers` or `delegated_subdomain`: `Retry-After` and `details.retry_after` are `10800` (3 hours). Or the deployment's Amazon SES control-plane budget (one call per second, shared by every domain) had no slot within 5 seconds, for a domain create, `PATCH` or removal that calls SES: `Retry-After` is the wait, usually a few seconds |
 
 A `402 billing_limit` is never returned for inbound mail (FR-BILL-8) or for replays of requests that already
-completed (FR-BILL-6). On a deployment with billing `disabled`, only operator quotas from tenant policy apply,
-and they return `429 daily_cap_reached`.
+completed (FR-BILL-6). On a deployment with billing `disabled`, only the daily caps in tenant policy apply,
+and they return `429 daily_cap_reached` or `429 agentic_budget_exhausted`.
 
 ### Server and dependencies
 
