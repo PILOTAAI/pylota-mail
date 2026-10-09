@@ -1,0 +1,15 @@
+/target
+**/target
+/build
+crates/worker/build/
+site/public/docs/
+deploy/wrangler.toml
+deploy/.secrets*
+.dev.vars
+.env
+.env.*
+!.env.example
+.DS_Store
+*.eml.local
+fuzz/artifacts/
+fuzz/corpus/*/.cache

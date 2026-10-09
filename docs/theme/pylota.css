@@ -1,0 +1,556 @@
+/*
+  Pylota Mail theme for mdBook (written against mdBook 0.5.4).
+  Loaded by book.toml: [output.html] additional-css = ["theme/pylota.css"].
+
+  It keeps mdBook's five theme switches and maps them onto the Pylota tokens used by
+  the landing page:
+    light, rust        -> Pylota light (warm paper, ink, blue accent)
+    coal, navy, ayu    -> Pylota dark
+  Colours go through mdBook's own CSS variables (variables.css), so the built-in
+  layout keeps working. Fonts are system stacks: nothing is fetched from a third party.
+*/
+
+/* ---------- Globals ---------- */
+
+:root {
+  --pm-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Inter, Roboto, "Helvetica Neue", Arial, sans-serif;
+  --mono-font: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  --code-font-size: 0.875em;
+  --content-max-width: 780px;
+}
+
+/* ---------- Light: light and rust (also the no-JS fallback) ---------- */
+
+html.light,
+html.rust,
+html:not(.js) {
+  --bg: #F6F4EE;
+  --fg: #171716;
+
+  --sidebar-bg: #EEEBE3;
+  --sidebar-fg: #3A3936;
+  --sidebar-non-existant: #6A6761;
+  --sidebar-active: #1F45E0;
+  --sidebar-spacer: rgba(26, 26, 26, 0.10);
+  --sidebar-header-border-color: #2E5BFF;
+
+  --scrollbar: #85827B;
+
+  --icons: #5D5B56;
+  --icons-hover: #171716;
+
+  --links: #1F45E0;
+
+  --inline-code-color: #171716;
+
+  --theme-popup-bg: #FFFFFF;
+  --theme-popup-border: rgba(26, 26, 26, 0.18);
+  --theme-hover: #EEEBE3;
+
+  --quote-bg: #E8EDFF;
+  --quote-border: #2E5BFF;
+
+  --warning-border: #BA7517;
+
+  --table-border-color: rgba(26, 26, 26, 0.12);
+  --table-header-bg: #EEEBE3;
+  --table-alternate-bg: rgba(26, 26, 26, 0.025);
+
+  --searchbar-border-color: rgba(26, 26, 26, 0.18);
+  --searchbar-bg: #FFFFFF;
+  --searchbar-fg: #171716;
+  --searchbar-shadow-color: rgba(46, 91, 255, 0.35);
+  --searchresults-header-fg: #5D5B56;
+  --searchresults-border-color: rgba(26, 26, 26, 0.12);
+  --searchresults-li-bg: #E8EDFF;
+  --search-mark-bg: #F6DFA6;
+
+  --color-scheme: light;
+
+  /* copy icon tint: roughly ink-2, and blue on hover */
+  --copy-button-filter: invert(36%) sepia(6%) saturate(320%) hue-rotate(10deg) brightness(92%) contrast(88%);
+  --copy-button-filter-hover: invert(24%) sepia(96%) saturate(4000%) hue-rotate(228deg) brightness(92%) contrast(101%);
+
+  --footnote-highlight: #2E5BFF;
+  --overlay-bg: rgba(246, 244, 238, 0.6);
+
+  --blockquote-note-color: #1F45E0;
+  --blockquote-tip-color: #137556;
+  --blockquote-important-color: #171716;
+  --blockquote-warning-color: #8A5410;
+  --blockquote-caution-color: #A32D2D;
+
+  /* Pylota extras used below */
+  --pm-heading: #171716;
+  --pm-muted: #5D5B56;
+  --pm-paper: #FFFFFF;
+  --pm-line: rgba(26, 26, 26, 0.10);
+  --pm-line-2: rgba(26, 26, 26, 0.18);
+  --pm-blue: #2E5BFF;
+  --pm-red: #A32D2D;
+  --pm-code-bg: #EEEBE3;
+  --pm-code-fg: #171716;
+  --pm-tk-keyword: #1F45E0;
+  --pm-tk-string: #137556;
+  --pm-tk-number: #8A5410;
+  --pm-tk-attr: #A32D2D;
+  --pm-tk-comment: #5D5B56;
+  --pm-tk-title: #171716;
+}
+
+/* ---------- Dark: coal, navy and ayu ---------- */
+
+html.coal,
+html.navy,
+html.ayu {
+  --bg: #0A0A0B;
+  --fg: #CFCFCF;
+
+  --sidebar-bg: #131315;
+  --sidebar-fg: #CFCFCF;
+  --sidebar-non-existant: #9E9E9E;
+  --sidebar-active: #8FA6FF;
+  --sidebar-spacer: rgba(255, 255, 255, 0.10);
+  --sidebar-header-border-color: #6B8AFF;
+
+  --scrollbar: #9E9E9E;
+
+  --icons: #9E9E9E;
+  --icons-hover: #F7F7F7;
+
+  --links: #8FA6FF;
+
+  --inline-code-color: #F7F7F7;
+
+  --theme-popup-bg: #131315;
+  --theme-popup-border: rgba(255, 255, 255, 0.18);
+  --theme-hover: #1C1C1F;
+
+  --quote-bg: #161B2E;
+  --quote-border: #6B8AFF;
+
+  --warning-border: #E8B76B;
+
+  --table-border-color: rgba(255, 255, 255, 0.12);
+  --table-header-bg: #131315;
+  --table-alternate-bg: rgba(255, 255, 255, 0.025);
+
+  --searchbar-border-color: rgba(255, 255, 255, 0.18);
+  --searchbar-bg: #131315;
+  --searchbar-fg: #F7F7F7;
+  --searchbar-shadow-color: rgba(107, 138, 255, 0.4);
+  --searchresults-header-fg: #9E9E9E;
+  --searchresults-border-color: rgba(255, 255, 255, 0.12);
+  --searchresults-li-bg: #161B2E;
+  --search-mark-bg: #5A4818;
+
+  --color-scheme: dark;
+
+  --copy-button-filter: invert(66%) sepia(0%) saturate(0%) brightness(98%);
+  --copy-button-filter-hover: invert(62%) sepia(40%) saturate(1800%) hue-rotate(200deg) brightness(102%) contrast(101%);
+
+  --footnote-highlight: #6B8AFF;
+  --overlay-bg: rgba(10, 10, 11, 0.6);
+
+  --blockquote-note-color: #8FA6FF;
+  --blockquote-tip-color: #4CC49A;
+  --blockquote-important-color: #F7F7F7;
+  --blockquote-warning-color: #E8B76B;
+  --blockquote-caution-color: #E87373;
+
+  --pm-heading: #F7F7F7;
+  --pm-muted: #9E9E9E;
+  --pm-paper: #0E0E10;
+  --pm-line: rgba(255, 255, 255, 0.10);
+  --pm-line-2: rgba(255, 255, 255, 0.18);
+  --pm-blue: #6B8AFF;
+  --pm-red: #E87373;
+  --pm-code-bg: #131315;
+  --pm-code-fg: #EDEBE6;
+  --pm-tk-keyword: #FFB38A;
+  --pm-tk-string: #9ED8B6;
+  --pm-tk-number: #F0C58A;
+  --pm-tk-attr: #A9B9FF;
+  --pm-tk-comment: #8F8C85;
+  --pm-tk-title: #F7F5F0;
+}
+
+/* No-JS visitors with a dark system setting (mdBook's own fallback is coal-like). */
+@media (prefers-color-scheme: dark) {
+  html:not(.js) {
+    --bg: #0A0A0B;
+    --fg: #CFCFCF;
+    --sidebar-bg: #131315;
+    --sidebar-fg: #CFCFCF;
+    --sidebar-non-existant: #9E9E9E;
+    --sidebar-active: #8FA6FF;
+    --sidebar-spacer: rgba(255, 255, 255, 0.10);
+    --sidebar-header-border-color: #6B8AFF;
+    --scrollbar: #9E9E9E;
+    --icons: #9E9E9E;
+    --icons-hover: #F7F7F7;
+    --links: #8FA6FF;
+    --inline-code-color: #F7F7F7;
+    --theme-popup-bg: #131315;
+    --theme-popup-border: rgba(255, 255, 255, 0.18);
+    --theme-hover: #1C1C1F;
+    --quote-bg: #161B2E;
+    --quote-border: #6B8AFF;
+    --warning-border: #E8B76B;
+    --table-border-color: rgba(255, 255, 255, 0.12);
+    --table-header-bg: #131315;
+    --table-alternate-bg: rgba(255, 255, 255, 0.025);
+    --searchbar-border-color: rgba(255, 255, 255, 0.18);
+    --searchbar-bg: #131315;
+    --searchbar-fg: #F7F7F7;
+    --searchresults-header-fg: #9E9E9E;
+    --searchresults-border-color: rgba(255, 255, 255, 0.12);
+    --searchresults-li-bg: #161B2E;
+    --search-mark-bg: #5A4818;
+    --color-scheme: dark;
+    --footnote-highlight: #6B8AFF;
+    --overlay-bg: rgba(10, 10, 11, 0.6);
+    --blockquote-note-color: #8FA6FF;
+    --blockquote-tip-color: #4CC49A;
+    --blockquote-important-color: #F7F7F7;
+    --blockquote-warning-color: #E8B76B;
+    --blockquote-caution-color: #E87373;
+    --pm-heading: #F7F7F7;
+    --pm-muted: #9E9E9E;
+    --pm-paper: #0E0E10;
+    --pm-line: rgba(255, 255, 255, 0.10);
+    --pm-line-2: rgba(255, 255, 255, 0.18);
+    --pm-blue: #6B8AFF;
+    --pm-red: #E87373;
+    --pm-code-bg: #131315;
+    --pm-code-fg: #EDEBE6;
+    --pm-tk-keyword: #FFB38A;
+    --pm-tk-string: #9ED8B6;
+    --pm-tk-number: #F0C58A;
+    --pm-tk-attr: #A9B9FF;
+    --pm-tk-comment: #8F8C85;
+    --pm-tk-title: #F7F5F0;
+  }
+}
+
+/* ---------- Type ---------- */
+
+html {
+  font-family: var(--pm-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+.content {
+  font-size: 1.6rem;
+}
+
+.content main {
+  line-height: 1.65;
+}
+
+.content p,
+.content ol,
+.content ul {
+  line-height: 1.65em;
+}
+
+.content h1,
+.content h2,
+.content h3,
+.content h4,
+.content h5 {
+  color: var(--pm-heading);
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+  text-wrap: balance;
+}
+
+.content h1 {
+  margin-block-start: 0.8em;
+  font-size: 2.35em;
+  letter-spacing: -0.035em;
+  line-height: 1.08;
+}
+
+.content h2 {
+  margin-block-start: 2.2em;
+  padding-block-start: 1.1em;
+  border-block-start: 1px solid var(--pm-line);
+  font-size: 1.6em;
+  letter-spacing: -0.03em;
+}
+
+.content h3 {
+  font-size: 1.25em;
+}
+
+.content h4,
+.content h5 {
+  font-size: 1.05em;
+}
+
+/* heading anchors keep the heading colour */
+.content .header:link,
+.content .header:visited,
+.content .header:visited:hover {
+  color: inherit;
+}
+
+.content main a:not(.header) {
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-decoration-color: color-mix(in srgb, var(--links) 40%, transparent);
+  text-underline-offset: 0.18em;
+}
+
+.content main a:not(.header):hover {
+  text-decoration-color: currentColor;
+}
+
+.content hr {
+  height: 1px;
+  border: 0;
+  background: var(--pm-line);
+}
+
+:focus-visible {
+  outline: 2px solid var(--pm-blue);
+  outline-offset: 2px;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--pm-blue) 24%, transparent);
+}
+
+/* ---------- Menu bar ---------- */
+
+#mdbook-menu-bar {
+  /* airmail edge, as on the landing page */
+  background:
+    repeating-linear-gradient(-45deg, var(--pm-blue) 0 10px, transparent 10px 15px, var(--pm-red) 15px 25px, transparent 25px 30px) top / 100% 3px no-repeat,
+    var(--bg);
+  border-block-end-color: var(--pm-line);
+}
+
+#mdbook-menu-bar.bordered {
+  border-block-end-color: var(--pm-line-2);
+}
+
+.menu-title {
+  color: var(--pm-heading);
+  font-size: 1.8rem;
+  font-weight: 600;
+  letter-spacing: -0.045em;
+}
+
+/* The Pylota mark (the stroked peak from logo-pack/svg/mark-*.svg), bare, in the heading ink.
+   Painted through a mask so it follows every mdBook theme. data: images are allowed by the
+   docs CSP (img-src 'self' data:). */
+.menu-title::before {
+  content: "";
+  display: inline-block;
+  width: 0.95em;
+  height: 0.95em;
+  margin-inline-end: 0.4em;
+  vertical-align: -0.12em;
+  background-color: currentColor;
+  -webkit-mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cpath d='M8 46 L26 14 L56 44' stroke='%23000' stroke-width='8' fill='none' stroke-linejoin='miter'/%3E%3C/svg%3E") center / contain no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cpath d='M8 46 L26 14 L56 44' stroke='%23000' stroke-width='8' fill='none' stroke-linejoin='miter'/%3E%3C/svg%3E") center / contain no-repeat;
+}
+
+/* ---------- Sidebar ---------- */
+
+.sidebar {
+  border-inline-end: 1px solid var(--pm-line);
+}
+
+.sidebar .sidebar-scrollbox {
+  padding: 18px 14px;
+}
+
+.chapter li a {
+  border-radius: 6px;
+}
+
+.chapter li a.active {
+  font-weight: 650;
+}
+
+.chapter li.part-title {
+  margin-block: 1.8em 0.4em;
+  color: var(--pm-muted);
+  font-family: var(--mono-font);
+  font-size: 0.78em;
+  font-weight: 650;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.chapter li.part-title:first-child {
+  margin-block-start: 0.6em;
+}
+
+.sidebar .spacer {
+  height: 1px;
+}
+
+/* ---------- Code ---------- */
+
+:not(pre) > code,
+:not(pre) > .hljs {
+  padding: 0.12em 0.38em;
+  border: 1px solid var(--pm-line);
+  border-radius: 5px;
+  background: var(--pm-code-bg);
+  color: var(--inline-code-color);
+  font-size: 0.86em;
+}
+
+.content pre {
+  margin: 1.4em 0;
+}
+
+pre > code,
+pre > code.hljs {
+  border: 1px solid var(--pm-line);
+  border-radius: 10px;
+  background: var(--pm-code-bg);
+  color: var(--pm-code-fg);
+  line-height: 1.6;
+}
+
+pre > .buttons button {
+  border-radius: 6px;
+}
+
+/* highlight.js tokens: same palette in all three highlight stylesheets */
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-built_in,
+.hljs-literal,
+.hljs-type,
+.hljs-meta .hljs-keyword {
+  color: var(--pm-tk-keyword);
+}
+
+.hljs-string,
+.hljs-regexp,
+.hljs-addition,
+.hljs-symbol,
+.hljs-bullet {
+  color: var(--pm-tk-string);
+}
+
+.hljs-number,
+.hljs-meta,
+.hljs-params {
+  color: var(--pm-tk-number);
+}
+
+.hljs-attr,
+.hljs-attribute,
+.hljs-variable,
+.hljs-template-variable,
+.hljs-name,
+.hljs-tag,
+.hljs-selector-id,
+.hljs-selector-class,
+.hljs-link,
+.hljs-deletion {
+  color: var(--pm-tk-attr);
+}
+
+.hljs-comment,
+.hljs-quote {
+  color: var(--pm-tk-comment);
+  font-style: italic;
+}
+
+.hljs-title,
+.hljs-section,
+.hljs-function .hljs-title {
+  color: var(--pm-tk-title);
+  font-weight: 650;
+}
+
+/* ---------- Tables ---------- */
+
+.content table {
+  margin: 1.6em 0;
+  border-collapse: collapse;
+  font-size: 0.95em;
+}
+
+.content table td,
+.content table th {
+  padding: 0.55em 0.9em;
+  border: 1px solid var(--table-border-color);
+  vertical-align: top;
+}
+
+.content table thead {
+  background: var(--table-header-bg);
+}
+
+.content table thead tr {
+  border: 1px solid var(--table-border-color);
+}
+
+.content table thead th,
+.content table thead td {
+  color: var(--pm-heading);
+  font-weight: 650;
+  text-align: start;
+}
+
+/* ---------- Quotes and callouts ---------- */
+
+blockquote {
+  margin: 1.4em 0;
+  padding: 0.3em 1.2em;
+  border: 0;
+  border-inline-start: 3px solid var(--quote-border);
+  border-radius: 0 8px 8px 0;
+}
+
+.warning {
+  border-radius: 0 8px 8px 0;
+}
+
+kbd {
+  border-radius: 5px;
+  font-family: var(--mono-font);
+}
+
+/* ---------- Popups and search ---------- */
+
+.theme-popup {
+  border-radius: 10px;
+  box-shadow: 0 16px 40px -16px rgba(0, 0, 0, 0.35);
+}
+
+.theme-popup .theme {
+  font-family: var(--pm-sans);
+}
+
+#mdbook-searchbar {
+  border-radius: 10px;
+}
+
+#mdbook-searchbar:focus,
+#mdbook-searchbar.active {
+  box-shadow: 0 0 0 3px var(--searchbar-shadow-color);
+}
+
+ul#mdbook-searchresults li {
+  border-radius: 8px;
+}
+
+/* ---------- Chapter navigation ---------- */
+
+.nav-chapters,
+.mobile-nav-chapters {
+  border-radius: 10px;
+}

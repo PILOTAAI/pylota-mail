@@ -1,0 +1,23 @@
+# Response headers for the Pylota Mail site (Workers static assets).
+# Docs: https://developers.cloudflare.com/workers/static-assets/headers/
+# When a request matches several rules, their headers are merged. A header set twice is
+# joined with a comma, so a rule that replaces one must detach it first with "! Name".
+
+/*
+  Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'none'
+  Strict-Transport-Security: max-age=63072000; includeSubDomains; preload
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: strict-origin-when-cross-origin
+  Permissions-Policy: camera=(), microphone=(), geolocation=()
+
+# The landing page references these with a ?v= query. Change it when a file changes.
+/assets/*
+  Cache-Control: public, max-age=31536000, immutable
+
+# mdBook 0.5 pages carry inline <script> blocks (theme, sidebar, path_to_root) and one
+# inline style attribute, and the no-JS sidebar frames toc.html from the same origin.
+# Under the policy above those are blocked and the docs lose their sidebar and theme.
+# This keeps every source first-party and only allows inline code for /docs/.
+/docs/*
+  ! Content-Security-Policy
+  Content-Security-Policy: default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'self'; base-uri 'self'; form-action 'none'

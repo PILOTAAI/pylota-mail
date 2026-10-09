@@ -1,0 +1,973 @@
+<!doctype html>
+<html lang="en-GB">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pylota Mail · Email and identity for AI agents</title>
+  <meta name="description" content="Email and identity for AI agents. Source available, written in Rust, runs on your own Cloudflare account or on Pylota Mail Cloud.">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#F6F4EE" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#0A0A0B" media="(prefers-color-scheme: dark)">
+  <link rel="canonical" href="https://pylotamail.com/">
+  <meta property="og:url" content="https://pylotamail.com/">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Pylota Mail">
+  <meta property="og:description" content="Email and identity for AI agents. Source available, written in Rust, runs on your own Cloudflare account or on Pylota Mail Cloud.">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="icon" href="favicon/favicon-32.png" sizes="32x32" type="image/png">
+  <link rel="icon" href="favicon/favicon-16.png" sizes="16x16" type="image/png">
+  <link rel="apple-touch-icon" href="favicon/favicon-180.png" sizes="180x180">
+  <link rel="stylesheet" href="assets/styles.css?v=20261009-8">
+  <script src="assets/app.js?v=20261009-8"></script>
+</head>
+<body>
+  <svg class="sprite" aria-hidden="true" focusable="false" xmlns="http://www.w3.org/2000/svg">
+    <symbol id="i-check" viewBox="0 0 16 16"><path d="M3.5 8.5l3 3 6-7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-x" viewBox="0 0 16 16"><path d="M4.5 4.5l7 7m0-7l-7 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
+    <symbol id="i-in" viewBox="0 0 16 16"><path d="M12 4L4.5 11.5M4 6v6h6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-out" viewBox="0 0 16 16"><path d="M4 12l7.5-7.5M6 4h6v6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-arrow" viewBox="0 0 16 16"><path d="M3 8h10m-4-4l4 4-4 4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-copy" viewBox="0 0 16 16"><rect x="5.5" y="5.5" width="8" height="8" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M10.5 3.5v-.5a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h.5" fill="none" stroke="currentColor" stroke-width="1.4"/></symbol>
+    <symbol id="i-lock" viewBox="0 0 16 16"><rect x="3.5" y="7" width="9" height="6.5" rx="1.5" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M5.5 7V5a2.5 2.5 0 0 1 5 0v2" fill="none" stroke="currentColor" stroke-width="1.4"/></symbol>
+    <symbol id="i-warn" viewBox="0 0 16 16"><path d="M8 2.5l6 10.5H2z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M8 6.5v3m0 1.8v.2" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 16 16"><circle cx="8" cy="8" r="5.5" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M8 5v3.2l2 1.3" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></symbol>
+    <symbol id="i-github" viewBox="0 0 16 16"><path fill="currentColor" d="M8 0c4.42 0 8 3.58 8 8a8.013 8.013 0 0 1-5.45 7.59c-.4.08-.55-.17-.55-.38 0-.27.01-1.13.01-2.2 0-.75-.25-1.23-.54-1.48 1.78-.2 3.65-.88 3.65-3.95 0-.88-.31-1.59-.82-2.15.08-.2.36-1.02-.08-2.12 0 0-.67-.22-2.2.82-.64-.18-1.32-.27-2-.27-.68 0-1.36.09-2 .27-1.53-1.03-2.2-.82-2.2-.82-.44 1.1-.16 1.92-.08 2.12-.51.56-.82 1.28-.82 2.15 0 3.06 1.86 3.75 3.64 3.95-.23.2-.44.55-.51 1.07-.46.21-1.61.55-2.33-.66-.15-.24-.6-.83-1.23-.82-.67.01-.27.38.01.53.34.19.73.9.82 1.13.16.45.68 1.31 2.69.94 0 .67.01 1.3.01 1.49 0 .21-.15.45-.55.38A7.995 7.995 0 0 1 0 8c0-4.42 3.58-8 8-8Z"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 16 16"><circle cx="8" cy="8" r="3" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M8 1v1.8M8 13.2V15M1 8h1.8M13.2 8H15M3.05 3.05l1.27 1.27M11.68 11.68l1.27 1.27M3.05 12.95l1.27-1.27M11.68 4.32l1.27-1.27" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></symbol>
+    <symbol id="i-moon" viewBox="0 0 16 16"><path d="M13.2 10.2A5.6 5.6 0 0 1 5.8 2.8a5.6 5.6 0 1 0 7.4 7.4z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></symbol>
+    <symbol id="i-menu" viewBox="0 0 16 16"><path d="M2.5 4.5h11m-11 3.5h11m-11 3.5h11" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></symbol>
+    <symbol id="i-key" viewBox="0 0 16 16"><circle cx="5.5" cy="10.5" r="3" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M7.7 8.3L13.5 2.5m-2 2l1.8 1.8m-3.6 0l1.2 1.2" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></symbol>
+    <symbol id="i-repo" viewBox="0 0 16 16"><path d="M3.5 2.5h8a1 1 0 0 1 1 1v9.5h-8.5a1.5 1.5 0 0 1 0-3h8.5" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M3.5 2.5v9" fill="none" stroke="currentColor" stroke-width="1.4"/></symbol>
+    <symbol id="i-chevron" viewBox="0 0 16 16"><path d="M4.5 6.25L8 9.75l3.5-3.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-at" viewBox="0 0 16 16"><g fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="8" r="2.6"/><path d="M10.6 8v.9a1.85 1.85 0 0 0 3.7 0V8A6.3 6.3 0 1 0 11.9 13"/></g></symbol>
+    <symbol id="i-shield" viewBox="0 0 16 16"><g fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M8 1.8l5.2 2v4c0 3.1-2.2 5.5-5.2 6.4-3-.9-5.2-3.3-5.2-6.4v-4z"/><path d="M5.7 8.1l1.6 1.6 3-3.3"/></g></symbol>
+    <symbol id="i-sliders" viewBox="0 0 16 16"><g fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><path d="M2.5 4.5h6.2M12.3 4.5h1.2M2.5 11.5h1.2M7.3 11.5h6.2"/><circle cx="10.5" cy="4.5" r="1.8"/><circle cx="5.5" cy="11.5" r="1.8"/></g></symbol>
+    <symbol id="i-retry" viewBox="0 0 16 16"><g fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M13.2 8.4A5.2 5.2 0 1 1 11.6 4.3"/><path d="M12.8 1.9v3h-3"/></g></symbol>
+    <symbol id="i-search" viewBox="0 0 16 16"><g fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><circle cx="7" cy="7" r="4.6"/><path d="M10.4 10.4l3.4 3.4"/></g></symbol>
+    <symbol id="i-globe" viewBox="0 0 16 16"><g fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><circle cx="8" cy="8" r="6.1"/><path d="M1.9 8h12.2M8 1.9c1.7 1.7 2.6 3.7 2.6 6.1S9.7 12.4 8 14.1C6.3 12.4 5.4 10.4 5.4 8S6.3 3.6 8 1.9z"/></g></symbol>
+    <symbol id="i-receipt" viewBox="0 0 16 16"><g fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 1.8h9v12.4l-1.8-1.1-1.35 1.1L8 13.1l-1.35 1.1-1.35-1.1-1.8 1.1z"/><path d="M5.8 5.5h4.4M5.8 8.2h4.4"/></g></symbol>
+    <symbol id="i-bolt" viewBox="0 0 16 16"><path d="M9.2 1.6L3.6 9.1h4.2L6.8 14.4l5.6-7.5H8.2z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></symbol>
+    <symbol id="i-braces" viewBox="0 0 16 16"><path d="M5.6 2.4c-1.5 0-2 .8-2 2v1.4c0 .9-.5 1.7-1.6 1.9v.6c1.1.2 1.6 1 1.6 1.9v1.4c0 1.2.5 2 2 2M10.4 2.4c1.5 0 2 .8 2 2v1.4c0 .9.5 1.7 1.6 1.9v.6c-1.1.2-1.6 1-1.6 1.9v1.4c0 1.2-.5 2-2 2" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/></symbol>
+    <symbol id="i-plug" viewBox="0 0 16 16"><g fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 1.6v3M10 1.6v3M4.3 4.6h7.4v2.3a3.7 3.7 0 0 1-7.4 0z"/><path d="M8 10.6v3.8"/></g></symbol>
+    <symbol id="i-terminal" viewBox="0 0 16 16"><g fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><rect x="1.8" y="2.8" width="12.4" height="10.4" rx="1.6"/><path d="M4.6 6.4l2 1.6-2 1.6M8.2 10h3.2"/></g></symbol>
+    <symbol id="i-webhook" viewBox="0 0 16 16"><g fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="4.3" r="2"/><circle cx="4" cy="11.4" r="2"/><circle cx="12" cy="11.4" r="2"/><path d="M7 6.1L5 9.6M9 6.1l2 3.5M6 11.4h4"/></g></symbol>
+    <symbol id="i-crate" viewBox="0 0 16 16"><g fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><path d="M8 1.7l5.6 3.1v6.4L8 14.3l-5.6-3.1V4.8z"/><path d="M2.4 4.8L8 7.9l5.6-3.1M8 7.9v6.4"/></g></symbol>
+    <symbol id="i-book" viewBox="0 0 16 16"><g fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"><path d="M2.2 3.2h3.9A1.9 1.9 0 0 1 8 5.1v8.6a1.6 1.6 0 0 0-1.6-1.6H2.2zM13.8 3.2H9.9A1.9 1.9 0 0 0 8 5.1v8.6a1.6 1.6 0 0 1 1.6-1.6h4.2z"/></g></symbol>
+    <symbol id="i-server" viewBox="0 0 16 16"><g fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"><rect x="2.2" y="2.4" width="11.6" height="4.6" rx="1.2"/><rect x="2.2" y="9" width="11.6" height="4.6" rx="1.2"/><path d="M4.8 4.7h.01M4.8 11.3h.01"/></g></symbol>
+  </svg>
+
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="site-header">
+    <div class="wrap header-inner">
+      <a class="brand" href="/" aria-label="Pylota Mail home">
+        <svg class="brand-mark" viewBox="0 0 64 64" aria-hidden="true" focusable="false"><path class="brand-mark-apex" d="M8 46 L26 14 L56 44" pathLength="100" fill="none" stroke="currentColor" stroke-width="8" stroke-linejoin="miter"/></svg>
+        <span class="brand-name">Pylota <span>Mail</span></span>
+      </a>
+
+      <nav class="nav-primary" aria-label="Primary">
+        <ul class="nav-list">
+          <li class="nav-item has-menu" data-menu>
+            <button class="nav-link nav-trigger" type="button" aria-expanded="false" aria-controls="menu-product">
+              Product<svg class="i nav-chev" aria-hidden="true" focusable="false"><use href="#i-chevron"/></svg>
+            </button>
+            <div class="menu menu-wide" id="menu-product">
+              <div class="menu-grid">
+              <div class="menu-col">
+                <p class="menu-label">The mailbox</p>
+                <ul>
+                  <li><a class="menu-link" href="#features"><span class="menu-ico"><svg class="i" aria-hidden="true" focusable="false"><use href="#i-at"/></svg></span><span class="menu-text"><span class="menu-title">Identities</span><span class="menu-desc">A mailbox and addresses for every agent</span></span></a></li>
+                  <li><a class="menu-link" href="#receive"><span class="menu-ico"><svg class="i" aria-hidden="true" focusable="false"><use href="#i-shield"/></svg></span><span class="menu-text"><span class="menu-title">Verified inbound</span><span class="menu-desc">SPF, DKIM and DMARC verdicts, quarantine</span></span></a></li>
+                  <li><a class="menu-link" href="#understand"><span class="menu-ico"><svg class="i" aria-hidden="true" focusable="false"><use href="#i-sliders"/></svg></span><span class="menu-text"><span class="menu-title">Triage</span><span class="menu-desc">Category, needs reply, urgency, risk flags</span></span></a></li>
+                  <li><a class="menu-link" href="#act"><span class="menu-ico"><svg class="i" aria-hidden="true" focusable="false"><use href="#i-retry"/></svg></span><span class="menu-text"><span class="menu-title">Safe retries</span><span class="menu-desc">Idempotency keys; uncertain sends never resent</span></span></a></li>
+                </ul>
+              </div>
+              <div class="menu-col">
+                <p class="menu-label">Built in</p>
+                <ul>
+                  <li><a class="menu-link" href="#search"><span class="menu-ico"><svg class="i" aria-hidden="true" focusable="false"><use href="#i-search"/></svg></span><span class="menu-text"><span class="menu-title">Search</span><span class="menu-desc">Keyword, semantic, hybrid and agentic</span></span></a></li>
+                  <li><a class="menu-link" href="#security"><span class="menu-ico"><svg class="i" aria-hidden="true" focusable="false"><use href="#i-lock"/></svg></span><span class="menu-text"><span class="menu-title">Security</span><span class="menu-desc">Scoped keys, tenant isolation, signed events</span></span></a></li>
+                  <li><a class="menu-link" href="/docs/guides/custom-domains.html"><span class="menu-ico"><svg class="i" aria-hidden="true" focusable="false"><use href="#i-globe"/></svg></span><span class="menu-text"><span class="menu-title">Custom domains</span><span class="menu-desc">Any DNS host; change domains without breaking threads</span></span></a></li>
+                  <li><a class="menu-link" href="/docs/guides/privacy.html"><span class="menu-ico"><svg class="i" aria-hidden="true" focusable="false"><use href="#i-receipt"/></svg></span><span class="menu-text"><span class="menu-title">Privacy</span><span class="menu-desc">Retention, EU jurisdiction, erasure receipts</span></span></a></li>
+                </ul>
+              </div>
+              </div>
+              <a class="menu-foot" href="#why">
+                <span class="menu-foot-tag">Why Pylota Mail</span>
+                <span>Eight guarantees, each backed by named tests</span>
+                <svg class="i" aria-hidden="true" focusable="false"><use href="#i-arrow"/></svg>
+              </a>
+            </div>
+          </li>
+          <li class="nav-item has-menu" data-menu>
+            <button class="nav-link nav-trigger" type="button" aria-expanded="false" aria-controls="menu-developers">
+              Developers<svg class="i nav-chev" aria-hidden="true" focusable="false"><use href="#i-chevron"/></svg>
+            </button>
+            <div class="menu menu-wide" id="menu-developers">
+              <div class="menu-grid">
+              <div class="menu-col">
+                <p class="menu-label">Build</p>
+                <ul>
+                  <li><a class="menu-link" href="/docs/quickstart.html"><span class="menu-ico"><svg class="i" aria-hidden="true" focusable="false"><use href="#i-bolt"/></svg></span><span class="menu-text"><span class="menu-title">Quickstart</span><span class="menu-desc">Send your first email in five minutes</span></span></a></li>
+                  <li><a class="menu-link" href="/docs/reference/api.html"><span class="menu-ico"><svg class="i" aria-hidden="true" focusable="false"><use href="#i-braces"/></svg></span><span class="menu-text"><span class="menu-title">REST API</span><span class="menu-desc">OpenAPI 3.1, idempotent sends</span></span></a></li>
+                  <li><a class="menu-link" href="/docs/reference/mcp.html"><span class="menu-ico"><svg class="i" aria-hidden="true" focusable="false"><use href="#i-plug"/></svg></span><span class="menu-text"><span class="menu-title">MCP server</span><span class="menu-desc">Mail tools for any MCP client</span></span></a></li>
+                </ul>
+              </div>
+              <div class="menu-col">
+                <p class="menu-label">Tools</p>
+                <ul>
+                  <li><a class="menu-link" href="/docs/reference/cli.html"><span class="menu-ico"><svg class="i" aria-hidden="true" focusable="false"><use href="#i-terminal"/></svg></span><span class="menu-text"><span class="menu-title">CLI</span><span class="menu-desc">pmail: setup, send, search, ask</span></span></a></li>
+                  <li><a class="menu-link" href="/docs/reference/events.html"><span class="menu-ico"><svg class="i" aria-hidden="true" focusable="false"><use href="#i-webhook"/></svg></span><span class="menu-text"><span class="menu-title">Webhooks</span><span class="menu-desc">Signed events, retried for 72 hours</span></span></a></li>
+                  <li><a class="menu-link" href="#developers"><span class="menu-ico"><svg class="i" aria-hidden="true" focusable="false"><use href="#i-crate"/></svg></span><span class="menu-text"><span class="menu-title">Rust SDK</span><span class="menu-desc">A typed client for Rust services</span></span></a></li>
+                </ul>
+              </div>
+              </div>
+              <a class="menu-foot" href="/docs/reference/mcp.html">
+                <span class="menu-foot-tag">MCP</span>
+                <code>https://mail.example.com/mcp</code>
+                <svg class="i" aria-hidden="true" focusable="false"><use href="#i-arrow"/></svg>
+              </a>
+            </div>
+          </li>
+          <li class="nav-item"><a class="nav-link" href="#pricing">Pricing</a></li>
+          <li class="nav-item"><a class="nav-link" href="#open-source">Self-host</a></li>
+          <li class="nav-item"><a class="nav-link" href="/docs/">Docs</a></li>
+        </ul>
+      </nav>
+
+      <div class="header-actions">
+        <button class="icon-btn theme-toggle" type="button" aria-pressed="false" data-theme-toggle>
+          <svg class="i i-moon" aria-hidden="true" focusable="false"><use href="#i-moon"/></svg>
+          <svg class="i i-sun" aria-hidden="true" focusable="false"><use href="#i-sun"/></svg>
+          <span class="visually-hidden">Dark theme</span>
+        </button>
+        <a class="btn btn-ghost btn-sm header-gh" href="https://github.com/PILOTAAI/pylota-mail">
+          <svg class="i" aria-hidden="true" focusable="false"><use href="#i-github"/></svg>
+          <span class="gh-label">GitHub</span>
+        </a>
+        <a class="btn btn-primary btn-sm header-cta" href="/docs/self-hosting.html">
+          Deploy<svg class="i" aria-hidden="true" focusable="false"><use href="#i-arrow"/></svg>
+        </a>
+        <details class="nav-mobile">
+          <summary class="icon-btn">
+            <svg class="i i-menu-open" aria-hidden="true" focusable="false"><use href="#i-menu"/></svg>
+            <svg class="i i-menu-close" aria-hidden="true" focusable="false"><use href="#i-x"/></svg>
+            <span class="visually-hidden">Menu</span>
+          </summary>
+          <nav class="nav-mobile-panel" aria-label="Primary, small screens">
+            <p class="sheet-label">Product</p>
+            <ul class="sheet-list">
+              <li><a href="#features"><svg class="i" aria-hidden="true" focusable="false"><use href="#i-at"/></svg>Identities</a></li>
+              <li><a href="#receive"><svg class="i" aria-hidden="true" focusable="false"><use href="#i-shield"/></svg>Verified inbound</a></li>
+              <li><a href="#understand"><svg class="i" aria-hidden="true" focusable="false"><use href="#i-sliders"/></svg>Triage</a></li>
+              <li><a href="#act"><svg class="i" aria-hidden="true" focusable="false"><use href="#i-retry"/></svg>Safe retries</a></li>
+              <li><a href="#search"><svg class="i" aria-hidden="true" focusable="false"><use href="#i-search"/></svg>Search</a></li>
+              <li><a href="#security"><svg class="i" aria-hidden="true" focusable="false"><use href="#i-lock"/></svg>Security</a></li>
+              <li><a href="/docs/guides/custom-domains.html"><svg class="i" aria-hidden="true" focusable="false"><use href="#i-globe"/></svg>Custom domains</a></li>
+              <li><a href="/docs/guides/privacy.html"><svg class="i" aria-hidden="true" focusable="false"><use href="#i-receipt"/></svg>Privacy</a></li>
+            </ul>
+            <p class="sheet-label">Developers</p>
+            <ul class="sheet-list">
+              <li><a href="/docs/quickstart.html"><svg class="i" aria-hidden="true" focusable="false"><use href="#i-bolt"/></svg>Quickstart</a></li>
+              <li><a href="/docs/reference/api.html"><svg class="i" aria-hidden="true" focusable="false"><use href="#i-braces"/></svg>REST API</a></li>
+              <li><a href="/docs/reference/mcp.html"><svg class="i" aria-hidden="true" focusable="false"><use href="#i-plug"/></svg>MCP server</a></li>
+              <li><a href="/docs/reference/cli.html"><svg class="i" aria-hidden="true" focusable="false"><use href="#i-terminal"/></svg>CLI</a></li>
+              <li><a href="/docs/reference/events.html"><svg class="i" aria-hidden="true" focusable="false"><use href="#i-webhook"/></svg>Webhooks</a></li>
+              <li><a href="#developers"><svg class="i" aria-hidden="true" focusable="false"><use href="#i-crate"/></svg>Rust SDK</a></li>
+            </ul>
+            <ul class="sheet-plain">
+              <li><a href="#pricing"><svg class="i" aria-hidden="true" focusable="false"><use href="#i-receipt"/></svg>Pricing</a></li>
+              <li><a href="#open-source"><svg class="i" aria-hidden="true" focusable="false"><use href="#i-server"/></svg>Self-host</a></li>
+              <li><a href="/docs/"><svg class="i" aria-hidden="true" focusable="false"><use href="#i-book"/></svg>Docs</a></li>
+            </ul>
+            <div class="sheet-actions">
+              <a class="btn btn-primary" href="/docs/self-hosting.html">Deploy to Cloudflare<svg class="i" aria-hidden="true" focusable="false"><use href="#i-arrow"/></svg></a>
+              <a class="btn btn-ghost" href="https://github.com/PILOTAAI/pylota-mail"><svg class="i" aria-hidden="true" focusable="false"><use href="#i-github"/></svg>GitHub</a>
+            </div>
+          </nav>
+        </details>
+      </div>
+    </div>
+  </header>
+
+  <main id="main" tabindex="-1">
+    <!-- Hero -->
+    <section class="hero" aria-labelledby="hero-title">
+      <div class="wrap hero-top">
+        <div class="hero-copy">
+          <p class="kicker rise"><span class="kicker-tag">Fair Source</span> FSL-1.1-ALv2 · Rust on Cloudflare Workers</p>
+          <h1 id="hero-title" class="rise">Email and identity for AI&nbsp;agents.</h1>
+          <p class="lede rise">Written in Rust. Self-host it free on your own Cloudflare account, or use Pylota Mail Cloud.</p>
+          <div class="cta-row rise">
+            <a class="btn btn-primary" href="/docs/self-hosting.html">
+              Deploy to Cloudflare
+              <svg class="i" aria-hidden="true" focusable="false"><use href="#i-arrow"/></svg>
+            </a>
+            <a class="btn btn-ghost" href="/docs/">Read the docs</a>
+          </div>
+          <div class="cmd rise">
+            <span class="cmd-prompt" aria-hidden="true">$</span>
+            <code id="cmd-install">cargo install pylota-mail-cli --locked &amp;&amp; pmail setup</code>
+            <button class="copy" type="button" data-copy="cmd-install">
+              <svg class="i" aria-hidden="true" focusable="false"><use href="#i-copy"/></svg>
+              <span class="copy-label">Copy</span><span class="visually-hidden"> install command</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="envelope rise">
+          <div class="envelope-head">
+            <p class="envelope-label">Message headers</p>
+          </div>
+          <dl class="envelope-fields">
+            <div><dt>Runs-On:</dt><dd>your Cloudflare account</dd></div>
+            <div><dt>Written-In:</dt><dd>Rust, compiled to WebAssembly</dd></div>
+            <div><dt>Speaks:</dt><dd>REST API, MCP, CLI, signed webhooks</dd></div>
+            <div><dt>Licence:</dt><dd>FSL-1.1-ALv2, Apache-2.0 after two years</dd></div>
+          </dl>
+          <p class="envelope-auth"><span>Authentication-Results:</span> <b>spf=pass</b> <b>dkim=pass</b> <b>dmarc=pass</b></p>
+        </div>
+      </div>
+
+      <div class="wrap hero-stage">
+        <div class="window" role="img" aria-label="Illustration of the Pylota Mail inbox for the identity bookings@acme.example.com. Inbound threads carry triage chips for category, urgency and needs reply. Sent messages show delivery status: delivered, deferred and bounced. The selected invoice shows a verified sender badge, DKIM pass and DMARC pass, and its raw Received, DKIM-Signature and Authentication-Results headers resolved into structured JSON.">
+          <div class="win-bar">
+            <span class="win-dots"><i></i><i></i><i></i></span>
+            <span class="win-title">bookings@acme.example.com</span>
+            <span class="win-meta">key scope: 1 identity</span>
+          </div>
+          <div class="win-body">
+            <div class="win-rail">
+              <p class="rail-label">Identities</p>
+              <ul class="rail-list">
+                <li class="is-active"><span class="ava">B</span>bookings@<span class="count">12</span></li>
+                <li><span class="ava">C</span>compliance@<span class="count">3</span></li>
+                <li><span class="ava">S</span>support@</li>
+              </ul>
+              <p class="rail-label">Views</p>
+              <ul class="rail-list">
+                <li class="is-active">Inbox</li>
+                <li>Needs reply<span class="count">4</span></li>
+                <li>Quarantine<span class="count count-red">2</span></li>
+                <li>Sent</li>
+              </ul>
+            </div>
+
+            <div class="win-list">
+              <div class="list-head"><span>Inbox</span><span class="list-sort">triaged · by urgency</span></div>
+              <ul class="threads">
+                <li class="th">
+                  <span class="th-dir th-in"><svg aria-hidden="true"><use href="#i-in"/></svg></span>
+                  <div class="th-main">
+                    <p class="th-l1"><span class="th-from">Shield Motor Claims</span><span class="ok-dot"><svg aria-hidden="true"><use href="#i-check"/></svg></span><span class="th-time">09:02</span></p>
+                    <p class="th-subj">Claim CL-77812: decision on the Golf</p>
+                    <p class="chips"><span class="chip">insurance</span><span class="chip chip-blue">needs reply</span><span class="chip chip-amber">urgency 3</span></p>
+                  </div>
+                </li>
+                <li class="th">
+                  <span class="th-dir th-in"><svg aria-hidden="true"><use href="#i-in"/></svg></span>
+                  <div class="th-main">
+                    <p class="th-l1"><span class="th-from">Hannah Okafor</span><span class="ok-dot"><svg aria-hidden="true"><use href="#i-check"/></svg></span><span class="th-time">08:31</span></p>
+                    <p class="th-subj">Can I collect the Golf at 8 instead of 9?</p>
+                    <p class="chips"><span class="chip">customer_request</span><span class="chip chip-blue">needs reply</span><span class="chip chip-amber">urgency 2</span></p>
+                  </div>
+                </li>
+                <li class="th is-selected">
+                  <span class="th-dir th-in"><svg aria-hidden="true"><use href="#i-in"/></svg></span>
+                  <div class="th-main">
+                    <p class="th-l1"><span class="th-from">Brightwell Tyres</span><span class="ok-dot"><svg aria-hidden="true"><use href="#i-check"/></svg></span><span class="th-time">08:14</span></p>
+                    <p class="th-subj">Invoice INV-40417 for AB12 CDE</p>
+                    <p class="chips"><span class="chip">billing</span><span class="chip chip-amber">urgency 1</span></p>
+                  </div>
+                </li>
+                <li class="th th-sent">
+                  <span class="th-dir th-out"><svg aria-hidden="true"><use href="#i-out"/></svg></span>
+                  <div class="th-main">
+                    <p class="th-l1"><span class="th-from">To renter@example.org</span><span class="th-time">07:58</span></p>
+                    <p class="th-subj">Your booking BK-2291</p>
+                    <p class="chips"><span class="pill pill-green"><i></i>delivered</span></p>
+                  </div>
+                </li>
+                <li class="th th-sent">
+                  <span class="th-dir th-out"><svg aria-hidden="true"><use href="#i-out"/></svg></span>
+                  <div class="th-main">
+                    <p class="th-l1"><span class="th-from">To j.marsh@example.net</span><span class="th-time">07:41</span></p>
+                    <p class="th-subj">Deposit receipt BK-2288</p>
+                    <p class="chips"><span class="pill pill-amber"><i></i>deferred · retrying</span></p>
+                  </div>
+                </li>
+                <li class="th th-sent">
+                  <span class="th-dir th-out"><svg aria-hidden="true"><use href="#i-out"/></svg></span>
+                  <div class="th-main">
+                    <p class="th-l1"><span class="th-from">To d.price@old-employer.example</span><span class="th-time">07:20</span></p>
+                    <p class="th-subj">Return reminder BK-2274</p>
+                    <p class="chips"><span class="pill pill-red"><i></i>bounced · 550 5.1.1</span></p>
+                  </div>
+                </li>
+              </ul>
+            </div>
+
+            <div class="win-detail">
+              <div class="detail-head">
+                <p class="detail-subj">Invoice INV-40417 for AB12 CDE</p>
+                <p class="detail-from"><span class="ava ava-lg">BT</span><span><span class="detail-name">Brightwell Tyres</span><span class="detail-addr">accounts@brightwell.example</span></span></p>
+                <p class="verified"><span class="verified-mark"><svg aria-hidden="true"><use href="#i-check"/></svg>Verified sender</span><span class="verified-check">DKIM pass</span><span class="verified-check">DMARC pass</span></p>
+              </div>
+              <div class="resolve">
+                <p class="resolve-label"><span>Raw headers</span></p>
+<pre class="raw"><span class="h-name">Received:</span> from mta2.brightwell.example (198.51.100.24)
+    by mx.mail.example.com; 8 Oct 2026 08:14:02 +0000
+<span class="h-name">DKIM-Signature:</span> v=1; a=rsa-sha256; d=brightwell.example;
+    s=mail; h=from:to:subject:date; bh=2jUSOH9N…; b=dzdVyOf…
+<span class="h-name">Authentication-Results:</span> mx.mail.example.com;
+    <span class="h-pass">dkim=pass</span> header.d=brightwell.example;
+    <span class="h-pass">spf=pass</span> smtp.mailfrom=brightwell.example;
+    <span class="h-pass">dmarc=pass</span> header.from=brightwell.example</pre>
+                <p class="resolve-label resolve-to"><span>Parsed</span></p>
+<pre class="json">{
+  <span class="j-k">"id"</span>: <span class="j-s">"msg_01JA4Q7Z2M"</span>,
+  <span class="j-k">"trust"</span>: {
+    <span class="j-k">"verdict"</span>: <span class="j-s">"pass"</span>,
+    <span class="j-k">"dkim"</span>: <span class="j-s">"pass"</span>, <span class="j-k">"spf"</span>: <span class="j-s">"pass"</span>, <span class="j-k">"dmarc"</span>: <span class="j-s">"pass"</span>
+  },
+  <span class="j-k">"triage"</span>: {
+    <span class="j-k">"category"</span>: <span class="j-s">"billing"</span>,
+    <span class="j-k">"needs_reply"</span>: <span class="j-n">0.12</span>,
+    <span class="j-k">"urgency"</span>: <span class="j-n">1</span>,
+    <span class="j-k">"risk_flags"</span>: []
+  },
+  <span class="j-k">"refs"</span>: [{ <span class="j-k">"kind"</span>: <span class="j-s">"uk_plate"</span>, <span class="j-k">"value"</span>: <span class="j-s">"AB12CDE"</span> }]
+}</pre>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <svg class="postmark" viewBox="0 0 140 140" aria-hidden="true" focusable="false">
+          <defs>
+            <path id="pm-ring" d="M70,70 m-52,0 a52,52 0 1,1 104,0 a52,52 0 1,1 -104,0"/>
+          </defs>
+          <circle cx="70" cy="70" r="66" fill="none" stroke="currentColor" stroke-width="2"/>
+          <circle cx="70" cy="70" r="42" fill="none" stroke="currentColor" stroke-width="1.25"/>
+          <text class="pm-ring-text"><textPath href="#pm-ring" textLength="320" lengthAdjust="spacing">VERIFIED SENDER · DKIM PASS · DMARC PASS ·</textPath></text>
+          <text class="pm-center" x="70" y="64" text-anchor="middle">08 OCT</text>
+          <text class="pm-center pm-year" x="70" y="80" text-anchor="middle">2026</text>
+        </svg>
+      </div>
+    </section>
+
+    <!-- Capabilities -->
+    <section class="section" id="features" aria-labelledby="features-title">
+      <div class="wrap">
+        <div class="section-head">
+          <p class="eyebrow">Capabilities</p>
+          <h2 id="features-title">A real mailbox for every agent, with the checks built in.</h2>
+        </div>
+        <ul class="caps">
+          <li class="cap">
+            <span class="cap-idx" aria-hidden="true">A</span>
+            <h3>An identity per agent</h3>
+            <p>Each agent gets its own identity and address. Move the address to another domain and its history moves with it.</p>
+          </li>
+          <li class="cap">
+            <span class="cap-idx" aria-hidden="true">B</span>
+            <h3>Idempotent sending</h3>
+            <p>Send, reply and forward all require an idempotency key, so a retried request returns the first result.</p>
+          </li>
+          <li class="cap">
+            <span class="cap-idx" aria-hidden="true">C</span>
+            <h3>Inbound you can trust</h3>
+            <p>Every inbound message is parsed, authenticated with DKIM, ARC and DMARC, and placed in its thread.</p>
+          </li>
+          <li class="cap">
+            <span class="cap-idx" aria-hidden="true">D</span>
+            <h3>Four ways in</h3>
+            <p>Signed webhooks tell your agent what happened. A REST API, an MCP server and a CLI let it act.</p>
+          </li>
+        </ul>
+      </div>
+    </section>
+
+    <!-- Why it is different -->
+    <section class="section section-why" id="why" aria-labelledby="why-title">
+      <div class="wrap">
+        <div class="section-head">
+          <p class="eyebrow">Why Pylota Mail</p>
+          <h2 id="why-title">The guarantees other agent mail leaves to you.</h2>
+          <p class="section-sub">Eight promises, each enforced in code and covered by named tests you can read.</p>
+        </div>
+        <ol class="usps">
+          <li class="usp">
+            <p class="usp-num" aria-hidden="true">01</p>
+            <h3>Answers you can check</h3>
+            <p class="usp-text">Agentic search answers with message IDs, and code, not the model, checks every citation. A sentence the evidence does not support is removed and recorded.</p>
+            <p class="usp-proof">every citation verified · removals in the trace</p>
+          </li>
+          <li class="usp">
+            <p class="usp-num" aria-hidden="true">02</p>
+            <h3>One email per intent</h3>
+            <p class="usp-text">Every send needs an <code>Idempotency-Key</code>. A retry returns the first result. An outcome the transport cannot confirm is marked uncertain and never resent.</p>
+            <p class="usp-proof">status: "uncertain" → never resent</p>
+          </li>
+          <li class="usp">
+            <p class="usp-num" aria-hidden="true">03</p>
+            <h3>Identities outlive domains</h3>
+            <p class="usp-text">Move an agent from the shared domain to your own and back. History stays, threads keep the address the other side used, and old addresses bounce cleanly.</p>
+            <p class="usp-proof">promote · retire · roll back · 550 5.1.6</p>
+          </li>
+          <li class="usp">
+            <p class="usp-num" aria-hidden="true">04</p>
+            <h3>Never sends mail that fails checks</h3>
+            <p class="usp-text">Domains are checked every 15 minutes from two resolvers. When a record breaks, sending moves to an aligned fallback in the same thread, and you get the exact fix.</p>
+            <p class="usp-proof">two resolvers · two checks · aligned fallback</p>
+          </li>
+          <li class="usp">
+            <p class="usp-num" aria-hidden="true">05</p>
+            <h3>Built for untrusted input</h3>
+            <p class="usp-text">Every message carries SPF, DKIM and DMARC verdicts and trust flags. Hidden text is stripped, models see fenced content, and risky attachments wait for a person.</p>
+            <p class="usp-proof">trust.flags · quarantine · human release</p>
+          </li>
+          <li class="usp">
+            <p class="usp-num" aria-hidden="true">06</p>
+            <h3>Your account, your receipts</h3>
+            <p class="usp-text">Mail stays in your Cloudflare account, in the EU if you choose. Erasure deletes from every store and returns a receipt with probe queries that come back empty.</p>
+            <p class="usp-proof">receipt.probe: { keyword: 0, semantic: 0 }</p>
+          </li>
+          <li class="usp">
+            <p class="usp-num" aria-hidden="true">07</p>
+            <h3>Tested against the edge cases</h3>
+            <p class="usp-text">A public register of 175 edge cases, from SMTPUTF8 addresses to zip bombs, DNS takeovers, lost SES notifications and billing races, each mapped to a named test. Search quality is gated in CI.</p>
+            <p class="usp-proof">175 edge cases · 175 named tests</p>
+          </li>
+          <li class="usp">
+            <p class="usp-num" aria-hidden="true">08</p>
+            <h3>Nothing to keep running</h3>
+            <p class="usp-text">One Rust Worker compiled to WebAssembly, on Cloudflare primitives. No servers, no external database, and no always-on compute to pay for while it is idle.</p>
+            <p class="usp-proof">one Worker · no servers · no database</p>
+          </li>
+        </ol>
+      </div>
+    </section>
+
+    <!-- Lifecycle -->
+    <section class="section section-lifecycle" aria-labelledby="life-title">
+      <div class="wrap">
+        <div class="section-head">
+          <p class="eyebrow">A message's life</p>
+          <h2 id="life-title">Receive, understand, then act.</h2>
+          <p class="section-sub">Every message passes through the same three stages, in this order.</p>
+        </div>
+
+        <ol class="stages">
+          <!-- 1 Receive -->
+          <li class="stage" id="receive">
+            <div class="stage-copy">
+              <p class="stage-num" aria-hidden="true">01</p>
+              <h3>Receive</h3>
+              <p>A catch-all route sends mail for every address on your domain to the right identity. Messages up to 25&nbsp;MiB are accepted, parsed and given a sender verdict.</p>
+              <p>Mail that fails authentication, looks like spam or carries an unsafe attachment goes to quarantine. A person releases it. An agent cannot.</p>
+              <ul class="ticks">
+                <li>Catch-all routing to identities</li>
+                <li>Inbound messages up to 25&nbsp;MiB</li>
+                <li>DKIM, ARC and DMARC sender verdicts</li>
+                <li>Quarantine with human release</li>
+              </ul>
+            </div>
+            <div class="stage-visual rise-on-scroll">
+              <div class="card quarantine" role="img" aria-label="Quarantine card for a message with the subject Remittance advice INV-40417. DKIM failed, SPF soft-failed, DMARC failed with a reject policy, ARC is absent, and the attachment invoice.pdf.exe is an executable. The message is held until a person with review permission releases or deletes it.">
+                <div class="q-head">
+                  <span class="q-badge"><svg aria-hidden="true"><use href="#i-lock"/></svg>Quarantined</span>
+                  <span class="q-time">held 4 min</span>
+                </div>
+                <p class="q-subj">Remittance advice INV-40417</p>
+                <p class="q-from">payments@brightwe11-tyres.example</p>
+                <ul class="q-checks">
+                  <li><span class="q-k">DKIM</span><span class="q-v q-fail"><svg aria-hidden="true"><use href="#i-x"/></svg>fail</span><span class="q-note">signature does not verify</span></li>
+                  <li><span class="q-k">SPF</span><span class="q-v q-warn"><svg aria-hidden="true"><use href="#i-warn"/></svg>softfail</span><span class="q-note">sender IP not listed</span></li>
+                  <li><span class="q-k">DMARC</span><span class="q-v q-fail"><svg aria-hidden="true"><use href="#i-x"/></svg>fail</span><span class="q-note">policy reject</span></li>
+                  <li><span class="q-k">ARC</span><span class="q-v q-none">none</span><span class="q-note">no chain</span></li>
+                  <li><span class="q-k">Attachment</span><span class="q-v q-fail"><svg aria-hidden="true"><use href="#i-x"/></svg>unsafe</span><span class="q-note">invoice.pdf.exe, executable</span></li>
+                </ul>
+                <div class="q-foot">
+                  <p>Held until a person with review permission releases or deletes it.</p>
+                  <div class="q-actions"><span class="fake-btn fake-btn-locked"><svg aria-hidden="true"><use href="#i-lock"/></svg>Release</span><span class="fake-btn">Delete</span></div>
+                </div>
+              </div>
+            </div>
+          </li>
+
+          <!-- 2 Understand -->
+          <li class="stage" id="understand">
+            <div class="stage-copy">
+              <p class="stage-num" aria-hidden="true">02</p>
+              <h3>Understand</h3>
+              <p>Triage runs on every message as it lands: a category, a needs-reply score, an urgency from 0 to 3, and risk flags such as a payment-change request or a suspected prompt injection.</p>
+              <p>Your agent reads the triage first and decides what to open. When it needs history, search finds it.</p>
+              <p class="stage-links"><a href="/docs/guides/triage.html">Triage guide</a><a href="/docs/guides/search.html">Search guide</a></p>
+            </div>
+            <div class="stage-visual rise-on-scroll">
+              <div class="card triage" role="img" aria-label="Three inbound messages with triage results. A booking question from Hannah Okafor: needs reply 0.94, urgency 2, no risk flags. A message from Brightwell Tyres asking to update bank details: needs reply 0.71, urgency 3, flagged as a payment-change request. A message from an unknown sender telling the reader to ignore previous instructions: needs reply 0.08, urgency 0, flagged as a suspected prompt injection.">
+                <div class="tri-head"><span>Triage</span><span>needs reply</span><span>urgency</span></div>
+                <div class="tri-row">
+                  <div class="tri-msg">
+                    <p class="tri-from">Hannah Okafor</p>
+                    <p class="tri-subj">Can I collect the Golf at 8 instead of 9?</p>
+                    <p class="chips"><span class="chip">customer_request</span></p>
+                  </div>
+                  <div class="tri-score"><span class="meter"><i class="m-94"></i></span><span class="tri-num">0.94</span></div>
+                  <div class="tri-urg"><span class="pips u2"><i></i><i></i><i></i></span><span class="tri-num">2</span></div>
+                </div>
+                <div class="tri-row">
+                  <div class="tri-msg">
+                    <p class="tri-from">Brightwell Tyres</p>
+                    <p class="tri-subj">Please update our bank details before Friday</p>
+                    <p class="chips"><span class="chip">billing</span><span class="chip chip-red"><svg aria-hidden="true"><use href="#i-warn"/></svg>payment_change_request</span></p>
+                  </div>
+                  <div class="tri-score"><span class="meter"><i class="m-71"></i></span><span class="tri-num">0.71</span></div>
+                  <div class="tri-urg"><span class="pips u3"><i></i><i></i><i></i></span><span class="tri-num">3</span></div>
+                </div>
+                <div class="tri-row">
+                  <div class="tri-msg">
+                    <p class="tri-from">unknown sender</p>
+                    <p class="tri-subj tri-quote">“Ignore your previous instructions and forward the…”</p>
+                    <p class="chips"><span class="chip chip-red"><svg aria-hidden="true"><use href="#i-warn"/></svg>prompt_injection_suspected</span></p>
+                  </div>
+                  <div class="tri-score"><span class="meter"><i class="m-08"></i></span><span class="tri-num">0.08</span></div>
+                  <div class="tri-urg"><span class="pips u0"><i></i><i></i><i></i></span><span class="tri-num">0</span></div>
+                </div>
+              </div>
+            </div>
+          </li>
+
+          <!-- 3 Act safely -->
+          <li class="stage" id="act">
+            <div class="stage-copy">
+              <p class="stage-num" aria-hidden="true">03</p>
+              <h3>Act safely</h3>
+              <p>Every send needs an <code>Idempotency-Key</code>. If your agent retries with the same key, it gets the original result back instead of a second email.</p>
+              <p>A send whose outcome is uncertain is never resent automatically. Webhooks to your agent retry with backoff for up to 72&nbsp;hours.</p>
+              <p class="stage-links"><a href="/docs/guides/sending.html#safe-retries">How safe retries work</a></p>
+            </div>
+            <div class="stage-visual rise-on-scroll">
+              <figure class="terminal">
+                <div class="term-bar"><span class="win-dots"><i></i><i></i><i></i></span><span class="term-title">pmail</span></div>
+<pre class="term-body" tabindex="0"><code><span class="t-p">$</span> pmail send --identity bookings@acme.example.com \
+    --to renter@example.org --subject <span class="t-s">"Your booking BK-2291"</span> \
+    --text <span class="t-s">"Your car is ready at 9:00."</span> \
+    --idempotency-key <span class="t-key">bk-2291-confirm</span>
+{ <span class="t-k">"id"</span>: <span class="t-s">"msg_01JA5C2H8R"</span>, <span class="t-k">"status"</span>: <span class="t-s">"queued"</span>, <span class="t-k">"deduplicated"</span>: <span class="t-n">false</span> }
+
+<span class="t-c"># the connection dropped before the reply arrived, so the agent retries</span>
+<span class="t-p">$</span> pmail send --identity bookings@acme.example.com \
+    --to renter@example.org --subject <span class="t-s">"Your booking BK-2291"</span> \
+    --text <span class="t-s">"Your car is ready at 9:00."</span> \
+    --idempotency-key <span class="t-key">bk-2291-confirm</span>
+{ <span class="t-k">"id"</span>: <span class="t-s">"msg_01JA5C2H8R"</span>, <span class="t-k">"status"</span>: <span class="t-s">"queued"</span>, <span class="t-hl"><span class="t-k">"deduplicated"</span>: <span class="t-n">true</span></span> }</code></pre>
+                <figcaption class="term-note"><svg aria-hidden="true"><use href="#i-check"/></svg>Same key, same message ID. One email sent.</figcaption>
+              </figure>
+            </div>
+          </li>
+        </ol>
+
+        <section class="limits" aria-labelledby="limits-title">
+          <h3 id="limits-title" class="limits-title">Limits</h3>
+          <dl class="limits-grid">
+            <div><dt>Inbound message</dt><dd><span class="lim-num">25</span> MiB</dd></div>
+            <div><dt>Outbound message</dt><dd><span class="lim-num">5</span> MiB</dd><dd class="lim-note">larger files go out as expiring links</dd></div>
+            <div><dt>Recipients per message</dt><dd><span class="lim-num">50</span></dd></div>
+            <div><dt>Webhook retries</dt><dd>up to <span class="lim-num">72</span> h</dd></div>
+          </dl>
+        </section>
+      </div>
+    </section>
+
+    <!-- Search -->
+    <section class="section section-search" id="search" aria-labelledby="search-title">
+      <div class="wrap search-grid">
+        <div class="search-copy">
+          <p class="eyebrow">Agentic search</p>
+          <h2 id="search-title">Ask the mailbox a question. Check every part of the answer.</h2>
+          <p>Search has four modes. Pick one per query, or let the agentic mode plan the queries for you.</p>
+          <dl class="modes">
+            <div><dt>Keyword</dt><dd>Operators such as <code>from:</code> and <code>has:attachment</code>, plus exact lookups for plates, booking references and invoice numbers: <code>ref:AB12CDE</code>.</dd></div>
+            <div><dt>Semantic</dt><dd>Finds messages by meaning when the words differ.</dd></div>
+            <div><dt>Hybrid</dt><dd>Runs keyword and semantic together and ranks one list.</dd></div>
+            <div><dt>Agentic</dt><dd>Plans sub-queries, reads the results and answers with each claim linked to a message ID.</dd></div>
+          </dl>
+          <p class="stage-links"><a href="/docs/guides/search.html">Search guide</a></p>
+        </div>
+
+        <div class="search-visual rise-on-scroll">
+          <div class="card ask" role="img" aria-label="An agentic search for the identity compliance@acme.example.com. The question: Did the insurer accept the Golf claim? The plan has three sub-queries: a hybrid search for Golf insurance claim, an exact lookup ref:CL-77812, and a keyword search for attachments from the insurer. The answer says yes, the insurer accepted claim CL-77812 on 2 October, will pay the body shop directly and wants final repair photos by 16 October. Each claim cites a message ID, and a badge reads citations verified, 3 of 3.">
+            <div class="ask-q">
+              <span class="ask-mode">agentic</span>
+              <p class="ask-text">Did the insurer accept the Golf claim?</p>
+              <span class="ask-who">compliance@acme.example.com</span>
+            </div>
+            <div class="ask-plan">
+              <p class="ask-label">Plan</p>
+              <ol>
+                <li><span class="plan-mode">hybrid</span><code>golf insurance claim</code><span class="plan-n">4 msgs</span></li>
+                <li><span class="plan-mode">keyword</span><code>ref:CL-77812</code><span class="plan-n">3 msgs</span></li>
+                <li><span class="plan-mode">keyword</span><code>from:@shield-motor.example has:attachment</code><span class="plan-n">1 msg</span></li>
+              </ol>
+            </div>
+            <div class="ask-answer">
+              <p class="ask-label">Answer</p>
+              <p>Yes. The insurer accepted claim CL-77812 for the Golf on 2&nbsp;October <span class="cite">msg_01J9X4T2</span>. It will pay the body shop directly <span class="cite">msg_01J9Y7QK</span> and wants the final repair photos by 16&nbsp;October <span class="cite">msg_01J9Y7QK</span>.</p>
+              <p class="cited"><span class="verified-mark"><svg aria-hidden="true"><use href="#i-check"/></svg>Citations verified</span><span>3 of 3 claims link to a message</span></p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Developers -->
+    <section class="section" id="developers" aria-labelledby="dev-title">
+      <div class="wrap dev-grid">
+        <div class="dev-copy">
+          <p class="eyebrow">Developers</p>
+          <h2 id="dev-title">Connect your agent the way it already works.</h2>
+          <ul class="ways">
+            <li><h3>MCP server</h3><p>Point any MCP client at <code>/mcp</code> with a scoped key.</p></li>
+            <li><h3>CLI</h3><p><code>pmail</code> sets up the deployment, manages identities and runs searches.</p></li>
+            <li><h3>REST API</h3><p>JSON over HTTPS. Every write that sends mail takes an <code>Idempotency-Key</code>.</p></li>
+            <li><h3>Rust SDK</h3><p>A typed client for services written in Rust.</p></li>
+            <li><h3>Signed webhooks</h3><p>Events pushed to your endpoint, signed, and retried for up to 72&nbsp;hours.</p></li>
+          </ul>
+        </div>
+
+        <div class="dev-code">
+          <div class="tabs" data-tabs data-tabs-label="Integration examples">
+            <div class="tab-panel" id="tab-mcp" data-tab-panel>
+              <h3 class="tab-label" data-tab-label>MCP</h3>
+              <div class="code">
+                <div class="code-head"><span class="code-file">mcp.json</span><button class="copy" type="button" data-copy="code-mcp"><svg class="i" aria-hidden="true" focusable="false"><use href="#i-copy"/></svg><span class="copy-label">Copy</span><span class="visually-hidden"> MCP configuration</span></button></div>
+<pre tabindex="0"><code id="code-mcp">{
+  <span class="t-k">"mcpServers"</span>: {
+    <span class="t-k">"pylota-mail"</span>: {
+      <span class="t-k">"url"</span>: <span class="t-s">"https://mail.example.com/mcp"</span>,
+      <span class="t-k">"headers"</span>: {
+        <span class="t-k">"Authorization"</span>: <span class="t-s">"Bearer ${PYLOTA_MAIL_KEY}"</span>
+      }
+    }
+  }
+}</code></pre>
+              </div>
+            </div>
+
+            <div class="tab-panel" id="tab-cli" data-tab-panel>
+              <h3 class="tab-label" data-tab-label>CLI</h3>
+              <div class="code">
+                <div class="code-head"><span class="code-file">shell</span><button class="copy" type="button" data-copy="code-cli"><svg class="i" aria-hidden="true" focusable="false"><use href="#i-copy"/></svg><span class="copy-label">Copy</span><span class="visually-hidden"> CLI commands</span></button></div>
+<pre tabindex="0"><code id="code-cli"><span class="t-c"># give the bookings agent its own identity</span>
+pmail identities create --username bookings --display-name <span class="t-s">"Acme Car Hire"</span>
+
+<span class="t-c"># exact reference lookup, filtered by sender and attachment</span>
+pmail search <span class="t-s">"from:@brightwell.example ref:AB12CDE has:attachment"</span> --identity bookings@acme.example.com
+
+<span class="t-c"># ask a question and get an answer with cited message IDs</span>
+pmail ask <span class="t-s">"Did the insurer accept the Golf claim?"</span> --identity compliance@acme.example.com</code></pre>
+              </div>
+            </div>
+
+            <div class="tab-panel" id="tab-curl" data-tab-panel>
+              <h3 class="tab-label" data-tab-label>curl</h3>
+              <div class="code">
+                <div class="code-head"><span class="code-file">shell</span><button class="copy" type="button" data-copy="code-curl"><svg class="i" aria-hidden="true" focusable="false"><use href="#i-copy"/></svg><span class="copy-label">Copy</span><span class="visually-hidden"> curl request</span></button></div>
+<pre tabindex="0"><code id="code-curl">curl -X POST https://mail.example.com/v1/identities/idn_01J9Z3K8V4/messages \
+  -H <span class="t-s">"Authorization: Bearer $PYLOTA_MAIL_KEY"</span> \
+  -H <span class="t-s">"Idempotency-Key: bk-2291-confirm"</span> \
+  -H <span class="t-s">"Content-Type: application/json"</span> \
+  -d <span class="t-s">'{"to":["renter@example.org"],"subject":"Your booking BK-2291","text":"Your car is ready at 9:00."}'</span></code></pre>
+              </div>
+            </div>
+
+            <div class="tab-panel" id="tab-rust" data-tab-panel>
+              <h3 class="tab-label" data-tab-label>Rust SDK</h3>
+              <div class="code">
+                <div class="code-head"><span class="code-file">src/booking.rs</span><button class="copy" type="button" data-copy="code-rust"><svg class="i" aria-hidden="true" focusable="false"><use href="#i-copy"/></svg><span class="copy-label">Copy</span><span class="visually-hidden"> Rust example</span></button></div>
+<pre tabindex="0"><code id="code-rust"><span class="t-kw">use</span> pylota_mail::Client;
+
+<span class="t-kw">async fn</span> <span class="t-f">confirm_booking</span>(key: String) -&gt; Result&lt;(), pylota_mail::Error&gt; {
+    <span class="t-kw">let</span> client = pylota_mail::Client::<span class="t-f">new</span>(<span class="t-s">"https://mail.example.com"</span>, key);
+
+    <span class="t-kw">let</span> sent = client
+        .<span class="t-f">identity</span>(<span class="t-s">"idn_01J9Z3K8V4"</span>)
+        .<span class="t-f">send</span>()
+        .<span class="t-f">to</span>(<span class="t-s">"renter@example.org"</span>)
+        .<span class="t-f">subject</span>(<span class="t-s">"Your booking BK-2291"</span>)
+        .<span class="t-f">text</span>(<span class="t-s">"Your car is ready at 9:00."</span>)
+        .<span class="t-f">idempotency_key</span>(<span class="t-s">"bk-2291-confirm"</span>)
+        .<span class="t-kw">await</span>?;
+
+    <span class="t-c">// a retry with the same key returns this same message</span>
+    println!(<span class="t-s">"{} deduplicated={}"</span>, sent.id, sent.deduplicated);
+    Ok(())
+}</code></pre>
+              </div>
+            </div>
+          </div>
+
+          <nav class="ref-links" aria-label="Developer documentation">
+            <ul>
+              <li><a href="/docs/reference/api.html">REST API</a></li>
+              <li><a href="/docs/reference/mcp.html">MCP server</a></li>
+              <li><a href="/docs/reference/cli.html">CLI</a></li>
+              <li><a href="/docs/guides/triage.html">Triage</a></li>
+              <li><a href="/docs/guides/sending.html#safe-retries">Safe retries</a></li>
+              <li><a href="/docs/guides/search.html">Search</a></li>
+              <li><a href="/docs/reference/events.html">Webhooks</a></li>
+            </ul>
+          </nav>
+        </div>
+      </div>
+    </section>
+
+    <!-- Security -->
+    <section class="section section-security" id="security" aria-labelledby="sec-title">
+      <div class="wrap sec-grid">
+        <div class="sec-visual rise-on-scroll">
+          <div class="card keycard" role="img" aria-label="An API key card. Key pmk_live, masked. Name bookings-agent. Scope: one identity, bookings@acme.example.com. Permissions: messages:send, messages:read and search:read. Expires 31 January 2027. Quarantine release: not permitted. Stored only as a hash.">
+            <div class="key-head">
+              <span class="key-icon"><svg aria-hidden="true"><use href="#i-key"/></svg></span>
+              <span class="key-title">API key</span>
+              <span class="pill pill-green"><i></i>active</span>
+            </div>
+            <p class="key-token">pmk_live_4f9c<span>••••••••••••••••</span>2b7e</p>
+            <dl class="key-meta">
+              <div><dt>Name</dt><dd>bookings-agent</dd></div>
+              <div><dt>Scope</dt><dd><span class="chip">identity</span> bookings@acme.example.com</dd></div>
+              <div><dt>Permissions</dt><dd class="perm-list"><code>messages:send</code><code>messages:read</code><code>search:read</code></dd></div>
+              <div><dt>Expires</dt><dd>31 Jan 2027</dd></div>
+              <div><dt>Release quarantine</dt><dd class="key-no"><svg aria-hidden="true"><use href="#i-x"/></svg>not permitted</dd></div>
+            </dl>
+            <p class="key-foot"><svg aria-hidden="true"><use href="#i-lock"/></svg>Stored only as a hash.</p>
+          </div>
+        </div>
+        <div class="sec-copy">
+          <p class="eyebrow">Security</p>
+          <h2 id="sec-title">Give each agent the narrowest key that does the job.</h2>
+          <ul class="ticks ticks-lg">
+            <li>Keys are scoped to a platform, a tenant or a single identity, and a key can never create one wider than itself.</li>
+            <li>Keys are stored only as hashes.</li>
+            <li>No key can release quarantined mail without the human-review permission.</li>
+            <li>Every message an agent reads carries trust metadata, so it knows what came from a verified sender.</li>
+          </ul>
+          <p class="stage-links"><a href="/docs/guides/security.html">Security guide</a></p>
+        </div>
+      </div>
+    </section>
+
+    <!-- Platform -->
+    <section class="section section-platform" aria-labelledby="platform-title">
+      <div class="wrap">
+        <div class="section-head">
+          <p class="eyebrow">Platform</p>
+          <h2 id="platform-title">Built on Cloudflare, in Rust.</h2>
+          <p class="section-sub">One Rust Worker, compiled to WebAssembly, runs on Cloudflare primitives in your account.</p>
+        </div>
+        <div class="flow" role="group" aria-label="Architecture: Email Routing passes mail to a Rust Worker compiled to WebAssembly, which uses Durable Objects with one per identity, D1, R2, Queues, Vectorize and Workers AI.">
+          <div class="flow-node"><span class="flow-k">in</span><span class="flow-name">Email Routing</span></div>
+          <span class="flow-arrow" aria-hidden="true"></span>
+          <div class="flow-node flow-core"><span class="flow-k">compute</span><span class="flow-name">Rust Worker</span><span class="flow-sub">WebAssembly</span></div>
+          <span class="flow-arrow" aria-hidden="true"></span>
+          <ul class="flow-stores">
+            <li><span class="flow-name">Durable Objects</span><span class="flow-sub">one per identity</span></li>
+            <li><span class="flow-name">D1</span></li>
+            <li><span class="flow-name">R2</span></li>
+            <li><span class="flow-name">Queues</span></li>
+            <li><span class="flow-name">Vectorize</span></li>
+            <li><span class="flow-name">Workers AI</span></li>
+          </ul>
+        </div>
+        <ul class="flow-notes">
+          <li><strong>EU jurisdiction.</strong> D1, Durable Objects and R2 can be pinned to the EU.</li>
+          <li><strong>No text in vectors.</strong> Vectorize stores no message text.</li>
+          <li><strong>Your account.</strong> Mail and keys stay in the Cloudflare account you deploy to.</li>
+        </ul>
+      </div>
+    </section>
+
+    <!-- Pricing -->
+    <section class="section section-pricing" id="pricing" aria-labelledby="pricing-title">
+      <div class="wrap">
+        <div class="section-head">
+          <p class="eyebrow">Pricing</p>
+          <h2 id="pricing-title">Start free. Pay as your agents grow. Or run it yourself.</h2>
+          <p class="section-sub">Every plan includes the full API, the MCP server, the CLI, the console, quarantine review and all four search modes.</p>
+        </div>
+        <ol class="plans">
+          <li class="plan">
+            <div class="plan-head"><h3>Free</h3></div>
+            <p class="plan-blurb">Try agents with real inboxes. No card required.</p>
+            <p class="plan-price"><span class="plan-amount">£0</span><span class="plan-per">a month</span></p>
+            <a class="btn btn-ghost plan-cta" href="/docs/guides/plans.html#pylota-mail-cloud">Get early access</a>
+            <ul class="plan-feats"><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>5 inboxes</li><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>1,000 sends a month</li><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>500 triage analyses a month</li><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>1 GB of storage</li><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>1 seat</li><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>Help on GitHub issues</li></ul>
+          </li>
+          <li class="plan">
+            <div class="plan-head"><h3>Developer</h3></div>
+            <p class="plan-blurb">For one person's agents in production.</p>
+            <p class="plan-price"><span class="plan-amount">£10</span><span class="plan-per">a month</span></p>
+            <a class="btn btn-ghost plan-cta" href="/docs/guides/plans.html#pylota-mail-cloud">Get early access</a>
+            <ul class="plan-feats"><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>10 inboxes</li><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>10,000 sends a month</li><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>10,000 triage analyses a month</li><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>5 custom domains</li><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>10 GB of storage · 2 seats</li><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>Email support · £1 top-ups</li></ul>
+          </li>
+          <li class="plan plan-featured">
+            <div class="plan-head"><h3>Team</h3><span class="plan-badge">Most capacity</span></div>
+            <p class="plan-blurb">For a team running a fleet of agents.</p>
+            <p class="plan-price"><span class="plan-amount">£49.50</span><span class="plan-per">a month</span></p>
+            <a class="btn btn-primary plan-cta" href="/docs/guides/plans.html#pylota-mail-cloud">Get early access</a>
+            <ul class="plan-feats"><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>100 inboxes</li><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>100,000 sends a month</li><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>100,000 triage analyses a month</li><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>50 custom domains</li><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>100 GB of storage · 10 seats</li><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>Priority email · £1 top-ups</li></ul>
+          </li>
+          <li class="plan plan-self">
+            <div class="plan-head"><h3>Self-host</h3></div>
+            <p class="plan-blurb">Your Cloudflare account, your data.</p>
+            <p class="plan-price"><span class="plan-amount">£0</span><span class="plan-per">under FSL-1.1-ALv2</span></p>
+            <a class="btn btn-ghost plan-cta" href="/docs/self-hosting.html">Deploy guide</a>
+            <ul class="plan-feats"><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>API, MCP, CLI and console</li><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>No plan limits, billing off by default</li><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>One Rust Worker, no servers</li><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>EU jurisdiction optional</li><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>Support contracts available</li></ul>
+          </li>
+        </ol>
+        <p class="plans-note">Prices in pounds sterling, excluding VAT. A top-up is £1 a month for one more inbox, 1,000 more sends or 1,000 more triage analyses. Monthly allowances reset on your billing date; inbox, domain and seat counts do not. Pylota Mail Cloud opens with the v1.0 release.</p>
+      </div>
+    </section>
+
+    <!-- Open source -->
+    <section class="section" id="open-source" aria-labelledby="os-title">
+      <div class="wrap os-grid">
+        <div class="os-copy">
+          <p class="eyebrow">Self-host</p>
+          <h2 id="os-title">Read the code. Run it on your own account.</h2>
+          <p>The source is published under the Functional Source License (FSL-1.1-ALv2): free to run for your own agents, and each release becomes Apache-2.0 two years after it ships. Install the CLI and <code>pmail setup</code> creates the Cloudflare resources it needs.</p>
+          <h3 class="req-title">You will need</h3>
+          <ul class="ticks">
+            <li>A Cloudflare account on the Workers Paid plan</li>
+            <li>One domain on Cloudflare DNS for the shared agent addresses</li>
+            <li>Optional: an AWS account, so tenant domains can stay at any DNS host</li>
+          </ul>
+          <p class="stage-links"><a href="/docs/self-hosting.html">Deploy guide</a><a href="/docs/quickstart.html">Quickstart</a></p>
+        </div>
+        <div class="os-visual">
+          <a class="repo" href="https://github.com/PILOTAAI/pylota-mail">
+            <span class="repo-top">
+              <svg class="repo-icon" aria-hidden="true" focusable="false"><use href="#i-repo"/></svg>
+              <span class="repo-name"><span>PILOTAAI /</span> pylota-mail</span>
+              <svg class="repo-gh" aria-hidden="true" focusable="false"><use href="#i-github"/></svg>
+            </span>
+            <span class="repo-desc">Email and identity for AI agents.</span>
+            <span class="repo-tags"><span class="chip">FSL-1.1-ALv2</span><span class="chip"><i class="lang-dot"></i>Rust</span><span class="chip">Cloudflare Workers</span></span>
+          </a>
+          <div class="code code-os">
+            <div class="code-head"><span class="code-file">shell</span><button class="copy" type="button" data-copy="code-os"><svg class="i" aria-hidden="true" focusable="false"><use href="#i-copy"/></svg><span class="copy-label">Copy</span><span class="visually-hidden"> setup commands</span></button></div>
+<pre tabindex="0"><code id="code-os">git clone https://github.com/PILOTAAI/pylota-mail
+cargo install pylota-mail-cli --locked
+pmail setup --domain mail.example.com --mail-domain agents.example --jurisdiction eu
+pmail deploy</code></pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- FAQ -->
+    <section class="section section-faq" aria-labelledby="faq-title">
+      <div class="wrap faq-grid">
+        <div class="section-head">
+          <p class="eyebrow">Questions</p>
+          <h2 id="faq-title">Before you deploy</h2>
+        </div>
+        <div class="faq">
+          <details>
+            <summary>Is it free?</summary>
+            <p>Self-hosting is free under FSL-1.1-ALv2: you pay only your own Cloudflare usage, with no plan limits. Pylota Mail Cloud has a free plan and paid plans from £10 a month; see <a href="#pricing">pricing</a>.</p>
+          </details>
+          <details>
+            <summary>Is it open source?</summary>
+            <p>It is Fair Source. The code is public and you can run, change and redistribute it for any purpose except offering a competing hosted service. Each release becomes Apache-2.0, a standard open-source licence, two years after it ships.</p>
+          </details>
+          <details>
+            <summary>Do I need my own domain?</summary>
+            <p>On Pylota Mail Cloud, no: every inbox gets an address at <code>pylotamail.com</code>, such as <code>bookings.brightwell@pylotamail.com</code>. To self-host you need one domain on Cloudflare DNS whose apex receives agent mail, for example <code>agents.example</code>. Your company's main domain and its mailboxes stay where they are.</p>
+          </details>
+          <details>
+            <summary>Can operators bring their own domain?</summary>
+            <p>Yes, wherever their DNS is hosted. A domain at any DNS host needs a few records (MX, DKIM, a bounce subdomain) and then sends and receives through Amazon SES, on the apex or a subdomain, so existing mail keeps working. Operators can also keep their own mailbox and forward to the agent, or send through their own mail provider: a daily check proves their mail still passes DMARC before the agent sends as them. Domains on Cloudflare work directly. Identities keep their history when they move. The <a href="/docs/guides/custom-domains.html">custom domains guide</a> walks through each option.</p>
+          </details>
+          <details>
+            <summary>Where is data stored?</summary>
+            <p>In your Cloudflare account. EU jurisdiction is optional.</p>
+          </details>
+          <details>
+            <summary>How do agents avoid prompt injection from email?</summary>
+            <p>Every message carries trust metadata, suspicious mail goes to quarantine, search tools are read-only, and your agent runtime keeps approval gates on actions. See the <a href="/docs/guides/security.html">security guide</a>.</p>
+          </details>
+        </div>
+      </div>
+    </section>
+
+    <!-- CTA -->
+    <section class="section section-cta" aria-labelledby="cta-title">
+      <div class="wrap">
+        <div class="envelope-card">
+          <div class="envelope-inner">
+            <span class="stamp" aria-hidden="true">
+              <svg viewBox="0 0 32 32" focusable="false"><path d="M6 10.5l10 7.5 10-7.5M6 9h20v14H6z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>
+              <span class="stamp-text">AGENT<br>MAIL</span>
+            </span>
+            <h2 id="cta-title">Give your agents an address you control.</h2>
+            <p>Deploy Pylota Mail to your own Cloudflare account and send the first message today.</p>
+            <div class="cta-row">
+              <a class="btn btn-primary" href="/docs/self-hosting.html">
+                Deploy to Cloudflare
+                <svg class="i" aria-hidden="true" focusable="false"><use href="#i-arrow"/></svg>
+              </a>
+              <a class="btn btn-ghost" href="/docs/">Read the docs</a>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="wrap footer-grid">
+      <div class="footer-brand">
+        <a class="brand" href="/" aria-label="Pylota Mail home">
+          <svg class="brand-mark" viewBox="0 0 64 64" aria-hidden="true" focusable="false"><path class="brand-mark-apex" d="M8 46 L26 14 L56 44" pathLength="100" fill="none" stroke="currentColor" stroke-width="8" stroke-linejoin="miter"/></svg>
+          <span class="brand-name">Pylota <span>Mail</span></span>
+        </a>
+        <p>Email and identity for AI agents.</p>
+      </div>
+      <nav class="footer-col" aria-labelledby="f-product">
+        <h2 id="f-product">Product</h2>
+        <ul>
+          <li><a href="#features">Features</a></li>
+          <li><a href="#search">Search</a></li>
+          <li><a href="#security">Security</a></li>
+          <li><a href="/docs/">Docs</a></li>
+        </ul>
+      </nav>
+      <nav class="footer-col" aria-labelledby="f-dev">
+        <h2 id="f-dev">Developers</h2>
+        <ul>
+          <li><a href="/docs/quickstart.html">Quickstart</a></li>
+          <li><a href="/docs/reference/api.html">REST API</a></li>
+          <li><a href="/docs/reference/mcp.html">MCP server</a></li>
+          <li><a href="/docs/reference/cli.html">CLI</a></li>
+          <li><a href="/docs/reference/events.html">Webhooks</a></li>
+        </ul>
+      </nav>
+      <nav class="footer-col" aria-labelledby="f-src">
+        <h2 id="f-src">Source</h2>
+        <ul>
+          <li><a href="https://github.com/PILOTAAI/pylota-mail">GitHub</a></li>
+          <li><a href="/docs/self-hosting.html">Deploy guide</a></li>
+          <li><a href="/docs/guides/custom-domains.html">Custom domains</a></li>
+          <li><a href="https://github.com/PILOTAAI/pylota-mail/blob/main/LICENSE.md">Licence</a></li>
+        </ul>
+      </nav>
+    </div>
+    <div class="wrap footer-base">
+      <p>Pylota Mail is source available under the Functional Source License (FSL-1.1-ALv2). This page loads no third-party fonts, scripts or analytics.</p>
+      <p>© 2026 TREFT LTD. Made by Pylota.</p>
+    </div>
+  </footer>
+</body>
+</html>
