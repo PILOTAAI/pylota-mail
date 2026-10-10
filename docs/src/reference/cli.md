@@ -52,7 +52,7 @@ key_env = "PYLOTA_MAIL_STAGING_KEY"
 | `key_env` | The name of an environment variable that holds the key |
 | `key_command` | A command whose output is the key, for example `op read op://vault/pylota-mail/key`. It runs once per invocation, with a 10-second timeout |
 | `identity` | The default identity for mail commands (an ID or an address) |
-| `tenant` | The default tenant for platform keys (an ID or a slug). `jobs start` ignores it and needs `--tenant` |
+| `tenant` | The default tenant for platform and partner keys (an ID or a slug). `jobs start` ignores it and needs `--tenant` |
 | `account_id` | Your Cloudflare account ID, written by `pmail setup`. Not a secret; the Cloudflare API token is never stored |
 
 Use only one of `key`, `key_env` and `key_command` in a profile. Unknown keys are an error.
@@ -174,9 +174,11 @@ Errors print the API's error envelope: in human mode as `error: <code> (<status>
   profile's `identity`, or the key's own identity for an identity key.
 - `--tenant` takes a tenant ID (`ten_…`) or a slug (`acme`). Without it, a tenant or identity key uses
   its own tenant, and a platform key uses the profile's `tenant`, else the **default tenant** created by
-  `pmail setup` (the one whose addresses have no suffix). Three commands never use the default tenant:
+  `pmail setup` (the one whose addresses have no suffix). A partner key uses the profile's `tenant`, else
+  the command stops (exit 2) and asks for `--tenant`: no tenant is a partner's by default. Three commands never use the default tenant:
   [`jobs start`](#jobs-start) needs `--tenant`, and [`usage`](#usage) and [`usage daily`](#usage-daily)
-  with a platform key need `--tenant` or the profile's `tenant`.
+  with a platform or partner key need `--tenant` or the profile's `tenant`.
+- `--partner` and partner arguments take a partner ID (`ptn_…`).
 - Domain arguments take a domain ID (`dom_…`) or a domain name.
 - Times take RFC 3339 (`2026-10-09T10:00:00Z`) or a date (`2026-10-09`, midnight UTC).
 
@@ -649,7 +651,8 @@ See [MCP server › Connect a client](mcp.md#connect-a-client).
 
 ## Tenants
 
-Platform keys with `tenants:manage`. A tenant key can `get` its own tenant.
+Keys with `tenants:manage`: a platform key manages every tenant, and a partner key the tenants its
+partner's keys created. A tenant key can `get` its own tenant.
 
 ### `tenants create`
 
@@ -666,6 +669,7 @@ pmail tenants create --slug <slug> --name <name> [--mode live|test] [--timezone 
 | `--address-suffix` | Defaults to `.` + slug |
 | `--policy-file` | JSON merged over the policy defaults ([Configuration › Tenant policy](configuration.md#tenant-policy)) |
 | `--owner-email`, `--owner-name` | Creates the workspace's console owner and emails a sign-in link |
+| `--billing-mode` | Platform keys only. A tenant a partner key creates takes the partner's default billing mode, and `--billing-mode` with a partner key is refused (`403 scope_denied`, exit 4) |
 
 ```bash
 pmail tenants create --slug acme --name "Acme Car Hire"
@@ -675,8 +679,11 @@ pmail tenants create --slug acme-test --name "Acme Car Hire (test)" --mode test
 ### `tenants list`
 
 ```text
-pmail tenants list [--status active|suspended|erasing|erased] [--mode live|test] [--limit <n>] [--all]
+pmail tenants list [--status active|suspended|erasing|erased] [--mode live|test] [--partner <partner_id>]
+                   [--limit <n>] [--all]
 ```
+
+`--partner` lists the tenants a partner's keys created. A partner key always lists only its own tenants.
 
 ```bash
 pmail tenants list --status active
@@ -695,9 +702,11 @@ pmail tenants update <tenant> [--name <name>] [--timezone <iana>] [--policy-file
 ```
 
 `--policy-file` and `--policy` deep-merge into the tenant's policy; `null` resets a field to its default.
+`quarantine.key_release` can be set only with a platform key or the partner key of the tenant's partner.
 
 ```bash
 pmail tenants update acme --policy '{"search":{"agentic_daily_cap":200}}'
+pmail tenants update acme --policy '{"quarantine":{"key_release":true}}'
 ```
 
 ### `tenants suspend` and `tenants resume`
@@ -707,6 +716,62 @@ Suspends a tenant (sends are refused with `tenant_suspended`; inbound mail is de
 ```bash
 pmail tenants suspend acme
 pmail tenants resume acme
+```
+
+---
+
+## Partners
+
+Platform keys with `partners:manage`. A partner is an integrator whose partner keys create tenants and act
+only on them ([API › Partners](api.md#partners)). A partner key cannot run these commands.
+
+### `partners create`
+
+```text
+pmail partners create --name <name> [--default-billing-mode exempt|metered]
+```
+
+`--default-billing-mode` (default `metered`) is the billing mode of every tenant the partner's keys
+create.
+
+```bash
+pmail partners create --name Pylota --default-billing-mode exempt
+```
+
+### `partners list`
+
+```text
+pmail partners list [--status active|suspended] [--limit <n>] [--all]
+```
+
+### `partners get`
+
+```bash
+pmail partners get ptn_01JA2B3C4D5E6F7G8H9J0K1M2N
+```
+
+### `partners update`
+
+```text
+pmail partners update <partner_id> [--name <name>] [--status active|suspended]
+                      [--default-billing-mode exempt|metered]
+```
+
+`--status suspended` refuses every key of the partner at once (`403 partner_suspended`); its tenants keep
+working. A new `--default-billing-mode` applies only to tenants created afterwards.
+
+```bash
+pmail partners update ptn_01JA2B3C4D5E6F7G8H9J0K1M2N --status suspended
+```
+
+### `partners delete`
+
+Deletes the partner, its partner keys and its partner webhook endpoints. Asks for confirmation unless
+`--yes`. While any of its tenants is not erased the API answers `409 partner_has_tenants` (exit 6): erase
+those tenants first with [`erasure create`](#erasure-create) and `--scope tenant`.
+
+```bash
+pmail partners delete ptn_01JA2B3C4D5E6F7G8H9J0K1M2N --yes
 ```
 
 ---
@@ -730,7 +795,7 @@ pmail identities create --username <name> --display-name <name> [--purpose <tag>
 | `--client-id` | Makes the create idempotent for your own provisioning |
 
 With a platform key and no `--tenant`, the identity is created in the profile's `tenant`, else in the
-default tenant.
+default tenant. A partner key needs `--tenant` or the profile's `tenant`.
 
 ```bash
 pmail identities create --username bookings --display-name "Acme Car Hire"
@@ -774,7 +839,7 @@ pmail identities update bookings.acme@agents.example \
 
 ### `identities pause` and `identities resume`
 
-A paused identity cannot send. Resuming an identity paused for abuse needs a tenant or platform key.
+A paused identity cannot send. Resuming an identity paused for abuse needs a tenant, partner or platform key.
 
 ```bash
 pmail identities pause bookings@acme.example.com
@@ -1287,7 +1352,7 @@ pmail search "<query>" [--identity <identity> | --tenant <tenant> [--identity-id
 | Flag | Meaning |
 |---|---|
 | `--mode` | `hybrid` (default), `keyword`, `semantic`, or `agentic` (the same as `pmail ask --no-stream`) |
-| `--tenant` | Search every identity of a tenant (tenant and platform keys); hits show their identity |
+| `--tenant` | Search every identity of a tenant (tenant, partner and platform keys); hits show their identity |
 | `--group-by thread` | One row per conversation |
 | `--require-mode` | Fail with `search_degraded` instead of falling back to keyword search |
 | `--include-quarantined` | Needs `quarantine:review` |
@@ -1316,7 +1381,7 @@ pmail ask "<question>" (--identity <identity> | --tenant <tenant>) [--max-steps 
 
 | Flag | Meaning |
 |---|---|
-| `--tenant` | Ask across every identity of a tenant (tenant and platform keys) |
+| `--tenant` | Ask across every identity of a tenant (tenant, partner and platform keys) |
 | `--max-steps`, `--max-seconds` | The search budget (defaults 6 steps and 8 seconds, or the tenant's policy) |
 | `--no-stream` | Wait for the whole answer instead of showing progress |
 | `--show-trace` | Print every step, even when stderr is not a terminal |
@@ -1387,6 +1452,9 @@ pmail quarantine list --identity bookings@acme.example.com
 ### `quarantine release`
 
 Moves a quarantined message into the mailbox and triages it. Needs `quarantine:review`; audit-logged.
+Where `PM_QUARANTINE_KEY_RELEASE` is `off` (Pylota Mail Cloud), it works only on a tenant whose policy has
+`quarantine.key_release: true`; elsewhere the API answers `403 permission_denied` (exit 4) and a person
+releases in the console.
 
 ```text
 pmail quarantine release <message-id> --identity <identity> --reason <text>
@@ -1405,11 +1473,12 @@ pmail quarantine release msg_01JA8H7N3XW7X2M5N6P8R0T1YS --identity bookings@acme
 
 ```text
 pmail webhooks create --url <https-url> --events <type,…> [--identity-ids <id,…>] [--description <text>]
-                      [--tenant <tenant> | --platform]
+                      [--tenant <tenant> | --platform | --partner]
 ```
 
 `--events '*'` subscribes to every event type, including future ones. `--platform` creates a
-platform-wide endpoint (platform keys). The signing secret (`whsec_…`) is printed once.
+platform-wide endpoint (platform keys). `--partner` creates a partner endpoint (partner keys), which
+receives only the events of the partner's own tenants. The signing secret (`whsec_…`) is printed once.
 
 ```bash
 pmail webhooks create --url https://api.example.com/webhooks/mail \
@@ -1505,23 +1574,26 @@ pmail webhooks verify --secret-env WEBHOOK_SECRET --headers headers.txt --body b
 ### `keys create`
 
 ```text
-pmail keys create --level platform|tenant|identity --name <name> [--tenant <tenant>] [--identity <identity>]
+pmail keys create --level platform|partner|tenant|identity --name <name> [--partner <partner_id>]
+                  [--tenant <tenant>] [--identity <identity>]
                   [--permissions <permission,…>] [--expires-at <time> | --expires-in <duration>]
                   [--save-profile <name>]
 ```
 
 | Flag | Meaning |
 |---|---|
-| `--level` | `platform` reaches every tenant; `tenant` one tenant; `identity` one identity |
+| `--level` | `platform` reaches every tenant; `partner` the tenants its partner's keys created; `tenant` one tenant; `identity` one identity |
+| `--partner` | With `--level partner` (required there, and refused with any other level): the partner the key acts for. Only a platform key can create a partner key |
 | `--permissions` | Comma-separated ([API › Permissions](api.md#permissions)). Required at every level: a platform key has no implicit full set, and `--level platform` without it is refused (exit 2) with the list of permissions a platform key may hold |
 | `--expires-in` | For example `90d` |
 | `--save-profile` | Also store the new key in this CLI profile |
 
 The new key cannot exceed your own key's level, tenant, identity or permissions. Some permissions are
 refused at some levels (`400 invalid_request`, `permission_not_allowed_for_level`, exit 7):
-`identities:sign` on a platform key; `tenants:manage` and `platform:ops` below platform level; and
-`members:read`, `members:manage`, `suppressions:manage`, `audit:read` and `usage:read` on an identity
-key. The secret (`pmk_live_…` or `pmk_test_…`) is printed **once**. Run interactively with the temporary
+`identities:sign` on a platform or partner key; `platform:ops` and `partners:manage` below platform level;
+`tenants:manage` on a tenant or identity key; and `members:read`, `members:manage`, `suppressions:manage`,
+`audit:read` and `usage:read` on an identity key. A partner key creates only tenant and identity keys of
+its own tenants (`403 key_scope_exceeded`, exit 4, otherwise). The secret (`pmk_live_…` or `pmk_test_…`) is printed **once**. Run interactively with the temporary
 key that `setup` stored, `pmail` offers to save the new platform key in that profile and revoke the
 temporary one.
 
@@ -1530,8 +1602,8 @@ can create every other key (`setup` prints this command for you):
 
 ```bash
 pmail keys create --level platform --name first-key --permissions \
-tenants:manage,platform:ops,keys:manage,identities:read,identities:write,domains:read,domains:write,\
-messages:read,messages:send,messages:write,attachments:read,search:read,search:agentic,\
+tenants:manage,partners:manage,platform:ops,keys:manage,identities:read,identities:write,domains:read,\
+domains:write,messages:read,messages:send,messages:write,attachments:read,search:read,search:agentic,\
 quarantine:review,webhooks:read,webhooks:manage,erasure:manage,suppressions:manage,usage:read,\
 audit:read,members:read,members:manage
 ```
@@ -1539,6 +1611,15 @@ audit:read,members:read,members:manage
 ```bash
 pmail keys create --level identity --identity bookings@acme.example.com --name bookings-agent \
   --permissions messages:read,messages:send,search:read,attachments:read
+```
+
+A partner key for an integrator such as Pylota, created with a platform key:
+
+```bash
+pmail keys create --level partner --partner ptn_01JA2B3C4D5E6F7G8H9J0K1M2N --name pylota-backend \
+  --permissions tenants:manage,keys:manage,webhooks:manage,quarantine:review,usage:read,identities:read,\
+identities:write,domains:read,domains:write,messages:read,messages:send,messages:write,attachments:read,\
+search:read,members:manage
 ```
 
 ### `keys list` and `keys get`
@@ -1640,8 +1721,8 @@ published until it resumes.
 ### `assertions create`
 
 Mints an agent assertion: a JWT signed with the identity's key, naming the identity's address, display
-name and workspace, for one audience. Needs `identities:sign` on a tenant or identity key (platform keys
-cannot hold it).
+name and workspace, for one audience. Needs `identities:sign` on a tenant or identity key (platform and
+partner keys cannot hold it).
 
 ```text
 pmail assertions create --identity <identity> --audience <audience> [--expires-in <60-600>]
@@ -1844,7 +1925,7 @@ pmail export get exp_01JA9N1S7BW7X2M5N6P8R0T1YX --download dsr-1182.zip
 
 Console users of a workspace. The console is the main place to manage them; these commands let you
 provision people from a script. `members list` needs `members:read`; the others need `members:manage`
-(tenant or platform keys).
+(tenant, partner or platform keys).
 
 ### `members list`
 
@@ -1910,7 +1991,9 @@ pmail plans list
 
 Read or change a workspace's billing account: its mode (`metered`, `exempt` or `disabled`) and, for a
 workspace without a Stripe subscription, a complimentary plan. A plan paid through Stripe changes only
-through Stripe (`plan_managed_by_stripe`, exit 6). Platform keys with `tenants:manage`; audit-logged.
+through Stripe (`plan_managed_by_stripe`, exit 6). Platform keys with `tenants:manage`; audit-logged. A
+partner key can `billing get` its own tenants; `billing set` with a partner key is `403 scope_denied`
+(exit 4).
 
 ```text
 pmail billing get [--tenant <tenant>]
@@ -1930,7 +2013,7 @@ pmail billing set --tenant brightwell --mode exempt
 
 Shows the workspace's billing mode, plan and every allowance (granted, used, remaining, reset time),
 from `GET /v1/usage`. A tenant or identity key reads its own workspace's usage and needs no permission.
-A platform key needs `usage:read` and must name the workspace with `--tenant` (or the profile's
+A platform or partner key needs `usage:read` and must name the workspace with `--tenant` (or the profile's
 `tenant`); it never falls back to the default tenant, and without a tenant the API answers
 `400 invalid_request` (exit 7).
 
@@ -1946,7 +2029,7 @@ pmail usage
 
 Prints per-day counts (inbound, outbound, sends, triage, search, agentic, assertions, HTTP signatures,
 AI neurons, storage), at most 92 days at a time, from `GET /v1/usage/daily`. Needs `usage:read` on a
-platform or tenant key; a platform key names the tenant as for [`usage`](#usage).
+platform, partner or tenant key; a platform or partner key names the tenant as for [`usage`](#usage).
 
 ```text
 pmail usage daily [--tenant <tenant>] [--from <date>] [--to <date>]
@@ -1977,6 +2060,7 @@ Deployment   setup · setup ses · deploy · upgrade · doctor · destroy · sec
 Platform     dlq list|redrive · keys rotate thread|link|cursor|web_bot_auth · jobs start|get · waitlist invite
 Profiles     login · config show|set · mcp config
 Tenants      tenants create|list|get|update|suspend|resume
+Partners     partners create|list|get|update|delete
 Identities   identities create|list|get|update|pause|resume|delete|lookup
 Addresses    addresses list|add|promote|retire|delete|test-forwarding
 Domains      domains add|list|get|update|records|verify|probe|health|reprove|subscribe|remove

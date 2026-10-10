@@ -7,8 +7,8 @@ the thread token in [Threading](threading.md)), this page states the security pr
 
 | | |
 |---|---|
-| Requirements | FR-KEY-1, FR-KEY-2, FR-KEY-3, FR-TEN-1, FR-TEN-2, FR-TEN-3, FR-IN-4, FR-IN-5, FR-IN-9, FR-IDN-6, FR-IDN-7, FR-IDN-8, FR-IDN-9, FR-WH-2, FR-WH-5, FR-TRI-3, FR-TRI-4, FR-SRCH-3, FR-SRCH-8, FR-SRCH-10, FR-MCP-1, FR-PRV-6, FR-DOM-9, FR-DOM-11, FR-CON-3, FR-CON-9, FR-CON-10, FR-CON-13, FR-CON-14, NFR-SEC-1, NFR-SEC-2 |
-| Edge cases | [A2](../edge-cases.md), [A4](../edge-cases.md), [A6](../edge-cases.md), [B7](../edge-cases.md), [B10](../edge-cases.md), [B11](../edge-cases.md), [D2](../edge-cases.md), [D5](../edge-cases.md), [D9](../edge-cases.md), [D10](../edge-cases.md), [E1](../edge-cases.md), [E2](../edge-cases.md), [F1](../edge-cases.md), [F3](../edge-cases.md), [F7](../edge-cases.md), [F10](../edge-cases.md), [I5](../edge-cases.md), [J6](../edge-cases.md), [L4](../edge-cases.md), [W15](../edge-cases.md)–[W18](../edge-cases.md), [W20](../edge-cases.md)–[W22](../edge-cases.md), [W27](../edge-cases.md), [W28](../edge-cases.md), [W31](../edge-cases.md), [N1](../edge-cases.md)–[N3](../edge-cases.md), [N14](../edge-cases.md), [N16](../edge-cases.md), [N18](../edge-cases.md), [N28](../edge-cases.md), [O1](../edge-cases.md), [O3](../edge-cases.md), [O7](../edge-cases.md), [O8](../edge-cases.md), [O12](../edge-cases.md), [O13](../edge-cases.md), [O15](../edge-cases.md), [O18](../edge-cases.md), [O24](../edge-cases.md) |
+| Requirements | FR-KEY-1, FR-KEY-2, FR-KEY-3, FR-KEY-4, FR-TEN-1, FR-TEN-2, FR-TEN-3, FR-IN-4, FR-IN-5, FR-IN-9, FR-IDN-6, FR-IDN-7, FR-IDN-8, FR-IDN-9, FR-WH-2, FR-WH-5, FR-TRI-3, FR-TRI-4, FR-SRCH-3, FR-SRCH-8, FR-SRCH-10, FR-MCP-1, FR-PRV-6, FR-DOM-9, FR-DOM-11, FR-CON-3, FR-CON-9, FR-CON-10, FR-CON-13, FR-CON-14, NFR-SEC-1, NFR-SEC-2 |
+| Edge cases | [A2](../edge-cases.md), [A4](../edge-cases.md), [A6](../edge-cases.md), [B7](../edge-cases.md), [B10](../edge-cases.md), [B11](../edge-cases.md), [D2](../edge-cases.md), [D5](../edge-cases.md), [D9](../edge-cases.md), [D10](../edge-cases.md), [E1](../edge-cases.md), [E2](../edge-cases.md), [F1](../edge-cases.md), [F3](../edge-cases.md), [F7](../edge-cases.md), [F10](../edge-cases.md), [I5](../edge-cases.md), [J6](../edge-cases.md), [J10](../edge-cases.md)–[J16](../edge-cases.md), [L4](../edge-cases.md), [W15](../edge-cases.md)–[W18](../edge-cases.md), [W20](../edge-cases.md)–[W22](../edge-cases.md), [W27](../edge-cases.md), [W28](../edge-cases.md), [W31](../edge-cases.md), [N1](../edge-cases.md)–[N3](../edge-cases.md), [N14](../edge-cases.md), [N16](../edge-cases.md), [N18](../edge-cases.md), [N28](../edge-cases.md), [O1](../edge-cases.md), [O3](../edge-cases.md), [O7](../edge-cases.md), [O8](../edge-cases.md), [O12](../edge-cases.md), [O13](../edge-cases.md), [O15](../edge-cases.md), [O18](../edge-cases.md), [O24](../edge-cases.md) |
 | Code | `crates/worker/src/auth/` (keys, router table, scope), `crates/core/src/ssrf.rs`, `crates/core/src/injection.rs`, `crates/core/src/sanitize.rs`, `crates/core/src/crypto.rs` (sealing, pure; nonces passed in), `crates/core/src/sealed.rs` (the sealed-column registry, pure), `crates/worker/src/ops/reseal.rs` (the master-key re-seal sweep), `crates/core/src/{jwk.rs, jwt.rs, httpsig.rs}` (agent signing, pure), `crates/worker/src/net.rs` (guarded HTTP), `crates/worker/src/log.rs` |
 | Reporting | [SECURITY.md](https://github.com/PILOTAAI/pylota-mail/blob/main/SECURITY.md) |
 
@@ -35,7 +35,7 @@ Each invariant below is enforced in code and covered by a named test (section 13
 
 | ID | Invariant |
 |---|---|
-| SEC-1 | Tenant and identity scope come only from the authenticated key, never from the request body, query or path (FR-KEY-3). A key reaches nothing outside its scope, and an out-of-scope resource is indistinguishable from a missing one (NFR-SEC-1) |
+| SEC-1 | Partner, tenant and identity scope come only from the authenticated key, never from the request body, query or path (FR-KEY-3). A key reaches nothing outside its scope (a partner key reaches only the tenants its partner's keys created, FR-KEY-4), and an out-of-scope resource is indistinguishable from a missing one (NFR-SEC-1) |
 | SEC-2 | A key never creates a key wider than itself in level, tenant, identity or permissions (FR-KEY-1) |
 | SEC-3 | Every secret has exactly one purpose and no secret is derived from another |
 | SEC-4 | The service never sends as a domain whose authentication records are broken or whose ownership signals changed (FR-DOM-5). For an `smtp_relay` domain, whose signing the relay controls, a passing alignment probe stands in for the records (FR-DOM-11, U4) |
@@ -110,13 +110,15 @@ reused; the others are defined in section 13.
 | S | Stolen or guessed key | 256-bit secret, HMAC lookup with constant-time comparison, expiry, revocation, rotation with overlap (section 4) | `it::auth::unknown_key_uniform`, `it::keys::j6_revoke_rotate` |
 | S | Probing a key's status with only its lookup prefix | `key_revoked` and `key_expired` are returned only after the secret matched; otherwise `unauthenticated` | `it::auth::status_after_secret_match` |
 | T | Replayed or altered send | Idempotency fingerprint; a changed body under the same key is `409 idempotency_conflict` (FR-OUT-1) | `it::send::g1_*` |
-| R | A key holder denies an administrative action | `audit_log` row with `actor_key_id` and `request_id` for every key, identity-key (`identity_key.*`), tenant, identity-status, quarantine, hold, suppression-removal, erasure, resolve and platform-operation action (signing-key rotation, `web_bot_auth` included, transport change, jobs, redrive); `GET /v1/audit-events?actor_key_id=` lists one key's actions; every request log line carries `key_id`. Sends are not audit rows: the message, its events and the delivery log record them. Signing calls are not audit rows either: each is logged as `signature_minted` with `key_id` and `identity_id` and counted in `usage_daily` ([Observability §2.2](observability.md#22-event-names)) | `it::keys::j6_revoke_rotate` |
+| R | A key holder denies an administrative action | `audit_log` row with `actor_key_id` and `request_id` for every key, identity-key (`identity_key.*`), partner (`partner.create`, `partner.update`, `partner.delete`), tenant (`tenant.create`, with the `partner_id` when a partner key created it), identity-status, quarantine, hold, suppression-removal, erasure, resolve and platform-operation action (signing-key rotation, `web_bot_auth` included, transport change, jobs, redrive); `GET /v1/audit-events?actor_key_id=` lists one key's actions; every request log line carries `key_id`. Sends are not audit rows: the message, its events and the delivery log record them. Signing calls are not audit rows either: each is logged as `signature_minted` with `key_id` and `identity_id` and counted in `usage_daily` ([Observability §2.2](observability.md#22-event-names)) | `it::keys::j6_revoke_rotate` |
 | I | Reading another tenant's or identity's data (IDOR) | Section 5: scope check against D1 before any Durable Object call, owner re-check inside the object, `*_not_found` for out-of-scope IDs | `it::security::cross_tenant_matrix` |
+| I/E | A partner key reaching a tenant another partner created, a tenant no partner created, or another partner's endpoints and keys | The owner check compares the target tenant's `partner_id` with the key's (section 5.2, step 4); a mismatch is the same `*_not_found` as a missing ID ([J10](../edge-cases.md)). Partner keys mint only tenant and identity keys of their own tenants (section 4.6, [J11](../edge-cases.md)), and partner endpoints receive only their partner's tenants' events ([J15](../edge-cases.md)) | `it::security::cross_tenant_matrix` (`foreign_partner`), `it::partners::j10_foreign_partner_not_found`, `it::keys::j11_partner_key_limits`, `it::webhooks::j15_partner_scope_filter` |
 | I | Quarantined, hidden or throttled mail reaching agents | Filtered inside the mailbox query layer: lists show it only for an explicit `status` filter from a key holding `quarantine:review`, and search never shows hidden or throttled mail and shows quarantined mail only with `include_quarantined` and `quarantine:review` (section 5.3, FR-IN-5, [F7](../edge-cases.md)) | `it::messages::list_hides_review_statuses`, `it::search::f7_quarantine_hidden` |
 | E | A key signing as an identity it should not, or a platform key signing at all | `identities:sign` is held only by tenant keys and by identity keys for their own identity; a platform key cannot hold it (section 4.6); the identity path is scope-checked like every route (section 5.2) | `it::keys::permission_level_rules`, `it::security::cross_tenant_matrix` |
 | D | Request floods, expensive searches | Rate-limit bindings per key and per identity, exact daily caps in `TenantQuota`, 7 MiB body cap, search and fan-out caps (section 10) | `it::auth::rate_limited`, `it::search::f8_budget` |
 | E | Minting a wider key | Section 4.6 subset rule, `403 key_scope_exceeded` | `it::keys::scope_exceeded` |
-| E | Test key acting on a live tenant, or the reverse | A key's mode follows its tenant; platform keys act on both, and every state-changing action they take is audit-logged except sends, which are recorded as messages ([L4](../edge-cases.md)) | `it::testmode::l4_mode_binding` |
+| E | An API key releasing quarantined mail where only a person should | With `PM_QUARANTINE_KEY_RELEASE=off` (Pylota Mail Cloud) every key gets `403 permission_denied`, unless the tenant's `policy.quarantine.key_release` is `true`, which only a platform key or the tenant's own partner key can set (section 5.3); every release is audit-logged with its key | `it::quarantine::j14_key_release_policy`, `it::quarantine::j16_key_release_override` |
+| E | Test key acting on a live tenant, or the reverse | A key's mode follows its tenant; platform keys act on both, and partner keys on both modes of their own tenants, and every state-changing action they take is audit-logged except sends, which are recorded as messages ([L4](../edge-cases.md)) | `it::testmode::l4_mode_binding` |
 
 ### 3.3 TB3: agent → MCP
 
@@ -164,6 +166,7 @@ reused; the others are defined in section 13.
 | Threat | Mitigation |
 |---|---|
 | A Cloudflare account member reads D1, R2 or Durable Object data | Out of scope for the software (SECURITY.md). Deployers keep account membership minimal and use Cloudflare's own audit logs. Secrets are Worker secrets and are never written to disk unless `pmail setup --print-secrets` is used |
+| A partner key is misused | A partner key reaches only the tenants its partner's keys created, never another Cloud customer's ([FR-KEY-4](../prd.md#61-tenancy-and-access)). A platform key suspends the partner (`PATCH /v1/partners/{partner_id}` with `status: suspended`), which refuses every partner key of it at once (`403 partner_suspended`) without stopping its tenants' mail or their own keys ([J13](../edge-cases.md)); every state-changing partner-key action is audit-logged like a platform key's |
 | A platform key is misused | Platform keys reach every tenant: issue few, set `expires_at`, store them in a secrets manager (`key_command` in the CLI profile). Every state-changing platform-key action on a tenant is audit-logged; sends are not audit rows: each is a stored message, and the request's structured log carries `key_id` ([Observability §2.1](observability.md#21-schema)). A platform key cannot sign as an identity: `identities:sign` is not allowed at that level (section 4.6) |
 | The CLI machine leaks a key | `~/.config/pylota-mail/config.toml` is created `0600` and refused when group- or world-readable ([Configuration](../../reference/configuration.md#cli-configuration)) |
 | The release pipeline is compromised | Section 11: pinned dependencies and actions, signed `SHA256SUMS`, build provenance attestations, protected tags and environments |
@@ -212,7 +215,7 @@ security properties.
 ```text
 pmk_{mode}_{lookup}_{secret}
 
-mode    live | test                         (follows the key's tenant; platform keys are live)
+mode    live | test                         (follows the key's tenant; platform and partner keys are live)
 lookup  12 chars, lower-case Crockford base32 (alphabet 0123456789abcdefghjkmnpqrstvwxyz), 60 random bits
 secret  52 chars, same alphabet, encoding 32 random bytes (256 bits)
 
@@ -243,12 +246,17 @@ Every authenticated request (REST and MCP) runs `auth::authenticate` once, befor
    secret and an expired overlap (except `request_id`).
 7. Only now: `revoked_at` set → `401 key_revoked`; `expires_at ≤ now` → `401 key_expired`.
 8. The `mode` in the token must equal the row's `mode`; otherwise `401 unauthenticated`.
-9. Resolve `Scope { key_id, level, tenant_id, identity_id, mode, permissions }`. For tenant and
+9. Resolve `Scope { key_id, level, partner_id, tenant_id, identity_id, mode, permissions }`. For tenant and
    identity keys, `permissions` is the key's list plus the implicit `usage:read` (section 4.6), and the
    tenant row is loaded; a tenant in status `erasing` or `erased` gives
    `401 key_revoked` (its keys were revoked by the erasure job; this covers the window before that
    step commits). A `suspended` tenant still authenticates: suspension is enforced by policy
-   (`403 tenant_suspended` on sends, FR-TEN-3).
+   (`403 tenant_suspended` on sends, FR-TEN-3). For a partner key the `partners` row is loaded in the
+   same D1 read (a join on `api_keys.partner_id`): `status = 'suspended'` gives `403 partner_suspended`
+   on every route, `GET /v1/me` included, and nothing else runs ([J13](../edge-cases.md)). This comes after
+   the secret matched, so it tells a guesser nothing. Suspending a partner never suspends its tenants:
+   their mail and their own tenant and identity keys keep working. A partner key gets no implicit
+   permission.
 
 ### 4.3 `last_used_at`
 
@@ -281,40 +289,86 @@ are ever valid. Revocation (`DELETE /v1/keys/{key_id}`) sets `revoked_at` and cl
 
 ### 4.6 Creating keys (FR-KEY-1)
 
+Key levels, from widest to narrowest (FR-KEY-1, FR-KEY-4): `platform` (every tenant), `partner` (the tenants created with its
+partner's keys, [Partner keys](#partner-keys)), `tenant` (one tenant) and `identity` (one identity).
+
 `POST /v1/keys` checks, in this order:
 
 1. **The request.** `permissions` is required and non-empty at every level, `level: platform` included:
    there is no implicit full set (`400 invalid_request` when it is missing or empty).
    `pmail keys create` without `--permissions` exits 2 with a message ([CLI and setup](cli.md)).
+   `level: partner` needs `partner_id` and no `tenant_id` or `identity_id`; every other level refuses
+   `partner_id` (`400 invalid_request`).
 2. **Permissions allowed at the new key's level.** Some permissions can never be held at some levels,
    whoever the caller is. Listing one is `400 invalid_request` with
    `details.reason = "permission_not_allowed_for_level"`:
 
-   | Permission | Platform key | Tenant key | Identity key |
-   |---|---|---|---|
-   | `tenants:manage`, `platform:ops` (platform-only) | yes | no | no |
-   | `members:read`, `members:manage`, `suppressions:manage`, `audit:read`, `usage:read` (tenant-only) | yes | yes | no |
-   | `identities:sign` | no | yes | yes, for its own identity |
-   | Every other permission | yes | yes | yes |
+   | Permission | Platform key | Partner key | Tenant key | Identity key |
+   |---|---|---|---|---|
+   | `platform:ops`, `partners:manage` (platform-only) | yes | no | no | no |
+   | `tenants:manage` | yes | yes, for its own tenants | no | no |
+   | `members:read`, `members:manage`, `suppressions:manage`, `audit:read`, `usage:read` (tenant-only: never on identity keys) | yes | yes | yes | no |
+   | `identities:sign` | no | no | yes | yes, for its own identity |
+   | Every other permission | yes | yes | yes | yes |
 
 3. **Scope.** Every condition below holds; otherwise `403 key_scope_exceeded`:
 
-   | Caller level | New key's level | Tenant | Identity |
-   |---|---|---|---|
-   | platform | any | any existing tenant (tenant, identity levels) | any identity of that tenant (identity level) |
-   | tenant | tenant or identity | must equal the caller's tenant | any identity of the caller's tenant |
-   | identity | identity | must equal the caller's tenant | must equal the caller's identity |
+   | Caller level | New key's level | Partner | Tenant | Identity |
+   |---|---|---|---|---|
+   | platform | any | an existing partner (partner level) | any existing tenant (tenant, identity levels) | any identity of that tenant (identity level) |
+   | partner | tenant or identity | – | a tenant whose `partner_id` is the caller's | any identity of that tenant (identity level) |
+   | tenant | tenant or identity | – | must equal the caller's tenant | any identity of the caller's tenant |
+   | identity | identity | – | must equal the caller's tenant | must equal the caller's identity |
 
-   and `permissions` is a subset of the caller's permissions.
+   and `permissions` is a subset of the caller's permissions. A partner key that asks for a `partner` or
+   `platform` key, or names a tenant outside its own, gets `403 key_scope_exceeded` ([J11](../edge-cases.md)).
+   A platform key naming a partner that does not exist gets `404 partner_not_found`.
 
 - **Implicit `usage:read`.** Every tenant and identity key holds `usage:read` for its own workspace
   without listing it: authentication adds it to the resolved permissions (section 4.2, step 9). A key
   reaches only its own workspace, so the grant never reaches another one. An identity key still cannot
-  list it (step 2), and a platform key holds it only when listed.
-- The caller needs `keys:manage`. The new key's `mode` is its tenant's mode; platform keys are `live`.
+  list it (step 2), and platform and partner keys hold it only when listed.
+- The caller needs `keys:manage`. The new key's `mode` is its tenant's mode; platform and partner keys
+  are `live`.
 - `created_by_key_id` records the lineage. Revoking a key does not revoke its children; the
   compromised-key runbook ([Observability](observability.md#compromised-key)) revokes descendants
   explicitly.
+- Minting and revoking a key write `key.create` and `key.revoke` audit rows; for a partner key
+  `tenant_id` is `NULL` and `details_json` holds `level` and `partner_id`.
+
+#### Partner keys
+
+A **partner** is an integrator that provisions tenants for its own customers on a shared deployment
+(on Pylota Mail Cloud, Pylota for its car-rental operators). It is a row in `partners`, created and
+managed by platform keys with `partners:manage` ([REST API › Partners](../../reference/api.md#partners)).
+Only a platform key mints a partner key (`POST /v1/keys` with `level: "partner"` and `partner_id`), and
+only a platform key rotates or revokes one.
+
+- **Reach.** A partner key reaches the tenants whose `tenants.partner_id` equals its `partner_id`, and
+  everything inside them, used with a `tenant_id` or a resource ID exactly as a platform key uses them. It
+  also reaches its partner's endpoints (`scope: "partner"`, [Webhooks](webhooks.md#endpoint-resolution-and-filters))
+  and, read-only with `domains:read`, the platform domain, as every key does. It never reaches a tenant
+  another partner created, a tenant no partner created, the platform's endpoints, any partner or platform
+  key (its own included: `GET /v1/me` describes it), or a deployment-wide route (`/v1/platform/*`,
+  `/v1/partners/*`).
+- **Tenants it creates.** `POST /v1/tenants` with a partner key writes the key's `partner_id` to
+  `tenants.partner_id` and the partner's `default_billing_mode` to the tenant's billing mode. Neither can
+  be changed by a partner key: `partner_id` is never updated, and the `billing` field of
+  `POST /v1/tenants` and `PATCH /v1/tenants/{tenant_id}/billing` are platform-only (`403 scope_denied`).
+- **Abuse controls.** A partner key may lower its tenants' `identity_daily_send_cap`,
+  `tenant_daily_send_cap`, `max_recipients`, `search.agentic_daily_cap` and `abuse` thresholds, but not raise
+  them above the deployment's defaults: raising one is platform-only (`403 scope_denied`, `details.field`),
+  so one partner cannot spend a shared deployment's sending reputation
+  ([Configuration › Tenant policy](../../reference/configuration.md#tenant-policy)).
+- **What it may hold.** `tenants:manage` (create, update, suspend and read its own tenants),
+  `keys:manage` (tenant and identity keys of its own tenants), `webhooks:manage` and `webhooks:read`
+  (its partner endpoints, and its tenants' endpoints), `quarantine:review`, `usage:read`, and every other
+  tenant-level permission. Never `platform:ops`, `partners:manage` or `identities:sign` (step 2).
+- **Suspension.** A suspended partner's keys get `403 partner_suspended` (section 4.2, step 9); its
+  tenants keep receiving and sending mail ([J13](../edge-cases.md)).
+- **Mode and limits.** Partner keys are `live` and act on the `live` and `test` tenants of their partner.
+  They count against the same rate-limit buckets as platform keys, keyed by their own key ID
+  (section 10).
 
 ### 4.7 Unauthenticated routes
 
@@ -375,20 +429,27 @@ idempotency rule. The router is built from that table only; a request matching n
 rule (the registration function takes them as non-optional arguments), and public routes use the
 explicit `Scope::Public` variant. The permission list may be empty only for `Scope::Public` and for
 two other routes: `GET /v1/me`, which any valid key may call (`Scope::AnyKey`), and
-`GET /v1/tenants/{tenant_id}`, which only platform and tenant keys may call (`min_level: Tenant`; an
+`GET /v1/tenants/{tenant_id}`, which only platform, partner and tenant keys may call (`min_level: Tenant`; an
 identity key gets `403 scope_denied` on its own tenant, step 3 of section 5.2). For the second,
 `foreign_permissions` (`tenants:manage`) is required as well when the target is not the key's own
-tenant, and always for a platform key, so a tenant key reads only its own tenant. A unit test fails when
+tenant, and always for a platform or partner key, so a tenant key reads only its own tenant. A unit test fails when
 any other route has an empty list. `GET /v1/usage` is not one of them: it is registered with
 `usage:read`, which every tenant and identity key holds implicitly for its own workspace (section 4.6),
-while a platform key needs it listed and must pass `tenant_id` (`400 invalid_request` without it).
+while a platform or partner key needs it listed and must pass `tenant_id` (`400 invalid_request` without it).
+
+Levels are ordered `Identity < Tenant < Partner < Platform`. `min_level` compares against that order,
+so a route with `min_level: Tenant` accepts a partner key on its own tenants, and a route or field with
+`min_level: Platform` (`PATCH /v1/tenants/{tenant_id}/billing`, the `billing` field of
+`POST /v1/tenants`, a domain's `transport`) answers a partner key `403 scope_denied` on its own tenant.
 
 ```rust
 // crates/worker/src/auth/routes.rs
 pub enum Scope {
     Public,                                  // section 4.7 only
     AnyKey,                                  // GET /v1/me
-    PlatformOnly,                            // e.g. POST /v1/tenants, POST /v1/webhooks, /v1/platform/*
+    PlatformOnly,                            // /v1/platform/*, /v1/partners/*
+    PlatformOrPartner,                       // POST /v1/tenants, GET /v1/tenants, POST /v1/webhooks
+                                             // (a partner key: its own tenants, or a partner endpoint)
     TenantPath { param: &'static str },      // /v1/tenants/{tenant_id}/...
     IdentityPath { param: &'static str },    // /v1/identities/{identity_id}/...
     Resource { kind: ResourceKind, param: &'static str }, // domain, webhook, key, erasure, export
@@ -402,7 +463,7 @@ pub struct RouteSpec {
     pub foreign_permissions: &'static [Permission], // also required when the target is not the key's own tenant
     pub scope: Scope,
     pub idempotency: Idempotency,            // Required | Optional | None (openapi x-idempotency)
-    pub min_level: Option<Level>,            // e.g. Tenant for tenant search (FR-SRCH-10)
+    pub min_level: Option<Level>,            // e.g. Tenant for tenant search (FR-SRCH-10), Platform for billing
 }
 ```
 
@@ -419,24 +480,37 @@ For each request, before any Durable Object or R2 call:
    leaks nothing.
 3. **Level.** If the route is above the key's level and the target is the key's own tenant (an identity
    key holding `search:read` on `POST /v1/tenants/{own}/search`), the result is `403 scope_denied`
-   ([F3](../edge-cases.md)). A route that needs a permission the key's level can never hold (a tenant key
-   on `GET /v1/tenants`, which needs `tenants:manage`) already failed step 2 with `permission_denied`. This also reveals nothing, because the target is the
+   ([F3](../edge-cases.md)), as is a partner key on a platform-only route or field of one of its own tenants
+   (`PATCH /v1/tenants/{own}/billing`). A route that needs a permission the key's level can never hold (a tenant key
+   on `GET /v1/tenants`, which needs `tenants:manage`, or a partner key on `/v1/partners`, which needs
+   `partners:manage`) already failed step 2 with `permission_denied`. This also reveals nothing, because the target is the
    key's own tenant.
 4. **Resolve the target's owner** from D1 with the key's scope as a mandatory parameter of the data-access
    function (`tenant_id` is a required argument of every tenant-data query):
-   - `TenantPath`: the tenant ID must equal the key's tenant (platform keys: the tenant must exist).
-   - `IdentityPath`: `SELECT tenant_id, status, mailbox_do_id FROM identities WHERE id = ?1`, then
-     compare with the key; identity keys must match their own identity.
-   - `Resource`: load the row and compare its `tenant_id` (and `identity_id` where relevant). The
-     platform domain (`tenant_id IS NULL`) is readable by every key with `domains:read`.
+   - `TenantPath`: the tenant ID must equal the key's tenant (platform keys: the tenant must exist;
+     partner keys: the tenant's `partner_id` must equal the key's `partner_id`).
+   - `IdentityPath`: `SELECT i.tenant_id, i.status, i.mailbox_do_id, t.partner_id FROM identities i JOIN tenants t ON t.id = i.tenant_id WHERE i.id = ?1`, then
+     compare with the key; identity keys must match their own identity, and partner keys need
+     `t.partner_id` equal to their own.
+   - `Resource`: load the row and compare its `tenant_id` (and `identity_id` where relevant); for a
+     partner key, the row's tenant must have the key's `partner_id`. The
+     platform domain (`tenant_id IS NULL`) is readable by every key with `domains:read`. A webhook
+     endpoint with `tenant_id IS NULL` is reachable by a platform key, and by a partner key only when its
+     `partner_id` is the key's. A key row is reachable by a partner key only when it is a tenant or
+     identity key of one of its tenants: a partner-level or platform-level key ID, its own included, is
+     `404 key_not_found` to it.
    - Any mismatch returns the resource's own `*_not_found` code with the same body as for a
      non-existent ID. The check runs whether or not the ID exists, so both paths do one D1 read.
 5. **Body and query parameters naming a tenant or identity** (`tenant_id` in `POST /v1/keys`,
    `POST /v1/erasure-requests`, `POST /v1/exports`, `identity_ids` filters, `tenant_id` filters):
    for non-platform keys, a value outside the key's scope returns `404 tenant_not_found` or
-   `404 identity_not_found` (for `POST /v1/keys`, `403 key_scope_exceeded`, as api.md states). A value
-   equal to the key's own scope is accepted. Missing values default to the key's scope; a platform key
-   has no default tenant, so on `GET /v1/usage` it must pass `tenant_id` (`400 invalid_request`).
+   `404 identity_not_found` (for `POST /v1/keys`, `403 key_scope_exceeded`, as api.md states); for a
+   partner key, every tenant whose `partner_id` is not its own is outside its scope. A value
+   equal to the key's own scope is accepted. Missing values default to the key's scope; platform and
+   partner keys have no default tenant, so on `GET /v1/usage` they must pass `tenant_id`
+   (`400 invalid_request`). A list without a `tenant_id` filter returns, for a partner key, only rows of
+   its own tenants (`GET /v1/tenants`, `GET /v1/identities`, `GET /v1/keys`, `GET /v1/audit-events`,
+   `GET /v1/erasure-requests`).
 6. **Call the Durable Object** with an `RpcEnvelope` carrying `tenant_id`, `identity_id`,
    `actor_key_id` and `request_id` taken from the resolved scope, never from the request. The object
    compares them with the owner in its `meta` and refuses a mismatch with `internal_error`, logging
@@ -451,8 +525,8 @@ For each request, before any Durable Object or R2 call:
 - An **identity** key reaches its tenant's domains read-only with `domains:read`, and its tenant's
   webhook endpoints and deliveries read-only with `webhooks:read` (api.md). Writes to either from an
   identity key return `403 scope_denied`.
-- `webhooks:manage` includes `webhooks:read`. `platform:ops` can only be held by platform keys, like
-  `tenants:manage`.
+- `webhooks:manage` includes `webhooks:read`. `platform:ops` and `partners:manage` can only be held by
+  platform keys; `tenants:manage` by platform and partner keys.
 - **Quarantined, hidden and throttled mail in lists** (FR-IN-5). This rule is the reference the API,
   MCP and console pages follow. A mail list (`GET /v1/identities/{identity_id}/messages`, and every
   MCP tool and console view built on it) excludes messages with status `quarantined`, `hidden` or
@@ -470,8 +544,17 @@ For each request, before any Durable Object or R2 call:
   `include_quarantined` (or uses `is:quarantined`) and the key holds `quarantine:review`; without
   `quarantine:review` the flag is ignored, never refused ([Search § 2](search.md#2-request-handling)).
 - Attachments with a `risk` require `quarantine:review` (api.md).
-- Resuming an identity paused for `abuse_threshold` requires a tenant or platform key and is
+- Resuming an identity paused for `abuse_threshold` requires a tenant, partner or platform key and is
   audit-logged (api.md).
+- **Quarantine release by API keys** (FR-CON-6). `POST …/messages/{message_id}/release` with
+  `quarantine:review` is allowed when `PM_QUARANTINE_KEY_RELEASE` is `on` (or `PM_CONSOLE=off`), or when
+  the message's tenant has `policy.quarantine.key_release: true`; otherwise `403 permission_denied` and
+  only a signed-in person can release, in the console. Only a platform key, or the partner key of the
+  tenant's own partner, can set that policy field, because `PATCH /v1/tenants/{tenant_id}` needs
+  `tenants:manage`, which a tenant key can never hold: a tenant key that tries gets
+  `403 permission_denied` at step 2, and the console shows the policy read-only
+  ([Configuration › Tenant policy](../../reference/configuration.md#tenant-policy), [J14](../edge-cases.md),
+  [J16](../edge-cases.md)).
 
 ### 5.4 Agentic planner and MCP scope
 
@@ -545,7 +628,7 @@ Rules:
 | Web Bot Auth key | `POST /v1/platform/keys/web_bot_auth/rotate` (`platform:ops`; `422 web_bot_auth_disabled` while `PM_WEB_BOT_AUTH=off`) | New signatures use the new key at once; the previous key stays in the key directory for 7 days, so requests signed shortly before the rotation still verify. With `?revoke_previous=true` it leaves the directory at once |
 | Identity signing key | `POST /v1/identities/{identity_id}/keys/rotate` (`identities:write`; tenant, identity or platform key; or the identity page in the console) | The new key signs at once; the previous one is `retiring` and stays in the JWKS until `verify_until` = now + `PM_IDENTITY_KEY_OVERLAP_DAYS` (default 7) ([O2](../edge-cases.md)). After a suspected leak, `POST …/keys/{kid}/revoke` moves the key to `retired` and removes it from the JWKS at once ([O3](../edge-cases.md)). Key management stays available while the identity is paused |
 | OAuth client secrets | Create a new client secret in the provider's console, `wrangler secret put PM_OAUTH_GOOGLE_CLIENT_SECRET` (or `…_GITHUB_…`), then delete the old secret at the provider | Sign-ins that are mid-flow during the switch may fail and are retried by the person. Whether a provider keeps two secrets valid at once: verify at build time |
-| SMTP relay credentials | `PATCH /v1/domains/{domain_id}` with `smtp` (tenant or platform key with `domains:write`) | The new values are kept pending until a probe passes; the old ones are used until then |
+| SMTP relay credentials | `PATCH /v1/domains/{domain_id}` with `smtp` (tenant, partner or platform key with `domains:write`) | The new values are kept pending until a probe passes; the old ones are used until then |
 | TOTP secret, recovery codes | At `/console/settings/security`, with re-authentication: turn two-step verification off and enrol again, or generate new recovery codes | The old secret or codes stop working at once |
 | `PM_KEY_PEPPER` | Break-glass: `pmail setup --rotate-pepper` (a new pepper and a new bootstrap key in one step, section 4.8), then reissue every key | Every existing key stops working immediately |
 | `PM_HASH_KEY` | Not rotatable in v1.0 | Tombstones, suppressions and erasure records would stop matching, which would let an erased address be reassigned (A5). A rotation needs a re-keying migration and an ADR |
@@ -845,6 +928,11 @@ fails. At delivery time a failure is recorded as a failed attempt with error `ss
 | Two-step verification codes | 5 attempts a minute per person; 10 failures in a row lock two-step sign-in for 15 minutes | A per-person failure counter ([Cloud sign-up §5](cloud-signup.md#5-two-step-verification)) | Code refused; lock page |
 | Sends from a new Free workspace | `tenant_daily_send_cap` 50 for the first 7 days; lifts on day 7 if bounce and complaint rates are under the auto-pause thresholds, or at once on a paid plan | `TenantQuota` ([W30](../edge-cases.md)) | `429 daily_cap_reached` |
 
+- **Partner keys** use the same buckets as platform keys: `RL_API`, `RL_SEARCH` and `RL_AGENTIC` keyed by
+  the partner key's own ID, so one partner key's 600 requests a minute cover all of its tenants. The
+  per-identity buckets (`RL_SEND`, `RL_SIGN`) and each tenant's exact daily caps in `TenantQuota` apply
+  as for every key. A partner that needs more throughput mints tenant keys for its tenants (section 4.6),
+  each with its own bucket.
 - The rate-limiting bindings are approximate and per location. Anything that must be exact (daily send
   caps, the agentic budget, abuse windows) is counted in `TenantQuota`.
 - **Headers.** A binding's `limit()` answers only allow or deny, so the Worker cannot report what is left.
@@ -927,12 +1015,20 @@ address used by the integration suite, captures all Worker output, and fails if 
 | `it::auth::status_after_secret_match` | `key_revoked` / `key_expired` appear only when the secret matches | FR-KEY-2 |
 | `it::auth::rotation_overlap` | Both secrets work during the overlap; only the new one after; overlap 0 cuts over at once; a second rotation keeps at most two | FR-KEY-2 |
 | `it::auth::last_used_throttle` | Twenty requests within a minute produce one `last_used_at` write | data model |
-| `it::auth::rate_limited` | `429 rate_limited` with `Retry-After`, including the 601st signing call in a minute for one identity (`RL_SIGN`); failed authentications are limited per client without logging the IP | section 10 |
+| `it::auth::rate_limited` | `429 rate_limited` with `Retry-After`, including the 601st signing call in a minute for one identity (`RL_SIGN`) and the 601st request in a minute from one partner key across two of its tenants (`RL_API`, keyed by the key ID); failed authentications are limited per client without logging the IP | section 10 |
 | `it::keys::scope_exceeded` | Every row of the scope table in section 4.6 (step 3), plus permissions wider than the caller's → `403 key_scope_exceeded` | FR-KEY-1, SEC-2 |
 | `it::keys::permission_level_rules` | Section 4.6, steps 1 and 2: `permissions` missing or empty (every level, `platform` included) → `400 invalid_request`; `identities:sign` on a platform key, a tenant-only permission on an identity key, and `tenants:manage` or `platform:ops` on a tenant or identity key → `400 invalid_request` with `details.reason = "permission_not_allowed_for_level"`, even from a caller that holds the permission; a tenant or identity key holds `usage:read` implicitly and reads its own `GET /v1/usage`; a platform key needs `usage:read` listed and `tenant_id` passed | FR-KEY-1, SEC-2 |
 | `it::messages::list_hides_review_statuses` | A message list never shows `quarantined`, `hidden` or `throttled` mail without a `status` filter, also to a key holding `quarantine:review`; with the filter, only a key holding `quarantine:review` sees them, and any other key gets `200` without them; a thread list never shows them | section 5.3, FR-IN-5 |
 | `it::keys::j6_revoke_rotate` | Revocation is immediate; rotation overlaps; audit rows name the actor | [J6](../edge-cases.md) |
-| `it::security::cross_tenant_matrix` | Section 5 matrix: every route × every foreign key class → `*_not_found` or `scope_denied`, identical to a missing ID, no side effects; REST and MCP | NFR-SEC-1, FR-KEY-3, FR-TEN-1 |
+| `it::keys::j11_partner_key_limits` | A partner key asking for a `partner` or `platform` key, or for a tenant or identity key of a tenant outside its partner, gets `403 key_scope_exceeded`; `platform:ops`, `partners:manage` or `identities:sign` on a partner key gets `400 invalid_request` (`permission_not_allowed_for_level`) from any caller; a tenant or identity key cannot list `partner_id` or ask for `level: partner`; a platform key mints a partner key with `partner_id` (`404 partner_not_found` for an unknown one), and `key.create` and `key.revoke` rows record `level` and `partner_id` | FR-KEY-1, FR-KEY-4, [J11](../edge-cases.md) |
+| `it::partners::routes_and_audit` | The five partner routes need a platform key with `partners:manage` (a partner key gets `403 permission_denied`); create, update and delete write `partner.create`, `partner.update` and `partner.delete`; a tenant created by a partner key has `partner_id` and the partner's `default_billing_mode`, and writes `tenant.create` with that `partner_id`; a partner key sending `billing` in `POST /v1/tenants`, or calling `PATCH /v1/tenants/{own}/billing`, gets `403 scope_denied`; `GET /v1/tenants` with a partner key lists only its tenants; changing `default_billing_mode` leaves existing tenants' billing modes unchanged; idempotency records of a partner key's `POST /v1/tenants` are scoped to its partner, so another partner's identical key and body create a separate tenant | FR-KEY-4 |
+| `it::partners::policy_caps_lower_only` | A partner key lowers its tenant's `tenant_daily_send_cap` and an `abuse` threshold; raising either above the deployment default gets `403 scope_denied` with `details.field`, and a platform key can raise them |
+| `it::partners::j10_foreign_partner_not_found` | A partner key against another partner's tenant, a tenant no partner created, the identities, messages, domains, keys and endpoints inside them, and another partner's endpoints and keys, gets the same `404 …_not_found` as for a missing ID, with no side effect | FR-KEY-4, NFR-SEC-1, [J10](../edge-cases.md) |
+| `it::partners::j12_delete_with_tenants` | `DELETE /v1/partners/{partner_id}` gets `409 partner_has_tenants` while one of its tenants is `active`, `suspended` or `erasing`, and changes nothing; once all are `erased` it deletes the partner, its keys (their next request is `401 unauthenticated`), its endpoints and their deliveries, and clears `partner_id` on the erased tenants | FR-KEY-4, [J12](../edge-cases.md) |
+| `it::partners::j13_suspended_partner` | With the partner `suspended`, each of its keys gets `403 partner_suspended` on every route, `GET /v1/me` included; its tenants keep receiving mail and their tenant and identity keys keep sending; `active` again restores the partner keys | FR-KEY-4, [J13](../edge-cases.md) |
+| `it::quarantine::j14_key_release_policy` | Only a platform key or the tenant's own partner key sets `quarantine.key_release`; a tenant key gets `403 permission_denied` and the policy is unchanged; another partner's key gets `404 tenant_not_found` | FR-CON-6, [J14](../edge-cases.md) |
+| `it::quarantine::j16_key_release_override` | With `PM_QUARANTINE_KEY_RELEASE=off`, a key with `quarantine:review` (a tenant key, an identity key and the partner key) releases mail of a tenant whose policy has `quarantine.key_release: true`, writing `quarantine.release` with the key; on a tenant without it every key gets `403 permission_denied`; with `on`, the policy changes nothing | FR-CON-6, [J16](../edge-cases.md) |
+| `it::security::cross_tenant_matrix` | Section 5 matrix: every route × every foreign key class, the `foreign_partner` class included → `*_not_found` or `scope_denied`, identical to a missing ID, no side effects; REST and MCP | NFR-SEC-1, FR-KEY-3, FR-KEY-4, FR-TEN-1 |
 | `it::security::route_table_complete` | Every entry of `GET /__test/routes` appears in the matrix; every route has a permission and scope | SEC-1 |
 | `it::security::body_scope_ignored` | `tenant_id` / `identity_id` / `identity_ids` naming another scope in bodies and queries never widen access | FR-KEY-3 |
 | `it::security::rpc_owner_mismatch` | A forged envelope (test hook) is refused with `internal_error`, logs `rpc_owner_mismatch`, increments the metric | SEC-1 |

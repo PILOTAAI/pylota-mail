@@ -1,6 +1,6 @@
 # Edge-case register
 
-Every row is a required behaviour. The register has 201 rows in 15 sections (A–L, N, O and W). The 195 rows
+Every row is a required behaviour. The register has 208 rows in 15 sections (A–L, N, O and W). The 202 rows
 that Pylota Mail owns (`S` or `S+I`) each name a test; the 6 integrator-owned rows (C5, E6, E7, K1, K2 and
 K4) are tested in the integrator's own suites. Section W was section M; it was renamed so that its rows
 (W1–W34) can never be mistaken for build-plan milestones (M0–M26).
@@ -173,6 +173,13 @@ Pull requests that change a behaviour here must update the row and its test in t
 | J7 | The D1 directory lookup fails transiently in `email()` | Accept to `inbound-staging/`, queue a pointer with the envelope, and route in the consumer. Never reject for our own outage | S | `it::inbound::j7_d1_transient` |
 | J8 | A dead-letter queue receives messages | The dead-letter consumer records each item in `dlq_items`, emits a metric, and alerts after 15 minutes non-empty. `GET /v1/platform/dlq` and `POST /v1/platform/dlq/{dlq_id}/redrive` (CLI `pmail dlq list` and `redrive`) list and redrive | S | `it::ops::j8_dlq_consumer`, `cli::dlq::j8_list_redrive` |
 | J9 | Deploy with a new Durable Object schema while old instances are live | Migrations are idempotent and run on wake, inside a transaction, guarded by `schema_version` | S | `it::mailbox::j9_migration_on_wake` |
+| J10 | A partner key addresses a tenant another partner's key created, a tenant no partner created, anything inside one (identity, message, domain, key, webhook endpoint), or another partner's endpoints or keys | The same `404 …_not_found` as for a missing ID, with no side effect. A partner key reaches only the tenants its own partner's keys created | S | `it::security::cross_tenant_matrix`, `it::partners::j10_foreign_partner_not_found` |
+| J11 | A partner key tries to mint a partner or platform key, or a key holding `platform:ops`, `partners:manage` or `identities:sign` | A partner or platform key, or a key for a tenant outside its partner: `403 key_scope_exceeded`. A permission partner keys can never hold: `400 invalid_request` with `details.reason = "permission_not_allowed_for_level"`. Only a platform key mints, rotates or revokes partner keys | S | `it::keys::j11_partner_key_limits` |
+| J12 | A partner is deleted while it still has tenants | `409 partner_has_tenants` while any tenant with its `partner_id` is not `erased`, and nothing changes. Once every one is erased, the deletion removes the partner, its keys and its endpoints | S | `it::partners::j12_delete_with_tenants` |
+| J13 | A partner is suspended | Its keys get `403 partner_suspended` on every route. Its tenants are not suspended: their mail keeps arriving, and their own tenant and identity keys keep working. `active` restores the partner keys | S | `it::partners::j13_suspended_partner` |
+| J14 | A self-serve tenant's key tries to set `quarantine.key_release` on its own tenant | `403 permission_denied`: `PATCH /v1/tenants/{tenant_id}` needs `tenants:manage`, which a tenant key can never hold. The policy is unchanged, and the console shows it read-only. Only a platform key, or the tenant's own partner key, can set it | S | `it::quarantine::j14_key_release_policy` |
+| J15 | A partner's webhook endpoint, and events of another partner's tenants or of a tenant no partner created | Never delivered, by fan-out or by replay: a partner endpoint matches only events of tenants with its `partner_id`. `webhook.disabled` for a partner endpoint goes to that partner's other endpoints and to platform endpoints | S | `it::webhooks::j15_partner_scope_filter` |
+| J16 | A key with `quarantine:review` releases held mail where `PM_QUARANTINE_KEY_RELEASE=off` (Pylota Mail Cloud) | Allowed only on a tenant whose policy has `quarantine.key_release: true`, its partner key included; on any other tenant every key gets `403 permission_denied` and a person releases in the console. Each release is audit-logged with its key | S | `it::quarantine::j16_key_release_override` |
 
 ## K · Integration and cutover (integrator side)
 
@@ -190,7 +197,7 @@ Pull requests that change a behaviour here must update the row and its test in t
 | L1 | A test tenant sends to a real external address | Refused with `test_mode_recipient` | S | `it::testmode::l1_refuse_external` |
 | L2 | A test tenant sends to `*@simulator.invalid` | Scripted outcomes: `delivered@`, `bounce@`, `softbounce@`, `complaint@`, `deferred@`, `reject@` and `timeout@` (which produces `uncertain`) | S | `it::testmode::l2_simulator_matrix` |
 | L3 | A test tenant sends to an identity on the same deployment | Delivered by loopback injection into the inbound pipeline, with `verdict: pass` and flag `loopback` | S | `it::testmode::l3_loopback` |
-| L4 | A live key used on a test tenant, or the reverse | Impossible: a key's mode follows its tenant. Platform keys act on both and are logged | S | `it::testmode::l4_mode_binding` |
+| L4 | A live key used on a test tenant, or the reverse | Impossible: a key's mode follows its tenant. Platform keys, and partner keys on their own tenants, act on both and are logged | S | `it::testmode::l4_mode_binding` |
 
 ## N · Domains on any DNS host
 

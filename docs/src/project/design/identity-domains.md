@@ -29,7 +29,7 @@ Items the documentation does not confirm are marked "verify at build time" with 
 | `active` | `PATCH status: paused` | `identities:write` | `pause_reason = 'manual'`; `identity.paused` | `paused` |
 | `active` | Abuse threshold ([Outbound](outbound.md#abuse-auto-pause-fr-dlv-3)) | – | `pause_reason = 'abuse_threshold'`; `identity.paused` with `metrics` | `paused` |
 | `active` | Tenant suspended | – | `pause_reason = 'tenant_suspended'`; `identity.paused` | `paused` |
-| `paused` | `PATCH status: active` | reason `manual`: `identities:write`; reason `abuse_threshold`: platform or tenant key, audit-logged; reason `tenant_suspended`: refused (`409 identity_paused`) | `pause_reason = NULL`; `identity.resumed` | `active` |
+| `paused` | `PATCH status: active` | reason `manual`: `identities:write`; reason `abuse_threshold`: platform, partner or tenant key, audit-logged; reason `tenant_suspended`: refused (`409 identity_paused`) | `pause_reason = NULL`; `identity.resumed` | `active` |
 | `paused` (`tenant_suspended`) | Tenant resumed | – | `identity.resumed` | `active` |
 | `active`, `paused` | `DELETE` | `identities:write` and `erasure:manage` | Tombstone and remove every address; create the identity-scope erasure ([Privacy](privacy.md)) | `deleting` |
 | `deleting` | Erasure completed with no holds left | – | `identity.deleted`, once, from the erasure job's outbox with `identity_id` set ([Privacy § 6.5](privacy.md#65-identity-scope-fr-idn-4)) | `deleted` |
@@ -477,7 +477,7 @@ The `cloudflare_zone` method. Needs `PM_CF_API_TOKEN` (`422 cf_token_required` w
 
 This is the `nameservers` method (old spelling: `kind: zone` with `"create_zone": true`), for a domain
 used only for mail ([Domains on any DNS host §3.2](domain-connections.md#32-nameservers)). Platform keys
-may always use it; tenant keys only when their policy has `domains.allow_create_zone: true` (see
+may always use it; tenant and partner keys only when the tenant's policy has `domains.allow_create_zone: true` (see
 [Adding a domain](#adding-a-domain)).
 
 1. **Dedicated-domain check ([N21](../edge-cases.md)).** Before creating anything, query both DoH
@@ -725,7 +725,7 @@ domain gets all three during onboarding when SES is configured (the optional ste
 [Kind `zone`](#kind-zone)), so `PATCH` to `ses` works for any such domain that has `ses_identity`. Only the methods that put the domain on Cloudflare
 (`cloudflare_zone`, `nameservers`, `delegated_subdomain`) can switch; any other method, and the platform
 domain, gets `422 transport_unavailable` with `details.reason = "method_not_supported"`. An `smtp_relay`
-domain changes its relay with `PATCH` and `smtp` instead (tenant or platform key with `domains:write`);
+domain changes its relay with `PATCH` and `smtp` instead (tenant, partner or platform key with `domains:write`);
 the new values are kept pending until a probe passes
 ([§5.3](domain-connections.md#53-proving-alignment-the-probe)). A transport change updates `domains.transport`,
 writes an `audit_log` row (`domain.transport`), and asks the monitor for a check at once, because DKIM

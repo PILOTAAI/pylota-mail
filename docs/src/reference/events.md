@@ -38,7 +38,8 @@ request locally.
   `POST /v1/webhooks/{id}/replay` for 30 days from its `occurred_at` (or `retention.events_days`, if
   shorter), counted from when the event happened, not from when the delivery went `dead`.
 - After 100 consecutive failures spread over at least 24 hours, the endpoint is disabled
-  (`disabled_reason: failing`) and a `webhook.disabled` event goes to the platform's other endpoints.
+  (`disabled_reason: failing`) and a `webhook.disabled` event goes to the platform's endpoints and, for
+  an endpoint that belongs to a partner, to that partner's other endpoints.
 - `410 Gone` from an endpoint disables it immediately.
 
 ### Ordering
@@ -147,7 +148,7 @@ The **message summary** used in `data.message` is:
 | `export.completed` | `export_id`, `expires_at` (fetch the download link from the API) |
 | `suppression.created` | `address_hint`, `reason`, `source_message_id` |
 | `quota.warning` | `metric` (`sends` in v1), `used`, `limit`, `scope` (tenant or identity). Sent at 80% and at 100% of a daily send cap |
-| `webhook.disabled` | `webhook_id`, `reason` (platform endpoints only) |
+| `webhook.disabled` | `webhook_id`, `reason` (platform endpoints, and the other endpoints of the disabled endpoint's partner) |
 | `webhook.test` | `message: "hello"` |
 
 ### Workspaces, members and billing

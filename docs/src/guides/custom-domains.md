@@ -48,7 +48,7 @@ A Cloudflare zone can have at most 30 mail domains (routing and sending together
 
 ## Before you start
 
-- You need a key with `domains:write` (tenant or platform) to add a domain, and `identities:write` to add
+- You need a key with `domains:write` (tenant, partner or platform) to add a domain, and `identities:write` to add
   and promote addresses.
 - `cloudflare_zone`, `nameservers` and `delegated_subdomain` work through the Cloudflare API, so the
   deployment needs `PM_CF_API_TOKEN`, with the permissions in

@@ -1142,7 +1142,7 @@ Agentic search (FR-SRCH-8/9, [ADR 0007](../adr/0007-agentic-search.md)) answers 
 cited evidence. The planner model only chooses read-only tool calls; code executes them in the
 caller's scope, and code verifies every citation. Like the other modes it runs at either scope: one
 identity (`POST /v1/identities/{identity_id}/search`) or the whole tenant
-(`POST /v1/tenants/{tenant_id}/search`, tenant and platform keys, [§10](#10-tenant-scope-fan-out)).
+(`POST /v1/tenants/{tenant_id}/search`, tenant, partner and platform keys, [§10](#10-tenant-scope-fan-out)).
 
 ### 11.1 Budgets and limits
 

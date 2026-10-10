@@ -342,20 +342,23 @@ request: a 50,000-message seed takes minutes, and timings on shared CI runners a
 
 ## 7. Cross-tenant attack suite
 
-Proves NFR-SEC-1 (zero cross-tenant access) and FR-KEY-3. Rules are in
+Proves NFR-SEC-1 (zero cross-tenant access), FR-KEY-3 and the partner isolation of FR-KEY-4. Rules are in
 [Security › Authorisation](security.md#5-authorisation-and-tenant-isolation).
 
 **Fixture.** Two tenants, A (victim) and B (attacker), each with two identities, a domain, a webhook, a
 key of each level holding every permission valid at that level, threads with messages and attachments,
 a held thread, an erasure request, an export, an identity signing key on each identity (one rotated, so a
 `retiring` key exists too) and `policy.web_bot_auth.allowed = true`. Tenant A's mail contains a unique
-canary term. A third tenant C is a test tenant.
+canary term. A third tenant C is a test tenant. Two partners, P and Q, each have a partner key holding
+every permission valid at the partner level and a partner webhook endpoint: P's key created A, Q's key
+created B, and C was created by a platform key, so it has no partner.
 
 "Every permission valid at that level" follows [Security §4.6](security.md#46-creating-keys-fr-key-1):
-a tenant key holds every permission except `tenants:manage` and `platform:ops`, so it holds
+a tenant key holds every permission except `tenants:manage`, `partners:manage` and `platform:ops`, so it holds
 `identities:sign`; an identity key holds the same set without the tenant-only permissions
 (`members:read`, `members:manage`, `suppressions:manage`, `audit:read`, `usage:read`), plus
-`usage:read` implicitly for its own workspace.
+`usage:read` implicitly for its own workspace. A partner key holds every permission except
+`platform:ops`, `partners:manage` and `identities:sign`.
 
 **Attacker key classes** (each with full permissions for its level):
 
@@ -365,6 +368,7 @@ a tenant key holds every permission except `tenants:manage` and `platform:ops`, 
 | `foreign_identity` | Identity key of B's first identity (with `identities:sign` for that identity) |
 | `sibling_identity` | Identity key of A's second identity, attacking A's first identity |
 | `mode_mismatch` | Test-mode key of C, attacking live tenant A ([L4](../edge-cases.md)) |
+| `foreign_partner` | Partner key of Q, which created B but not A: a partner reaching another partner's tenant ([J10](../edge-cases.md)) |
 | `revoked`, `expired` | A's own tenant key, revoked or expired |
 
 **Matrix.** `it::security::cross_tenant_matrix` reads `GET /__test/routes` and, for every route with a
@@ -394,6 +398,8 @@ ID of the same type. It asserts:
 | `it::security::rpc_owner_mismatch` | `/__test/rpc` sends an envelope with B's IDs to A's mailbox; `internal_error`, `rpc_owner_mismatch` logged, metric incremented, alert fired |
 | `it::inbound::a2_forged_token_ignored` | Mail to B's address with a token minted for A's thread files into B's mailbox only |
 | `it::security::webhook_filter_scope` | B creating a webhook with `identity_ids` of A gets `404 identity_not_found` |
+| `it::partners::j10_foreign_partner_not_found` | P's partner key against every route with the resource IDs of B (Q's tenant) and of C (no partner), and against Q's partner endpoint and Q's partner key by ID: the same `404` as a missing ID and no side effect; `GET /v1/tenants`, `GET /v1/keys` and `GET /v1/webhooks` with P's key list only A's rows and P's endpoint ([J10](../edge-cases.md)) |
+| `it::webhooks::j15_partner_scope_filter` | Events of B and C never reach P's partner endpoint, and events of A never reach Q's ([J15](../edge-cases.md)) |
 | `it::security::mcp_tools_follow_key` | Tools listed and callable only with their permission; `mail_sign_assertion` and `mail_sign_http_request` are never listed to a platform key |
 | `it::identity_keys::paused_withdraws_jwks`, `it::assertions::erasure_tombstones_kid` | Without a key: a paused identity's JWKS answers the same `404 identity_not_found` as an unknown ID; an erased identity's kid is never published again ([O1](../edge-cases.md), [O7](../edge-cases.md)) |
 | `it::notify::one_click_unsubscribe` | An unsubscribe token for a person of B, altered to name A's workspace or another kind, changes nothing and gets the same page as an expired token ([O18](../edge-cases.md)) |
@@ -589,6 +595,7 @@ It prints the traceability matrix as Markdown into the CI summary.
 | J7 | `d1.query` fault on the directory lookup |
 | J8 | Forced dead-letter delivery (a consumer fault beyond `max_retries`); fake clock for the 15-minute alert |
 | J9 | `/__test/mailbox-schema` |
+| J10–J16 | The two partners of the attack-suite fixture (section 7), each with a partner key and a partner endpoint, and the webhook receiver fake; `restart_runtime_with` setting `PM_QUARANTINE_KEY_RELEASE=off` for J16 |
 | L1–L4 | Test tenants with the real simulator and loopback paths |
 | B1, C7, J5 | Live (B1 and J5 also need real providers). C7 has an `it::` part too, and J5's API part is `it::domains::transport_patch` |
 | N1–N7, N10, N11, N26–N29 | SNS push and SQS fakes; S3 fake with `NoSuchKey`; SES fake identity, account and receipt-rule state; a generated 39 MB message for N5; seeded domain rows for the identity count |

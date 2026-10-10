@@ -215,8 +215,8 @@ read 2026-10-09). Pass: `401` before registration. Fallback: signed HTTP request
 
 - New permission `identities:sign`. It is granted like any other permission (there are no wildcard
   permissions): a tenant key holds it when it is in the key's list, and an identity key holds it only when
-  granted, for its own identity. Platform keys cannot sign as an identity: creating a platform key with
-  `identities:sign` is refused with `400 invalid_request` and `details.reason =
+  granted, for its own identity. Platform and partner keys cannot sign as an identity: creating a platform
+  or partner key with `identities:sign` is refused with `400 invalid_request` and `details.reason =
   "permission_not_allowed_for_level"`. In the console, the owner's and admins' session principals hold it,
   so they can create keys that carry it.
 - Console: owners and admins create, rotate and revoke identity keys on the identity page (sensitive

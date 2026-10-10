@@ -75,7 +75,7 @@ Two things to know:
   dialog has no **Request headers** section, your organisation does not have it yet. Use Claude Code or
   another client that sends headers, or wait for OAuth support (v1.1).
 - A header value is shared by everyone who uses the connector, so use a key whose scope suits all of
-  them, and never a platform key.
+  them, and never a platform or partner key.
 
 (Claude connector documentation, read 2026-10-09.)
 
@@ -147,7 +147,7 @@ curl -s https://mail.example.com/mcp \
 
 The agent sees only the tools its key's permissions allow, and only the mailboxes the key can reach.
 Give each agent its own **identity key** with the fewest permissions that do the job. Never give an
-agent a platform key.
+agent a platform or partner key.
 
 The **read tools** are `mail_list_identities` to `mail_get_usage` in the [Tools](#tools) table. A key
 sees each one only if it holds that tool's permission, so the last column names exactly what each key
@@ -163,9 +163,9 @@ gets.
 | Supervisor across a tenant's mailboxes | tenant | `identities:read`, `messages:read`, `search:read` | the read tools except `mail_deep_search` and `mail_get_attachment_text`, with `scope: "tenant"` on `mail_search` |
 
 Every tenant and identity key also sees `mail_get_usage`: it holds `usage:read` for its own workspace
-without asking, as for REST `GET /v1/usage`. A platform key never sees that tool: it needs `usage:read`
-explicitly and reads a tenant's usage through REST with `tenant_id`. A platform key can never hold
-`identities:sign` either, so it never sees the signing tools.
+without asking, as for REST `GET /v1/usage`. Platform and partner keys never see that tool: they need
+`usage:read` explicitly and read a tenant's usage through REST with `tenant_id`. They can never hold
+`identities:sign` either, so they never see the signing tools.
 
 Create one with the CLI:
 
@@ -213,7 +213,7 @@ subjects, snippets, bodies, filenames, attachment text) is **untrusted content**
 
 ### `mail_list_identities`
 
-Arguments: `tenant_id` (platform keys), `status` (`active` or `paused`), `purpose`, `limit` (default
+Arguments: `tenant_id` (platform and partner keys), `status` (`active` or `paused`), `purpose`, `limit` (default
 25, max 100), `cursor`. They are the filters of `GET /v1/identities`.
 
 ```json

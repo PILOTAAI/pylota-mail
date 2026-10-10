@@ -809,7 +809,7 @@ WHERE id = ?1 AND status = 'active';
 
 and only when it changed a row: `EmitEvent identity.paused` with `reason: "abuse_threshold"` and
 `metrics: { complaints, complaint_window: 1000, bounces, bounce_window: 200 }`, and an `audit_log` row
-(`identity.auto_pause`). Resuming needs a platform or tenant key ([API](../../reference/api.md#patch-v1identitiesidentity_id--identitieswrite)).
+(`identity.auto_pause`). Resuming needs a platform, partner or tenant key ([API](../../reference/api.md#patch-v1identitiesidentity_id--identitieswrite)).
 
 **Tenant outcome counters.** `RecordOutcome` also increments `counters` rows of the tenant for the UTC
 day of `at`: `outcomes` for every outcome, and `bounced` or `complained` when the outcome is one of those.

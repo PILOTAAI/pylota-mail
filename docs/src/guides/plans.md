@@ -216,8 +216,8 @@ Paying later restores the plan, with a `billing.plan_changed` event whose reason
 Agents can read their own limits before they hit one ([REST API › Usage](../reference/api.md#usage-and-audit)).
 
 **`GET /v1/usage`** works with every tenant and identity key for its own workspace: they hold
-`usage:read` there implicitly. A platform key needs `usage:read` and must pass `tenant_id` (a request
-without `tenant_id` gets `400 invalid_request`).
+`usage:read` there implicitly. A platform or partner key needs `usage:read` and must pass `tenant_id` (a
+request without `tenant_id` gets `400 invalid_request`).
 
 ```bash
 curl https://mail.example.com/v1/usage -H "Authorization: Bearer $PYLOTA_MAIL_KEY"
@@ -247,7 +247,7 @@ curl https://mail.example.com/v1/usage -H "Authorization: Bearer $PYLOTA_MAIL_KE
 - `granted` includes top-ups. `remaining` also allows for actions in flight, so it is what you can use now.
 - `plans` is the full plan catalog.
 
-**`GET /v1/usage/daily`** (`usage:read`, tenant or platform key) gives per-day figures: inbound,
+**`GET /v1/usage/daily`** (`usage:read`, tenant, partner or platform key) gives per-day figures: inbound,
 outbound, sends, triage, search, agentic searches, AI usage, storage, and the agent assertions and
 signed HTTP requests minted (`assertions`, `http_signatures`), for up to 92 days per request. Signing is
 counted but not limited by any plan.
@@ -259,8 +259,8 @@ on a deployment without billing.
 `--json` for the raw response.
 
 **MCP.** [`mail_get_usage`](../reference/mcp.md#mail_get_usage) returns the same object. It is read-only
-and takes no input; every tenant and identity key sees it for its own workspace, and platform keys do
-not (they use REST with `tenant_id`). A `billing_limit` tool error also carries the feature, the numbers
+and takes no input; every tenant and identity key sees it for its own workspace, and platform and
+partner keys do not (they use REST with `tenant_id`). A `billing_limit` tool error also carries the feature, the numbers
 and `resets_at` in its `details`.
 
 ## Tax

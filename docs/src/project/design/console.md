@@ -121,23 +121,27 @@ Rules:
   ([Members](#members)).
 - **Admins and the owner.** An admin can manage admins, members and viewers, but cannot change the owner
   or make anyone owner.
-- **Keys from the console** are tenant-level or identity-level, never platform-level, and can never hold a
+- **Keys from the console** are tenant-level or identity-level, never partner- or platform-level, and can never hold a
   permission the session lacks (FR-KEY-1). Owners and admins hold `identities:sign`, so they can create
   API keys that sign as an identity; members and viewers cannot. The level rules of
   [Security §4.6](security.md#46-creating-keys-fr-key-1) apply as in the API: an identity-level key never
   carries a tenant-only permission (`members:read`, `members:manage`, `suppressions:manage`,
   `audit:read`, `usage:read`), so the key form does not offer them for that level.
-- **Tenant policy** is changed with a platform key, as in the API (`PATCH /v1/tenants/{id}` needs
-  `tenants:manage`). The settings page shows the effective policy read-only.
+- **Tenant policy** is changed with a platform key, or with the partner key of the workspace's partner,
+  as in the API (`PATCH /v1/tenants/{id}` needs `tenants:manage`). The settings page shows the effective
+  policy read-only, `quarantine.key_release` included.
 - **Workspace settings** (name, time zone, `require_two_factor`) are console-only owner rights, like
   billing: the settings form posts to a console handler that checks `role = owner` and updates exactly
   those three columns of `tenants`, with an audit row. It never calls `PATCH /v1/tenants/{tenant_id}`
-  and never touches the platform-only fields (`policy`, `status`, `mode`, `slug`, `address_suffix`,
-  billing).
+  and never touches the fields that need a key with `tenants:manage` (`policy`, `status`, `mode`, `slug`,
+  `address_suffix`, billing).
 - **Members list.** Every role can see members and pending invitations, through
   `GET /v1/tenants/{tenant_id}/members`, which needs `members:read` (included in `members:manage`).
-- **Quarantine release** is possible for a signed-in person with the role above. On Pylota Mail Cloud no API
-  key can release; a self-hosted deployment can also allow keys with `quarantine:review` (FR-CON-6).
+- **Quarantine release** is possible for a signed-in person with the role above. On Pylota Mail Cloud
+  (`PM_QUARANTINE_KEY_RELEASE=off`) no API key can release, except in a workspace whose policy has
+  `quarantine.key_release: true`, which only a platform key or the workspace's partner key can set (so a
+  partner such as Pylota can release from its own review screen); a self-hosted deployment can also allow
+  keys with `quarantine:review` everywhere (`on`, its default) (FR-CON-6).
 - **Every handler checks the role**, through the console's route table, which registers each route with its
   required permission exactly like the API's deny-by-default table
   ([Security](security.md#51-deny-by-default-router-table)). A viewer's `POST` to a write route gets `403`,
@@ -615,7 +619,10 @@ the workspace's `tenant_id` and delivered like `webhook.disabled`
    for a console release ([Webhook events](../../reference/events.md)).
 4. **Key-based quarantine release** (FR-CON-6). Closed: `PM_QUARANTINE_KEY_RELEASE`
    ([Configuration](../../reference/configuration.md#variables)) is `on` by default for self-hosting, and
-   Pylota Mail Cloud sets it to `off`, so only a signed-in person can release there.
+   Pylota Mail Cloud sets it to `off`, so only a signed-in person can release there, except in a workspace
+   whose policy has `quarantine.key_release: true` (decided 2026-10-10). Only a platform key, or the
+   partner key of the workspace's partner, can set that field; Pylota sets it on its operators'
+   workspaces ([Configuration › Tenant policy](../../reference/configuration.md#tenant-policy)).
 5. **Erasure of console data.** Closed: tenant erasure deletes the workspace's `members`, `invitations`
    and `sessions`, and deletes every person it leaves with no workspace; deleting a person removes their
    `oauth_identities` and any `waitlist` row ([Cloud sign-up §11](cloud-signup.md#11-data-model),
@@ -638,7 +645,7 @@ the workspace's `tenant_id` and delivered like `webhook.disabled`
 | `it::console::reauth_sensitive` | Each sensitive action redirects to re-authentication after 10 minutes, writes an audit row, and the session is rotated | FR-CON-5 |
 | `it::members::invitation_lifecycle` | Accept, re-send, revoke and expire, with the seat count after each | FR-CON-4 |
 | `it::members::ownership_transfer` | Exactly one owner before and after; concurrent transfers leave one owner | FR-CON-2 |
-| `it::console::quarantine_release` | A member releases with re-authentication and an audit row; with key release off, an API key cannot release | FR-CON-6 |
+| `it::console::quarantine_release` | A member releases with re-authentication and an audit row; with key release off, an API key cannot release unless the workspace's policy has `quarantine.key_release: true` (`it::quarantine::j16_key_release_override`); the settings page shows that field read-only | FR-CON-6 |
 | `it::console::disabled` | `PM_CONSOLE=off` removes every `/console` route except the invitation-accept and unsubscribe pairs; the members API still works | FR-CON-7 |
 | `it::console::notification_settings` | Each role sees its defaults; saving writes rows for the session's person and workspace only; a mode a kind does not accept and an inbox from another workspace are refused; `account` cannot be turned off; the cap notice appears after the 50th email of the day | FR-CON-14, FR-CON-15 |
 | `it::console::identity_keys_page` | Every role sees the key list and the JWKS link; only owner and admin can create, rotate and revoke, each after re-authentication with an `identity_key.*` audit row and event; a paused identity's keys can still be revoked | FR-IDN-6, [W18] |

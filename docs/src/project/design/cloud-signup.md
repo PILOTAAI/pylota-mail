@@ -19,7 +19,7 @@ open point 6 of [Console and workspaces](console.md#open-points) and extends tha
 | **Cloud customer** (a developer or a team buying Pylota Mail) | Self-serve sign-up, this page | The console on Pylota Mail Cloud |
 | **Teammate** of a Cloud customer | An invitation ([Invitations](console.md#invitations)) | The same console, in the inviter's workspace |
 | **Self-hoster** | `pmail setup --owner-email` creates the first owner ([Console](console.md#workspaces)) | The console on their own deployment |
-| **Pylota car-rental operator** | Not on Cloud. Pylota runs its own self-hosted deployment of Pylota Mail for its operators, and Pylota's backend creates their workspaces there with that deployment's platform key | Inside the Pylota app, which reads and acts on mail through the API |
+| **Pylota car-rental operator** | Never signs in here. The operator's workspace is a tenant of Cloud on `pylotamail.com`, which Pylota's backend creates with Pylota's partner key ([REST API › Partners](../../reference/api.md#partners)) | Inside the Pylota app, which reads and acts on mail through the API |
 
 Self-serve sign-up exists only where `PM_SIGNUP` is `waitlist` or `open` (Cloud). It is `closed` by
 default, so a self-hosted deployment has no public sign-up unless its operator turns it on.
@@ -36,10 +36,15 @@ Using `pylota.io` would mix agent mail with Pylota's own sign-in mail and its bo
 | `app.pylotamail.com` | The console, `PM_CONSOLE_HOST` | Same Worker as the API. Only console routes answer on this host |
 | `api.pylotamail.com` | REST API, MCP, signed links (`/v1/links/*`), `/hooks/*`, the Stripe webhook (`/billing/stripe/webhook`), `/health`, `PM_API_HOST` | No cookies are ever set or read on this host |
 
-Pylota's own car-rental operators are not tenants of Cloud (decided 2026-10-10). Pylota runs a separate
-self-hosted deployment for them, so the platform key its backend uses never reaches a Cloud customer's mail, and
-Cloud keeps `PM_QUARANTINE_KEY_RELEASE=off`. Amazon SES for Cloud runs in `eu-west-2` (London), decided on
-2026-10-09.
+Pylota's own car-rental operators are tenants of Cloud (decided 2026-10-10), on the shared
+`pylotamail.com` domain until each operator adds its own domain. Pylota is a partner
+([REST API › Partners](../../reference/api.md#partners)) with `default_billing_mode: exempt`: its backend
+holds a partner key, not a platform key, and every operator workspace that key creates is billed `exempt`.
+A partner key reaches only the tenants its partner's keys created, so no Pylota key reaches another Cloud
+customer's mail. Cloud keeps `PM_QUARANTINE_KEY_RELEASE=off`, and Pylota's tenants set
+`quarantine.key_release: true`, so Pylota's app can release held mail through its key
+([Configuration › Tenant policy](../../reference/configuration.md#tenant-policy)). Amazon SES for Cloud runs
+in `eu-west-2` (London), decided on 2026-10-09.
 
 `PM_CONSOLE_HOST` defaults to `PM_API_HOST`, so a self-hosted deployment keeps one hostname. When the two
 differ, the router answers console paths only on the console host and API paths only on the API host;

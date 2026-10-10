@@ -666,7 +666,10 @@ Every runbook ends by recording what was done in the incident log and checking t
    alone.
 3. **Remediate.** Rotate integrator secrets that may have been read through the key (webhook secrets
    with `rotate-secret`). Cancel queued sends made by the key (`POST …/cancel`). If the key was a
-   platform key, review every tenant. For `rpc_owner_mismatch`, treat it as a possible isolation bug:
+   platform key, review every tenant; if it was a partner key, review its partner's tenants
+   (`GET /v1/tenants?partner_id=`), and to stop every key of that partner at once, suspend the partner
+   (`PATCH /v1/partners/{partner_id}` with `status: suspended`, a platform key), which leaves its tenants'
+   mail running. For `rpc_owner_mismatch`, treat it as a possible isolation bug:
    capture the logged IDs and open a private security advisory.
 4. **Verify.** Requests with the old key return `401 key_revoked`.
 
@@ -674,7 +677,7 @@ Every runbook ends by recording what was done in the incident log and checking t
 
 1. **Diagnose.** `identity.paused` with `reason: abuse_threshold` carries the complaint and bounce
    metrics. Review recent outbound messages and recipients.
-2. **Mitigate.** Keep the identity paused (inbound continues). Resume only with a tenant or platform key
+2. **Mitigate.** Keep the identity paused (inbound continues). Resume only with a tenant, partner or platform key
    after the cause is fixed (`PATCH … {"status": "active"}`, audit-logged). For a whole tenant,
    suspend it. For `mailbox_size` (above 70% of 10 GB), set `retention.message_days` for the tenant or
    split traffic across identities; raw MIME and attachments are already in R2.

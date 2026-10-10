@@ -38,7 +38,7 @@ Conventions on this page:
 ## 1. Get a key
 
 Every request carries an API key: `Authorization: Bearer pmk_live_…` (or `pmk_test_…` for test
-tenants). Keys have a level (platform, tenant or identity) and a list of permissions. See
+tenants). Keys have a level (platform, partner, tenant or identity) and a list of permissions. See
 [API keys and permissions](concepts.md#api-keys-and-permissions).
 
 **If someone else runs the deployment**, ask them for a tenant key for your tenant. This quickstart

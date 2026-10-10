@@ -33,7 +33,7 @@ info:
       cookie is set or read on the API host.
     - **Format.** JSON (`application/json; charset=utf-8`). Times are RFC 3339 UTC strings. Sizes are bytes.
     - **IDs** are a type prefix, an underscore and a 26-character upper-case Crockford base32 ULID
-      (`ten_ idn_ adr_ dom_ thr_ msg_ att_ whk_ dlv_ evt_ key_ era_ exp_ job_ aud_ req_ usr_ inv_ dlq_ hld_ prb_`).
+      (`ten_ idn_ adr_ dom_ thr_ msg_ att_ whk_ dlv_ evt_ key_ era_ exp_ job_ aud_ req_ usr_ inv_ dlq_ hld_ prb_ ptn_`).
     - **Pagination.** List endpoints take `limit` (default 25, max 100) and `cursor`, and return
       `{ "data": [...], "next_cursor": "…" | null }`. Cursors are opaque and expire after 24 hours
       (`410 cursor_expired`).
@@ -62,7 +62,7 @@ info:
     | Extension | On | Meaning |
     |---|---|---|
     | `x-required-permission` | operation | Array of permissions the key must hold, all of them. `[]` means any valid key |
-    | `x-key-levels` | operation | Key levels (`platform`, `tenant`, `identity`) that can call the operation at all |
+    | `x-key-levels` | operation | Key levels (`platform`, `partner`, `tenant`, `identity`) that can call the operation at all. A `partner` key acts only on the tenants its partner's keys created |
     | `x-permission-notes` | operation | Conditional permission or scope rules that the two fields above cannot express |
     | `x-rate-limit-buckets` | operation | Rate-limit buckets the request counts against (`api`, `search`, `agentic`, `send`, `sign`) |
     | `x-idempotency` | operation | `required`, `optional` or `none` for the `Idempotency-Key` header. `required` means a request without it fails with `400 idempotency_key_required`, except a dry run (`dry_run=true`). `none` means the header is ignored and never recorded |
@@ -89,7 +89,13 @@ tags:
   - name: Meta
     description: Health, the OpenAPI document and the calling key.
   - name: Tenants
-    description: Tenants and their policy. Platform keys with `tenants:manage`.
+    description: >-
+      Tenants and their policy. Keys with `tenants:manage`: platform keys for every tenant, partner keys for
+      the tenants their partner's keys created.
+  - name: Partners
+    description: >-
+      Partners: integrators whose partner keys create tenants and act only on those tenants. Platform keys
+      with `partners:manage`.
   - name: Identities
     description: Agent identities (one mailbox each).
   - name: Addresses
@@ -125,7 +131,7 @@ tags:
   - name: Audit
     description: Audit log.
   - name: Members
-    description: Console members and invitations of a workspace. `members:manage`, tenant and platform keys.
+    description: Console members and invitations of a workspace. `members:manage`, tenant, partner and platform keys.
   - name: Platform
     description: >-
       Platform operations: signing-key rotation, the dead-letter queue, maintenance jobs and waitlist
@@ -221,7 +227,7 @@ paths:
       summary: Describe the calling key
       description: Any valid key. Describes the key that made the request.
       x-required-permission: []
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -238,6 +244,7 @@ paths:
                 name: pylota-api
                 level: tenant
                 mode: live
+                partner_id: null
                 tenant_id: ten_01J9Z3K8V4QW7X2M5N6P8R0T1Y
                 identity_id: null
                 permissions: ['identities:read', 'messages:send', 'search:read']
@@ -255,14 +262,18 @@ paths:
       tags: [Tenants]
       summary: Create a tenant
       description: >-
-        Platform keys only. `address_suffix` defaults to `"." + slug`; only one tenant (the default tenant
+        Platform and partner keys. `address_suffix` defaults to `"." + slug`; only one tenant (the default tenant
         made by `pmail setup`) can have an empty suffix. `policy` is merged over the defaults (built-in
         defaults, then `PM_DEFAULT_POLICY`). `owner` (optional) creates the workspace's console owner and
-        emails them a sign-in link; without it, a platform key can add an owner later with an invitation
+        emails them a sign-in link; without it, a platform or partner key can add an owner later with an invitation
         and an ownership transfer in the console. `billing.mode` defaults to `metered` (plan `free`) on a
-        deployment with billing on, and to `disabled` otherwise.
+        deployment with billing on, and to `disabled` otherwise. With a partner key, the tenant's
+        `partner_id` is the key's partner, for good, and its billing mode is the partner's
+        `default_billing_mode`; `billing` is platform-only. The audit row `tenant.create` records the
+        `partner_id`.
       x-required-permission: ['tenants:manage']
-      x-key-levels: [platform]
+      x-key-levels: [platform, partner]
+      x-permission-notes: A partner key that sends `billing` gets `403 scope_denied`.
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -314,8 +325,9 @@ paths:
       operationId: listTenants
       tags: [Tenants]
       summary: List tenants
+      description: A partner key lists only the tenants its partner's keys created.
       x-required-permission: ['tenants:manage']
-      x-key-levels: [platform]
+      x-key-levels: [platform, partner]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -323,6 +335,12 @@ paths:
           in: query
           description: Only tenants with this status.
           schema: {$ref: '#/components/schemas/TenantStatus'}
+        - name: partner_id
+          in: query
+          description: >-
+            Only tenants created by this partner's keys. An unknown partner, or for a partner key any partner
+            but its own, gets `404 partner_not_found`.
+          schema: {$ref: '#/components/schemas/PartnerId'}
         - name: mode
           in: query
           description: Only tenants with this mode.
@@ -341,6 +359,7 @@ paths:
         '400': {$ref: '#/components/responses/BadRequest'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
         '410': {$ref: '#/components/responses/CursorExpired'}
         '429': {$ref: '#/components/responses/TooManyRequests'}
         '500': {$ref: '#/components/responses/InternalError'}
@@ -353,9 +372,11 @@ paths:
       operationId: getTenant
       tags: [Tenants]
       summary: Get a tenant
-      description: Platform keys with `tenants:manage` can read any tenant. A tenant key can read its own tenant.
+      description: >-
+        Platform keys with `tenants:manage` can read any tenant, and partner keys with `tenants:manage` the
+        tenants their partner's keys created. A tenant key can read its own tenant.
       x-required-permission: ['tenants:manage']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-permission-notes: A tenant key can read its own tenant without `tenants:manage`.
       x-rate-limit-buckets: [api]
       x-idempotency: none
@@ -382,9 +403,16 @@ paths:
         Updatable: `name`, `timezone`, `policy` (deep merge; `null` resets a field to its default) and
         `status` (`active` or `suspended`). While a tenant is suspended, inbound mail gets a temporary
         failure for up to five days and then a permanent one, and every send is refused (FR-TEN-3).
-        Tenants are deleted through an erasure request with `scope: "tenant"`.
+        Tenants are deleted through an erasure request with `scope: "tenant"`. `partner_id` and `mode` never
+        change. Only a platform key, or the partner key of the tenant's own partner, can set
+        `policy.quarantine.key_release` (a tenant key cannot call this operation: it can never hold
+        `tenants:manage`).
       x-required-permission: ['tenants:manage']
-      x-key-levels: [platform]
+      x-key-levels: [platform, partner]
+      x-permission-notes: >-
+        A partner key updates only the tenants its partner's keys created. It may lower their send caps,
+        `max_recipients`, `search.agentic_daily_cap` and `abuse` thresholds but not raise them above the
+        deployment's defaults (`403 scope_denied`, `details.field`).
       x-rate-limit-buckets: [api]
       x-idempotency: none
       requestBody:
@@ -415,6 +443,197 @@ paths:
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
 
+  # ──────────────────────────────────────────── Partners ──────────────────────────────────────────
+
+  /partners:
+    post:
+      operationId: createPartner
+      tags: [Partners]
+      summary: Create a partner
+      description: >-
+        Platform keys with `partners:manage`. A partner is an integrator that creates tenants for its own
+        customers and manages them with partner keys (FR-KEY-4), which a platform key then mints with
+        `POST /v1/keys` (`level: partner`). Every tenant a partner key creates gets the partner's
+        `partner_id` and `default_billing_mode`. Audit-logged (`partner.create`).
+      x-required-permission: ['partners:manage']
+      x-key-levels: [platform]
+      x-rate-limit-buckets: [api]
+      x-idempotency: optional
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyOptional'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/PartnerCreateRequest'}
+            example:
+              name: Pylota
+              default_billing_mode: exempt
+      responses:
+        '201':
+          description: The partner was created.
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
+            Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Partner'}
+              example:
+                id: ptn_01JA2B3C4D5E6F7G8H9J0K1M2N
+                name: Pylota
+                status: active
+                default_billing_mode: exempt
+                created_at: '2026-10-10T09:00:00Z'
+                updated_at: '2026-10-10T09:00:00Z'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/IdempotencyConflict'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    get:
+      operationId: listPartners
+      tags: [Partners]
+      summary: List partners
+      x-required-permission: ['partners:manage']
+      x-key-levels: [platform]
+      x-rate-limit-buckets: [api]
+      x-idempotency: none
+      parameters:
+        - name: status
+          in: query
+          description: Only partners with this status.
+          schema: {$ref: '#/components/schemas/PartnerStatus'}
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: A page of partners.
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PartnerPage'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '410': {$ref: '#/components/responses/CursorExpired'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+
+  /partners/{partner_id}:
+    parameters:
+      - $ref: '#/components/parameters/PartnerIdPath'
+    get:
+      operationId: getPartner
+      tags: [Partners]
+      summary: Get a partner
+      x-required-permission: ['partners:manage']
+      x-key-levels: [platform]
+      x-rate-limit-buckets: [api]
+      x-idempotency: none
+      responses:
+        '200':
+          description: The partner.
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Partner'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    patch:
+      operationId: updatePartner
+      tags: [Partners]
+      summary: Update or suspend a partner
+      description: >-
+        Updatable: `name`, `status` and `default_billing_mode`. `suspended` refuses every key of the partner
+        at once with `403 partner_suspended`, on every route; its tenants are not suspended, so their mail
+        keeps arriving and their own tenant and identity keys keep working ([J13]). `active` restores the
+        partner keys. A new `default_billing_mode` applies to tenants created afterwards; existing tenants
+        keep theirs, which only a platform key changes (`PATCH /v1/tenants/{tenant_id}/billing`).
+        Audit-logged (`partner.update`).
+      x-required-permission: ['partners:manage']
+      x-key-levels: [platform]
+      x-rate-limit-buckets: [api]
+      x-idempotency: none
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/PartnerUpdateRequest'}
+            example:
+              status: suspended
+      responses:
+        '200':
+          description: The updated partner.
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Partner'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    delete:
+      operationId: deletePartner
+      tags: [Partners]
+      summary: Delete a partner
+      description: >-
+        Deletes the partner's name, its partner keys and its partner webhook endpoints with their
+        deliveries. Refused with `409 partner_has_tenants` while any tenant with this `partner_id` is not
+        `erased` (`active`, `suspended` or `erasing`); erase them first with an erasure request of scope
+        `tenant` ([J12]). Audit-logged (`partner.delete`).
+      x-required-permission: ['partners:manage']
+      x-key-levels: [platform]
+      x-rate-limit-buckets: [api]
+      x-idempotency: none
+      responses:
+        '204':
+          description: The partner was deleted.
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409':
+          description: The partner still has tenants that are not erased. Nothing changed.
+          x-error-codes: [partner_has_tenants]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+              example:
+                error:
+                  code: partner_has_tenants
+                  message: This partner still has 3 tenants that are not erased.
+                  retryable: false
+                  fix: Erase each of the partner's tenants (POST /v1/erasure-requests with scope tenant), then delete the partner.
+                  request_id: req_01J9Z4K8V4QW7X2M5N6P8R0T1Y
+                  details:
+                    tenants: 3
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+
   # ─────────────────────────────────────────── Identities ─────────────────────────────────────────
 
   /tenants/{tenant_id}/identities:
@@ -432,7 +651,7 @@ paths:
         `200` and the existing identity; with a different body it returns `409 client_id_conflict`.
         `owner` is required before the identity can send (`identity_owner_required`).
       x-required-permission: ['identities:write']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -516,7 +735,7 @@ paths:
       tags: [Identities]
       summary: List a tenant's identities
       x-required-permission: ['identities:read']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -564,7 +783,7 @@ paths:
         identities. An identity key sees only its own identity. The system identity (the sender of
         `PM_SYSTEM_FROM`) is never listed.
       x-required-permission: ['identities:read']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -606,7 +825,7 @@ paths:
         Resolves any `active` or `retiring` address to its identity. Unknown, retired and out-of-scope
         addresses all return `404 identity_not_found`.
       x-required-permission: ['identities:read']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -641,7 +860,7 @@ paths:
       tags: [Identities]
       summary: Get an identity
       x-required-permission: ['identities:read']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -667,10 +886,10 @@ paths:
         Updatable: `display_name`, `purpose`, `owner`, `signature`, `metadata`, `send_policy` and `status`
         (`active` or `paused`). A paused identity still receives and stores mail and refuses every send with
         `identity_paused` (FR-IDN-3). Setting `status: "active"` on an identity paused for
-        `abuse_threshold` needs a platform or tenant key and is audit-logged.
+        `abuse_threshold` needs a platform, partner or tenant key and is audit-logged.
       x-required-permission: ['identities:write']
-      x-key-levels: [platform, tenant, identity]
-      x-permission-notes: Resuming an identity paused for `abuse_threshold` needs a platform or tenant key, and is audit-logged.
+      x-key-levels: [platform, partner, tenant, identity]
+      x-permission-notes: Resuming an identity paused for `abuse_threshold` needs a platform, partner or tenant key, and is audit-logged.
       x-rate-limit-buckets: [api]
       x-idempotency: none
       requestBody:
@@ -707,7 +926,7 @@ paths:
         and their key IDs tombstoned, so they are never published again ([O7]). While the identity is
         `deleting` or `deleted`, signing and its JWK Set return `404 identity_not_found`.
       x-required-permission: ['identities:write', 'erasure:manage']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -737,7 +956,7 @@ paths:
       summary: List an identity's addresses
       description: Every address of the identity, in every status.
       x-required-permission: ['identities:read']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -769,7 +988,7 @@ paths:
         pending address per identity and domain is allowed: a newer request replaces an older pending one
         ([A11]). Emits `identity.address_added`, and `identity.address_activated` once active.
       x-required-permission: ['identities:write']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -846,7 +1065,7 @@ paths:
         is how you roll back (FR-ADR-4). Fails with `409 domain_not_ready` unless the domain is `healthy` or
         `degraded`. Emits `identity.address_promoted`.
       x-required-permission: ['identities:write']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -900,7 +1119,7 @@ paths:
         identity's platform address (`409 address_in_use`), which stays active as the fallback address for
         the identity's whole life. Emits `identity.address_retired` when the address becomes `retired`.
       x-required-permission: ['identities:write']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -951,7 +1170,7 @@ paths:
         Only for `pending` addresses that never received mail. Any other address returns
         `409 address_in_use`: retire it instead. The platform address can never be deleted.
       x-required-permission: ['identities:write']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -992,7 +1211,7 @@ paths:
         `forwarding` becomes `ok`; otherwise `failed` ([N12]). The check is never stored as a message and
         does not count as a plan send. No webhook event is sent: read the address again for the result.
       x-required-permission: ['identities:write']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -1052,7 +1271,7 @@ paths:
         while the identity is paused (including every identity of a suspended tenant), so a suspected leak
         can be handled before it resumes. A `deleting` or `deleted` identity returns `404 identity_not_found`.
       x-required-permission: ['identities:read']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -1123,7 +1342,7 @@ paths:
         created, `identity.key_created` is emitted and the audit action is `identity_key.create`. Available
         while the identity is paused; a `deleting` or `deleted` identity returns `404 identity_not_found`.
       x-required-permission: ['identities:write']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -1187,7 +1406,7 @@ paths:
         `identity_key.rotate`. Available while the identity is paused; a `deleting` or `deleted` identity
         returns `404 identity_not_found`.
       x-required-permission: ['identities:write']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -1259,7 +1478,7 @@ paths:
         `identity.key_revoked`; the audit action is `identity_key.revoke`. No body. Available while the
         identity is paused.
       x-required-permission: ['identities:write']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -1588,7 +1807,7 @@ paths:
           is refused with `400 spf_lookup_limit`; `details.lookups` gives the count and `fix` names the
           includes to flatten ([H2]).
       x-required-permission: ['domains:write']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-permission-notes: '`nameservers` (or the old `create_zone: true`) needs a platform key, or a tenant key whose policy has `domains.allow_create_zone: true`.'
       x-rate-limit-buckets: [api]
       x-idempotency: optional
@@ -1739,7 +1958,7 @@ paths:
         The tenant's domains. The platform domain is visible to every key, with `tenant_id: null`, and is
         included in this list. An identity key with `domains:read` can read its tenant's domains.
       x-required-permission: ['domains:read']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -1772,7 +1991,7 @@ paths:
       summary: Get a domain
       description: 'The platform domain is visible to every key, with `tenant_id: null`.'
       x-required-permission: ['domains:read']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -1797,7 +2016,7 @@ paths:
       description: |
         The body has `transport`, `smtp` or both. Audit-logged.
 
-        - **`transport`** (platform keys only; others get `403 scope_denied`) switches the transport that
+        - **`transport`** (platform keys only; partner and tenant keys get `403 scope_denied`) switches the transport that
           sends as a domain on Cloudflare: `cloudflare` or `ses`. This is the Email Sending failover of
           [J5]. `ses` needs the SES transport configured (`422 transport_unavailable`,
           `ses_not_configured`) and an SES identity for the domain (`ses_region` set): a `cloudflare_zone`,
@@ -1808,15 +2027,15 @@ paths:
           only through `cloudflare`; another value returns `422 transport_unavailable`,
           `method_not_supported`. The change applies to sends that reach the transport after it and starts
           a health check at once (alignment differs per transport).
-        - **`smtp`** (tenant or platform keys; `smtp_relay` domains only, otherwise `method_not_supported`)
+        - **`smtp`** (tenant, partner or platform keys; `smtp_relay` domains only, otherwise `method_not_supported`)
           rotates the relay credentials or changes the relay. The port rule and the one-off connection of
           domain create apply (`400 smtp_port_not_allowed`, `422 smtp_tls_required`,
           `422 smtp_auth_failed`, `502 upstream_error`). The new values are kept pending until an alignment
           probe with them passes; until then sends keep using the current values, which `smtp` in the
           response still shows. The probe result arrives as a domain health change.
       x-required-permission: ['domains:write']
-      x-key-levels: [platform, tenant]
-      x-permission-notes: '`transport` needs a platform key: a tenant key gets `403 scope_denied`. `smtp` is allowed for tenant and platform keys.'
+      x-key-levels: [platform, partner, tenant]
+      x-permission-notes: '`transport` needs a platform key: a partner or tenant key gets `403 scope_denied`. `smtp` is allowed for tenant, partner and platform keys.'
       x-rate-limit-buckets: [api]
       x-idempotency: none
       requestBody:
@@ -1908,7 +2127,7 @@ paths:
         retired-address receipt rules (`pm-retired-{n}`). The domain moves to `removing`, then `removed`,
         and `domain.removed` is emitted with `reason: requested`.
       x-required-permission: ['domains:write']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -1969,7 +2188,7 @@ paths:
         `ok`, `missing`, `mismatch` or `unexpected` (an extra record that conflicts, for example a second
         SPF record).
       x-required-permission: ['domains:read']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -2024,7 +2243,7 @@ paths:
         `smtp_from_rewritten` or `smtp_probe_timeout`. At most once a minute per domain
         (`429 rate_limited`). A probe also runs before the domain's first send and every day after.
       x-required-permission: ['domains:write']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -2081,7 +2300,7 @@ paths:
         domain (`429 rate_limited`). A state change still needs two consecutive agreeing results from two
         resolvers (FR-DOM-4).
       x-required-permission: ['domains:write']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -2116,7 +2335,7 @@ paths:
       summary: Get a domain's health
       description: The current health state, open issues with exact fixes, recent checks and whether fallback sending is active.
       x-required-permission: ['domains:read']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -2163,7 +2382,7 @@ paths:
         `_pylota-mail` record in `records`. The domain leaves `suspended` once the new record is observed.
         Any other state returns `409 domain_not_suspended`.
       x-required-permission: ['domains:write']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -2210,7 +2429,7 @@ paths:
         key with `quarantine:review` reaches them through `GET …/messages` with an explicit `status` filter,
         or `GET …/quarantine` (quarantined messages only).
       x-required-permission: ['messages:read']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -2301,7 +2520,7 @@ paths:
         message carries `extracted_text` (quotes and signature removed) rather than the full `text`; use
         `include` for more. `next_cursor` pages through the messages.
       x-required-permission: ['messages:read']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -2340,7 +2559,7 @@ paths:
         `labels_add` and `labels_remove` apply to every message in the thread. `read: true` marks every
         message read. `archived` archives or unarchives the thread.
       x-required-permission: ['messages:write']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       requestBody:
@@ -2383,7 +2602,7 @@ paths:
         A held thread is skipped by retention and erasure, and erasure receipts list it (FR-PRV-4).
         Replaces any existing hold on the thread. Audit-logged.
       x-required-permission: ['erasure:manage']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -2421,7 +2640,7 @@ paths:
       summary: Remove a thread's legal hold
       description: Audit-logged.
       x-required-permission: ['erasure:manage']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -2457,7 +2676,7 @@ paths:
         `quarantine:review`. A key without it that sends such a filter gets `200` with none of those
         messages, never `403`, as search treats `include_quarantined`.
       x-required-permission: ['messages:read']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-permission-notes: A `status` filter of `quarantined`, `hidden` or `throttled` returns those messages only if the key also holds `quarantine:review`; without it the page has none of them (never `403`).
       x-rate-limit-buckets: [api]
       x-idempotency: none
@@ -2546,7 +2765,7 @@ paths:
         Failures after `202` arrive as message status and events (`message.rejected`, `message.failed`,
         `message.uncertain`, `message.bounced`), never as HTTP errors.
       x-required-permission: ['messages:send']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api, send]
       x-idempotency: required
       parameters:
@@ -2617,7 +2836,7 @@ paths:
         By default the message carries `extracted_text` and not `text`, `html` or `headers`. `include`
         adds them. Quarantined messages need `quarantine:review`.
       x-required-permission: ['messages:read']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-permission-notes: A `quarantined`, `hidden` or `throttled` message needs `quarantine:review` as well; without it the message is `404 message_not_found`, as if it did not exist.
       x-rate-limit-buckets: [api]
       x-idempotency: none
@@ -2709,7 +2928,7 @@ paths:
       tags: [Messages]
       summary: Label a message or mark it read
       x-required-permission: ['messages:write']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       requestBody:
@@ -2744,7 +2963,7 @@ paths:
       summary: Erase a message
       description: Starts an erasure request of scope `message` for this message. A message in a thread under a legal hold is refused with `423 legal_hold` and nothing is created; an erasure request (`createErasureRequest`) instead skips held threads and lists them in its receipt.
       x-required-permission: ['erasure:manage']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -2776,7 +2995,7 @@ paths:
         The raw `message/rfc822` bytes: the message as received, or for an outbound message the composed
         MIME that was sent. Available for `policy.retention.raw_days` (default 90), then `410 raw_expired`.
       x-required-permission: ['messages:read']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-permission-notes: A `quarantined`, `hidden` or `throttled` message needs `quarantine:review` as well; without it the message is `404 message_not_found`, as if it did not exist.
       x-rate-limit-buckets: [api]
       x-idempotency: none
@@ -2814,7 +3033,7 @@ paths:
         attachment's type; when the declared type and the type sniffed from the bytes disagree, the sniffed
         type wins ([B10]). Attachments with a `risk` need `quarantine:review`.
       x-required-permission: ['attachments:read']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-permission-notes: A `quarantined`, `hidden` or `throttled` message needs `quarantine:review` as well; without it the attachment is `404 message_not_found`, as if the message did not exist. That check comes first; then an attachment with a non-null `risk` needs `quarantine:review` too (`403 permission_denied`).
       x-rate-limit-buckets: [api]
       x-idempotency: none
@@ -2853,7 +3072,7 @@ paths:
         (extraction failed or the type is unsupported) or `skipped` (by policy or risk). Without `pages`,
         every page is returned, capped at 200 KB of text (`truncated: true` when cut).
       x-required-permission: ['attachments:read']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-permission-notes: A `quarantined`, `hidden` or `throttled` message needs `quarantine:review` as well; without it the message is `404 message_not_found`, as if it did not exist.
       x-rate-limit-buckets: [api]
       x-idempotency: none
@@ -2899,7 +3118,7 @@ paths:
       summary: Re-run triage on a message
       description: Queues triage again. A `message.triaged` event follows when it finishes (or fails).
       x-required-permission: ['messages:write']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-permission-notes: A `quarantined`, `hidden` or `throttled` message needs `quarantine:review` as well; without it the message is `404 message_not_found`, as if it did not exist.
       x-rate-limit-buckets: [api]
       x-idempotency: optional
@@ -2930,11 +3149,17 @@ paths:
       tags: [Quarantine]
       summary: Release a quarantined message
       description: >-
-        Moves a quarantined message to `received`, emits `message.released` and runs triage. Audit-logged.
-        When `PM_QUARANTINE_KEY_RELEASE` is `off` (Pylota Mail Cloud), every API key gets
-        `403 permission_denied` and the release has to be done by a person in the console (FR-CON-6).
+        Moves a quarantined message to `received`, emits `message.released` and runs triage. Audit-logged
+        (`quarantine.release`, with the key). When `PM_QUARANTINE_KEY_RELEASE` is `off` (Pylota Mail Cloud),
+        every API key gets `403 permission_denied` and the release has to be done by a person in the console
+        (FR-CON-6), unless the message's tenant has `policy.quarantine.key_release: true`. Then any key with
+        `quarantine:review` that reaches the message may release it, the tenant's partner key included.
       x-required-permission: ['quarantine:review']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
+      x-permission-notes: >-
+        Allowed for API keys when `PM_QUARANTINE_KEY_RELEASE` is `on` (or `PM_CONSOLE=off`), or when the
+        tenant's `policy.quarantine.key_release` is `true`; otherwise `403 permission_denied`. Only a platform
+        key, or the partner key of the tenant's own partner, can set `quarantine.key_release`.
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -2958,7 +3183,17 @@ paths:
               schema: {$ref: '#/components/schemas/Message'}
         '400': {$ref: '#/components/responses/BadRequest'}
         '401': {$ref: '#/components/responses/Unauthorized'}
-        '403': {$ref: '#/components/responses/Forbidden'}
+        '403':
+          description: >-
+            The key lacks `quarantine:review`; or release by API keys is off for this tenant
+            (`PM_QUARANTINE_KEY_RELEASE=off` and `policy.quarantine.key_release` is `false`), so only a person
+            can release, in the console (`permission_denied`); or the partner is suspended.
+          x-error-codes: [permission_denied, scope_denied, tenant_suspended, partner_suspended]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
         '404': {$ref: '#/components/responses/NotFound'}
         '409':
           description: The message is not quarantined, or the idempotency key is in use.
@@ -2991,7 +3226,7 @@ paths:
         `dry_run`, policy, size and response behave as in `sendMessage`. `kind: "auto_reply"` is refused for
         automated mail or over the automatic-exchange limit (`409 auto_reply_not_allowed`, [D6]).
       x-required-permission: ['messages:send']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-permission-notes: 'The message replied to or forwarded must be visible to the key: a `quarantined` one needs `quarantine:review` as well, and a `hidden` or `throttled` one can never be the target; otherwise `404 message_not_found`, as if it did not exist.'
       x-rate-limit-buckets: [api, send]
       x-idempotency: required
@@ -3048,7 +3283,7 @@ paths:
         reveals that the identity was BCC'd ([A10]). The combined recipients count against
         `policy.max_recipients`.
       x-required-permission: ['messages:send']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-permission-notes: 'The message replied to or forwarded must be visible to the key: a `quarantined` one needs `quarantine:review` as well, and a `hidden` or `throttled` one can never be the target; otherwise `404 message_not_found`, as if it did not exist.'
       x-rate-limit-buckets: [api, send]
       x-idempotency: required
@@ -3103,7 +3338,7 @@ paths:
         `risk` are never forwarded. Idempotency, `dry_run`, policy, size and response behave as in
         `sendMessage`.
       x-required-permission: ['messages:send']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-permission-notes: 'The message replied to or forwarded must be visible to the key: a `quarantined` one needs `quarantine:review` as well, and a `hidden` or `throttled` one can never be the target; otherwise `404 message_not_found`, as if it did not exist.'
       x-rate-limit-buckets: [api, send]
       x-idempotency: required
@@ -3157,7 +3392,7 @@ paths:
         Only while the message is `queued` (FR-OUT-11). Returns the message with `status: "canceled"` and
         emits `message.canceled`. Any later status returns `409 not_cancelable`.
       x-required-permission: ['messages:send']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -3202,7 +3437,7 @@ paths:
         later delivery events still apply. `not_sent` marks the message `failed` with reason
         `resolved_not_sent`, after which you may send again with a **new** `Idempotency-Key`. Audit-logged.
       x-required-permission: ['messages:write']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -3271,7 +3506,7 @@ paths:
         **Agentic mode** (`mode: "agentic"`, an `AgenticRequest`) returns an `AgenticResponse`. With
         `stream: true` and `Accept: text/event-stream`, the response is a server-sent event stream instead.
       x-required-permission: ['search:read']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-permission-notes: '`mode: "agentic"` needs `search:agentic`. `include_quarantined: true` returns quarantined mail only if the key also holds `quarantine:review`.'
       x-rate-limit-buckets: [api, search, agentic]
       x-idempotency: optional
@@ -3470,14 +3705,14 @@ paths:
       description: >-
         The same body and modes as `searchIdentity`, plus an optional `identity_ids` filter. Runs across
         every identity of the tenant, up to 100; more without an `identity_ids` filter returns
-        `422 scope_too_large`. Hits carry `identity_id`. Needs a tenant or platform key: an identity key
+        `422 scope_too_large`. Hits carry `identity_id`. Needs a tenant, partner or platform key: an identity key
         gets `403 scope_denied` ([F3], FR-SRCH-10). Facet counts are summed across identities. The response
         always carries `partial` and `failed_identities`: each identity's mailbox has 900 ms from the start
         of the fan-out, and one that errors or misses it is listed in `failed_identities` with
         `partial: true` ([F15]); otherwise they are `false` and `[]`. `mode: "agentic"` with agentic search
         turned off by tenant policy returns `422 agentic_disabled`.
       x-required-permission: ['search:read']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-permission-notes: '`mode: "agentic"` needs `search:agentic`. `include_quarantined: true` returns quarantined mail only if the key also holds `quarantine:review`.'
       x-rate-limit-buckets: [api, search, agentic]
       x-idempotency: optional
@@ -3586,7 +3821,7 @@ paths:
       summary: Find related messages
       description: Semantically similar messages from other threads of the same identity, as search hits.
       x-required-permission: ['search:read']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api, search]
       x-idempotency: none
       parameters:
@@ -3624,7 +3859,7 @@ paths:
       summary: Search contacts
       description: People and services the identity has exchanged mail with.
       x-required-permission: ['search:read']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api, search]
       x-idempotency: none
       parameters:
@@ -3680,7 +3915,7 @@ paths:
         message passed authentication (`verdict: pass`) ([E4]). An active `wait` also marks OTP mail from
         that sender domain as solicited for 30 minutes ([E5]).
       x-required-permission: ['search:read']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -3751,7 +3986,7 @@ paths:
         Quarantined messages, newest first, each with its `quarantine_reason`. Release one with
         `releaseMessage`.
       x-required-permission: ['quarantine:review']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -3781,14 +4016,16 @@ paths:
     post:
       operationId: createPlatformWebhook
       tags: [Webhooks]
-      summary: Create a platform webhook endpoint
+      summary: Create a platform or partner webhook endpoint
       description: >-
-        Platform keys only. A platform endpoint receives events from every tenant (filtered by `events` and
-        `identity_ids`). The response carries `secret` (`whsec_…`), **shown only once**. `events: ["*"]`
-        subscribes to everything, including event types added later. The URL must be HTTPS; private,
-        loopback and reserved addresses are refused (FR-WH-5).
+        Platform and partner keys. With a platform key it creates a platform endpoint (`scope: "platform"`),
+        which receives events from every tenant; with a partner key, a partner endpoint
+        (`scope: "partner"`), which receives only the events of the tenants its partner's keys created. Both
+        are filtered by `events` and `identity_ids`. The response carries `secret` (`whsec_…`), **shown only
+        once**. `events: ["*"]` subscribes to everything, including event types added later. The URL must be
+        HTTPS; private, loopback and reserved addresses are refused (FR-WH-5).
       x-required-permission: ['webhooks:manage']
-      x-key-levels: [platform]
+      x-key-levels: [platform, partner]
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -3819,7 +4056,7 @@ paths:
         '409': {$ref: '#/components/responses/IdempotencyConflict'}
         '413': {$ref: '#/components/responses/PayloadTooLarge'}
         '422':
-          description: The tenant (or the platform) already has 20 webhook endpoints.
+          description: The tenant (or the partner, or the platform) already has 20 webhook endpoints.
           x-error-codes: [webhook_limit_reached]
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
@@ -3834,11 +4071,11 @@ paths:
       tags: [Webhooks]
       summary: List webhook endpoints
       description: >-
-        With a platform key: the platform endpoints. With a tenant key: the tenant's endpoints. An identity
-        key reads its tenant's endpoints, read-only.
+        With a platform key: the platform endpoints. With a partner key: its partner's endpoints. With a
+        tenant key: the tenant's endpoints. An identity key reads its tenant's endpoints, read-only.
       x-required-permission: ['webhooks:read']
       x-permission-notes: '`webhooks:manage` includes `webhooks:read`. An identity key can read its tenant''s endpoints and deliveries with `webhooks:read`.'
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -3874,7 +4111,7 @@ paths:
         everything, including event types added later. The URL must be HTTPS; private, loopback and
         reserved addresses are refused (FR-WH-5).
       x-required-permission: ['webhooks:manage']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -3906,7 +4143,7 @@ paths:
         '409': {$ref: '#/components/responses/IdempotencyConflict'}
         '413': {$ref: '#/components/responses/PayloadTooLarge'}
         '422':
-          description: The tenant (or the platform) already has 20 webhook endpoints.
+          description: The tenant (or the partner, or the platform) already has 20 webhook endpoints.
           x-error-codes: [webhook_limit_reached]
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
@@ -3923,7 +4160,7 @@ paths:
       description: An identity key can read its tenant's endpoints read-only.
       x-required-permission: ['webhooks:read']
       x-permission-notes: '`webhooks:manage` includes `webhooks:read`. An identity key can read its tenant''s endpoints and deliveries with `webhooks:read`.'
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -3956,7 +4193,7 @@ paths:
       summary: Get a webhook endpoint
       x-required-permission: ['webhooks:read']
       x-permission-notes: '`webhooks:manage` includes `webhooks:read`. An identity key can read its tenant''s endpoints and deliveries with `webhooks:read`.'
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -3982,7 +4219,7 @@ paths:
         Accepts `url`, `events`, `identity_ids`, `description` and `enabled`. `enabled: true` re-enables a
         disabled endpoint; `enabled: false` disables it with `disabled_reason: manual`.
       x-required-permission: ['webhooks:manage']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       requestBody:
@@ -4016,7 +4253,7 @@ paths:
       summary: Delete a webhook endpoint
       description: Deletes the endpoint. Its delivery log is deleted with it.
       x-required-permission: ['webhooks:manage']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -4043,7 +4280,7 @@ paths:
         Issues a new secret and returns it once. During the overlap (0–168 hours, default 24) every
         delivery carries both signatures in `webhook-signature` (FR-WH-2).
       x-required-permission: ['webhooks:manage']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -4084,7 +4321,7 @@ paths:
       summary: Send a test event
       description: Sends a `webhook.test` event straight away and returns the delivery attempt.
       x-required-permission: ['webhooks:manage']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -4118,7 +4355,7 @@ paths:
       description: Delivery attempts to this endpoint, newest first. Kept for 30 days.
       x-required-permission: ['webhooks:read']
       x-permission-notes: '`webhooks:manage` includes `webhooks:read`. An identity key can read its tenant''s endpoints and deliveries with `webhooks:read`.'
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -4165,7 +4402,7 @@ paths:
         that); the window never starts from when a delivery went `dead`. Older events are not queued.
         Returns the number of events queued.
       x-required-permission: ['webhooks:manage']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -4221,7 +4458,7 @@ paths:
         Suppressed recipients of the tenant. Addresses are stored only as a keyed hash, so items show a
         masked `address_hint`; use `address` for an exact lookup.
       x-required-permission: ['suppressions:manage']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -4257,7 +4494,7 @@ paths:
       tags: [Suppressions]
       summary: Suppress an address
       x-required-permission: ['suppressions:manage']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -4307,7 +4544,7 @@ paths:
         Removes a `manual`, `unsubscribe`, `hard_bounce` or `provider` suppression. Removing a `complaint`
         suppression needs `"confirm_complaint_removal": true` in the body and is audit-logged.
       x-required-permission: ['suppressions:manage']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       requestBody:
@@ -4348,7 +4585,7 @@ paths:
         - **Send-block**: refused per recipient.
         - **Send-allow**: with `policy.send_allowlist_only`, only listed recipients are allowed.
       x-required-permission: ['suppressions:manage']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -4383,7 +4620,7 @@ paths:
       tags: [Lists]
       summary: Get a list entry
       x-required-permission: ['suppressions:manage']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -4408,7 +4645,7 @@ paths:
       summary: Add or update a list entry
       description: Adds the entry, or updates its `note` if it already exists.
       x-required-permission: ['suppressions:manage']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       requestBody:
@@ -4440,7 +4677,7 @@ paths:
       tags: [Lists]
       summary: Remove a list entry
       x-required-permission: ['suppressions:manage']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -4466,21 +4703,28 @@ paths:
       summary: Create an API key
       description: >-
         The new key's level, tenant, identity and permissions must all lie within the caller's own,
-        otherwise `403 key_scope_exceeded` (FR-KEY-1). A tenant or identity key's `mode` follows its tenant.
+        otherwise `403 key_scope_exceeded` (FR-KEY-1). A tenant or identity key's `mode` follows its tenant;
+        platform and partner keys are `live`.
         The response carries `secret` (`pmk_live_…` or `pmk_test_…`), **shown only once**; only a keyed
         hash is stored (FR-KEY-2).
 
         - **Explicit permissions.** `permissions` is required at every level, `platform` included: there is
           no implicit full set. A missing or empty list is `400 invalid_request`.
         - **Permissions tied to levels.** A permission the new key's level cannot hold is refused, whoever
-          the caller is, with `400 invalid_request` and `details.reason = "permission_not_allowed_for_level"`: `tenants:manage`
-          and `platform:ops` on a tenant or identity key; `members:read`, `members:manage`,
-          `suppressions:manage`, `audit:read` and `usage:read` on an identity key (an identity key holds
-          `usage:read` implicitly for its own workspace's `GET /v1/usage`); `identities:sign` on a platform
-          key. The table is under `Permission`.
+          the caller is, with `400 invalid_request` and `details.reason = "permission_not_allowed_for_level"`: `platform:ops`
+          and `partners:manage` on any key but a platform key; `tenants:manage` on a tenant or identity key;
+          `members:read`, `members:manage`, `suppressions:manage`, `audit:read` and `usage:read` on an
+          identity key (an identity key holds `usage:read` implicitly for its own workspace's
+          `GET /v1/usage`); `identities:sign` on a platform or partner key. The table is under `Permission`.
+        - **Partner keys** (FR-KEY-4). `level: partner` needs `partner_id` and no `tenant_id` or
+          `identity_id`, and only a platform key may ask for it (an unknown partner is
+          `404 partner_not_found`); other levels refuse `partner_id`. A partner key mints only `tenant` and
+          `identity` keys of the tenants its partner's keys created; a `partner` or `platform` key, or another
+          tenant, is `403 key_scope_exceeded`.
         - **Order.** These two checks run first; the scope check (`403 key_scope_exceeded`) comes after them.
+          Minting is audit-logged (`key.create`, with `level` and, for a partner key, `partner_id`).
       x-required-permission: ['keys:manage']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -4533,8 +4777,8 @@ paths:
                         message: identities:sign cannot be held by a platform key
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403':
-          description: The key lacks `keys:manage`, the target is out of scope, or the new key would be wider than the caller.
-          x-error-codes: [permission_denied, scope_denied, key_scope_exceeded, tenant_suspended]
+          description: The key lacks `keys:manage`, the target is out of scope, the new key would be wider than the caller, or the partner is suspended.
+          x-error-codes: [permission_denied, scope_denied, key_scope_exceeded, tenant_suspended, partner_suspended]
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
           content:
@@ -4550,9 +4794,11 @@ paths:
       operationId: listKeys
       tags: [Keys]
       summary: List API keys
-      description: Keys within the caller's scope (never with secrets).
+      description: >-
+        Keys within the caller's scope (never with secrets). A partner key lists only tenant and identity
+        keys of its own tenants.
       x-required-permission: ['keys:manage']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -4583,7 +4829,7 @@ paths:
       tags: [Keys]
       summary: Get an API key
       x-required-permission: ['keys:manage']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -4607,7 +4853,7 @@ paths:
       summary: Revoke an API key
       description: Revokes the key immediately. Later requests with it get `401 key_revoked`.
       x-required-permission: ['keys:manage']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -4634,7 +4880,7 @@ paths:
         Issues a new secret for the same key and returns it once. The old secret keeps working until the
         overlap ends (0–168 hours, default 24).
       x-required-permission: ['keys:manage']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -4688,8 +4934,8 @@ paths:
         | `identity` | `identity_id` | The whole mailbox. Its addresses are tombstoned |
         | `tenant` | none | Everything in the tenant. Then the tenant is marked `erased` |
       x-required-permission: ['erasure:manage']
-      x-key-levels: [platform, tenant, identity]
-      x-permission-notes: An identity key can only erase within its own identity (`message`, `thread` and `identity` scopes). `counterparty` needs a tenant or platform key; `tenant` needs a platform key or the tenant's own key.
+      x-key-levels: [platform, partner, tenant, identity]
+      x-permission-notes: An identity key can only erase within its own identity (`message`, `thread` and `identity` scopes). `counterparty` needs a tenant, partner or platform key; `tenant` needs a platform key, the partner key of the tenant's own partner, or the tenant's own key.
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -4728,7 +4974,7 @@ paths:
       tags: [Privacy]
       summary: List erasure requests
       x-required-permission: ['erasure:manage']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -4767,7 +5013,7 @@ paths:
         The request and its status. `completed_with_holds` means the erasure finished but skipped held
         threads, which the receipt lists in `held`.
       x-required-permission: ['erasure:manage']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -4820,8 +5066,8 @@ paths:
         (`status: "queued"`). When finished, the export has a `download_url` (a signed link valid until
         `expires_at`, 7 days) and an `export.completed` event is emitted.
       x-required-permission: ['erasure:manage']
-      x-key-levels: [platform, tenant, identity]
-      x-permission-notes: '`counterparty` scope needs a tenant or platform key. An identity key can export only its own identity.'
+      x-key-levels: [platform, partner, tenant, identity]
+      x-permission-notes: '`counterparty` scope needs a tenant, partner or platform key. An identity key can export only its own identity.'
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -4867,7 +5113,7 @@ paths:
         `download_url`, a signed link (`getSignedLink`) valid until `expires_at`. The link is minted again on
         each `GET`.
       x-required-permission: ['erasure:manage']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -4907,17 +5153,17 @@ paths:
         their limits before they hit `402 billing_limit`.
 
         - **Who can read it.** Every tenant and identity key holds `usage:read` implicitly for its own
-          workspace, so they can always call this without listing it. A platform key must hold `usage:read`
-          explicitly and must pass `tenant_id`; without `tenant_id` it gets `400 invalid_request`.
+          workspace, so they can always call this without listing it. A platform or partner key must hold
+          `usage:read` explicitly and must pass `tenant_id`; without `tenant_id` it gets `400 invalid_request`.
         - `billing` is `metered`, `exempt` (no limits) or `disabled` (self-hosted without billing; `features`
           show the real `used` with `granted: null`, `remaining: null` and `unlimited: true`).
         - `used` for `storage_gb` is measured, rounded up, and refreshed at least hourly.
         - `granted` includes top-ups. `plans` is the catalog from `PM_PLAN_CATALOG`.
       x-required-permission: ['usage:read']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-permission-notes: >-
-        Tenant and identity keys hold `usage:read` implicitly for their own workspace. Platform keys must
-        hold it explicitly and pass `tenant_id` (`400 invalid_request` without it).
+        Tenant and identity keys hold `usage:read` implicitly for their own workspace. Platform and partner
+        keys must hold it explicitly and pass `tenant_id` (`400 invalid_request` without it).
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -4995,12 +5241,12 @@ paths:
       tags: [Usage]
       summary: Get daily usage
       description: >-
-        Usage per UTC day. `from` and `to` are dates at most 92 days apart. A platform key can name a tenant
-        with `tenant_id` and needs `usage:read` explicitly; a tenant key gets its own tenant and holds
+        Usage per UTC day. `from` and `to` are dates at most 92 days apart. A platform or partner key can name
+        a tenant with `tenant_id` and needs `usage:read` explicitly; a tenant key gets its own tenant and holds
         `usage:read` implicitly for it. `assertions` and `http_signatures` count signing calls, which are
         not metered against any plan allowance.
       x-required-permission: ['usage:read']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -5087,9 +5333,9 @@ paths:
       operationId: getTenantBilling
       tags: [Usage]
       summary: Get a workspace's billing account
-      description: Platform keys only.
+      description: Platform keys, and partner keys for the tenants their partner's keys created.
       x-required-permission: ['tenants:manage']
-      x-key-levels: [platform]
+      x-key-levels: [platform, partner]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -5112,8 +5358,9 @@ paths:
       tags: [Usage]
       summary: Change a workspace's billing mode or plan
       description: >-
-        Platform keys only. Accepts `mode` (`metered`, `exempt`, `disabled`) and, for workspaces without a
-        Stripe subscription, `plan_id` (a complimentary plan). Plans paid through Stripe change only through
+        Platform keys only: a partner key gets `403 scope_denied` on its own tenants, so only a platform key
+        changes a partnered tenant's billing mode. Accepts `mode` (`metered`, `exempt`, `disabled`) and, for
+        workspaces without a Stripe subscription, `plan_id` (a complimentary plan). Plans paid through Stripe change only through
         Stripe: a `plan_id` on such a workspace returns `409 plan_managed_by_stripe`. Audit-logged.
       x-required-permission: ['tenants:manage']
       x-key-levels: [platform]
@@ -5159,14 +5406,18 @@ paths:
       summary: List audit events
       description: >-
         Audit entries, newest first. They never hold message content or clear-text addresses. Audit rows
-        cover administrative actions: keys, tenants, identity status, identity signing keys
+        cover administrative actions: keys (`key.create`, `key.rotate`, `key.revoke`), partners
+        (`partner.create`, `partner.update`, `partner.delete`), tenants (`tenant.create`, with the
+        `partner_id` when a partner key created it), identity status, identity signing keys
         (`identity_key.create`, `identity_key.rotate`, `identity_key.revoke`), quarantine releases, holds,
         suppression removals, erasure, resolve, members, billing and platform operations. **Sends are not
         audit rows**: each send is recorded by its message, its events (`message.sent` and the delivery
         events) and its per-recipient delivery log. To review what a key sent, list the outbound messages
-        of the identities it reaches for the period; request logs also carry the key ID for 7 days.
+        of the identities it reaches for the period; request logs also carry the key ID for 7 days. A partner
+        key reads the rows of its own tenants only; rows about a partner itself have no `tenant_id` and are
+        for platform keys.
       x-required-permission: ['audit:read']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -5234,7 +5485,7 @@ paths:
         each customer workspace). Needs `members:read`, which every console role holds and `members:manage`
         includes.
       x-required-permission: ['members:read']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -5283,7 +5534,7 @@ paths:
         `admin`, `member`, `viewer`. The owner is set at workspace creation (`owner` in `createTenant`) or by
         an ownership transfer in the console.
       x-required-permission: ['members:manage']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -5329,7 +5580,7 @@ paths:
       summary: Revoke an invitation
       description: Revokes a pending invitation and frees its seat.
       x-required-permission: ['members:manage']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -5357,7 +5608,7 @@ paths:
         Removes a member from the workspace and ends their sessions. The owner cannot be removed
         (`409 owner_required`): transfer ownership in the console first.
       x-required-permission: ['members:manage']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -6996,7 +7247,7 @@ webhooks:
       operationId: onWebhookDisabled
       tags: [Events]
       summary: 'webhook.disabled'
-      description: 'A webhook endpoint was disabled. Sent to the platform''s other endpoints only.'
+      description: 'A webhook endpoint was disabled. Sent to platform endpoints and, when the disabled endpoint belongs to a partner, to that partner''s other endpoints.'
       security: []
       parameters:
         - $ref: '#/components/parameters/WebhookIdHeader'
@@ -7261,7 +7512,9 @@ components:
     TenantIdQuery:
       name: tenant_id
       in: query
-      description: Platform keys only. Restrict to one tenant. Other keys are always restricted to their own tenant.
+      description: >-
+        Platform and partner keys only (a partner key, one of its own tenants). Restrict to one tenant. Other
+        keys are always restricted to their own tenant.
       schema: {$ref: '#/components/schemas/TenantId'}
     IdempotencyKeySend:
       name: Idempotency-Key
@@ -7294,8 +7547,8 @@ components:
       in: header
       required: false
       description: >-
-        Optional. 1–255 printable ASCII characters. Kept for 30 days, scoped to the tenant (or the platform
-        for platform-level requests). The same key with the same request returns the original response with
+        Optional. 1–255 printable ASCII characters. Kept for 30 days, scoped to the tenant (or, for a request
+        that names no tenant, to the partner for a partner key and to the platform for a platform key). The same key with the same request returns the original response with
         `Idempotent-Replayed: true`; with a different request, `409 idempotency_conflict`.
       schema:
         type: string
@@ -7308,6 +7561,11 @@ components:
       in: path
       required: true
       schema: {$ref: '#/components/schemas/TenantId'}
+    PartnerIdPath:
+      name: partner_id
+      in: path
+      required: true
+      schema: {$ref: '#/components/schemas/PartnerId'}
     IdentityIdPath:
       name: identity_id
       in: path
@@ -7601,8 +7859,9 @@ components:
     Forbidden:
       description: >-
         The key lacks the permission (`details.required` names it), the resource is outside the key's
-        tenant or identity, or the tenant is suspended.
-      x-error-codes: [permission_denied, scope_denied, tenant_suspended]
+        tenant or identity, the tenant is suspended, or the key is a partner key whose partner is suspended
+        (`partner_suspended`, on every route).
+      x-error-codes: [permission_denied, scope_denied, tenant_suspended, partner_suspended]
       headers:
         Request-Id: {$ref: '#/components/headers/Request-Id'}
       content:
@@ -7621,7 +7880,7 @@ components:
       description: >-
         As `Forbidden`, plus `test_mode_recipient` when a test tenant sends outside `*@simulator.invalid`
         and this deployment ([L1]).
-      x-error-codes: [permission_denied, scope_denied, tenant_suspended, test_mode_recipient]
+      x-error-codes: [permission_denied, scope_denied, tenant_suspended, partner_suspended, test_mode_recipient]
       headers:
         Request-Id: {$ref: '#/components/headers/Request-Id'}
       content:
@@ -7632,7 +7891,7 @@ components:
         The resource does not exist **or** is outside the key's scope (deliberately indistinguishable). A
         `404` always carries one of this service's own codes; a `404` without this envelope came from
         something else and must not be read as "already deleted".
-      x-error-codes: [tenant_not_found, identity_not_found, address_not_found, domain_not_found, thread_not_found, message_not_found, attachment_not_found, webhook_not_found, key_not_found, erasure_not_found, export_not_found, suppression_not_found, list_entry_not_found, member_not_found, invitation_not_found, job_not_found, dlq_item_not_found]
+      x-error-codes: [tenant_not_found, identity_not_found, address_not_found, domain_not_found, thread_not_found, message_not_found, attachment_not_found, webhook_not_found, key_not_found, erasure_not_found, export_not_found, suppression_not_found, list_entry_not_found, member_not_found, invitation_not_found, job_not_found, dlq_item_not_found, partner_not_found]
       headers:
         Request-Id: {$ref: '#/components/headers/Request-Id'}
       content:
@@ -7890,6 +8149,11 @@ components:
       description: Tenant ID (`ten_` + ULID).
       pattern: '^ten_[0-9A-HJKMNP-TV-Z]{26}$'
       examples: [ten_01J9Z3K8V4QW7X2M5N6P8R0T1Y]
+    PartnerId:
+      type: string
+      description: Partner ID (`ptn_` + ULID).
+      pattern: '^ptn_[0-9A-HJKMNP-TV-Z]{26}$'
+      examples: [ptn_01JA2B3C4D5E6F7G8H9J0K1M2N]
     IdentityId:
       type: string
       description: Identity ID (`idn_` + ULID).
@@ -8124,6 +8388,10 @@ components:
           type: [string, 'null']
           format: uri
           description: '`billing_limit`: the console plan page, or `null` when the console is off.'
+        tenants:
+          type: integer
+          minimum: 1
+          description: '`partner_has_tenants`: how many of the partner''s tenants are not erased yet.'
         lookups:
           type: integer
           minimum: 0
@@ -8143,6 +8411,7 @@ components:
         - scope_denied
         - key_scope_exceeded
         - tenant_suspended
+        - partner_suspended
         - test_mode_recipient
         - invalid_signature
         - policy_denied
@@ -8181,6 +8450,7 @@ components:
         - invitation_not_found
         - job_not_found
         - dlq_item_not_found
+        - partner_not_found
         - idempotency_conflict
         - request_in_progress
         - client_id_conflict
@@ -8193,6 +8463,7 @@ components:
         - domain_not_dedicated
         - zone_hold
         - owner_required
+        - partner_has_tenants
         - plan_managed_by_stripe
         - address_taken
         - address_is_primary
@@ -8242,7 +8513,7 @@ components:
         | `ses_receiving_not_configured` | `dns_records`, or `smtp_relay` with `inbound: ses`, without `PM_SES_INBOUND_TOPIC_ARN` (and the bucket and queue) |
         | `ses_identity_limit` | The SES region already has 10,000 identities, and the method needs one (`dns_records`, `send_only`, `smtp_relay` with `inbound: ses`) |
         | `subdomain_setup_disabled` | `delegated_subdomain` while `PM_CF_SUBDOMAIN_SETUP` is not `on` |
-        | `zone_creation_not_allowed` | `nameservers` by a tenant key whose policy lacks `domains.allow_create_zone: true` |
+        | `zone_creation_not_allowed` | `nameservers` by a tenant or partner key whose tenant's policy lacks `domains.allow_create_zone: true` |
         | `method_not_supported` | The domain's method does not support the operation: `PATCH` with a transport it cannot use, `probe` on a domain whose transport is not `smtp`, `test-forwarding` on an address whose domain does not use `inbound: forward` |
         | `marketing_needs_ses` | A `kind: marketing` send or reply from a domain whose transport is `cloudflare`, the platform domain included: Cloudflare Email Service is for transactional mail only. Use a domain with the `ses` or `smtp` transport |
       enum: [ses_not_configured, ses_receiving_not_configured, ses_identity_limit, subdomain_setup_disabled, zone_creation_not_allowed, method_not_supported, marketing_needs_ses]
@@ -8256,9 +8527,9 @@ components:
 
         | Permission | Allows |
         |---|---|
-        | `tenants:manage` | Create, update and suspend tenants, and their billing accounts (platform keys only) |
+        | `tenants:manage` | Create, update and suspend tenants, and their billing accounts. Platform keys, for every tenant; partner keys, for the tenants their partner's keys created, without changing billing |
         | `identities:read`, `identities:write` | Read, and create, update, pause or delete identities and addresses, and test forwarding; read, and create, rotate or revoke identity signing keys. Deleting an identity also needs `erasure:manage`, because it starts an identity-scope erasure |
-        | `identities:sign` | Mint agent assertions and Web Bot Auth HTTP signatures as an identity. Tenant and identity keys (an identity key only for its own identity); platform keys cannot hold it |
+        | `identities:sign` | Mint agent assertions and Web Bot Auth HTTP signatures as an identity. Tenant and identity keys (an identity key only for its own identity); platform and partner keys cannot hold it |
         | `domains:read`, `domains:write` | Read, and add, update, verify, probe or remove domains |
         | `messages:read` | Threads, messages, raw MIME, deliveries |
         | `messages:send` | Send, reply, reply-all, forward, cancel |
@@ -8269,13 +8540,14 @@ components:
         | `quarantine:review` | See and release quarantined mail |
         | `webhooks:read` | Read webhook endpoints and their deliveries |
         | `webhooks:manage` | Create, change, test, rotate and delete webhook endpoints, and replay. Includes `webhooks:read` |
-        | `keys:manage` | API keys within the caller's scope |
+        | `keys:manage` | API keys within the caller's scope. A partner key manages only tenant and identity keys of its own tenants |
         | `erasure:manage` | Erasure requests, legal holds, exports |
         | `suppressions:manage` | Suppressions and allow or block lists |
-        | `usage:read` | Plan, allowances and usage figures. Every tenant and identity key holds it implicitly for its own workspace; platform keys must hold it explicitly and pass `tenant_id` |
+        | `usage:read` | Plan, allowances and usage figures. Every tenant and identity key holds it implicitly for its own workspace; platform and partner keys must hold it explicitly and pass `tenant_id` |
         | `audit:read` | Audit log |
-        | `members:read` | List console members and pending invitations (tenant and platform keys; every console role holds it) |
-        | `members:manage` | Invite, revoke, change roles and remove console members (tenant and platform keys). Includes `members:read` |
+        | `members:read` | List console members and pending invitations (tenant, partner and platform keys; every console role holds it) |
+        | `members:manage` | Invite, revoke, change roles and remove console members (tenant, partner and platform keys). Includes `members:read` |
+        | `partners:manage` | Create, list, read, update and delete partners (platform keys only) |
         | `platform:ops` | Platform operations: signing-key rotation, the dead-letter queue, maintenance jobs, waitlist invitations (platform keys only) |
 
         Which key levels can hold a permission. `POST /v1/keys` refuses any other combination with
@@ -8283,12 +8555,14 @@ components:
 
         | Permissions | Key levels |
         |---|---|
-        | `tenants:manage`, `platform:ops` | platform |
-        | `members:read`, `members:manage`, `suppressions:manage`, `audit:read`, `usage:read` | platform, tenant |
+        | `platform:ops`, `partners:manage` | platform |
+        | `tenants:manage` | platform, partner |
+        | `members:read`, `members:manage`, `suppressions:manage`, `audit:read`, `usage:read` | platform, partner, tenant |
         | `identities:sign` | tenant, identity |
-        | Every other permission | platform, tenant, identity |
+        | Every other permission | platform, partner, tenant, identity |
       enum:
         - 'tenants:manage'
+        - 'partners:manage'
         - 'identities:read'
         - 'identities:write'
         - 'identities:sign'
@@ -8314,11 +8588,12 @@ components:
     KeyLevel:
       type: string
       description: >-
-        `platform` reaches every tenant; `tenant` reaches its own tenant; `identity` reaches its own identity,
-        plus its tenant's domains read-only with `domains:read` and its tenant's webhook endpoints and
-        deliveries read-only with `webhooks:read`. A route or field that needs a higher level returns
-        `403 scope_denied`.
-      enum: [platform, tenant, identity]
+        From widest to narrowest: `platform` reaches every tenant; `partner` reaches the tenants its
+        partner's keys created and its partner's webhook endpoints (FR-KEY-4); `tenant` reaches its own
+        tenant; `identity` reaches its own identity, plus its tenant's domains read-only with `domains:read`
+        and its tenant's webhook endpoints and deliveries read-only with `webhooks:read`. A route or field
+        that needs a higher level returns `403 scope_denied`.
+      enum: [platform, partner, tenant, identity]
     Mode:
       type: string
       description: '`live` or `test`. Mail a `test` tenant sends never leaves the deployment (FR-TEN-2).'
@@ -8326,15 +8601,20 @@ components:
     Me:
       type: object
       description: The key that made the request.
-      required: [key_id, name, level, mode, tenant_id, identity_id, permissions, expires_at]
+      required: [key_id, name, level, mode, partner_id, tenant_id, identity_id, permissions, expires_at]
       properties:
         key_id: {$ref: '#/components/schemas/KeyId'}
         name:
           type: string
         level: {$ref: '#/components/schemas/KeyLevel'}
         mode: {$ref: '#/components/schemas/Mode'}
+        partner_id:
+          description: '`null` unless the key is partner-level.'
+          oneOf:
+            - $ref: '#/components/schemas/PartnerId'
+            - type: 'null'
         tenant_id:
-          description: '`null` for platform keys.'
+          description: '`null` for platform and partner keys.'
           oneOf:
             - $ref: '#/components/schemas/TenantId'
             - type: 'null'
@@ -8388,7 +8668,7 @@ components:
       examples: [.acme]
     Tenant:
       type: object
-      required: [id, slug, name, mode, status, address_suffix, timezone, policy, created_at, updated_at]
+      required: [id, slug, name, mode, status, partner_id, address_suffix, timezone, policy, created_at, updated_at]
       properties:
         id: {$ref: '#/components/schemas/TenantId'}
         slug: {$ref: '#/components/schemas/TenantSlug'}
@@ -8397,6 +8677,13 @@ components:
           examples: [Acme Car Hire]
         mode: {$ref: '#/components/schemas/Mode'}
         status: {$ref: '#/components/schemas/TenantStatus'}
+        partner_id:
+          description: >-
+            The partner whose key created the tenant, or `null` (created by a platform key, by `pmail setup` or
+            by self-serve sign-up). Set at creation and never changed.
+          oneOf:
+            - $ref: '#/components/schemas/PartnerId'
+            - type: 'null'
         address_suffix: {$ref: '#/components/schemas/AddressSuffix'}
         timezone:
           type: string
@@ -8440,7 +8727,9 @@ components:
               examples: [Sam Patel]
         billing:
           type: object
-          description: The workspace's billing account.
+          description: >-
+            The workspace's billing account. Platform keys only: a partner key gets `403 scope_denied`, and its
+            tenants take the partner's `default_billing_mode`.
           properties:
             mode:
               description: Defaults to `metered` (plan `free`) on a deployment with billing on, and to `disabled` otherwise.
@@ -8537,7 +8826,7 @@ components:
             max_automatic_exchanges: 2
         quarantine:
           type: object
-          required: [on_auth_fail, spam_threshold, unsolicited_otp]
+          required: [on_auth_fail, spam_threshold, unsolicited_otp, key_release]
           properties:
             on_auth_fail:
               type: boolean
@@ -8553,10 +8842,18 @@ components:
               type: boolean
               default: true
               description: Quarantine password-reset and OTP mail that no `wait` asked for ([E5]).
+            key_release:
+              type: boolean
+              default: false
+              description: >-
+                Lets keys with `quarantine:review` that reach this tenant (its partner key included) release
+                quarantined mail even when `PM_QUARANTINE_KEY_RELEASE` is `off`. Only a platform key, or the
+                partner key of the tenant's own partner, can set it ([J14], [J16]).
           default:
             on_auth_fail: true
             spam_threshold: 0.8
             unsolicited_otp: true
+            key_release: false
         inbound:
           type: object
           required: [per_sender_per_hour, extract_attachment_text, extract_image_text, ses_bounce_retired]
@@ -8719,9 +9016,9 @@ components:
               type: boolean
               default: false
               description: >-
-                Lets the tenant's own keys use the `nameservers` method, which creates a Cloudflare zone.
-                Without it, they get `422 transport_unavailable` (`zone_creation_not_allowed`). Platform keys
-                may always use it. Pylota Mail Cloud sets it to `true`.
+                Lets the tenant's own keys, and its partner key, use the `nameservers` method, which creates a
+                Cloudflare zone. Without it, they get `422 transport_unavailable` (`zone_creation_not_allowed`).
+                Platform keys may always use it. Pylota Mail Cloud sets it to `true`.
           default:
             allow_create_zone: false
         domain_fallback:
@@ -8795,6 +9092,9 @@ components:
               maximum: 1
             unsolicited_otp:
               type: [boolean, 'null']
+            key_release:
+              type: [boolean, 'null']
+              description: Platform keys, and the partner key of the tenant's own partner, only.
         inbound:
           type: [object, 'null']
           properties:
@@ -9055,6 +9355,59 @@ components:
           type: string
           description: How matched values are normalised before storage and comparison.
           examples: [upper]
+
+    # ── Partners ─────────────────────────────────────────────────────────────────────────────────
+
+    PartnerStatus:
+      type: string
+      description: '`suspended` refuses every key of the partner with `403 partner_suspended`; its tenants are not suspended.'
+      enum: [active, suspended]
+    PartnerBillingMode:
+      type: string
+      description: >-
+        The billing mode given to every tenant a partner key creates (`billing_accounts.mode`). Only a
+        platform key changes a tenant's mode afterwards.
+      enum: [exempt, metered]
+    Partner:
+      type: object
+      description: >-
+        An integrator whose partner keys create tenants and act only on those tenants (FR-KEY-4). A partner
+        holds nothing but its name and these settings.
+      required: [id, name, status, default_billing_mode, created_at, updated_at]
+      properties:
+        id: {$ref: '#/components/schemas/PartnerId'}
+        name:
+          type: string
+          examples: [Pylota]
+        status: {$ref: '#/components/schemas/PartnerStatus'}
+        default_billing_mode: {$ref: '#/components/schemas/PartnerBillingMode'}
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    PartnerCreateRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+        default_billing_mode:
+          description: Defaults to `metered`.
+          allOf:
+            - $ref: '#/components/schemas/PartnerBillingMode'
+          default: metered
+    PartnerUpdateRequest:
+      type: object
+      minProperties: 1
+      properties:
+        name:
+          type: string
+          minLength: 1
+        status: {$ref: '#/components/schemas/PartnerStatus'}
+        default_billing_mode: {$ref: '#/components/schemas/PartnerBillingMode'}
 
     # ── Identities ───────────────────────────────────────────────────────────────────────────────
 
@@ -11000,11 +11353,22 @@ components:
           const: '*'
     Webhook:
       type: object
-      required: [id, tenant_id, url, events, identity_ids, description, enabled, disabled_reason, created_at, updated_at]
+      required: [id, scope, partner_id, tenant_id, url, events, identity_ids, description, enabled, disabled_reason, created_at, updated_at]
       properties:
         id: {$ref: '#/components/schemas/WebhookId'}
+        scope:
+          type: string
+          description: >-
+            Whose events the endpoint receives: `platform`, every tenant's; `partner`, only those of the
+            tenants its partner's keys created; `tenant`, its tenant's. Set by the key that created it.
+          enum: [platform, partner, tenant]
+        partner_id:
+          description: The partner of a `partner` endpoint; `null` otherwise.
+          oneOf:
+            - $ref: '#/components/schemas/PartnerId'
+            - type: 'null'
         tenant_id:
-          description: '`null` for a platform endpoint.'
+          description: '`null` for a platform or partner endpoint.'
           oneOf:
             - $ref: '#/components/schemas/TenantId'
             - type: 'null'
@@ -11234,13 +11598,18 @@ components:
 
     ApiKey:
       type: object
-      required: [id, name, level, mode, tenant_id, identity_id, permissions, expires_at, revoked_at, last_used_at, created_at]
+      required: [id, name, level, mode, partner_id, tenant_id, identity_id, permissions, expires_at, revoked_at, last_used_at, created_at]
       properties:
         id: {$ref: '#/components/schemas/KeyId'}
         name:
           type: string
         level: {$ref: '#/components/schemas/KeyLevel'}
         mode: {$ref: '#/components/schemas/Mode'}
+        partner_id:
+          description: '`null` unless the key is partner-level.'
+          oneOf:
+            - $ref: '#/components/schemas/PartnerId'
+            - type: 'null'
         tenant_id:
           oneOf:
             - $ref: '#/components/schemas/TenantId'
@@ -11281,8 +11650,9 @@ components:
       type: object
       description: >-
         `tenant_id` is required for `tenant` and `identity` keys, and `identity_id` for `identity` keys;
-        neither is allowed on `platform` keys. `permissions` is required at every level, `platform`
-        included (no implicit full set). Level, tenant, identity and permissions must lie within the
+        neither is allowed on `platform` or `partner` keys. `partner_id` is required for `partner` keys, which
+        only a platform key may create, and refused on every other level. `permissions` is required at every
+        level, `platform` included (no implicit full set). Level, tenant, identity and permissions must lie within the
         caller's own (`403 key_scope_exceeded`), and each permission must be one the level can hold
         (`400 invalid_request`, `details.reason = "permission_not_allowed_for_level"`; see `Permission`).
       required: [name, level, permissions]
@@ -11291,6 +11661,7 @@ components:
           type: string
           minLength: 1
         level: {$ref: '#/components/schemas/KeyLevel'}
+        partner_id: {$ref: '#/components/schemas/PartnerId'}
         tenant_id: {$ref: '#/components/schemas/TenantId'}
         identity_id: {$ref: '#/components/schemas/IdentityId'}
         permissions:
@@ -12332,6 +12703,15 @@ components:
           items: {$ref: '#/components/schemas/Tenant'}
         next_cursor:
           type: [string, 'null']
+    PartnerPage:
+      type: object
+      required: [data, next_cursor]
+      properties:
+        data:
+          type: array
+          items: {$ref: '#/components/schemas/Partner'}
+        next_cursor:
+          type: [string, 'null']
     IdentityPage:
       type: object
       required: [data, next_cursor]
@@ -13066,7 +13446,7 @@ components:
             data: {$ref: '#/components/schemas/QuotaWarningData'}
 
     WebhookDisabledEvent:
-      description: '`webhook.disabled`: A webhook endpoint was disabled. Sent to the platform''s other endpoints only.'
+      description: '`webhook.disabled`: A webhook endpoint was disabled. Sent to platform endpoints and, when the disabled endpoint belongs to a partner (a partner endpoint, or an endpoint of a tenant a partner''s key created), to that partner''s other endpoints; never to tenant endpoints or to the endpoint itself.'
       allOf:
         - $ref: '#/components/schemas/EventBase'
         - type: object

@@ -161,6 +161,7 @@ resets) are in [Plans and billing](../guides/plans.md). Read your workspace's li
 | Limit | Value |
 |---|---|
 | Endpoints per tenant | 20 |
+| Endpoints per partner | 20 |
 | Platform endpoints | 20 |
 | Timeout per attempt | 15 seconds |
 | Retry window | About 72 hours, 13 attempts |

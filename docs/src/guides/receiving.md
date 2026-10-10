@@ -180,7 +180,9 @@ Releasing moves the message to `received`, emits `message.released`, runs triage
 entry. The CLI commands are `pmail quarantine list` and `pmail quarantine release`.
 
 Release is a human decision. Give `quarantine:review` to the people who review mail, not to agents
-([Security](security.md#quarantine)).
+([Security](security.md#quarantine)). Where `PM_QUARANTINE_KEY_RELEASE` is `off`, as on Pylota Mail Cloud,
+every key gets `403 permission_denied` and a person releases in the console, unless the workspace's
+policy has `quarantine.key_release: true` ([Configuration › Tenant policy](../reference/configuration.md#tenant-policy)).
 
 ## Blocked senders and throttling
 
@@ -348,7 +350,8 @@ so you can deploy the new secret without dropping events. CLI: `pmail webhooks r
   event's `occurred_at` (or `retention.events_days`, if shorter, because the payloads are then gone).
   The window counts from the event, not from when the delivery went dead.
 - After 100 consecutive failures spread over at least 24 hours, the endpoint is disabled
-  (`disabled_reason: failing`) and a `webhook.disabled` event goes to the platform's other endpoints.
+  (`disabled_reason: failing`) and a `webhook.disabled` event goes to the platform's endpoints and, for
+  an endpoint that belongs to a partner, to that partner's other endpoints.
   A `410 Gone` response disables the endpoint immediately. Re-enable it with
   `PATCH /v1/webhooks/{webhook_id}` and `{"enabled": true}`.
 

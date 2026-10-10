@@ -153,16 +153,18 @@ The full schema is in [Data model](design/data-model.md).
 
 ```text
 Platform (deployment) ── platform keys, platform domain, platform webhooks
-  └─ Tenant (ten_)  live | test, policy, quotas, address suffix
+  ├─ Partner (ptn_)  partner keys and partner webhooks; reaches only the tenants its keys created
+  └─ Tenant (ten_)  live | test, policy, quotas, address suffix, partner_id (optional)
        ├─ Domain (dom_)      kind: zone | delegated | external; method, inbound, transport
        │                     (the platform domain is shared)
        └─ Identity (idn_)    one IdentityMailbox DO
             └─ Address (adr_)  role: primary | alias, status: pending | active | retiring | retired
 ```
 
-- An API key resolves to `(level, tenant_id?, identity_id?, permissions)`. Every handler takes scope from
+- An API key resolves to `(level, partner_id?, tenant_id?, identity_id?, permissions)`. Every handler takes scope from
   the resolved key and checks the target resource's tenant against it **before** touching a Durable
-  Object. A Durable Object also checks the tenant ID passed in the internal request against its own
+  Object; for a partner key, the tenant's `partner_id` must be the key's
+  ([Security › Partner keys](design/security.md#partner-keys)). A Durable Object also checks the tenant ID passed in the internal request against its own
   stored owner, so a routing bug cannot cross tenants.
 - Every D1 query on tenant data includes `tenant_id` in its `WHERE` clause. The data-access layer
   makes it a required parameter.
@@ -255,7 +257,7 @@ Tenant scope fans out to each identity's mailbox in parallel and merges the resu
 Every state change appends an event to the owning Durable Object's **outbox**, in the same transaction
 as the change. An alarm drains the outbox to `pm-webhooks`. The consumer:
 
-- resolves matching endpoints (platform and tenant), from D1 with a short cache;
+- resolves matching endpoints (platform, partner and tenant), from D1 with a short cache;
 - signs each delivery per endpoint (Standard Webhooks);
 - POSTs it with SSRF guards;
 - records a delivery row;

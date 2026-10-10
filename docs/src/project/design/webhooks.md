@@ -5,8 +5,8 @@ signed HTTPS deliveries with retries, dead letters and replay.
 
 | | |
 |---|---|
-| Requirements | FR-WH-1 … FR-WH-5, NFR-REL-3, NFR-REL-4, FR-PRV-6, FR-IDN-6 (key events), FR-CON-14 (the Notifier hand-off) |
-| Edge cases | [J4](../edge-cases.md), [I5](../edge-cases.md), [K1](../edge-cases.md) (integrator side), [C5](../edge-cases.md) (sequence), [O14](../edge-cases.md), [O16](../edge-cases.md) (Notifier hand-off) |
+| Requirements | FR-WH-1 … FR-WH-5, NFR-REL-3, NFR-REL-4, FR-PRV-6, FR-IDN-6 (key events), FR-CON-14 (the Notifier hand-off), FR-KEY-4 (partner endpoints) |
+| Edge cases | [J4](../edge-cases.md), [J15](../edge-cases.md), [I5](../edge-cases.md), [K1](../edge-cases.md) (integrator side), [C5](../edge-cases.md) (sequence), [O14](../edge-cases.md), [O16](../edge-cases.md) (Notifier hand-off) |
 | Code | `crates/worker/src/mailbox/outbox.rs` (and the outbox modules of `DomainMonitor` and `JobRunner`), `webhooks/envelope.rs` (build plan M6: the envelope, `WebhookJob` and the identity payload builders), `handlers/webhooks.rs`, `consumers/webhooks.rs`, `webhooks/{sign.rs, client.rs, replay.rs, payloads.rs}` (build plan M8), `crons/outbox_sweep.rs`; the SSRF guard is `crates/core/src/ssrf.rs` and `crates/worker/src/net.rs` ([Security](security.md#9-ssrf-controls)) |
 | Contract | [Webhook events](../../reference/events.md) (envelope, types, signing, retry schedule), [REST API › Webhooks](../../reference/api.md#webhooks) |
 
@@ -157,21 +157,37 @@ serialised `data` never contains a body field other than the capped `extracted_t
 
 ## Endpoint resolution and filters
 
-For a `Fanout` (FR-WH-1):
+For a `Fanout` (FR-WH-1). An endpoint has one of three scopes, from its row: `tenant` (`tenant_id` set),
+`partner` (`partner_id` set) or `platform` (both `NULL`). The scope filter runs here, in the `Fanout`
+consumer (`consumers/webhooks.rs`), before any `Deliver` is queued; replay (`webhooks/replay.rs`) applies
+the same match function to the events it selects ([Replay](#replay)). The `Deliver` consumer only
+re-reads the endpoint to skip a deleted or disabled one, so these two are the only places that decide
+which endpoints receive an event.
 
-1. Load the enabled endpoints that can see the event, cached in the isolate for 30 seconds per tenant:
+1. Load the enabled endpoints that can see the event, cached in the isolate for 30 seconds per tenant
+   (per partner for an event with no tenant). `?1` is the event's `tenant_id`; `?2` is that tenant's
+   `partner_id` (read with the endpoints, from `tenants`, and cached with them), or, for `webhook.disabled`,
+   the partner of the endpoint the event is about (its own `partner_id`, or its tenant's):
 
    ```sql
-   SELECT id, tenant_id, event_types_json, identity_ids_json FROM webhook_endpoints
-   WHERE enabled = 1 AND (tenant_id IS NULL OR tenant_id = ?1);
+   SELECT id, tenant_id, partner_id, event_types_json, identity_ids_json FROM webhook_endpoints
+   WHERE enabled = 1
+     AND (tenant_id = ?1                                        -- the tenant's own endpoints
+          OR (tenant_id IS NULL AND partner_id IS NULL)         -- platform endpoints
+          OR (tenant_id IS NULL AND partner_id = ?2));          -- the endpoints of the tenant's partner
    ```
 
 2. An endpoint matches when:
    - its `event_types_json` is `["*"]` (which includes types added later) or contains the event type;
    - its `identity_ids_json` is null, or contains the event's `identity_id` (events without an identity,
      such as `domain.*`, match only endpoints without an identity filter);
-   - platform endpoints (`tenant_id IS NULL`) see every tenant's events;
-   - `webhook.disabled` goes only to platform endpoints, never to the endpoint it is about;
+   - platform endpoints see every tenant's events;
+   - partner endpoints see only the events of tenants whose `partner_id` is theirs: never another
+     partner's tenants, nor a tenant no partner created, nor a platform event without a tenant other than
+     the `webhook.disabled` below ([J15](../edge-cases.md));
+   - `webhook.disabled` goes to platform endpoints and to the endpoints of the disabled endpoint's partner
+     (`?2`), never to tenant endpoints and never to the endpoint it is about; so a disabled partner
+     endpoint is reported to that partner's other endpoints and to platform endpoints;
    - `webhook.test` is never fanned out (it is delivered synchronously, below).
 3. Queue one `Deliver { attempt: 1, first_attempt: 1 }` per matching endpoint (`send_batch`). For a
    platform event, then run `UPDATE event_index SET fanned_out_at = ?now WHERE id = ?1 AND fanned_out_at IS NULL`.
@@ -368,7 +384,9 @@ seconds, at most 86,400 (the Queues delay limit). The 13th attempt is the last: 
   ```
 
   `data` is `{ "webhook_id": "whk_…", "reason": "gone" }` or `{ … "reason": "failing" }`. The event goes
-  to the platform's other endpoints.
+  to the platform's endpoints and, when the disabled endpoint belongs to a partner (a partner endpoint, or
+  a tenant endpoint of a partner's tenant), to that partner's other endpoints. `tenant_id` is the
+  endpoint's tenant, or `NULL` for a platform or partner endpoint.
 - `PATCH /v1/webhooks/{id}` with `enabled: true` re-enables it and resets `consecutive_failures` and
   `disabled_reason`. `enabled: false` disables it with `disabled_reason = 'manual'` and no event.
 
@@ -378,13 +396,16 @@ seconds, at most 86,400 (the Queues delay limit). The 13th attempt is the last: 
 
 1. **Select events** from `event_index` whose `occurred_at` is within the last 30 days (or the tenant's
    `retention.events_days`, if shorter; 30 days for platform events, which have no tenant), scoped to
-   the endpoint's tenant (all tenants for a platform endpoint), at most 1,000 per request (more → `400 invalid_request` asking for a
+   the endpoint's tenant (all tenants for a platform endpoint; for a partner endpoint, the tenants whose
+   `partner_id` is its partner's, plus platform events with no tenant), at most 1,000 per request (more → `400 invalid_request` asking for a
    narrower window):
    - by IDs: `WHERE id IN (…)` (at most 100 IDs);
    - by window: `WHERE occurred_at >= ?since AND occurred_at < ?until`, plus, when `status` is given,
      `dead`: `EXISTS (… d.status = 'dead')` and no `succeeded` attempt for this endpoint; `failed`: the
      latest attempt for this endpoint is `failed`; `succeeded`: some attempt succeeded.
-2. **Filter** to events the endpoint would receive (event types and identity filter).
+2. **Filter** to events the endpoint would receive: event types, identity filter, and the scope rules of
+   [Endpoint resolution](#endpoint-resolution-and-filters), so a partner endpoint never replays another
+   partner's events.
 3. For each event: `first_attempt = 1 + COALESCE(MAX(attempt), 0)` over this endpoint's rows for the event,
    then queue `Deliver { attempt: first_attempt, first_attempt, replay: true }`. The full retry schedule
    restarts for the replay. The payload is read from the owner as for a normal delivery, so an event whose
@@ -457,6 +478,7 @@ event and endpoint IDs, status codes and durations, never payloads or URLs' quer
 | `it::webhooks::no_redirects_and_caps` | A `3xx` is a failure and is not followed; a slow endpoint times out at 15 s; only 4 KB of the body is read (FR-WH-5) |
 | `it::webhooks::j4_retry_schedule` | A time-controlled harness sees 13 attempts at the scheduled delays (±10%), then `dead` ([J4](../edge-cases.md), FR-WH-3) |
 | `it::webhooks::disable_on_410` | `410 Gone` disables at once and emits `webhook.disabled` to other platform endpoints |
+| `it::webhooks::j15_partner_scope_filter` | With partners P and Q, each with a partner endpoint subscribed to `*`: events of P's tenants reach P's endpoint and platform endpoints, never Q's; events of a tenant no partner created reach no partner endpoint; a tenant endpoint still receives only its tenant; replay to P's endpoint never selects Q's or an unpartnered tenant's events; a `410` on P's endpoint sends `webhook.disabled` to P's other endpoint and to platform endpoints, never to Q's or to tenant endpoints; `POST /v1/webhooks` with a partner key returns `scope: "partner"` and `partner_id`, and the 21st partner endpoint gets `422 webhook_limit_reached` ([J15](../edge-cases.md), FR-WH-1, FR-KEY-4) |
 | `it::webhooks::disable_after_100_failures_24h` | 100 failures within 24 h do not disable; 100 spread over ≥ 24 h do |
 | `it::webhooks::replay_by_ids_and_window` | Replay by IDs and by window with `status: dead`; the limit is 30 days from `occurred_at` (an event that went `dead` on day 3 cannot be replayed after day 30), or `events_days` when shorter; erased events are not replayed |
 | `it::webhooks::notifier_handoff_never_blocks` | `message.received` reaches the tenant's Notifier only when a `new_mail` preference is on (after the 60-second cache), and never for a re-parse; `message.triaged` reaches it under the same condition, with `filter = all` as with `needs_reply`; a failing Notifier leaves every delivery queued and the event acked |

@@ -22,7 +22,7 @@ of truth for both.
   | `aud_` | audit entry | `req_` | request ID |
   | `usr_` | console user | `inv_` | invitation |
   | `dlq_` | dead-letter item | `hld_` | quota hold |
-  | `prb_` | alignment probe | | |
+  | `prb_` | alignment probe | `ptn_` | partner |
 
 - **Times** are stored as Unix milliseconds (`INTEGER`) and exposed in the API as RFC 3339 UTC strings.
 - **Email addresses** are stored lower-cased, with the domain as an IDNA A-label (punycode). Local parts
@@ -42,10 +42,27 @@ of truth for both.
 -- migrations/d1/0001_init.sql
 PRAGMA foreign_keys = ON;
 
+-- An integrator whose partner keys create tenants and act only on those tenants (Security § 4.6).
+CREATE TABLE partners (
+  id                   TEXT PRIMARY KEY,                   -- ptn_
+  name                 TEXT NOT NULL,                      -- the only data a partner holds (Privacy § 6.10)
+  status               TEXT NOT NULL DEFAULT 'active'
+                       CHECK (status IN ('active','suspended')),
+  default_billing_mode TEXT NOT NULL DEFAULT 'metered'     -- copied to billing_accounts.mode of each tenant
+                       CHECK (default_billing_mode IN ('exempt','metered')),  -- a partner key creates
+  created_at           INTEGER NOT NULL,
+  updated_at           INTEGER NOT NULL
+);
+
 CREATE TABLE tenants (
   id               TEXT PRIMARY KEY,                       -- ten_
   slug             TEXT NOT NULL UNIQUE,                   -- ^[a-z0-9][a-z0-9-]{1,31}$
   name             TEXT NOT NULL,
+  partner_id       TEXT REFERENCES partners(id) ON DELETE SET NULL,
+                                                           -- the partner whose key created the tenant; NULL
+                                                           -- otherwise. Written at insert and never updated;
+                                                           -- only deleting the partner, which needs every one
+                                                           -- of its tenants erased, clears it
   mode             TEXT NOT NULL CHECK (mode IN ('live','test')),
   status           TEXT NOT NULL DEFAULT 'active'
                    CHECK (status IN ('active','suspended','erasing','erased')),
@@ -73,6 +90,7 @@ CREATE TABLE tenants (
   updated_at       INTEGER NOT NULL
 );
 CREATE UNIQUE INDEX tenants_suffix ON tenants(address_suffix) WHERE address_suffix <> '';
+CREATE INDEX tenants_partner ON tenants(partner_id) WHERE partner_id IS NOT NULL;
 
 CREATE TABLE domains (
   id                    TEXT PRIMARY KEY,                  -- dom_
@@ -195,7 +213,8 @@ CREATE TABLE api_keys (
   prev_hash         TEXT,                                  -- previous secret during rotation overlap
   prev_expires_at   INTEGER,
   name              TEXT NOT NULL,
-  level             TEXT NOT NULL CHECK (level IN ('platform','tenant','identity')),
+  level             TEXT NOT NULL CHECK (level IN ('platform','partner','tenant','identity')),
+  partner_id        TEXT REFERENCES partners(id),          -- partner keys only: the partner they act for
   tenant_id         TEXT REFERENCES tenants(id),
   identity_id       TEXT REFERENCES identities(id),
   mode              TEXT NOT NULL CHECK (mode IN ('live','test')),
@@ -205,15 +224,18 @@ CREATE TABLE api_keys (
   revoked_at        INTEGER,
   last_used_at      INTEGER,                               -- updated at most once per minute
   created_at        INTEGER NOT NULL,
-  CHECK ((level = 'platform' AND tenant_id IS NULL AND identity_id IS NULL)
-      OR (level = 'tenant'   AND tenant_id IS NOT NULL AND identity_id IS NULL)
-      OR (level = 'identity' AND tenant_id IS NOT NULL AND identity_id IS NOT NULL))
+  CHECK ((level = 'platform' AND partner_id IS NULL AND tenant_id IS NULL AND identity_id IS NULL)
+      OR (level = 'partner'  AND partner_id IS NOT NULL AND tenant_id IS NULL AND identity_id IS NULL)
+      OR (level = 'tenant'   AND partner_id IS NULL AND tenant_id IS NOT NULL AND identity_id IS NULL)
+      OR (level = 'identity' AND partner_id IS NULL AND tenant_id IS NOT NULL AND identity_id IS NOT NULL))
 );
 CREATE INDEX api_keys_tenant ON api_keys(tenant_id);
+CREATE INDEX api_keys_partner ON api_keys(partner_id) WHERE partner_id IS NOT NULL;
 
 CREATE TABLE webhook_endpoints (
   id                     TEXT PRIMARY KEY,                 -- whk_
-  tenant_id              TEXT REFERENCES tenants(id),      -- NULL = platform-wide endpoint
+  tenant_id              TEXT REFERENCES tenants(id),      -- NULL = platform or partner endpoint
+  partner_id             TEXT REFERENCES partners(id),     -- partner endpoint (scope "partner"); NULL otherwise
   url                    TEXT NOT NULL,                    -- https only, validated (SSRF rules)
   description            TEXT,
   event_types_json       TEXT NOT NULL,                    -- ["*"] or explicit list
@@ -226,9 +248,11 @@ CREATE TABLE webhook_endpoints (
   prev_secret_expires_at INTEGER,
   consecutive_failures   INTEGER NOT NULL DEFAULT 0,
   created_at             INTEGER NOT NULL,
-  updated_at             INTEGER NOT NULL
+  updated_at             INTEGER NOT NULL,
+  CHECK (tenant_id IS NULL OR partner_id IS NULL)          -- scope: tenant, partner, or platform (both NULL)
 );
 CREATE INDEX webhook_endpoints_tenant ON webhook_endpoints(tenant_id, enabled);
+CREATE INDEX webhook_endpoints_partner ON webhook_endpoints(partner_id, enabled) WHERE partner_id IS NOT NULL;
 
 CREATE TABLE webhook_deliveries (
   id              TEXT PRIMARY KEY,                        -- dlv_
@@ -336,7 +360,9 @@ CREATE TABLE exports (
 
 -- Idempotency for non-mail POSTs (mail sends are idempotent inside the mailbox).
 CREATE TABLE idempotency_records (
-  scope           TEXT NOT NULL,                           -- tenant_id or 'platform'
+  scope           TEXT NOT NULL,                           -- tenant_id; the partner_id for a partner key's POST
+                                                           -- that names no tenant (POST /v1/tenants,
+                                                           -- POST /v1/webhooks); or 'platform'
   idem_key        TEXT NOT NULL,                           -- ≤ 255 printable ASCII
   method          TEXT NOT NULL,
   path            TEXT NOT NULL,
@@ -730,6 +756,25 @@ CREATE TABLE platform_objects (
   release is not stored on the message, which goes back to `received`: its actor is in the
   `quarantine.release` audit row and in the `message.released` event (`released_by_key_id`, or
   `released_by_user_id` for a console release).
+- **Partners.** `partners` rows are written by `POST /v1/partners` and changed by
+  `PATCH /v1/partners/{partner_id}` (platform keys with `partners:manage`,
+  [REST API › Partners](../../reference/api.md#partners)). `status` is read by authentication for every
+  partner key ([Security § 4.2](security.md#42-verification), step 9), and `default_billing_mode` by
+  `POST /v1/tenants` with a partner key, which writes it to the new tenant's `billing_accounts.mode` and
+  the key's `partner_id` to `tenants.partner_id`. `tenants.partner_id` is read by the owner check of every
+  partner-key request ([Security § 5.2](security.md#52-order-of-checks), step 4), by the `partner_id`
+  filter of `GET /v1/tenants`, and by the webhook fan-out to find a tenant's partner endpoints
+  ([Webhooks › Endpoint resolution](webhooks.md#endpoint-resolution-and-filters)).
+  `api_keys.partner_id` is written by `POST /v1/keys` for `level: "partner"` and read by authentication
+  (step 9). `webhook_endpoints.partner_id` is written by `POST /v1/webhooks` with a partner key and read
+  by the fan-out, the replay selection and the owner check. `DELETE /v1/partners/{partner_id}` runs one
+  D1 batch: it deletes the partner's `webhook_endpoints` (their deliveries cascade), its `api_keys`, its
+  `idempotency_records` (`scope` = the partner ID) and then the `partners` row. Every statement of the
+  batch carries the guard `AND NOT EXISTS (SELECT 1 FROM tenants WHERE partner_id = ?1 AND status <> 'erased')`,
+  so while any of its tenants is not erased the batch changes nothing and the route answers
+  `409 partner_has_tenants`; a tenant created concurrently is either seen by the guard or fails its own
+  insert on the foreign key. Deleting the row sets `partner_id` to `NULL` on the partner's erased tenants
+  (`ON DELETE SET NULL`) ([Privacy § 6.10](privacy.md#610-partners)).
 - **Console token hashes** (`invitations.token_hash`, `login_tokens.token_hash` and `code_hash`,
   `sessions.id_hash`, `oauth_states.state_hash` and `cookie_hash`) use the current `link` key and record
   its kid in `key_kid`. A lookup computes the HMAC under each `link` key still inside its verify window,

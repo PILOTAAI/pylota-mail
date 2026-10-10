@@ -95,7 +95,7 @@ Cron triggers:
 | `PM_LOG_LEVEL` | `info` | `error`, `warn`, `info` or `debug`. Content is never logged at any level |
 | `PM_DEFAULT_POLICY` | `{}` | JSON merged over the built-in tenant policy defaults |
 | `PM_CONSOLE` | `on` | `on` serves the console at `/console`; `off` removes its routes |
-| `PM_QUARANTINE_KEY_RELEASE` | `on` | `on`: API keys with `quarantine:review` may release quarantined mail (`POST …/release`). `off`: only a signed-in person can, in the console, and API keys get `403 permission_denied` (FR-CON-6). Pylota Mail Cloud sets `off`. With `PM_CONSOLE=off` it is always treated as `on` |
+| `PM_QUARANTINE_KEY_RELEASE` | `on` | `on`: API keys with `quarantine:review` may release quarantined mail (`POST …/release`). `off`: only a signed-in person can, in the console, and API keys get `403 permission_denied` (FR-CON-6), except on a tenant whose policy has `quarantine.key_release: true` ([Tenant policy](#tenant-policy)). Pylota Mail Cloud sets `off`. With `PM_CONSOLE=off` it is always treated as `on` |
 | `PM_CONSOLE_HOST` | the value of `PM_API_HOST` | The host that serves the console. When it differs from `PM_API_HOST`, console paths answer only on this host and API paths only on `PM_API_HOST`; anything else gets `404`, and no cookie is set or read on the API host. Every console POST must carry `Origin: https://{PM_CONSOLE_HOST}` (CSRF defence in depth), and console links in mail use that origin. It is read even with `PM_CONSOLE=off`, because invitation links use it |
 | `PM_SIGNUP` | `closed` | Self-serve sign-up: `closed` (people join by invitation or `pmail setup --owner-email`), `waitlist` (double opt-in, invited in batches with `pmail waitlist invite`) or `open` ([Cloud sign-up](../project/design/cloud-signup.md#6-sign-up)) |
 | `PM_SYSTEM_FROM` | `Pylota Mail <no-reply@{PM_PLATFORM_DOMAIN}>` | The display name and address of the **system identity**, which `pmail setup` creates on the default tenant and which sends sign-in, invitation and notification mail through the platform domain. Its local part may be a reserved name; it is never listed to tenants ([Identities and domains › The system identity](../project/design/identity-domains.md#the-system-identity)). Read even with `PM_CONSOLE=off` |
@@ -158,9 +158,14 @@ OAuth flows and cursors fail). Then rotate `PM_MASTER_KEY`.
 
 ## Tenant policy
 
-Stored per tenant. `PATCH /v1/tenants/{tenant_id}` (a platform key with `tenants:manage`) with
-`{ "policy": { … } }` deep-merges it. This is the full
-document with defaults:
+Stored per tenant. `PATCH /v1/tenants/{tenant_id}` with `{ "policy": { … } }` deep-merges it; it needs
+`tenants:manage`, so a platform key changes any tenant's policy and a partner key the policy of the
+tenants its partner's keys created ([REST API › Partners](api.md#partners)). Tenant keys and the console
+cannot change it. A partner key may lower the abuse controls of its tenants but not raise them above the
+deployment's defaults: `identity_daily_send_cap`, `tenant_daily_send_cap`, `max_recipients`,
+`search.agentic_daily_cap` and the `abuse` thresholds (a higher threshold makes auto-pause more lenient).
+Raising one needs a platform key; a partner key gets `403 scope_denied` with `details.field`, so one
+partner cannot spend the shared sending reputation of a Cloud deployment. This is the full document with defaults:
 
 ```json
 {
@@ -178,7 +183,8 @@ document with defaults:
   "quarantine": {
     "on_auth_fail": true,
     "spam_threshold": 0.8,
-    "unsolicited_otp": true
+    "unsolicited_otp": true,
+    "key_release": false
   },
   "inbound": {
     "per_sender_per_hour": 60,
@@ -228,13 +234,14 @@ document with defaults:
 | `auto_reply.max_automatic_exchanges` | Automatic replies allowed per thread before a human must act ([D6](../project/edge-cases.md)) |
 | `inbound.ses_bounce_retired` | `true` bounces mail to retired addresses on SES-receiving domains with `550 5.1.6`, through SES receipt rules; `false` drops it without a bounce ([Domains on any DNS host › Retired and unknown recipients](../project/design/domain-connections.md#46-retired-and-unknown-recipients)) |
 | `quarantine.unsolicited_otp` | Quarantine password-reset and OTP mail that no `wait` asked for ([E5](../project/edge-cases.md)) |
+| `quarantine.key_release` | `true` lets keys with `quarantine:review` that reach this tenant, its partner key included, release its quarantined mail even when `PM_QUARANTINE_KEY_RELEASE` is `off`. `false` by default. Only a platform key, or the partner key of the tenant's own partner, can set it (a tenant key cannot call `PATCH /v1/tenants/{tenant_id}`: `403 permission_denied`). With `PM_QUARANTINE_KEY_RELEASE=on` it changes nothing. On Pylota Mail Cloud, Pylota's partner key sets it to `true` on each operator's tenant ([J14](../project/edge-cases.md), [J16](../project/edge-cases.md)) |
 | `retention.message_days` | `null` keeps parsed messages indefinitely. A number deletes messages, attachments, index rows and vectors after that age, except held threads |
 | `retention.events_days` | 1–365, default 30. Webhook delivery rows, the event index and the event payloads kept for replay are deleted after this many days. Webhook replay reaches back 30 days from an event's `occurred_at`, or this many days if fewer ([Privacy design › Retention](../project/design/privacy.md#52-steps-of-a-tenant-retention-job)) |
 | `triage.categories` | `null` uses the built-in list. Otherwise an array of up to 20 `{ "name": "pcn", "description": "Penalty charge notices from councils" }`, which replaces it |
 | `triage.rules` | Deterministic rules. See [Triage](../guides/triage.md#rules) |
 | `search.refs_packs` | `core` (amounts, phones, emails, domains, dates, invoice and order numbers) and optional `uk_vehicle` (plates, PCNs). There is no built-in pack for booking references: add them with `custom_refs` |
 | `search.custom_refs` | Up to 20 `{ "name": "booking", "pattern": "BK-\\d{4,6}", "normalise": "upper" }`. Patterns use the `regex` crate syntax: linear time, no back-references, compiled size capped at 64 KB |
-| `domains.allow_create_zone` | Lets the tenant's own keys use the `nameservers` method, which creates a Cloudflare zone. `false` by default; Pylota Mail Cloud sets it to `true`. Without it, the request gets `422 transport_unavailable` (`zone_creation_not_allowed`). Platform keys may always use it |
+| `domains.allow_create_zone` | Lets the tenant's own keys, and its partner key, use the `nameservers` method, which creates a Cloudflare zone. `false` by default; Pylota Mail Cloud sets it to `true`. Without it, the request gets `422 transport_unavailable` (`zone_creation_not_allowed`). Platform keys may always use it |
 | `web_bot_auth.allowed` | Lets the tenant's identities obtain signed HTTP requests (Web Bot Auth). `false` by default: a tenant must opt in, and until it does those requests get `403 policy_denied`. It has no effect while `PM_WEB_BOT_AUTH` is `off` ([Agent signing keys](../project/design/agent-keys.md#5-signed-http-requests-web-bot-auth)) |
 | `domain_fallback` | `false` fails sends on a failing domain instead of using the platform address |
 

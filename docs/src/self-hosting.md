@@ -220,8 +220,8 @@ setup, it finds nothing to change and exits without deploying.
 
 ```bash
 pmail keys create --level platform --name first-key --permissions \
-tenants:manage,platform:ops,keys:manage,identities:read,identities:write,domains:read,domains:write,\
-messages:read,messages:send,messages:write,attachments:read,search:read,search:agentic,\
+tenants:manage,partners:manage,platform:ops,keys:manage,identities:read,identities:write,domains:read,\
+domains:write,messages:read,messages:send,messages:write,attachments:read,search:read,search:agentic,\
 quarantine:review,webhooks:read,webhooks:manage,erasure:manage,suppressions:manage,usage:read,\
 audit:read,members:read,members:manage
 ```

@@ -13,7 +13,7 @@ designed in [Notifications and usage alerts](notifications.md#4-usage-alerts); t
 | Code | `crates/worker/src/billing/{mod.rs, catalog.rs, quota.rs, stripe.rs, webhook.rs, usage.rs}`, `handlers/{usage.rs, plans.rs, billing.rs}`, console page `console/pages/plan.rs`. The `TenantQuota` class lives in `quota/mod.rs` ([Outbound › TenantQuota](outbound.md#tenantquota)); `billing/quota.rs` adds allowances and holds to it |
 | Tables | D1 `billing_accounts`, `billing_events`; `TenantQuota` `allowances`, `holds` ([Data model](data-model.md#1-d1-control-plane), [Other Durable Objects](data-model.md#3-other-durable-objects)) |
 | Configuration | `PM_BILLING`, `PM_PLAN_CATALOG`, `PM_BILLING_GRACE_DAYS`, `PM_STRIPE_SECRET_KEY`, `PM_STRIPE_WEBHOOK_SECRET` ([Configuration](../../reference/configuration.md#variables)) |
-| Contracts | `GET /v1/usage`, `GET /v1/usage/daily`, `GET /v1/plans`, `GET`/`PATCH /v1/tenants/{id}/billing` ([REST API](../../reference/api.md#usage-and-audit)). The usage routes need `usage:read`, which every tenant and identity key holds implicitly for its own workspace; a platform key must hold it explicitly and pass `tenant_id` (`400 invalid_request` without it); `402 billing_limit`, `409 plan_managed_by_stripe` ([Errors](../../reference/errors.md#policy-and-limits)); `billing.*` events ([Webhook events](../../reference/events.md#workspaces-members-and-billing)) |
+| Contracts | `GET /v1/usage`, `GET /v1/usage/daily`, `GET /v1/plans`, `GET`/`PATCH /v1/tenants/{id}/billing` ([REST API](../../reference/api.md#usage-and-audit)). The usage routes need `usage:read`, which every tenant and identity key holds implicitly for its own workspace; a platform or partner key must hold it explicitly and pass `tenant_id` (`400 invalid_request` without it); `402 billing_limit`, `409 plan_managed_by_stripe` ([Errors](../../reference/errors.md#policy-and-limits)); `billing.*` events ([Webhook events](../../reference/events.md#workspaces-members-and-billing)) |
 | External facts | Stripe documentation, read on 2026-10-09 (see the `Verified` line at the end) |
 
 ## Principles
@@ -42,8 +42,11 @@ Each workspace has one mode in `billing_accounts.mode` (FR-BILL-1):
 | `disabled` | None. The daily caps in tenant policy (`identity_daily_send_cap`, `tenant_daily_send_cap`, `search.agentic_daily_cap`) still apply, as on every workspace | Self-hosting without billing | `NULL` (unlimited) |
 
 - `POST /v1/tenants` sets the mode from `billing.mode`. The default is `metered` on plan `free` when
-  `PM_BILLING=stripe`, and `disabled` otherwise.
-- `PATCH /v1/tenants/{id}/billing` (platform key, `tenants:manage`) changes `mode`, and sets `plan_id` on a
+  `PM_BILLING=stripe`, and `disabled` otherwise. A tenant created with a partner key gets its partner's
+  `default_billing_mode` (`exempt` or `metered`) instead, and the partner key cannot send `billing`
+  (`403 scope_denied`); on Pylota Mail Cloud, Pylota's operators are `exempt` this way
+  ([REST API › Partners](../../reference/api.md#partners)).
+- `PATCH /v1/tenants/{id}/billing` (platform key, `tenants:manage`; a partner key gets `403 scope_denied`) changes `mode`, and sets `plan_id` on a
   workspace with no Stripe subscription (a complimentary plan). On a workspace whose plan is paid through
   Stripe, a `plan_id` change returns `409 plan_managed_by_stripe`. Both are audit-logged
   (`billing.mode_change`, `billing.plan_set`) and a plan change emits `billing.plan_changed` with reason

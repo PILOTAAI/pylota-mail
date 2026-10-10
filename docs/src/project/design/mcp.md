@@ -287,12 +287,12 @@ therefore never a tool error.
 | `mail_find_related` | `search:read` | – |
 | `mail_search_contacts` | `search:read` | – |
 | `mail_wait` | `search:read` | – |
-| `mail_get_usage` | `usage:read` | held implicitly by every tenant and identity key for its own workspace, as for REST `GET /v1/usage`, so those keys always see it; never listed for platform keys (they have no workspace of their own: they need `usage:read` explicitly and call REST `GET /v1/usage` with `tenant_id`) |
+| `mail_get_usage` | `usage:read` | held implicitly by every tenant and identity key for its own workspace, as for REST `GET /v1/usage`, so those keys always see it; never listed for platform or partner keys (they have no workspace of their own: they need `usage:read` explicitly and call REST `GET /v1/usage` with `tenant_id`) |
 | `mail_send` | `messages:send` | – |
 | `mail_reply` | `messages:send` | – |
 | `mail_forward` | `messages:send` | – |
 | `mail_update_labels` | `messages:write` | – |
-| `mail_sign_assertion` | `identities:sign` | tenant and identity keys only: a platform key can never hold `identities:sign` ([Agent signing keys](agent-keys.md#6-permissions-limits-and-plans)), so it never sees the tool; an identity key signs only as its own identity |
+| `mail_sign_assertion` | `identities:sign` | tenant and identity keys only: a platform or partner key can never hold `identities:sign` ([Agent signing keys](agent-keys.md#6-permissions-limits-and-plans)), so it never sees the tool; an identity key signs only as its own identity |
 | `mail_sign_http_request` | `identities:sign` | as `mail_sign_assertion`; `PM_WEB_BOT_AUTH` and the tenant's `policy.web_bot_auth.allowed` are checked per call (tool errors `web_bot_auth_disabled` and `policy_denied`) |
 
 **Identity argument.** Identity-scoped tools take an optional `identity` argument: an identity ID
@@ -301,10 +301,10 @@ therefore never a tool error.
 - An identity key uses its own identity. If `identity` is given and names a different identity, the
   tool returns the `identity_not_found` error (scope failures are indistinguishable from missing
   resources, as in REST).
-- A tenant or platform key must pass `identity`. An address is resolved with the same logic as
+- A tenant, partner or platform key must pass `identity`. An address is resolved with the same logic as
   `GET /v1/identities/lookup`.
-- `mail_search` and `mail_deep_search` take `scope: "tenant"` for tenant and platform keys (a platform
-  key also passes `tenant_id`), and then call `POST /v1/tenants/{tenant_id}/search`. An identity key
+- `mail_search` and `mail_deep_search` take `scope: "tenant"` for tenant, partner and platform keys (a
+  platform or partner key also passes `tenant_id`, a partner key one of its own tenants), and then call `POST /v1/tenants/{tenant_id}/search`. An identity key
   asking for tenant scope gets `scope_denied` ([F3]). With tenant scope, `identity_ids` (at most 100)
   limits the search to those identities, as in REST; without it, a tenant with more than 100 identities
   gets `scope_too_large`.
@@ -402,7 +402,7 @@ Title "List mail identities". Description:
 
 ```json
 { "type": "object", "additionalProperties": false, "properties": {
-    "tenant_id": { "type": "string", "pattern": "^ten_[0-9A-HJKMNP-TV-Z]{26}$", "description": "Platform keys only: limit to one tenant." },
+    "tenant_id": { "type": "string", "pattern": "^ten_[0-9A-HJKMNP-TV-Z]{26}$", "description": "Platform and partner keys only: limit to one tenant." },
     "status": { "type": "string", "enum": ["active", "paused"], "description": "Only identities with this status." },
     "purpose": { "type": "string", "maxLength": 64, "description": "Only identities with this purpose tag." },
     "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 25 },
@@ -421,7 +421,7 @@ Title "List threads". Description:
 
 ```json
 { "type": "object", "additionalProperties": false, "properties": {
-    "identity": { "type": "string", "maxLength": 254, "description": "Identity id (idn_…) or address. Required for tenant and platform keys." },
+    "identity": { "type": "string", "maxLength": 254, "description": "Identity id (idn_…) or address. Required for tenant, partner and platform keys." },
     "label": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_:-]{0,63}$" },
     "category": { "type": "string", "maxLength": 32 },
     "needs_reply_gte": { "type": "number", "minimum": 0, "maximum": 1 },
@@ -445,8 +445,8 @@ Title "Search mail". Description:
 { "type": "object", "additionalProperties": false, "required": ["q"], "properties": {
     "q": { "type": "string", "maxLength": 1024, "description": "Query in the Pylota Mail query language. Empty string lists the newest messages." },
     "identity": { "type": "string", "maxLength": 254 },
-    "scope": { "type": "string", "enum": ["identity", "tenant"], "default": "identity", "description": "tenant searches every identity of the tenant (tenant and platform keys)." },
-    "tenant_id": { "type": "string", "pattern": "^ten_[0-9A-HJKMNP-TV-Z]{26}$", "description": "Platform keys with scope tenant." },
+    "scope": { "type": "string", "enum": ["identity", "tenant"], "default": "identity", "description": "tenant searches every identity of the tenant (tenant, partner and platform keys)." },
+    "tenant_id": { "type": "string", "pattern": "^ten_[0-9A-HJKMNP-TV-Z]{26}$", "description": "Platform and partner keys with scope tenant." },
     "identity_ids": { "type": "array", "uniqueItems": true, "minItems": 1, "maxItems": 100, "items": { "type": "string", "pattern": "^idn_[0-9A-HJKMNP-TV-Z]{26}$" }, "description": "Scope tenant only: search only these identities. Needed when the tenant has more than 100 identities." },
     "mode": { "type": "string", "enum": ["keyword", "semantic", "hybrid"], "default": "hybrid" },
     "group_by": { "type": "string", "enum": ["message", "thread"], "default": "message" },
@@ -611,7 +611,7 @@ Title "Check plan allowances". Description:
 
 Output: the usage response of `GET /v1/usage` ([API › Usage and audit](../../reference/api.md#usage-and-audit))
 (`billing`, `plan`, `features`, `topups`, `plans`) for the key's own workspace. The tool takes no
-`tenant_id`; a platform key never sees it ([§3](#3-authentication-and-tool-filtering)).
+`tenant_id`; platform and partner keys never see it ([§3](#3-authentication-and-tool-filtering)).
 
 #### `mail_send`
 
@@ -823,7 +823,7 @@ errors).
 
 A key without a tool's permission never reaches the tool: the call is `-32602 Unknown tool`
 ([§2.4](#24-errors-at-the-protocol-level)), so `permission_denied` for the tool's own permission is not
-returned. This is why platform keys, which can never hold `identities:sign`, see neither signing tool.
+returned. This is why platform and partner keys, which can never hold `identities:sign`, see neither signing tool.
 
 ## 6. Prompt and instructions
 
@@ -944,7 +944,7 @@ v1.1 needs an ADR and updates to [Configuration](../../reference/configuration.m
 | `it::mcp::auth_401` | Missing, expired and revoked keys give `401` with `WWW-Authenticate` | FR-MCP-1 |
 | `it::mcp::sse_deep_search_progress` | Progress notifications per step, keep-alive, final response; closing the stream stops the loop | §2.6 |
 | `it::mcp::size_budgets` | Truncation flags and the 96 KB cap; attachment text is cut per page; every cut result still validates against its tool's `outputSchema` and has `truncated: true` | §4.2 |
-| `it::mcp::get_usage` | `mail_get_usage` is listed for tenant and identity keys that do not hold `usage:read` explicitly and never for platform keys; it returns the same body as `GET /v1/usage` for the key's own workspace; any argument gives `invalid_request` | §3, §4.3, FR-BILL-11 |
+| `it::mcp::get_usage` | `mail_get_usage` is listed for tenant and identity keys that do not hold `usage:read` explicitly and never for platform or partner keys; it returns the same body as `GET /v1/usage` for the key's own workspace; any argument gives `invalid_request` | §3, §4.3, FR-BILL-11 |
 | `it::mcp::sign_tools` | `mail_sign_assertion` and `mail_sign_http_request` are listed only for tenant and identity keys holding `identities:sign`; an identity key naming another identity gets `identity_not_found`; the results have the REST shapes and verify (the token against the identity's JWKS); two identical calls return different tokens; an identity of a suspended tenant gets `tenant_suspended` (checked first) and a paused identity `identity_paused`, and `PM_WEB_BOT_AUTH=off` and a tenant not opted in give `web_bot_auth_disabled` and `policy_denied` as `isError` results | §3, §4.3, §5, FR-IDN-7, FR-IDN-8 |
 | `it::mcp::rmcp_roundtrip` (native) | Every local protocol type round-trips through `rmcp::model` 3.4.1 | S5 fallback |
 | `it::mcp::inspector_replay` | A recorded MCP Inspector session replays green | M15 |

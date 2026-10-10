@@ -70,7 +70,7 @@ Unchanged: [Identities, addresses and domains › Kind `zone`](identity-domains.
 This is `create_zone` from [Creating a zone](identity-domains.md#creating-a-zone), opened to tenants and
 made safe for domains that are not empty.
 
-1. **Who may use it.** Platform keys always. Tenant keys only when the tenant's policy has
+1. **Who may use it.** Platform keys always. Tenant and partner keys only when the tenant's policy has
    `domains.allow_create_zone: true`; otherwise `422 transport_unavailable` with
    `details.reason = "zone_creation_not_allowed"`. The default is `false` for self-hosted deployments, and
    Pylota Mail Cloud sets it to `true`.
@@ -587,7 +587,7 @@ storage until they arrive or expire (15 and 10 minutes).
 |---|---|
 | `POST /v1/tenants/{tenant_id}/domains` | New field `method` (required for new clients; when it is absent, the old `kind` is mapped: `zone` → `cloudflare_zone`, `external` → `send_only`; `create_zone: true` with `kind: zone` is the old spelling of `nameservers`). New fields: `confirm_dedicated` (`nameservers`), `smtp` and `inbound` (`smtp_relay`). `replace_mx` applies to a `cloudflare_zone` apex and to `dns_records`. `402 billing_limit` (`feature: custom_domains`) as before. `422 cf_token_required` only for `cloudflare_zone`, `nameservers` and `delegated_subdomain` |
 | Domain object | Adds `method`, `inbound`, `transport`, `ses_region`, `mail_from_domain`, `smtp` (`host`, `port`, `username`, `probe_from`; never the password; `null` unless `smtp_relay`) and `probe` (`last_at`, `result`; `null` unless the transport is `smtp`). `kind` is `platform`, `zone`, `delegated` or `external`. Records gain `host` (relative to the registrable domain) next to `name` |
-| `PATCH /v1/domains/{id}` | `transport` (platform key only, as before) and `smtp` (tenant or platform key with `domains:write`: rotate credentials or change the host). New `smtp` values stay pending until a probe with them passes ([5.3](#53-proving-alignment-the-probe)). `200` with the domain |
+| `PATCH /v1/domains/{id}` | `transport` (platform key only, as before) and `smtp` (tenant, partner or platform key with `domains:write`: rotate credentials or change the host). New `smtp` values stay pending until a probe with them passes ([5.3](#53-proving-alignment-the-probe)). `200` with the domain |
 | `POST /v1/domains/{id}/probe` | `domains:write`. Runs the alignment probe now (`smtp` transport only); `202 { "probe_id": "prb_…" }`; at most once a minute per domain (`429 rate_limited`); the result arrives as a domain health change |
 | `POST /v1/identities/{identity_id}/addresses/{address_id}/test-forwarding` | `identities:write`. Domains with `inbound: forward` (`send_only`, `smtp_relay`); `202`; the result is in the address's `forwarding` |
 | Address object | Adds `forwarding` (`null` unless the domain uses `inbound: forward`, else `unverified`, `ok` or `failed`) and `forwarding_checked_at` |
@@ -613,7 +613,7 @@ New error codes:
 | `ses_receiving_not_configured` | `dns_records`, or `smtp_relay` with `inbound: ses`, without `PM_SES_INBOUND_TOPIC_ARN` (and bucket and queue) |
 | `ses_identity_limit` | The SES region already has 10,000 identities; creating a domain that needs one ([4.3](#43-dns_records)) |
 | `subdomain_setup_disabled` | `delegated_subdomain` while `PM_CF_SUBDOMAIN_SETUP` is not `on` |
-| `zone_creation_not_allowed` | `nameservers` by a tenant key whose policy lacks `domains.allow_create_zone: true` |
+| `zone_creation_not_allowed` | `nameservers` by a tenant or partner key whose tenant's policy lacks `domains.allow_create_zone: true` |
 | `method_not_supported` | The method does not support the operation: `PATCH transport` to a transport the method cannot use; `probe` when the transport is not `smtp`; `test-forwarding` without `inbound: forward` |
 | `marketing_needs_ses` | A `kind: marketing` send from a domain whose transport is `cloudflare`, the platform domain included ([Outbound › Pipeline](outbound.md), step 9): Cloudflare Email Service is for transactional mail only |
 

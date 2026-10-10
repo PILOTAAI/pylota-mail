@@ -305,16 +305,25 @@ Cloudflare implementations and in-memory fakes for native tests.
 
 ## M5 · Worker base: routing, auth, tenants, keys
 
-**Files:** `crates/worker/src/{lib.rs, router.rs, auth.rs, errors.rs, ratelimit.rs, request_id.rs, keyring.rs, handlers/{meta.rs, tenants.rs, keys.rs, audit.rs}, db/{mod.rs, tenants.rs, keys.rs, audit.rs, idempotency.rs, signing_keys.rs}, quota/mod.rs}`,
+**Files:** `crates/worker/src/{lib.rs, router.rs, auth.rs, errors.rs, ratelimit.rs, request_id.rs, keyring.rs, handlers/{meta.rs, tenants.rs, partners.rs, keys.rs, audit.rs}, db/{mod.rs, tenants.rs, partners.rs, keys.rs, audit.rs, idempotency.rs, signing_keys.rs}, quota/mod.rs}`,
 `crates/core/src/{keys.rs, crypto.rs}` (key format and the sealing envelope, pure)
 (`TenantQuota` as a stub class that answers every `QuotaRequest` variant, see below),
 `migrations/d1/0001_init.sql` (every D1 table and index in [Data model](design/data-model.md), including those that
 later milestones use: the console, billing, sign-up and domain-method tables and columns),
 `crates/worker/tests/` harness (`cargo xtask itest`).
 
-**Implements:** FR-TEN-1/2/3, FR-KEY-1/2/3, NFR-SEC-1 (the cross-tenant suite), the error envelope, rate limits, request IDs,
+**Implements:** FR-TEN-1/2/3, FR-KEY-1/2/3/4, NFR-SEC-1 (the cross-tenant suite), the error envelope, rate limits, request IDs,
 idempotency for non-mail POSTs, and the thread and link keyring (`signing_keys`, created on first use;
 [Security](design/security.md#62-rotation-procedures)).
+
+**Partners and partner keys** (FR-KEY-4) land here with the other key levels: the `partners` table and
+the `partner_id` columns of `tenants`, `api_keys` and `webhook_endpoints` (all in `0001_init.sql`); the
+five `/v1/partners` routes; `level: "partner"` in `POST /v1/keys`; the partner checks of authentication
+(`403 partner_suspended`) and of the owner check ([Security › Partner keys](design/security.md#partner-keys));
+`POST /v1/tenants` with a partner key (its `partner_id` and `default_billing_mode`); and the
+`foreign_partner` class of the cross-tenant suite. Partner endpoints (`POST /v1/webhooks` with a partner
+key, and their scoped delivery) land with the webhook routes in M8, and `quarantine.key_release` with the
+release route in M7.
 
 **Tenants without owner or billing behaviour.** `POST /v1/tenants` accepts `owner` and `billing` as
 [REST API](../reference/api.md) specifies, validates them, and stores them: the owner's `users` and
@@ -358,8 +367,15 @@ well-formed answer. Later milestones replace behaviour, never a signature:
 - `/health`, `/v1/me`, `/openapi.json` and `/.well-known/security.txt` are served (the last as
   [Security](design/security.md) specifies, from `PM_SECURITY_CONTACT`).
 - J6 (`it::keys::j6_revoke_rotate`, above).
-- NFR-SEC-1: the cross-tenant suite (`it::security::cross_tenant_matrix`) finds 0 cross-tenant reads or
-  writes. Every later milestone extends it with its routes, and it must stay at 0.
+- Partners (FR-KEY-4): `it::partners::routes_and_audit`; `it::partners::policy_caps_lower_only`; J10 (`it::partners::j10_foreign_partner_not_found`,
+  and the `foreign_partner` class of `it::security::cross_tenant_matrix`); J11
+  (`it::keys::j11_partner_key_limits`); J13 (`it::partners::j13_suspended_partner`); a partner key's
+  requests counted in `RL_API` by key ID (`it::auth::rate_limited`). `DELETE /v1/partners/{partner_id}`
+  ships here with its `409 partner_has_tenants`; J12 is accepted in M14, because its test erases the
+  partner's tenant first.
+- NFR-SEC-1: the cross-tenant suite (`it::security::cross_tenant_matrix`), with its `foreign_partner`
+  class, finds 0 cross-tenant reads or writes. Every later milestone extends it with its routes, and it
+  must stay at 0.
 
 **One migration until v1.0.** `0001_init.sql` holds every table until v1.0 is released. No later
 milestone adds a D1 migration: M6–M26 change code only. A milestone that finds a missing column or table
@@ -412,12 +428,14 @@ and the promote, retire and rollback flows in M13 (they need a tenant domain).
 this stage), `crates/api-types/src/internal/index_job.rs` (the whole `IndexJob` enum, so M10 and M12 only
 fill in their arms).
 
-**Implements:** FR-IN-1–9, FR-THR-1/2, NFR-REL-1/2, read APIs, quarantine and release, and `wait`
+**Implements:** FR-IN-1–9, FR-THR-1/2, NFR-REL-1/2, read APIs, quarantine and release (with the
+`quarantine.key_release` override of FR-CON-6 for API keys), and `wait`
 ([Inbound › The `wait` handler](design/inbound.md#the-wait-handler-e4)), which is P0 because quarantine
 rule 5 (E5) depends on its registrations.
 
 **Acceptance:** A2, A6 (`it::inbound::a6_reject_codes`; its SES part in M23), A9, A10 (inbound part), A13, B1 (documented), B3, B12, B14, C1, D4, D5, D9, D10,
-E4 (`it::wait::e4_*`), E5, J1, J2, J7, and every `conf::` corpus case ingested end to end through workerd.
+E4 (`it::wait::e4_*`), E5, J1, J2, J7, J14 (`it::quarantine::j14_key_release_policy`), J16
+(`it::quarantine::j16_key_release_override`), and every `conf::` corpus case ingested end to end through workerd.
 Rows whose inbound side needs a later milestone are accepted there: C7 (it matches replies to outbound
 mail), D7 (suppressions and lists) and loopback L3 in M9, and C3 (a retiring address) and A4's role-mail
 routing (it sends a new message and needs a tenant domain) in M13.
@@ -437,7 +455,7 @@ temporarily failed mail.
 `crons/outbox_sweep.rs`, the SSRF guard `crates/core/src/ssrf.rs` (pure) and `crates/worker/src/net.rs` (guarded HTTP)
 ([Webhooks](design/webhooks.md), [Security § 9](design/security.md#9-ssrf-controls)).
 
-**Implements:** FR-WH-1–5, NFR-REL-4.
+**Implements:** FR-WH-1–5, NFR-REL-4, and the partner endpoints of FR-KEY-4 (`scope: "partner"`).
 
 **Acceptance:**
 
@@ -448,6 +466,10 @@ temporarily failed mail.
 - J4: a time-controlled harness checks the retry schedule.
 - Replay.
 - Auto-disable on `410` and on 100 consecutive failures.
+- J15: partner endpoints receive only their partner's tenants' events, by fan-out and by replay, and
+  `webhook.disabled` for a partner endpoint reaches that partner's other endpoints and platform endpoints
+  (`it::webhooks::j15_partner_scope_filter`). M8 also adds the endpoint cases (another partner's endpoint
+  by ID) to `it::partners::j10_foreign_partner_not_found`.
 - NFR-REL-4: the retry schedule reaches 24 hours within its 13 attempts, and `webhook_delivery_latency_ms`
   and `webhook_dead_total` are emitted for the SLI.
 - `webhook_endpoints.secret_enc` and `prev_secret_enc` are registered in `crates/core/src/sealed.rs`
@@ -632,12 +654,13 @@ also needs S11; without it, `smtp_relay` ships with `inbound: forward` only. `cl
 **Files:** `jobs/{mod.rs (JobRunner DO), erasure.rs, retention.rs, export.rs, reembed.rs, reparse.rs, reindex.rs, backup.rs}`,
 `handlers/{erasure.rs, exports.rs, holds.rs}`, `crons/retention.rs`.
 
-**Implements:** FR-PRV-1–6, FR-IDN-4, NFR-PRV-1.
+**Implements:** FR-PRV-1–6, FR-IDN-4, NFR-PRV-1, and partner deletion after its tenants' erasure (FR-KEY-4).
 
 **Acceptance:** F6, I1–I7, the `reparse` job that J3 starts (J3 itself is accepted with M17 Completion,
 which adds its start through `POST /v1/platform/jobs`), plus every erasure scope with receipt counts and
 empty probes (identity and tenant scope also delete `identity_keys` and write `key_tombstones`; with M25
-this is O7), the optional backup copy (`it::retention::backup_copy`), and
+this is O7), J12 (a partner whose tenants are all erased can be deleted, and not before:
+`it::partners::j12_delete_with_tenants`), the optional backup copy (`it::retention::backup_copy`), and
 `it::logs::i5_no_content_in_logs`, which greps captured Worker logs for any test-message body string and
 any test address. NFR-PRV-1: in a time-controlled harness every erasure scope completes within 24 hours,
 and a step that keeps failing still produces a receipt (`it::erasure::step_retry_and_fail`). Tenant scope

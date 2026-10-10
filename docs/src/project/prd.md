@@ -5,7 +5,7 @@
 | Product | Pylota Mail |
 | Document owner | Pylota engineering |
 | Status | Approved for build (v1.0) |
-| Last reviewed | 2026-10-09 |
+| Last reviewed | 2026-10-10 |
 | Licence | FSL-1.1-ALv2 (Fair Source; each release becomes Apache-2.0 two years after it ships) |
 | Related | [Architecture](architecture.md) · [Design](design/index.md) · [Build plan](build-plan.md) · [Edge cases](edge-cases.md) |
 
@@ -22,7 +22,7 @@ a CLI. It reports what happened through signed webhooks.
 It is source available under the Functional Source License (FSL-1.1-ALv2), written entirely in Rust, and
 runs as one Cloudflare Worker on the deployer's own Cloudflare account. Pylota also operates it as a hosted
 service, **Pylota Mail Cloud**, with Free, Developer and Team plans (section 13). Pylota (a platform for independent car-rental operators) is the first
-user, on its own self-hosted deployment. Pylota gives each operator four agent identities (bookings, inquiry, compliance, maintenance), and
+user, as a partner on Pylota Mail Cloud. Pylota gives each operator four agent identities (bookings, inquiry, compliance, maintenance), and
 operators move those identities from a shared platform domain to their own domain over time.
 
 ## 2. Problem
@@ -50,7 +50,7 @@ Pylota's own experience showed the cost of these gaps:
 
 | Persona | Needs |
 |---|---|
-| **Integrator** (a developer building an agent product, e.g. Pylota's API) | Provision identities per customer, send and receive reliably, get events, change domains, erase data, all through a stable API |
+| **Integrator** (a developer building an agent product, e.g. Pylota's API, which uses a partner key on Pylota Mail Cloud) | Provision a tenant and identities per customer, send and receive reliably, get events, change domains, erase data, all through a stable API; on a shared deployment, with a partner key that reaches only its own customers' tenants (FR-KEY-4) |
 | **Agent** (an LLM driving tools through MCP or an integrator's tool layer) | Small, well-described tools; search that finds the right email; reads that fit a context window; sends that are safe to retry; content marked untrusted |
 | **Operator** (the integrator's customer, e.g. a car-rental business) | Their agents email from their brand, history survives domain changes, nothing is sent from a broken domain, clear instructions when DNS breaks |
 | **Self-hoster / maintainer** | Deploy to their own Cloudflare account in minutes, upgrade safely, observe health, restore after mistakes |
@@ -107,7 +107,7 @@ copy (README, landing page) may only claim what this table lists.
 | U2 | **One email per intent.** Idempotency is required; an unknown outcome becomes `uncertain` and is never resent; plan limits never break a retry | FR-OUT-1, FR-OUT-2, FR-BILL-6 | G1, G2, L2, W3 |
 | U3 | **Identities outlive domains.** Addresses move between domains with history and threads intact, with rollback and a clean `550 5.1.6` after retirement | FR-ADR-1–5 | A11, C3, live domain-change test |
 | U4 | **Never sends mail that fails authentication.** Two-resolver health checks, aligned fallback in the same thread, suspension when ownership changes, and, for a relay we do not control, an alignment probe before the first send and every day | FR-DOM-4–6, FR-DOM-11 | H1, H4, H7, N18 |
-| U5 | **Built for untrusted input.** Verdicts and trust flags on every message, hidden text stripped, fenced model input, human-only quarantine release | FR-IN-4–9, FR-CON-6 | B10, B11, D2, D9, E1 |
+| U5 | **Built for untrusted input.** Verdicts and trust flags on every message, hidden text stripped, fenced model input, quarantine release only with the human-review permission | FR-IN-4–9, FR-CON-6 | B10, B11, D2, D9, E1 |
 | U6 | **Your account, your receipts.** Runs in the deployer's Cloudflare account (EU optional); erasure returns per-store counts and empty probe queries | FR-PRV-1–6 | I1–I7 |
 | U7 | **Real team seats.** Members, roles and seat limits are enforced, with an audit log of every privileged action and two-step verification that a workspace can require | FR-CON-2–5, FR-CON-10 | W8–W10, W27 |
 | U8 | **Tested against the edge cases.** A public edge-case register where every row the service owns names its test, a MIME conformance corpus, and quality gates in CI | Release criteria §9 | the register itself |
@@ -142,6 +142,7 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
 
 | Area | P0 | P1 | P2 |
 |---|---|---|---|
+| Tenancy and keys | Tenants (live and test), API keys at four levels, partner keys for integrators on a shared deployment (FR-KEY-4) | – | – |
 | Identities | CRUD, idempotent create, pause, accountable human; agent signing keys and assertions (JWKS) | Signed HTTP requests (Web Bot Auth, spike S13) | – |
 | Addresses | Platform domain, aliases, promote, retire, rollback | – | – |
 | Domains | Platform domain; `cloudflare_zone`; `nameservers` | `dns_records` (spike S11); `send_only` (S8); `smtp_relay` (S12); `delegated_subdomain` behind `PM_CF_SUBDOMAIN_SETUP` (S10) | Mailgun and SendGrid inbound sources |
@@ -168,11 +169,21 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
   temporary failure for up to five days, then refused permanently, and every send is refused. On domains
   that receive through SES, which accepts mail before the Worker sees it, inbound mail is held for the same
   five days and then dropped without a bounce (FR-DOM-9).
-- **FR-KEY-1** API keys **must** be scoped at one of three levels: `platform`, `tenant` or `identity`.
+- **FR-KEY-1** API keys **must** be scoped at one of four levels: `platform`, `partner`, `tenant` or `identity`.
   Each key holds a list of permissions. A key can never create a key wider than itself.
 - **FR-KEY-2** Key secrets **must** be shown once, stored only as a keyed hash, support expiry, and
   support rotation with an overlap window.
 - **FR-KEY-3** Tenant and identity scope **must** come from the authenticated key, never from the request body.
+- **FR-KEY-4** A deployment **must** support **partners**: integrators that run their own customers as
+  tenants of a shared deployment (Pylota on Pylota Mail Cloud). A platform key creates, suspends and
+  deletes a partner and mints its **partner keys**. A partner key **must** be able to create tenants and
+  act on them as a platform key does, and on nothing else: a tenant created by another partner or by no
+  partner, and everything in it, **must** answer it as a missing one does. It **must never** mint a partner
+  or platform key, hold `platform:ops`, `partners:manage` or `identities:sign`, or change a tenant's
+  billing mode, which comes from the partner's `default_billing_mode`. A partner's webhook endpoints
+  **must** receive only its own tenants' events. A suspended partner's keys **must** be refused while its
+  tenants keep working, and a partner **must not** be deletable while it has a tenant that is not erased
+  ([REST API › Partners](../reference/api.md#partners), [Security › Partner keys](design/security.md#partner-keys)).
 
 ### 6.2 Identities and addresses
 
@@ -422,7 +433,7 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
 
 ### 6.10 Events and webhooks
 
-- **FR-WH-1** Webhook endpoints **must** be configurable at platform and tenant level, with event-type
+- **FR-WH-1** Webhook endpoints **must** be configurable at platform, partner and tenant level, with event-type
   and identity filters.
 - **FR-WH-2** Payloads **must** be signed with Standard Webhooks, using a separate secret per endpoint.
   Rotation **must** support an overlap window, during which both signatures are sent.
@@ -493,8 +504,10 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
 - **FR-CON-6** The console **must** show inboxes, threads and messages (with untrusted content rendered as
   sanitised, inert HTML in a sandboxed frame or as text), search, quarantine with release, keys, domains,
   webhooks, members, plan and usage, and settings. On Cloud, releasing quarantine **must** be possible
-  only for a signed-in person (`PM_QUARANTINE_KEY_RELEASE=off`); self-hosters can allow release by API keys
-  with `quarantine:review` (`on`, the default for self-hosting).
+  only for a signed-in person (`PM_QUARANTINE_KEY_RELEASE=off`), except in a workspace whose policy has
+  `quarantine.key_release: true`, which only a platform key or the workspace's partner key can set; there,
+  API keys with `quarantine:review` can release too. Self-hosters can allow release by API keys with
+  `quarantine:review` everywhere (`on`, the default for self-hosting).
 - **FR-CON-7** A self-hosted deployment **must** create its first owner during `pmail setup`
   (`--owner-email`). The console **must** be optional (`PM_CONSOLE=off` removes its routes).
 - **FR-CON-8** Self-serve sign-up **must** follow `PM_SIGNUP`: `closed` (the default; no public sign-up),
@@ -536,8 +549,9 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
 ### 6.15 Plans, metering and billing
 
 - **FR-BILL-1** Each workspace **must** have a billing mode: `metered` (a plan applies), `exempt` (no checks,
-  for the operator's own tenants) or `disabled` (self-hosting without billing: only the daily caps in tenant
-  policy apply).
+  for the operator's own tenants, or a partner's tenants that the operator does not bill per workspace) or
+  `disabled` (self-hosting without billing: only the daily caps in tenant policy apply). A tenant created
+  with a partner key takes its partner's `default_billing_mode`; only a platform key changes it (FR-KEY-4).
 - **FR-BILL-2** The plan catalog **must** be data (`PM_PLAN_CATALOG`), defaulting to the Pylota Mail Cloud
   plans in section 13. A plan defines allowances for `inboxes`, `sends`, `triage`, `custom_domains`,
   `storage_gb` and `seats`, a price, and whether top-ups are allowed.

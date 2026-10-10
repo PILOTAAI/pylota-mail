@@ -62,7 +62,8 @@ You do not need a Rust toolchain unless you build from source.
 cargo install pylota-mail-cli --locked     # or download a prebuilt pmail from GitHub Releases
 export CLOUDFLARE_API_TOKEN=...            # permissions listed in docs/src/self-hosting.md
 pmail setup --account-id <account-id> --domain mail.example.com --mail-domain agents.example --jurisdiction eu
-pmail keys create --level platform --name first-key
+pmail keys create --level platform --name first-key \
+  --permissions tenants:manage,keys:manage,webhooks:manage   # full list: docs/src/self-hosting.md
 ```
 
 `--domain` is the API host. `--mail-domain` is the shared mail domain, and it must be a zone apex,

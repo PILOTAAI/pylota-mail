@@ -7,10 +7,10 @@ explanation is in [Privacy, retention and erasure](../../guides/privacy.md).
 
 | | |
 |---|---|
-| Requirements | FR-PRV-1, FR-PRV-2, FR-PRV-3, FR-PRV-4, FR-PRV-5, FR-PRV-6, FR-IDN-4, FR-IDN-7, FR-IDN-9, FR-ADR-5, FR-SRCH-11, FR-DOM-9, FR-CON-8, FR-CON-14, FR-CON-15, NFR-PRV-1 |
-| Edge cases | [I1](../edge-cases.md)–[I7](../edge-cases.md), [A5](../edge-cases.md), [A6](../edge-cases.md), [A13](../edge-cases.md), [F6](../edge-cases.md), [J8](../edge-cases.md), [W34](../edge-cases.md), [N4](../edge-cases.md), [N7](../edge-cases.md), [O7](../edge-cases.md), [O15](../edge-cases.md), [O19](../edge-cases.md) |
+| Requirements | FR-PRV-1, FR-PRV-2, FR-PRV-3, FR-PRV-4, FR-PRV-5, FR-PRV-6, FR-IDN-4, FR-IDN-7, FR-IDN-9, FR-ADR-5, FR-SRCH-11, FR-DOM-9, FR-CON-8, FR-CON-14, FR-CON-15, FR-KEY-4 (partner deletion), NFR-PRV-1 |
+| Edge cases | [I1](../edge-cases.md)–[I7](../edge-cases.md), [A5](../edge-cases.md), [A6](../edge-cases.md), [A13](../edge-cases.md), [F6](../edge-cases.md), [J8](../edge-cases.md), [J12](../edge-cases.md), [W34](../edge-cases.md), [N4](../edge-cases.md), [N7](../edge-cases.md), [O7](../edge-cases.md), [O15](../edge-cases.md), [O19](../edge-cases.md) |
 | Code | `crates/worker/src/jobs/` (`JobRunner`, step planners), `crates/core/src/jobs/` (pure step logic, receipt builder), `crates/worker/src/mailbox/erase.rs`, `crates/worker/src/mailbox/export.rs` |
-| Tables | `jobs`, `erasure_requests`, `exports`, `address_tombstones`, `suppressions`, `ses_ingest`, `identity_keys`, `key_tombstones`, `notification_prefs`, the console tables (`users`, `members`, `invitations`, `login_tokens`, `sessions`, `oauth_identities`, `oauth_states`, `waitlist`) (D1); `steps`, `meta` (JobRunner); every `IdentityMailbox` table; the `Notifier` tables ([Data model](data-model.md)) |
+| Tables | `jobs`, `erasure_requests`, `exports`, `address_tombstones`, `suppressions`, `ses_ingest`, `identity_keys`, `key_tombstones`, `notification_prefs`, `partners`, the console tables (`users`, `members`, `invitations`, `login_tokens`, `sessions`, `oauth_identities`, `oauth_states`, `waitlist`) (D1); `steps`, `meta` (JobRunner); every `IdentityMailbox` table; the `Notifier` tables ([Data model](data-model.md)) |
 
 ## 1. Principles
 
@@ -50,7 +50,8 @@ explanation is in [Privacy, retention and erasure](../../guides/privacy.md).
 | D1 `addresses` | Agent addresses | Directory | Life of the identity; retired rows kept so they are never reassigned | Moved to `address_tombstones` on identity deletion or erasure |
 | D1 `domains` | Domain names; for `smtp_relay`, the sealed relay credentials (`smtp_sealed`; the username is often an address) and the last probe result | Domain management and sending | Life of the domain | Domain removal; tenant erasure |
 | D1 `ses_ingest` | S3 object key and the envelope recipient (an agent address) | Exactly-once ingestion of SES messages ([N4](../edge-cases.md)) | 30 days | Global retention job (`ses_ingest` step) |
-| D1 `tenants` | Workspace name, slug, address suffix, time zone, `policy_json`; `require_two_factor`, `onboarding_dismissed_at`, `quota_do_id` and `notify_do_id` hold no personal data | The workspace | Life of the tenant | Tenant erasure blanks `name` and `policy_json` and keeps the row, so the slug and suffix are never reused |
+| D1 `tenants` | Workspace name, slug, address suffix, time zone, `policy_json`; `require_two_factor`, `onboarding_dismissed_at`, `quota_do_id`, `notify_do_id` and `partner_id` hold no personal data | The workspace | Life of the tenant | Tenant erasure blanks `name` and `policy_json` and keeps the row, so the slug and suffix are never reused |
+| D1 `partners` | The partner's name (an organisation's name; nothing about a person is asked for), its status and default billing mode | Partner keys ([REST API › Partners](../../reference/api.md#partners)) | Life of the partner | `DELETE /v1/partners/{partner_id}` once every tenant of the partner is erased (section 6.10) |
 | D1 `users` | Sign-in address, name, `last_login_at`, `last_tenant_id`, `terms_version` and `terms_accepted_at`, the sealed TOTP secret (`totp_sealed`, with `totp_enabled_at` and `totp_last_step`), the sealed recovery-code hashes (`recovery_codes_sealed`) | Console accounts | Life of the account | Person deletion (section 6.9); tenant erasure for people left in no workspace |
 | D1 `members` | Which person belongs to which workspace, and the role | Console access | Life of the membership | Member removal; person deletion; tenant erasure |
 | D1 `invitations` | Invited address, role, inviting user | Invitations | Pending: until accepted, revoked or expired (7 days). Expired and revoked: 30 days after `expires_at`. Accepted: life of the workspace, because the row records who invited the member and when | Global retention job (`console` step) for expired and revoked rows; person deletion scrubs the address of the person's accepted invitations (section 6.9); tenant erasure |
@@ -64,7 +65,7 @@ explanation is in [Privacy, retention and erasure](../../guides/privacy.md).
 | D1 `address_tombstones` | Keyed hash of the address | Never reassign an address ([A5](../edge-cases.md)) | Permanent | Never deleted (no clear-text address) |
 | D1 `suppressions` | Keyed hash, masked hint, optional note and source message ID | Honour bounces, complaints and objections | `expires_at` or permanent | Counterparty erasure clears `note` and `source_message_id` and keeps the rest ([I7](../edge-cases.md)); tenant erasure deletes |
 | D1 `sender_lists` | Clear addresses or domains chosen by the tenant | Allow and block lists | Until the tenant removes them | Tenant erasure; otherwise the tenant's own `DELETE …/lists/…` (section 7.3) |
-| D1 `webhook_endpoints`, `webhook_deliveries`, `event_index` | URLs; event IDs and types | Webhooks and replay | Deliveries and index: the tenant's `retention.events_days` (default 30); platform rows (`tenant_id IS NULL`): 30 days | Retention job; tenant erasure |
+| D1 `webhook_endpoints`, `webhook_deliveries`, `event_index` | URLs; event IDs and types | Webhooks and replay | Deliveries and index: the tenant's `retention.events_days` (default 30); platform rows (`tenant_id IS NULL`): 30 days | Retention job; tenant erasure; partner deletion removes a partner's endpoints and their deliveries (section 6.10) |
 | D1 `idempotency_records` | Response bodies of non-mail POSTs (may include an identity's owner) | Safe retries | 30 days (`expires_at`) | Retention job (global step) |
 | D1 `erasure_requests`, `jobs` | Counterparty HMAC, free-text `reason`, receipt counts | Accountability for erasure | Erasure records: life of the deployment. Other jobs: 90 days after completion | Retention job (global step) for non-erasure jobs |
 | D1 `audit_log` | Key IDs and target IDs; never content or clear addresses | Accountability | Life of the tenant | Tenant erasure deletes all but `erasure.*` rows |
@@ -384,7 +385,7 @@ those identities.
 
 **Holds on an identity being deleted.** The request completes as `completed_with_holds`: everything
 outside held threads is gone, the addresses are tombstoned, and the identity stays `deleting`. The hold
-routes stay usable on a `deleting` identity for tenant and platform keys with `erasure:manage`. When the
+routes stay usable on a `deleting` identity for tenant, partner and platform keys with `erasure:manage`. When the
 daily retention job finds a `deleting` identity with no remaining holds (removed, or `until` passed),
 it creates a new identity-scope erasure request with reason `hold_released:{era_id}`, audit-logged, which
 finishes the deletion and emits `erasure.completed`.
@@ -403,7 +404,7 @@ Order: stop routing, then billing (money stops before anything else is removed),
 | 6 | `sweep_vectors` | Vectorize has no method to delete a namespace (Vectorize client API, read 2026-10-09: only `deleteByIds`). Query the tenant namespace with a fixed probe vector (`topK = 100`, `returnMetadata: "none"`), `deleteByIds` the IDs returned, wait 10 seconds, and repeat until two consecutive queries return nothing (at most 100 rounds per alarm slice; section 6.8) |
 | 7 | `sweep_r2` | List and delete every object under `t/{tenant_id}/`, in `BLOBS` and, when configured, `BACKUP` |
 | 8 | `probe` | Section 6.7, plus: `t/{tenant_id}/` lists empty; a namespace query returns nothing; D1 counts for the tenant are zero except the kept rows |
-| 9 | `receipt` | Section 10. `erasure.completed` goes to platform endpoints (the tenant's own endpoints are disabled) |
+| 9 | `receipt` | Section 10. `erasure.completed` goes to platform endpoints and, for a tenant a partner's key created, to that partner's endpoints (the tenant's own endpoints are disabled) |
 | 10 | `finalise` | — |
 
 Suppressions are deleted in tenant erasure because the tenant can no longer send; [I7](../edge-cases.md)
@@ -460,6 +461,27 @@ deletion for every person it leaves with no workspace (section 6.6, step 5).
 Invitations to the address that were not accepted stay with the workspaces that sent them: a pending one
 expires after 7 days, and the global retention job deletes expired and revoked rows 30 days after
 `expires_at` (section 5.3). Section 11 lists them.
+
+### 6.10 Partners
+
+A partner holds only its name, its status and its default billing mode; its customers' data lives in its
+tenants, which tenant erasure covers (section 6.6). A partner key with `erasure:manage` can start that
+erasure for each of its own tenants (`POST /v1/erasure-requests` with `scope: "tenant"`).
+
+`DELETE /v1/partners/{partner_id}` (platform key, `partners:manage`) deletes a partner only when every
+tenant with its `partner_id` is `erased` ([J12](../edge-cases.md)); otherwise `409 partner_has_tenants`
+and nothing changes. In one D1 batch, guarded by that condition on every statement
+([Data model › Notes](data-model.md#notes)), it deletes:
+
+1. the partner's webhook endpoints (`webhook_endpoints.partner_id`), and with them their delivery rows
+   (`ON DELETE CASCADE`);
+2. its partner keys (`api_keys.partner_id`), so their next request is `401 unauthenticated`;
+3. its `idempotency_records` (`scope` = the partner ID);
+4. the `partners` row, which clears `partner_id` on its erased tenants (`ON DELETE SET NULL`).
+
+It writes the audit row `partner.delete` with `tenant_id = NULL` and only the `ptn_` ID as its target.
+The `audit_log` rows about the partner (`partner.*`, and `key.create`/`key.revoke` of its keys) keep only
+IDs and stay like other audit rows of the deployment. Nothing else refers to the partner.
 
 ## 7. Special cases
 
@@ -711,7 +733,8 @@ canaries.
 | `it::erasure::identity_scope` | Addresses tombstoned (`550 5.1.1` afterwards; on an SES domain, removed from `pm-retired-{n}` and dropped like unknown mail), keys revoked, identity keys deleted with their kids in `key_tombstones`, mailbox wiped and refusing requests, D1 row scrubbed, `identity.deleted` emitted | FR-IDN-4, [A13](../edge-cases.md) |
 | `it::assertions::erasure_tombstones_kid` | Identity erasure deletes the identity's keys; their kids are in `key_tombstones` and are never published again, and key generation refuses a tombstoned thumbprint | FR-IDN-9, [O7](../edge-cases.md) |
 | `it::erasure::identity_with_hold_continues` | An identity with a held thread ends `completed_with_holds`; removing the hold leads to a continuation request that completes the deletion | section 6.5 |
-| `it::erasure::tenant_scope_order` | Routing stops first (inbound rejected while mailboxes still exist), then the `cancel_billing` step runs before any domain or mailbox is removed, then domains, mailboxes, D1 rows and the vector sweep; the tenant ends `erased`; platform endpoints receive `erasure.completed` | section 6.6 |
+| `it::erasure::tenant_scope_order` | Routing stops first (inbound rejected while mailboxes still exist), then the `cancel_billing` step runs before any domain or mailbox is removed, then domains, mailboxes, D1 rows and the vector sweep; the tenant ends `erased`; platform endpoints, and for a partner's tenant the partner's endpoints, receive `erasure.completed` | section 6.6 |
+| `it::partners::j12_delete_with_tenants` | A partner with a tenant that is not erased cannot be deleted (`409 partner_has_tenants`); after the tenant's erasure, deleting the partner removes its name, keys, endpoints, their deliveries and its idempotency records, clears `partner_id` on the erased tenant, and writes `partner.delete` | section 6.10, [J12](../edge-cases.md) |
 | `it::erasure::tenant_cancels_billing` | With the Stripe fake holding a plan subscription and two top-up subscriptions, tenant erasure cancels all three at once, with no proration, as its second step, right after routing stops and before any domain, mailbox or D1 row is removed; a failing Stripe call is retried with backoff and the third failure fires `billing_cancel_failed`; with `PM_BILLING=off`, or no Stripe customer, the step is skipped; a `customer.subscription.deleted` webhook after the erasure is answered `200` and recorded `ignored_erased`, while a live subscription created after the deletion is cancelled (`cancelled_after_erasure`, [Billing › Tests](billing.md#tests)) | section 6.6 |
 | `it::erasure::tenant_console_rows` | After tenant erasure no `members`, `invitations`, `sessions`, `notification_prefs`, `identity_keys` or billing rows remain for the tenant, every deleted kid is in `key_tombstones`, and the tenant's `Notifier` holds nothing; a member of another workspace keeps their account; a person left with no workspace is scrubbed and loses `oauth_identities`, `login_tokens` and `waitlist` rows | section 6.6 |
 | `it::erasure::tenant_ses_rows` | With the SES fake, tenant erasure of a workspace with an SES domain (`dns_records` or `send_only`) removes every address of that domain from the `pm-retired-{n}` receipt rules, so later mail to them is dropped like unknown mail, and leaves no SES identity for the domain | section 6.6 |

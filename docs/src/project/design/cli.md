@@ -6,7 +6,7 @@ handling and the client-side behaviour of the mail and admin commands. It implem
 to FR-OPS-3, FR-CON-7 and FR-BILL-12, build plan milestone M16, the CLI half of M17 (`dlq`, and `secrets rotate-master` in M17 Foundation), the
 `deploy --version` acceptance of M19, the CLI parts of FR-DOM-7 to FR-DOM-12 (M23: `domains add
 --method`, `domains update`, `domains probe`, `addresses test-forwarding`, `setup ses`), of FR-CON-8
-(M24: `waitlist invite`) and of FR-IDN-6 to FR-IDN-8 (M25: `identity-keys`, `assertions`, `http-sign`,
+(M24: `waitlist invite`), of FR-KEY-4 (M5: `partners`, `keys create --level partner`) and of FR-IDN-6 to FR-IDN-8 (M25: `identity-keys`, `assertions`, `http-sign`,
 `keys rotate web_bot_auth`, [Agent signing keys](agent-keys.md#7-api-mcp-and-cli)), and the edge-case
 rows H5, J8, J9 and N30 in the [edge-case register](../edge-cases.md).
 
@@ -47,7 +47,7 @@ crates/cli/src/
     migrate.rs         D1 migration runner (D1 query API, schema_migrations)
   commands/
     setup.rs setup_ses.rs deploy.rs upgrade.rs doctor.rs destroy.rs login.rs config.rs secrets.rs
-    dlq.rs jobs.rs waitlist.rs tenants.rs identities.rs addresses.rs domains.rs mail.rs threads.rs
+    dlq.rs jobs.rs waitlist.rs tenants.rs partners.rs identities.rs addresses.rs domains.rs mail.rs threads.rs
     messages.rs search.rs ask.rs triage.rs wait.rs quarantine.rs webhooks.rs keys.rs suppressions.rs
     lists.rs erasure.rs export.rs members.rs billing.rs usage.rs audit.rs mcp.rs
     identity_keys.rs assertions.rs http_sign.rs
@@ -164,16 +164,18 @@ request:
 | Argument | Accepts | Resolution |
 |---|---|---|
 | `--identity` | `idn_…`, or an address | An ID is used as is. An address is resolved with `GET /v1/identities/lookup?address=…` (case-insensitive; an IDN domain is converted to its A-label first) |
-| `--tenant` | `ten_…`, or a slug | An ID is used as is. A slug is resolved by paging `GET /v1/tenants` (platform keys) and matching `slug` exactly; a tenant key may only name its own tenant |
+| `--tenant` | `ten_…`, or a slug | An ID is used as is. A slug is resolved by paging `GET /v1/tenants` (platform and partner keys; a partner key sees only its own tenants) and matching `slug` exactly; a tenant key may only name its own tenant |
 | `--domain` (domain commands) | `dom_…`, or a domain name | Names are resolved by listing the tenant's domains (and the platform domain) |
 | webhook arguments | `whk_…` | IDs only |
+| `--partner`, partner arguments | `ptn_…` | IDs only |
 
 When a mail command needs an identity and none is given, the profile's `identity` is used; an
 identity key uses its own identity (from `GET /v1/me`); otherwise exit 2 with "Pass --identity".
 
 When a tenant-scoped command needs a tenant and none is given: a tenant or identity key uses its own
 tenant; a platform key uses the profile's `tenant`, else the **default tenant** (the one tenant with
-an empty `address_suffix`, created by `setup`). This is why
+an empty `address_suffix`, created by `setup`); a partner key uses the profile's `tenant`, else exits 2
+with "Pass --tenant", because no tenant is a partner's by default (the default tenant has no partner). This is why
 `pmail identities create --username bookings --display-name "Acme Car Hire"` works with the platform
 key that setup leaves in the profile. `GET /v1/me` is called at most once per invocation and cached for
 that invocation only.
@@ -182,7 +184,7 @@ Three commands never fall back to the default tenant. `jobs start` needs `--tena
 profile's `tenant` ([§18](#18-other-client-side-behaviour)). `usage` and `usage daily` with a platform
 key send `tenant_id` only from `--tenant` or the profile's `tenant`; without either the request carries
 none, and the API answers `400 invalid_request` (exit 7), because a platform key must name the workspace
-whose usage it reads.
+whose usage it reads. A partner key follows the same rule.
 
 ### 2.5 Cloudflare credentials
 
@@ -1239,7 +1241,7 @@ Output: `valid` (exit 0), or `invalid: <reason>` (exit 11) where reason is `no_m
    "stream": true}` and `Accept: text/event-stream` (needs `search:read` and `search:agentic`).
    Agentic search is scoped to an identity or a tenant, as the API defines it
    ([REST API › Search](../../reference/api.md#search)): `--tenant` sends the same body to
-   `POST /v1/tenants/{t}/search`, which needs a tenant or platform key with the same two permissions and
+   `POST /v1/tenants/{t}/search`, which needs a tenant, partner or platform key with the same two permissions and
    covers up to 100 identities (`422 scope_too_large`, exit 7, above that); an identity key gets
    `403 scope_denied` (exit 4). `search --mode agentic --tenant` is the same call without a stream.
 2. `sse.rs` reads events as defined in [Search §11.11](search.md#1111-streaming): lines `id:`,
@@ -1291,6 +1293,11 @@ answered · confidence 0.86 · 3 steps · 2.8 s
   `large_attachments: "link"`). Recipients take `Name <addr>` or `addr`.
 - **`keys create` and `webhooks create`** print the secret once. In human mode it is on its own line
   after the object, with "shown only once"; `--quiet` prints only the secret.
+- **`webhooks create --platform` and `--partner`** both call `POST /v1/webhooks`, whose endpoint scope
+  follows the key. The CLI first reads the key's level from `GET /v1/me`: `--platform` needs a platform
+  key and `--partner` a partner key; the other way round is exit 2 before any request. Without either
+  flag, the endpoint is a tenant endpoint of `--tenant` or of the tenant chosen as in
+  [§2.4](#24-resolving-names-to-ids).
 - **`messages raw` and `messages attachment`** write bytes to `--out <file>` (created with mode `0600`)
   or to stdout only when stdout is not a terminal; to a terminal they refuse, so binary or hostile
   bytes never reach it.
@@ -1319,14 +1326,26 @@ answered · confidence 0.86 · 3 steps · 2.8 s
 - **`waitlist invite --count N [--plan P]`** checks `N` is 1–500 before sending (exit 2 otherwise) and
   prints `Invited 50; 262 still waiting.` from `{ "invited", "waiting" }`
   ([Cloud sign-up §6.1](cloud-signup.md#61-before-launch-the-waitlist)).
+- **`partners create|list|get|update|delete`** call the five `/v1/partners` routes (platform key,
+  `partners:manage`; [REST API › Partners](../../reference/api.md#partners)). `create` sends `name` and,
+  with `--default-billing-mode`, `default_billing_mode`; `update` sends only the flags given (`--name`,
+  `--status active|suspended`, `--default-billing-mode`) and prints a warning that suspending refuses
+  every key of the partner at once while its tenants keep working. `delete` asks for confirmation unless
+  `--yes`; `409 partner_has_tenants` is exit 6 and prints `details.tenants` with the fix (erase those
+  tenants first). A partner key gets `403 permission_denied` on all five (exit 4).
+- **`keys create --level partner --partner <ptn_…>`** sends `level: "partner"` and `partner_id`, and no
+  tenant or identity: `--tenant` or `--identity` with `--level partner`, or `--partner` with another
+  level, is exit 2 before any request. Only a platform key may create one (a partner key gets
+  `403 key_scope_exceeded`, exit 4), and `platform:ops`, `partners:manage` or `identities:sign` in
+  `--permissions` comes back as `400 invalid_request` (`permission_not_allowed_for_level`, exit 7).
 - **`keys create`** needs `--permissions` at every level (least privilege is the default, not an
   option). A platform key has no implicit full set: `--level platform` without `--permissions` is exit 2
   before any request, with a message listing the permissions a platform key may hold (the API would
   answer `400 invalid_request`). The API also refuses, with `400 invalid_request` and
   `details.reason = "permission_not_allowed_for_level"` (exit 7), a permission the level cannot hold:
-  `identities:sign` on a platform key; `tenants:manage` and `platform:ops` below platform level; and
-  the tenant-only `members:read`, `members:manage`, `suppressions:manage`, `audit:read` and `usage:read`
-  on an identity key. `--save-profile <name>` writes the new key into that profile.
+  `identities:sign` on a platform or partner key; `platform:ops` and `partners:manage` below platform
+  level; `tenants:manage` on a tenant or identity key; and the tenant-only `members:read`,
+  `members:manage`, `suppressions:manage`, `audit:read` and `usage:read` on an identity key. `--save-profile <name>` writes the new key into that profile.
 - **Notification preferences** have no command: they belong to people, not keys, and are set only in the
   console ([Notifications §2](notifications.md#2-preferences)).
 
@@ -1563,7 +1582,8 @@ have no command: they are set only in the console ([Notifications §2](notificat
 
 | Command | Endpoint(s) |
 |---|---|
-| `tenants create\|list\|get\|update` | `POST /v1/tenants`; `GET /v1/tenants`; `GET /v1/tenants/{id}`; `PATCH /v1/tenants/{id}` |
+| `tenants create\|list\|get\|update` | `POST /v1/tenants`; `GET /v1/tenants` (`--partner` sends `partner_id`); `GET /v1/tenants/{id}`; `PATCH /v1/tenants/{id}` (platform or partner key, `tenants:manage`) |
+| `partners create\|list\|get\|update\|delete` | `POST /v1/partners`; `GET /v1/partners`; `GET /v1/partners/{id}`; `PATCH /v1/partners/{id}`; `DELETE /v1/partners/{id}` (platform key, `partners:manage`) |
 | `tenants suspend\|resume` | `PATCH /v1/tenants/{id}` `{"status":"suspended"\|"active"}` |
 | `identities create\|list\|get\|update` | `POST /v1/tenants/{t}/identities`; `GET /v1/tenants/{t}/identities` or `GET /v1/identities`; `GET /v1/identities/{id}`; `PATCH /v1/identities/{id}` |
 | `identities pause\|resume` | `PATCH /v1/identities/{id}` `{"status":"paused"\|"active"}` |
@@ -1585,9 +1605,9 @@ have no command: they are set only in the console ([Notifications §2](notificat
 | `triage list\|rerun` | `GET /v1/identities/{id}/threads?category=&needs_reply_gte=` (threads with their roll-up); `POST …/messages/{m}/triage` |
 | `wait` | `GET /v1/identities/{id}/wait` |
 | `quarantine list\|release` | `GET /v1/identities/{id}/quarantine`; `POST …/messages/{m}/release` |
-| `webhooks create\|list\|get\|update\|delete\|rotate\|test\|deliveries\|replay` | `POST /v1/webhooks` or `POST /v1/tenants/{t}/webhooks`; `GET` (both); `GET\|PATCH\|DELETE /v1/webhooks/{w}`; `POST …/rotate-secret`; `POST …/test`; `GET …/deliveries`; `POST …/replay` |
+| `webhooks create\|list\|get\|update\|delete\|rotate\|test\|deliveries\|replay` | `POST /v1/webhooks` (`--platform` with a platform key, `--partner` with a partner key) or `POST /v1/tenants/{t}/webhooks`; `GET` (both); `GET\|PATCH\|DELETE /v1/webhooks/{w}`; `POST …/rotate-secret`; `POST …/test`; `GET …/deliveries`; `POST …/replay` |
 | `webhooks verify` | none (offline, [§16](#16-webhooks-verify)) |
-| `keys create\|list\|get\|revoke` | `POST /v1/keys`; `GET /v1/keys`; `GET /v1/keys/{k}`; `DELETE /v1/keys/{k}` |
+| `keys create\|list\|get\|revoke` | `POST /v1/keys` (`--level partner --partner <ptn_…>`: platform key only); `GET /v1/keys`; `GET /v1/keys/{k}`; `DELETE /v1/keys/{k}` |
 | `keys rotate key_…` | `POST /v1/keys/{k}/rotate` (`keys:manage`) |
 | `keys rotate thread\|link\|cursor\|web_bot_auth` | `POST /v1/platform/keys/{purpose}/rotate`, `?revoke_previous=true` with `--revoke-previous` (platform key, `platform:ops`; [§12.2](#122-signing-keys-keys-rotate-threadlinkcursorweb_bot_auth)) |
 | `identity-keys list` | `GET /v1/identities/{id}/keys` (`identities:read`; [§18.5](#185-identity-keys-assertions-and-http-sign)) |
@@ -1601,12 +1621,12 @@ have no command: they are set only in the console ([Notifications §2](notificat
 | `lists list\|add\|remove` | `GET /v1/tenants/{t}/lists/{direction}/{kind}`; `PUT …/{entry}`; `DELETE …/{entry}` |
 | `erasure create\|get\|list` | `POST /v1/erasure-requests`; `GET /v1/erasure-requests/{id}`; `GET /v1/erasure-requests` |
 | `export create\|get` | `POST /v1/exports`; `GET /v1/exports/{id}` |
-| `members list\|invite\|remove` | `GET /v1/tenants/{t}/members` (`members:read`); `POST /v1/tenants/{t}/invitations`; `DELETE /v1/tenants/{t}/members/{user_id}` (`members:manage`, tenant or platform key) |
+| `members list\|invite\|remove` | `GET /v1/tenants/{t}/members` (`members:read`); `POST /v1/tenants/{t}/invitations`; `DELETE /v1/tenants/{t}/members/{user_id}` (`members:manage`, tenant, partner or platform key) |
 | `invitations revoke` | `DELETE /v1/tenants/{t}/invitations/{invitation_id}` (`members:manage`) |
 | `plans list` | `GET /v1/plans` (no key) |
-| `billing get\|set` | `GET\|PATCH /v1/tenants/{t}/billing` (platform key, `tenants:manage`) |
-| `usage` | `GET /v1/usage` (tenant and identity keys: their own workspace, no permission needed; platform keys: `usage:read` and `tenant_id` from `--tenant` or the profile, else `400 invalid_request`) |
-| `usage daily` | `GET /v1/usage/daily` (`usage:read`, platform or tenant key; a platform key passes `tenant_id` as for `usage`) |
+| `billing get\|set` | `GET\|PATCH /v1/tenants/{t}/billing` (`tenants:manage`; `get` also with a partner key on its own tenants, `set` platform key only) |
+| `usage` | `GET /v1/usage` (tenant and identity keys: their own workspace, no permission needed; platform and partner keys: `usage:read` and `tenant_id` from `--tenant` or the profile, else `400 invalid_request`) |
+| `usage daily` | `GET /v1/usage/daily` (`usage:read`, platform, partner or tenant key; a platform or partner key passes `tenant_id` as for `usage`) |
 | `audit` | `GET /v1/audit-events` |
 | `dlq list\|redrive` | `GET /v1/platform/dlq`; `POST /v1/platform/dlq/{dlq_id}/redrive` (platform key, `platform:ops`; [§13](#13-dlq)) |
 | `jobs start\|get` | `POST /v1/platform/jobs`; `GET /v1/platform/jobs/{job_id}` (platform key, `platform:ops`) |
@@ -1670,6 +1690,7 @@ have no command: they are set only in the console ([Notifications §2](notificat
 | `cli::billing::plans_and_billing` | `plans list` sends no key; `billing set` sends only the flags given; `409 plan_managed_by_stripe` is exit 6 | FR-BILL-1 |
 | `cli::usage::daily` | `usage` reads `GET /v1/usage`; `usage daily` passes `from`, `to` and `tenant_id` to `GET /v1/usage/daily` and prints the `assertions` and `http_signatures` columns; a platform key without `--tenant` or a profile tenant sends no `tenant_id` (never the default tenant) and `400 invalid_request` is exit 7 | FR-BILL-11 |
 | `cli::keys::create_permissions_by_level` | `--level platform` without `--permissions` is exit 2 before any request, listing the allowed permissions; `identities:sign` on a platform key and a tenant-only permission on an identity key come back as `400 invalid_request` (`permission_not_allowed_for_level`), exit 7 | FR-KEY-2, FR-IDN-6 |
+| `cli::partners::lifecycle` | `partners create\|list\|get\|update\|delete` call their routes with only the flags given; `delete` needs confirmation or `--yes`, and `409 partner_has_tenants` is exit 6 with the count; `keys create --level partner --partner ptn_…` sends `level` and `partner_id` only, `--tenant` with it (or `--partner` with another level) is exit 2 before any request, and `403 key_scope_exceeded` for a partner key is exit 4; a partner key without `--tenant` or a profile tenant is exit 2 on a tenant-scoped command, never the default tenant; `webhooks create --partner` with a platform key is exit 2 | FR-KEY-4 |
 | `cli::identity_keys::lifecycle` | `list`, `create` (`201` and `200` both exit 0), `rotate` (with and without a previous key) and `revoke` (confirmation or `--yes`; unknown kid exit 5; already retired exit 0) call their endpoints and never print key material | FR-IDN-6, [O2], [O3] |
 | `cli::assertions::create_and_verify` | `create` sends no `Idempotency-Key` and `--quiet` prints only the token; `verify` accepts a fresh token against the workerd harness with no API key, and exits 11 for a wrong audience, another issuer, an expired token, an unknown kid, `alg: none` and a paused identity (JWKS `404`); a JWKS network failure is exit 9; the JWKS URL is built from `--issuer`, never from the token | FR-IDN-7, [O1], [O4], [O5] |
 | `cli::http_sign::headers_and_errors` | Prints the four headers as `Name: value` lines in order, or the response with `--json`; `--component` adds only `@method`, `@path` or `@query`; `422 web_bot_auth_disabled` is exit 7 and `403 policy_denied` exit 4 | FR-IDN-8, [O9], [O13] |

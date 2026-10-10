@@ -413,7 +413,7 @@ An identity is **paused automatically** with reason `abuse_threshold` when its c
 ([FR-DLV-3](../project/prd.md#66-delivery); policy `abuse.complaint_rate_pause` and
 `abuse.bounce_rate_pause`). It keeps receiving mail. An `identity.paused` event carries the metrics.
 Find out why the rates rose (a stale address list, an agent writing to strangers) before resuming:
-setting `status: "active"` on an identity paused for abuse needs a platform or tenant key and is
+setting `status: "active"` on an identity paused for abuse needs a platform, partner or tenant key and is
 audit-logged.
 
 ## When a domain fails
