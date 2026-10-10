@@ -1,4 +1,4 @@
-# 0011 Marketing mail only through SES or SMTP
+# 0014 Marketing mail only through SES or SMTP
 
 | | |
 |---|---|

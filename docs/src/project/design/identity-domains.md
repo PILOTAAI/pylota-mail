@@ -114,7 +114,7 @@ normal outbound pipeline.
    a console user's sign-in address is refused with `409 address_taken` too, because every key that reads
    the mailbox could then read that person's sign-in codes. The same check runs when `POST …/addresses`
    adds an address ([Cloud sign-up §10](cloud-signup.md#10-abuse-and-safety-on-cloud),
-   [W43](../edge-cases.md)).
+   [W45](../edge-cases.md)).
 5. `mailbox_do_id = objects.new_object_id(Mailbox)`.
 6. One D1 `batch`: `INSERT INTO identities …`, `INSERT INTO addresses …` (one or two rows),
    `INSERT INTO audit_log …` (`identity.create`).

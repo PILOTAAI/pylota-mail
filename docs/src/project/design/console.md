@@ -2,7 +2,7 @@
 
 Binding design for the console at `/console`, and for the workspaces, members, roles, invitations, sign-in
 and sessions behind it. It implements FR-CON-1 to FR-CON-7, FR-CON-16, NFR-CON-1, build plan milestone
-M21, and the edge-case rows W9–W10, W15–W18, W38 and W41 in the [edge-case register](../edge-cases.md); and the console parts
+M21, and the edge-case rows W9–W10, W15–W18, W40 and W43 in the [edge-case register](../edge-cases.md); and the console parts
 of agent signing keys (FR-IDN-6, M25) and of notifications (FR-CON-14, FR-CON-15, M26; rows O17–O19). The plan and usage
 page and everything about money is in [Plans, metering and billing](billing.md). Self-serve sign-up,
 Google and GitHub sign-in, two-step verification, the landing rules and the Overview (FR-CON-8 to
@@ -168,7 +168,7 @@ Every method ends in the same session creation ([Sessions](#sessions)), and the 
 |---|---|
 | Link or code requests | 3 per 10 minutes per address |
 | Code verification attempts | 10 per code; the token is burned after 10 failures |
-| Failed codes per address | 30 per UTC day across all of the address's tokens; then sign-in by code is locked for that address until the next UTC day, links keep working, and the person is told once ([W41](../edge-cases.md)) |
+| Failed codes per address | 30 per UTC day across all of the address's tokens; then sign-in by code is locked for that address until the next UTC day, links keep working, and the person is told once ([W43](../edge-cases.md)) |
 | Requests per client network | `RL_SIGNIN`: 10 per 60 seconds, keyed by `CF-Connecting-IP` (an IPv6 address by its /64 prefix), on `POST /console/sign-in`, `/console/sign-in/link`, `/console/sign-in/code`, `/console/sign-in/verify`, `/console/sign-up` and `/console/waitlist`, and `GET /console/oauth/{provider}/start` |
 | Two-step verification codes | 5 attempts a minute per person; 10 failures in a row lock two-step sign-in for 15 minutes |
 | Link and code lifetime | 10 minutes, single use (using one burns the other) |
@@ -236,7 +236,7 @@ kept 24 hours after they expire, so the day is complete). At 30 it refuses every
 until the next UTC day, with a page that says to use the link in the email instead, and compares nothing.
 The failure that reaches 30 also sends the `account` email `sign_in_codes_locked` when the address
 belongs to an active user (nothing is sent for an unknown address, so the lock reveals nothing)
-([W41](../edge-cases.md)). Without this, one client network could try about 4,300 codes a day
+([W43](../edge-cases.md)). Without this, one client network could try about 4,300 codes a day
 (`RL_SIGNIN` × 3 tokens × 10 attempts) against one address. On top of the per-address limits, the
 Workers rate-limiting binding `RL_SIGNIN` ([Configuration › Bindings](../../reference/configuration.md#bindings))
 allows 10 requests per 60 seconds per client network, keyed by `CF-Connecting-IP` with an IPv6 address
@@ -410,11 +410,11 @@ Members are invited by email (FR-CON-4). The owner and admins can invite, from t
 
 1. Validate the address and the role (`admin`, `member` or `viewer`). An address that is already a member
    is refused with `400 invalid_request`, and so is an address this deployment hosts (path `email`;
-   [Cloud sign-up §10](cloud-signup.md#10-abuse-and-safety-on-cloud), [W43](../edge-cases.md)). The
+   [Cloud sign-up §10](cloud-signup.md#10-abuse-and-safety-on-cloud), [W45](../edge-cases.md)). The
    workspace's invitation budget comes next: at most 50 invitation emails (new and re-sent) per tenant per
    UTC day, counted by the system-mail budgets; past it the request gets `429 daily_cap_reached` with
    `details.cap: "invitations"` and `details.resets_at`, before anything is written
-   ([Cloud sign-up §10.2](cloud-signup.md#102-system-mail-budgets), [W42](../edge-cases.md)).
+   ([Cloud sign-up §10.2](cloud-signup.md#102-system-mail-budgets), [W44](../edge-cases.md)).
 2. If a pending invitation for the address exists (`invitations_pending` is unique per workspace and
    address), it is re-sent instead: new token, `expires_at` restarted, no new seat.
 3. Take a `seats` hold in `TenantQuota` (`ref` = the new `inv_` ID). With no seat left the request fails
@@ -435,7 +435,7 @@ Members are invited by email (FR-CON-4). The owner and admins can invite, from t
 A pending invitation counts as a seat until it is accepted, revoked or expires.
 
 **Accepting** is always an explicit click, and it never creates a session that skips a factor
-(FR-CON-16, [W38](../edge-cases.md)). The link was sent to the invited address, so it proves control of
+(FR-CON-16, [W40](../edge-cases.md)). The link was sent to the invited address, so it proves control of
 that address, which is a first factor and nothing more:
 
 - `GET /console/invitations/accept?t=…` changes nothing. It shows the workspace name and the role with an
@@ -717,15 +717,15 @@ the workspace's `tenant_id` and delivered like `webhook.disabled`
 | `it::members::w10_owner_required` | Removing, demoting or leaving as the owner gets `409 owner_required`; a transfer to a non-admin changes nothing | [W10], FR-CON-2 |
 | `it::console::w15_signin_limits` | A fourth request in 10 minutes is refused; a token burns after 10 failed codes; an 11th request from one client IP within 60 seconds is refused by `RL_SIGNIN`, also from a second IPv6 address in the same /64; responses for known and unknown addresses are byte-identical apart from the request ID, and no email goes to an unknown address. M21 covers its own routes (sign-in, link, code); M24 adds sign-up, waitlist, the pending step and the OAuth start to the same test | [W15], FR-CON-3 |
 | `it::console::w16_csrf` | A `POST` without the token, with another session's token, without `Origin`, with `Origin: null` or a foreign origin (also `http://` with the right host) gets `403`; the cookie has `__Host-`, `Secure`, `HttpOnly` and `SameSite=Lax`; the unsubscribe `POST` alone is accepted without a session, token or `Origin` | [W16], FR-CON-1 |
-| `it::members::w38_invitation_needs_second_factor` | Accepting an invitation as a person enrolled in two-step verification creates no session and no membership until the second factor passes, then both in one batch; abandoning the step leaves the invitation pending; a person without two-step verification, or a new person, gets the membership and a session; a session of another person accepts nothing; signing in with a pending invitation accepts nothing and lands on `/console/invitations`, where the **Accept** form does | [W38], FR-CON-16 |
-| `it::console::w41_failed_code_daily_cap` | 30 failed codes in a UTC day for one address, spread over several tokens and client IPs, lock code sign-in until 00:00 UTC while the link still works; the lock sends one `sign_in_codes_locked` email to an active user and none to an unknown address; the response for the two is the same | [W41], FR-CON-3 |
+| `it::members::w40_invitation_needs_second_factor` | Accepting an invitation as a person enrolled in two-step verification creates no session and no membership until the second factor passes, then both in one batch; abandoning the step leaves the invitation pending; a person without two-step verification, or a new person, gets the membership and a session; a session of another person accepts nothing; signing in with a pending invitation accepts nothing and lands on `/console/invitations`, where the **Accept** form does | [W40], FR-CON-16 |
+| `it::console::w43_failed_code_daily_cap` | 30 failed codes in a UTC day for one address, spread over several tokens and client IPs, lock code sign-in until 00:00 UTC while the link still works; the lock sends one `sign_in_codes_locked` email to an active user and none to an unknown address; the response for the two is the same | [W43], FR-CON-3 |
 | `it::console::attachments_and_inline_images` | The console attachment route serves a file with the API's serving headers for every role, `404` for a foreign ID and nothing for a quarantined message; a `cid:` PNG of 1 MiB becomes a `data:` URI in the `srcdoc`, a 3 MiB one a placeholder linking to the route, and the rendered page makes no request to the API host | FR-CON-6, [W17], [W18] |
 | `it::console::w17_hostile_html` | The hostile-HTML corpus renders in a sandboxed `srcdoc` frame under the CSP: no script runs, no remote request is made, no form posts | [W17], FR-CON-6 |
 | `it::console::w18_role_and_scope` (table test) | Each role against each route of [Roles](#roles) gets exactly the allowed outcome; IDs from another workspace give `404`; a `tenant_id` in a form is ignored | [W18], FR-CON-2 |
 | `it::console::signin_link_and_code` | The link `GET` does not consume the token; link and code are single use and burn each other; expired tokens fail | FR-CON-3 |
 | `it::console::session_lifetime` | 7-day rolling and 30-day absolute expiry with a fake clock; sign-out and sign-out-everywhere | FR-CON-3 |
 | `it::console::reauth_sensitive` | Each sensitive action redirects to re-authentication after 10 minutes, writes an audit row, and the session is rotated | FR-CON-5 |
-| `it::members::invitation_lifecycle` | Accept (only by the explicit form), re-send, revoke and expire, with the seat count after each (the per-tenant daily invitation budget is tested by `it::abuse::w42_system_mail_budgets`) | FR-CON-4 |
+| `it::members::invitation_lifecycle` | Accept (only by the explicit form), re-send, revoke and expire, with the seat count after each (the per-tenant daily invitation budget is tested by `it::abuse::w44_system_mail_budgets`) | FR-CON-4 |
 | `it::members::ownership_transfer` | Exactly one owner before and after; concurrent transfers leave one owner | FR-CON-2 |
 | `it::console::quarantine_release` | A member releases with re-authentication and an audit row; with key release off, an API key cannot release unless the workspace's policy has `quarantine.key_release: true` (`it::quarantine::j16_key_release_override`); the settings page shows that field read-only | FR-CON-6 |
 | `it::console::disabled` | `PM_CONSOLE=off` removes every `/console` route except the invitation-accept and unsubscribe pairs; the members API still works | FR-CON-7 |
@@ -744,5 +744,5 @@ the workspace's `tenant_id` and delivered like `webhook.disabled`
 [W16]: ../edge-cases.md
 [W17]: ../edge-cases.md
 [W18]: ../edge-cases.md
-[W38]: ../edge-cases.md
-[W41]: ../edge-cases.md
+[W40]: ../edge-cases.md
+[W43]: ../edge-cases.md

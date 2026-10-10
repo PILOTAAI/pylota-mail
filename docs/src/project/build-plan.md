@@ -914,7 +914,7 @@ console pages `plan.rs`, and the dispute check in outbound policy step 18 (`deta
 
 **Acceptance:**
 
-- Edge rows W1–W8, W11–W14, W19 and W35–W37 (the `ramp_lifted_at` assertions of W35 and W36 are added
+- Edge rows W1–W8, W11–W14, W19 and W37–W39 (the `ramp_lifted_at` assertions of W37 and W38 are added
   by M24, which owns the ramp), and `it::billing::unresolved_event_ignored`.
 - `xtask::stripe_setup_idempotent`: `cargo xtask stripe-setup` creates the products, prices, the three
   Portal configurations and the webhook endpoint once, and writes a catalog that `pmail deploy`
@@ -962,12 +962,12 @@ person step of `jobs/erasure.rs`).
 
 **Acceptance:**
 
-- Edge rows W38–W44 (W41's `sign_in_codes_locked` email assertion is added by M26), with
-  `it::members::w38_invitation_needs_second_factor`, `it::totp::w39_pending_auth_single_use`,
-  `it::oauth::w40_link_needs_code`, `it::console::w41_failed_code_daily_cap`,
-  `it::abuse::w42_system_mail_budgets`, `it::console::w43_hosted_address_refused` and
-  `it::abuse::w44_shared_domain_breaker`, and the ramp assertions of `it::billing::w35_grant_after_payment`
-  and `it::billing::w36_dispute_and_refund`.
+- Edge rows W40–W46 (W43's `sign_in_codes_locked` email assertion is added by M26), with
+  `it::members::w40_invitation_needs_second_factor`, `it::totp::w41_pending_auth_single_use`,
+  `it::oauth::w42_link_needs_code`, `it::console::w43_failed_code_daily_cap`,
+  `it::abuse::w44_system_mail_budgets`, `it::console::w45_hosted_address_refused` and
+  `it::abuse::w46_shared_domain_breaker`, and the ramp assertions of `it::billing::w37_grant_after_payment`
+  and `it::billing::w38_dispute_and_refund`.
 - Edge rows W20–W34, with the tests named in the register (`it::oauth::*`, `it::signup::*`, `it::totp::*`,
   `it::landing::routing_table`, `it::checkout::*`, `it::abuse::free_ramp`, `it::abuse::ramp_evaluator`,
   `it::abuse::partner_ramp` (W30's partner part: a partner's tenants are ramped unless `ramp_exempt`),
@@ -1112,7 +1112,7 @@ column are in `0001_init.sql`). Hooks in other milestones' files, each reviewed 
 - The cross-tenant suite covers the unsubscribe route: a token never changes another person's or
   workspace's preferences (O18).
 - `it::notify::system_mail_blocked_retries`, and `it::console::account_emails` for all five `account`
-  events; the `sign_in_codes_locked` assertion of `it::console::w41_failed_code_daily_cap`.
+  events; the `sign_in_codes_locked` assertion of `it::console::w43_failed_code_daily_cap`.
 - `it::notify::unsubscribe_token_format`: the token layout of
   [Notifications § 5](design/notifications.md#5-the-emails) round-trips and every malformed token is
   refused.

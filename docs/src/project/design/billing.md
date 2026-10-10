@@ -2,7 +2,7 @@
 
 Binding design for plans, allowances, metering and payment. It implements FR-BILL-1 to FR-BILL-12,
 FR-BILL-14, NFR-BILL-1 and NFR-BILL-2, build plan milestone M22, and the edge-case rows W1–W8, W11–W14,
-W19 and W35–W37 in the [edge-case register](../edge-cases.md). Usage alerts by email (FR-BILL-13, rows
+W19 and W37–W39 in the [edge-case register](../edge-cases.md). Usage alerts by email (FR-BILL-13, rows
 O20, O21 and O23) are
 designed in [Notifications and usage alerts](notifications.md#4-usage-alerts); this page owns the
 `TenantQuota` side of them ([Usage thresholds](#usage-thresholds)). The user-facing description is
@@ -170,7 +170,7 @@ first matching row gives the candidate plan, and then the payment gate below app
 | `incomplete` (first payment not made) | The default plan until the first invoice is paid |
 | `incomplete_expired`, `paused`, `canceled`, or no subscription | The default plan, or a complimentary plan set by the operator |
 
-**Paid before granted (FR-BILL-14, [W35]).** A subscription's status alone never raises an allowance.
+**Paid before granted (FR-BILL-14, [W37]).** A subscription's status alone never raises an allowance.
 Stripe says `active` "doesn't necessarily indicate that all outstanding invoices associated with the
 subscription have been paid", and a subscription is `incomplete` while a first payment is still
 processing (Stripe "Using webhooks with subscriptions", read 2026-10-10); and an update made in the
@@ -469,7 +469,7 @@ The session expires after Stripe's default of 24 hours. The console refuses a pl
 subscription already exists (the Portal changes plans), and a top-up Checkout when the plan does not allow
 top-ups or a top-up subscription for that feature exists (the Portal changes its quantity). Before the
 first webhook D1 cannot know about a subscription, so two plan Checkouts opened in two tabs can both be
-paid; [Applying state](#applying-state) keeps the older subscription and cancels the other ([W37]).
+paid; [Applying state](#applying-state) keeps the older subscription and cancels the other ([W39]).
 Returning to
 `success_url` changes nothing by itself: the plan changes when the webhook arrives, usually within
 seconds. The return page retrieves the session, checks that its `client_reference_id` and
@@ -505,7 +505,7 @@ What follows from them:
 
 - **Increases are charged at once.** `always_invoice` invoices a move to a dearer plan, or a larger top-up
   quantity, for the rest of the period when it is made, instead of at the next renewal. The allowance
-  rises when that invoice is paid ([Paid before granted](#allowances-and-periods), [W35]).
+  rises when that invoice is paid ([Paid before granted](#allowances-and-periods), [W37]).
 - **Top-up decreases wait for the period end.** A lower quantity is a decreasing item amount, so the
   Portal schedules it (through a subscription schedule) instead of crediting units that may already have
   been used. While it is scheduled, the Portal cannot change or cancel that subscription (Stripe "Customer
@@ -596,7 +596,7 @@ three `charge.*` events are the risk events Stripe asks a subscription integrati
    status filter, which returns every subscription that is not canceled (pages of 100), each with its
    latest invoice's `status`.
 3. Derive:
-   - **duplicates** ([W37]): when two subscriptions carry a plan price, or two carry the same top-up
+   - **duplicates** ([W39]): when two subscriptions carry a plan price, or two carry the same top-up
      price, the one with the earliest `created` is kept and each other one is cancelled at once
      (`DELETE /v1/subscriptions/{id}` with `prorate=true` and `invoice_now=true`, so its unused time is
      credited to the customer's balance), with the audit row `billing.duplicate_cancelled` and the metric
@@ -681,7 +681,7 @@ limits.
 
 ### Disputes and refunds
 
-FR-BILL-14 and [W36]: a disputed payment means the money may be taken back, and a stolen card is the
+FR-BILL-14 and [W38]: a disputed payment means the money may be taken back, and a stolen card is the
 usual cause, so the workspace is contained at once, without waiting for a person.
 
 - **`charge.dispute.created`.** The handler retrieves the disputed charge (`GET /v1/charges/{id}`) to
@@ -857,9 +857,9 @@ Metrics: `quota_hold_denied_total{feature}`, `quota_hold_expired_total{feature}`
 | `it::billing::stripe_fixtures` | `stripe trigger` fixtures recorded as JSON: checkout completed, subscription updated, payment failed, canceled | M22 |
 | `it::billing::plan_managed_by_stripe` | `PATCH …/billing` with `plan_id` on a Stripe-paid workspace gets `409`; on others it sets a complimentary plan and emits reason `operator` | FR-BILL-1 |
 | `it::billing::usage_matches_quota` (property) | `GET /v1/usage` equals the catalog plus `TenantQuota` state for random sequences of holds, settles and plan changes | FR-BILL-11, M22 |
-| `it::billing::w35_grant_after_payment` | A Portal upgrade and a top-up increase whose `latest_invoice` is `open` keep the stored plan and quantities (`billing_increase_held_total`), and `invoice.paid` grants them; a downgrade applies at once; a subscription `active` with an unpaid first invoice grants nothing and does not lift the ramp; during grace the kept plan is the one last paid for, not a failed upgrade; the Checkout session sends `payment_method_types[0]=card`, `customer`, `customer_update[address]=auto` and `customer_update[name]=auto` | [W35], FR-BILL-14 |
-| `it::billing::w36_dispute_and_refund` | `charge.dispute.created` sets `dispute_open_at`, applies the default plan (reason `dispute`), clears `ramp_lifted_at`, fires `billing_dispute`, and every send gets `429 daily_cap_reached` with `details.cap: "billing_dispute"` while inbound is stored; `charge.dispute.closed` `won` restores the plan and sending; `lost` cancels every live subscription and leaves the workspace ramped on the default plan; `charge.refunded` writes `billing.refund_recorded` and changes no plan | [W36], FR-BILL-14 |
-| `it::billing::w37_duplicate_subscription` | Two plan Checkouts paid before the first webhook: the later subscription is cancelled once with `prorate=true` and `invoice_now=true`, the older one applies, and the same holds for two top-up subscriptions of one feature; a Customer is created once for two concurrent Checkout clicks | [W37] |
+| `it::billing::w37_grant_after_payment` | A Portal upgrade and a top-up increase whose `latest_invoice` is `open` keep the stored plan and quantities (`billing_increase_held_total`), and `invoice.paid` grants them; a downgrade applies at once; a subscription `active` with an unpaid first invoice grants nothing and does not lift the ramp; during grace the kept plan is the one last paid for, not a failed upgrade; the Checkout session sends `payment_method_types[0]=card`, `customer`, `customer_update[address]=auto` and `customer_update[name]=auto` | [W37], FR-BILL-14 |
+| `it::billing::w38_dispute_and_refund` | `charge.dispute.created` sets `dispute_open_at`, applies the default plan (reason `dispute`), clears `ramp_lifted_at`, fires `billing_dispute`, and every send gets `429 daily_cap_reached` with `details.cap: "billing_dispute"` while inbound is stored; `charge.dispute.closed` `won` restores the plan and sending; `lost` cancels every live subscription and leaves the workspace ramped on the default plan; `charge.refunded` writes `billing.refund_recorded` and changes no plan | [W38], FR-BILL-14 |
+| `it::billing::w39_duplicate_subscription` | Two plan Checkouts paid before the first webhook: the later subscription is cancelled once with `prorate=true` and `invoice_now=true`, the older one applies, and the same holds for two top-up subscriptions of one feature; a Customer is created once for two concurrent Checkout clicks | [W39] |
 | `it::billing::unresolved_event_ignored` | An event whose customer and metadata name no workspace is answered `200`, recorded `ignored_unresolved`, and fires no alert; an invoice event before the customer is linked resolves through `parent.subscription_details.metadata.tenant_id` | [Webhook endpoint](#webhook-endpoint) |
 | `xtask::stripe_setup_idempotent` | [Stripe account setup](#stripe-account-setup): a second run creates nothing; a live key without `--live`, or no `--vat-from` in live mode, stops before any call; the written catalog validates | M22 |
 | `it::notify::usage_once_per_threshold_per_period`, `it::notify::count_feature_cooldown`, `it::notify::billing_off_no_usage_alerts` | The `TenantQuota` side of usage alerts ([Usage thresholds](#usage-thresholds)), listed in [Notifications § 10](notifications.md#10-tests) | FR-BILL-13, [O20](../edge-cases.md), [O21](../edge-cases.md), [O23](../edge-cases.md) |
@@ -877,9 +877,9 @@ Metrics: `quota_hold_denied_total{feature}`, `quota_hold_expired_total{feature}`
 [W13]: ../edge-cases.md
 [W14]: ../edge-cases.md
 [W19]: ../edge-cases.md
-[W35]: ../edge-cases.md
-[W36]: ../edge-cases.md
 [W37]: ../edge-cases.md
+[W38]: ../edge-cases.md
+[W39]: ../edge-cases.md
 
 Verified (2026-10-09): Stripe documentation at docs.stripe.com, read through WebFetch on this date.
 `/api/checkout/sessions/create` (modes `payment`, `setup` and `subscription`; `client_reference_id` up to

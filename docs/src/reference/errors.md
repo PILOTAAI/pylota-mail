@@ -101,7 +101,7 @@ whether or not the first attempt reached the server.
 | 409 | `plan_managed_by_stripe` | no | Tried to set a plan on a workspace whose plan is paid through Stripe |
 | 409 | `partner_has_tenants` | no | `DELETE /v1/partners/{partner_id}` while one of the partner's tenants is not erased. `details.tenants` says how many; erase them first ([J12](../project/edge-cases.md)) |
 | 409 | `tenant_erased` | no | A tenant-scope erasure request for a tenant that is already `erased`, or a platform key's `PATCH /v1/tenants/{tenant_id}` with `status` on a tenant that is `erasing` or `erased`: only the erasure job changes its status. (A tenant-scope request for a tenant still `erasing` returns the existing request with `200`.) ([I8](../project/edge-cases.md)) |
-| 409 | `address_taken` | no | The address belongs to another identity, is tombstoned, or is a console user's sign-in address ([W43](../project/edge-cases.md)) |
+| 409 | `address_taken` | no | The address belongs to another identity, is tombstoned, or is a console user's sign-in address ([W45](../project/edge-cases.md)) |
 | 409 | `address_is_primary` | no | Tried to retire or delete the primary address |
 | 409 | `address_in_use` | no | Tried to delete an address that received mail (retire it instead), or to retire or delete the identity's platform address, which stays active as the fallback address for the identity's whole life |
 | 409 | `domain_not_ready` | yes | A send from a domain that is `pending` or `verifying`, or from a `pending` address. A `failing` or `suspended` domain is not an error: the send is accepted and falls back to the platform address. Also an identity create whose primary address is on a domain that is not `healthy` or `degraded`, and a `promote` to such an address |

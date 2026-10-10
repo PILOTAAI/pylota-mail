@@ -8,7 +8,7 @@ open point 6 of [Console and workspaces](console.md#open-points) and extends tha
 | | |
 |---|---|
 | Requirements | FR-CON-8 to FR-CON-13 and FR-CON-16 to FR-CON-18 ([PRD](../prd.md)) |
-| Edge cases | [W20–W34 and W38–W44](../edge-cases.md) |
+| Edge cases | [W20–W34 and W40–W46](../edge-cases.md) |
 | Code | `crates/worker/src/console/{signup.rs, oauth.rs, totp.rs, pending.rs, landing.rs, onboarding.rs, pages/overview.rs}`; `crates/worker/src/crons/{signup_ramp.rs, send_breaker.rs}` (the daily ramp evaluation, [§10.1](#101-new-workspace-send-ramp), and the shared-domain breaker, [§10.3](#103-shared-domain-breaker)); `crates/worker/src/console/sysmail.rs` (system-mail budgets, [§10.2](#102-system-mail-budgets)); `crates/core/src/totp.rs` (RFC 6238 codes, pure) |
 | Tables | D1 `users`, `tenants`, `login_tokens` and `oauth_states` (new columns), `oauth_identities`, `pending_auth`, `waitlist`, `platform_state` ([§11](#11-data-model)) |
 
@@ -71,7 +71,7 @@ the same cookie, lifetimes and re-authentication rules ([Sessions](console.md#se
 Both flows are server-side redirects. They need no JavaScript.
 
 1. `GET /console/oauth/{provider}/start?intent={sign_in|sign_up}&next={path}&plan={plan}&terms=1&invite={token}`.
-   The route counts against `RL_SIGNIN`, because each hit writes a row ([W41](../edge-cases.md)). On
+   The route counts against `RL_SIGNIN`, because each hit writes a row ([W43](../edge-cases.md)). On
    the sign-up page the "Continue with" buttons are `GET` forms that include the terms checkbox, so
    `intent=sign_up` arrives with `terms=1`; without it the start shows the sign-up page again with the
    checkbox marked as required, and creates nothing. On an invitation's accept page the "Accept with
@@ -100,7 +100,7 @@ Both flows are server-side redirects. They need no JavaScript.
    first equal that invitation's address (the flow knows it came from an invitation only through this
    column). Otherwise the flow is refused, nothing is created or linked, and the invitation stays pending
    ([W23](../edge-cases.md)). A verified address that this deployment hosts is refused the same way
-   ([§10](#10-abuse-and-safety-on-cloud), [W43](../edge-cases.md)). Then:
+   ([§10](#10-abuse-and-safety-on-cloud), [W45](../edge-cases.md)). Then:
    1. `oauth_identities` has `(provider, subject)` → that user; set its `last_used_at = now`.
    2. Otherwise a `users` row with the verified email exists → link it, but only after the person proves
       the address again. Google warns that its `email` claim may not be unique to an account and can
@@ -110,7 +110,7 @@ Both flows are server-side redirects. They need no JavaScript.
       a pending step `link_code` ([§5.1](#51-the-pending-step)) that carries `oauth_provider`,
       `oauth_subject` and `oauth_email`. Only a correct code inserts the `oauth_identities` row, sends the
       `account` email `sign_in_method_linked`, and continues. The same person can then use either method
-      ([W22](../edge-cases.md), [W40](../edge-cases.md)).
+      ([W22](../edge-cases.md), [W42](../edge-cases.md)).
    3. Otherwise, create the user ([§6](#6-sign-up)) when a pending invitation exists for that verified
       address, or when the flow's `intent` is `sign_up` and either sign-up is open or the verified
       address has a valid waitlist invite ([§6.1](#61-before-launch-the-waitlist)). The new `users` row
@@ -178,7 +178,7 @@ link. They never reveal whether an account exists.
 ### 5.1 The pending step
 
 A first factor that is not the last step leaves the browser in a pending state, never in a session
-([W39](../edge-cases.md)). The state lives in D1 `pending_auth` ([§11](#11-data-model)) and in the
+([W41](../edge-cases.md)). The state lives in D1 `pending_auth` ([§11](#11-data-model)) and in the
 cookie `__Host-pm_pending=<value>; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=600`:
 
 1. **Start.** After a first factor, when the person is enrolled in two-step verification
@@ -274,7 +274,7 @@ An unknown plan value means `free`.
    ([§4](#4-google-and-github)). Addresses on the built-in list of disposable-mail domains (it ships with
    each release) or on a domain in `PM_SIGNUP_BLOCKED_DOMAINS` are refused before any mail is sent
    ([W29](../edge-cases.md)), and so are addresses this deployment hosts, whose mail an API key could
-   read ([§10](#10-abuse-and-safety-on-cloud), [W43](../edge-cases.md)).
+   read ([§10](#10-abuse-and-safety-on-cloud), [W45](../edge-cases.md)).
 3. **Create the workspace** (`/console/workspaces/new?plan={plan}`, the plan carried from the token or the
    OAuth flow), shown when the person has no workspace and no pending invitation. The fields are the
    workspace name, the address suffix (pre-filled from the name, for example `.brightwell`, with the
@@ -283,7 +283,7 @@ An unknown plan value means `free`.
    `workspace_limit` when this person, or another person whose address is the same mailbox with a
    different `+tag` (the local part compared with everything from the first `+` removed, through
    `users.email = ?base OR users.email LIKE ?pattern ESCAPE '\'`), already owns a workspace on the
-   catalog's default plan ([W44](../edge-cases.md)). On success the tenant is
+   catalog's default plan ([W46](../edge-cases.md)). On success the tenant is
    created on the Free plan with this person as owner, and `users.last_tenant_id` is set.
 4. **Pay, when a paid plan was chosen.** The owner goes straight to Stripe Checkout for that plan
    ([Billing › Checkout](billing.md#checkout)). Coming back from Checkout is [§9](#9-coming-back-from-checkout).
@@ -302,7 +302,7 @@ again", when the ticket is missing or altered, names another form or network, or
 seconds or more than 30 minutes before. It is the no-JavaScript stand-in for a proof of work: each
 submission costs a page fetch and a wait from the same network, which the per-network budgets of
 [§10.2](#102-system-mail-budgets) then count. Tickets are not single use; the budgets bound reuse
-([W42](../edge-cases.md)).
+([W44](../edge-cases.md)).
 
 ## 7. Where people land
 
@@ -312,7 +312,7 @@ After any successful sign-in (and two-step verification), the first matching row
 |---|---|
 | A valid `next` was carried through sign-in: a relative path starting with `/console/`, with no `//`, no backslash and no scheme ([W31](../edge-cases.md)) | That page |
 | The sign-in accepted an invitation (its accept page, or **Accept with Google** or **GitHub**) | That workspace's Overview |
-| No workspace, and a pending invitation exists for this address | The pending invitations, `/console/invitations`, each with its own **Accept** button. Nothing is accepted without that click ([W38](../edge-cases.md)) |
+| No workspace, and a pending invitation exists for this address | The pending invitations, `/console/invitations`, each with its own **Accept** button. Nothing is accepted without that click ([W40](../edge-cases.md)) |
 | No workspace, and sign-up is open or the address has a valid waitlist invite ([§6.1](#61-before-launch-the-waitlist)) | Create your workspace ([§6.2](#62-after-launch-open-sign-up)), with the plan from the sign-up token or OAuth flow |
 | No workspace, sign-up is closed or waitlist, and no valid waitlist invite | "No workspace yet", explaining how to be invited |
 | The target workspace requires two-step verification and the person has none | Enrol two-step verification, then continue |
@@ -402,11 +402,11 @@ Stripe redirects to `/console/plan/return?session_id={CHECKOUT_SESSION_ID}`.
 
 | Risk | Control |
 |---|---|
-| Sign-in mail used as a spam cannon, and code guessing | 3 link or code requests per 10 minutes per address and 10 attempts per code, after which the token is burned ([Sign-in](console.md#sign-in)); 30 failed codes per address per UTC day lock sign-in by code for that address until the next UTC day, links keep working, and the address is told once ([W41](../edge-cases.md)). Plus a rate-limit binding `RL_SIGNIN`: 10 requests per 60 s per client network (`CF-Connecting-IP`; an IPv6 address counts by its /64 prefix, so rotating addresses inside one prefix does not help), on `POST /console/sign-in`, `/console/sign-in/link`, `/console/sign-in/code`, `/console/sign-in/verify`, `/console/sign-up` and `/console/waitlist` and on `GET /console/oauth/{provider}/start`. Plus the form ticket ([§6.2](#62-after-launch-open-sign-up)) and the system-mail budgets ([§10.2](#102-system-mail-budgets)). This closes [Console open point 1](console.md#open-points) |
-| Free workspaces created to send spam | A new-workspace send ramp: the effective tenant daily cap is at most 50 for the first 7 days on Free, lifted on day 7 by a daily evaluation when the bounce and complaint rates are under the auto-pause thresholds, or by a paid plan once its invoice is paid ([§10.1](#101-new-workspace-send-ramp)). The usual auto-pause still applies ([W30](../edge-cases.md)). One self-serve Free workspace per person, `+tag` variants included (`workspace_limit`, [§6.2](#62-after-launch-open-sign-up)), and an automatic breaker for the whole shared domain ([§10.3](#103-shared-domain-breaker), [W44](../edge-cases.md)) |
+| Sign-in mail used as a spam cannon, and code guessing | 3 link or code requests per 10 minutes per address and 10 attempts per code, after which the token is burned ([Sign-in](console.md#sign-in)); 30 failed codes per address per UTC day lock sign-in by code for that address until the next UTC day, links keep working, and the address is told once ([W43](../edge-cases.md)). Plus a rate-limit binding `RL_SIGNIN`: 10 requests per 60 s per client network (`CF-Connecting-IP`; an IPv6 address counts by its /64 prefix, so rotating addresses inside one prefix does not help), on `POST /console/sign-in`, `/console/sign-in/link`, `/console/sign-in/code`, `/console/sign-in/verify`, `/console/sign-up` and `/console/waitlist` and on `GET /console/oauth/{provider}/start`. Plus the form ticket ([§6.2](#62-after-launch-open-sign-up)) and the system-mail budgets ([§10.2](#102-system-mail-budgets)). This closes [Console open point 1](console.md#open-points) |
+| Free workspaces created to send spam | A new-workspace send ramp: the effective tenant daily cap is at most 50 for the first 7 days on Free, lifted on day 7 by a daily evaluation when the bounce and complaint rates are under the auto-pause thresholds, or by a paid plan once its invoice is paid ([§10.1](#101-new-workspace-send-ramp)). The usual auto-pause still applies ([W30](../edge-cases.md)). One self-serve Free workspace per person, `+tag` variants included (`workspace_limit`, [§6.2](#62-after-launch-open-sign-up)), and an automatic breaker for the whole shared domain ([§10.3](#103-shared-domain-breaker), [W46](../edge-cases.md)) |
 | Disposable addresses | `PM_SIGNUP_BLOCKED_DOMAINS` ([W29](../edge-cases.md)) |
-| A console account whose sign-in address is mail this deployment receives | Refused: every key that reads that mailbox could read the sign-in codes. An address is **hosted** when its domain is `PM_PLATFORM_DOMAIN`, or when it is an `addresses` row in state `pending`, `active` or `retiring`. Sign-up (email, Google, GitHub), the waitlist, invitations (`400 invalid_request` on `email`) and workspace owners (`POST /v1/tenants`, `400 invalid_request` on `owner.email`) refuse it; `pmail setup --owner-email` refuses the platform domain. In the other direction, an identity address equal to an existing console user's sign-in address is refused with `409 address_taken` ([Identities and domains › Create](identity-domains.md#create), [W43](../edge-cases.md)) |
-| System mail drained by others | Budgets per recipient, per client network and ASN, and per inviting tenant, and a reserve of the system identity's day for sign-in mail ([§10.2](#102-system-mail-budgets), [W42](../edge-cases.md)) |
+| A console account whose sign-in address is mail this deployment receives | Refused: every key that reads that mailbox could read the sign-in codes. An address is **hosted** when its domain is `PM_PLATFORM_DOMAIN`, or when it is an `addresses` row in state `pending`, `active` or `retiring`. Sign-up (email, Google, GitHub), the waitlist, invitations (`400 invalid_request` on `email`) and workspace owners (`POST /v1/tenants`, `400 invalid_request` on `owner.email`) refuse it; `pmail setup --owner-email` refuses the platform domain. In the other direction, an identity address equal to an existing console user's sign-in address is refused with `409 address_taken` ([Identities and domains › Create](identity-domains.md#create), [W45](../edge-cases.md)) |
+| System mail drained by others | Budgets per recipient, per client network and ASN, and per inviting tenant, and a reserve of the system identity's day for sign-in mail ([§10.2](#102-system-mail-budgets), [W44](../edge-cases.md)) |
 | Who system mail comes from | `PM_SYSTEM_FROM`, for example `Pylota Mail <no-reply@pylotamail.com>`, sent through the platform domain by the system identity ([Identities and domains › The system identity](identity-domains.md#the-system-identity)). It is the identity that other pages name as the sender of sign-in, invitation and notification mail. This closes [Console open point 2](console.md#open-points) |
 | Open redirects through `next` | [§7](#7-where-people-land) |
 | Lost access to the sign-in address | No recovery route. Nothing the deployment holds proves who controls a workspace once its sign-in address is gone, and a Free workspace has no billing record either, so moving ownership on request would let anyone who tells a good story take a workspace. Owners should keep a second admin (who still cannot take ownership) and keep their address. The workspace keeps working through its API keys; billing stays reachable through Stripe's own Portal sign-in page (`login_page`, [Billing › Customer Portal](billing.md#customer-portal)), where the owner can cancel |
@@ -451,7 +451,7 @@ sending history ([W30](../edge-cases.md)).
   suspend the tenant (FR-TEN-3) or change its plan with `PATCH /v1/tenants/{tenant_id}/billing`.
 - **Lifted on a paid plan once paid.** The billing webhook's state application sets `ramp_lifted_at` when
   the workspace moves to a paid plan, which its payment gate allows only once that plan's invoice is
-  `paid` ([Billing › Applying state](billing.md#applying-state), [W35](../edge-cases.md)), so a later
+  `paid` ([Billing › Applying state](billing.md#applying-state), [W37](../edge-cases.md)), so a later
   downgrade to Free does not ramp it again. This applies to a partner's `metered` tenant too; an `exempt`
   tenant has no plan, so only the daily evaluation (or `ramp_exempt`) ends its ramp. A disputed payment
   clears `ramp_lifted_at` again ([Billing › Disputes and refunds](billing.md#disputes-and-refunds)).
@@ -463,7 +463,7 @@ Email Sending quota, which is per account and on Pylota Mail Cloud shared with P
 could spend it, `system_mail_blocked` would follow and nobody could sign in. Every system-identity send is
 therefore counted, before it is submitted, against exact budgets kept by the default tenant's
 `TenantQuota` (`QuotaRequest::SystemMail`, [Outbound › TenantQuota](outbound.md#tenantquota)), in its
-`counters` rows `sysmail:{class}:{key}` per UTC day ([W42](../edge-cases.md)):
+`counters` rows `sysmail:{class}:{key}` per UTC day ([W44](../edge-cases.md)):
 
 | Class | What | Budgets per UTC day |
 |---|---|---|
@@ -491,7 +491,7 @@ therefore counted, before it is submitted, against exact budgets kept by the def
 The ramp contains one new workspace; the breaker contains all of them at once. The `*/15` cron
 (`crons/send_breaker.rs`) reads today's (UTC) `sends` in `usage_daily` summed over live tenants, which
 lag by up to the hourly roll-up, and compares them with `PM_DAILY_SEND_QUOTA` (no variable, no breaker)
-([W44](../edge-cases.md)):
+([W46](../edge-cases.md)):
 
 | Share of the daily quota | Stage | Effect until 00:00 UTC |
 |---|---|---|
@@ -638,10 +638,10 @@ adds no migration ([Data model](data-model.md#1-d1-control-plane)).
 | `it::oauth::state_cookie_binding` | Missing, reused, expired or other-browser state → refused ([W20](../edge-cases.md)) |
 | `it::oauth::sign_up_records_terms` | `intent=sign_up` without `terms=1` creates nothing; with it, the new user's `terms_version` comes from the `oauth_states` row; `intent=sign_in` creates no account for an address without an invitation |
 | `it::oauth::unverified_email_refused` | GitHub without a verified primary address; Google `email_verified: false` ([W21](../edge-cases.md)) |
-| `it::oauth::link_by_verified_email` | Google, then an email link → one user ([W22](../edge-cases.md)); an existing email account, then Google with the same verified address → linked only after the emailed code ([W40](../edge-cases.md)) |
+| `it::oauth::link_by_verified_email` | Google, then an email link → one user ([W22](../edge-cases.md)); an existing email account, then Google with the same verified address → linked only after the emailed code ([W42](../edge-cases.md)) |
 | `it::oauth::invitation_email_mismatch` | **Accept with Google** for an invitation to one address, verified with another → refused, invitation still pending ([W23](../edge-cases.md)); with the invited address on a deployment where sign-up is closed → account created and invitation accepted through `oauth_states.invitation_id`; a plain sign-in (no `invite`) with the invited address creates the account but accepts nothing |
-| `it::oauth::w40_link_needs_code` | An OAuth identity whose verified address matches an existing user starts a `link_code` pending step: no `oauth_identities` row and no session until the emailed code is entered; 5 wrong codes use the step up; a correct code links, sends `sign_in_method_linked`, then asks for the second factor when enrolled; **Unlink** in settings needs re-authentication, deletes the row and writes `user.oauth_unlink`; `GET /console/oauth/{provider}/start` counts against `RL_SIGNIN` ([W40](../edge-cases.md), FR-CON-17) |
-| `it::totp::w39_pending_auth_single_use` | After a first factor an enrolled person has a `pending_auth` row and the `__Host-pm_pending` cookie but no session; the row expires after 5 minutes; a second `POST` of the same correct code, or a replay of the cookie, creates no second session; an enrolment secret is kept in `totp_pending_sealed` and refused after 10 minutes; turning on `require_two_factor` sends an already signed-in, unenrolled member to enrolment on their next request ([W39](../edge-cases.md), FR-CON-16) |
+| `it::oauth::w42_link_needs_code` | An OAuth identity whose verified address matches an existing user starts a `link_code` pending step: no `oauth_identities` row and no session until the emailed code is entered; 5 wrong codes use the step up; a correct code links, sends `sign_in_method_linked`, then asks for the second factor when enrolled; **Unlink** in settings needs re-authentication, deletes the row and writes `user.oauth_unlink`; `GET /console/oauth/{provider}/start` counts against `RL_SIGNIN` ([W42](../edge-cases.md), FR-CON-17) |
+| `it::totp::w41_pending_auth_single_use` | After a first factor an enrolled person has a `pending_auth` row and the `__Host-pm_pending` cookie but no session; the row expires after 5 minutes; a second `POST` of the same correct code, or a replay of the cookie, creates no second session; an enrolment secret is kept in `totp_pending_sealed` and refused after 10 minutes; turning on `require_two_factor` sends an already signed-in, unenrolled member to enrolment on their next request ([W41](../edge-cases.md), FR-CON-16) |
 | `core::totp::rfc6238_vectors` | RFC 6238 test vectors; drift ±1; replay in the same step refused |
 | `it::totp::workspace_requirement` | `require_two_factor` sends an unenrolled member to enrolment before the workspace opens, and on every later request until they enrol (only enrolment, the picker, settings and sign-out answer); API keys of that workspace still work ([W27](../edge-cases.md)) |
 | `it::totp::recovery_code_single_use` | A recovery code signs in once and is refused the second time; generating new codes makes every old code fail ([W28](../edge-cases.md)) |
@@ -651,9 +651,9 @@ adds no migration ([Data model](data-model.md#1-d1-control-plane)).
 | `it::checkout::return_before_webhook` | Waits, then "within a minute"; the plan is applied by the webhook only ([W25](../edge-cases.md), FR-CON-13) |
 | `it::onboarding::derived_steps` | Each checklist step turns done from real data alone; each Overview banner condition shows its banner and hides it once resolved (FR-CON-12) |
 | `it::abuse::free_ramp` | 51st send on day 1 of a Free workspace → `429 daily_cap_reached` (effective cap min(policy, 50)); lifted once the upgrade's invoice is paid (not while it is open), and not ramped again after a downgrade ([W30](../edge-cases.md)) |
-| `it::abuse::w42_system_mail_budgets` | The 11th system email of a day to one address (sign-in and invitations together), the 21st sign-in email from one IPv4 address or IPv6 /64 (also when the address part rotates), and the 201st from one ASN send nothing while the page stays identical; a tenant's 51st invitation of the day → `429 daily_cap_reached` with `details.cap: "invitations"`; `invitation` and `notification` mail stop at 20% and 50% of the system identity's day while sign-in mail still goes out; a sign-up `POST` without a valid ticket, with one issued under 2 seconds before, or from another network sends nothing ([W42](../edge-cases.md), FR-CON-18) |
-| `it::abuse::w44_shared_domain_breaker` | With `PM_DAILY_SEND_QUOTA` set and today's `usage_daily` sends at 60%, the cron writes stage 1: a Free or ramped workspace's send → `429 daily_cap_reached` with `details.cap: "shared_domain"` and `resets_at` at 00:00 UTC, a paid workspace still sends; at 90% every tenant is refused and sign-in mail still goes out; at 00:00 UTC the row is deleted; without the variable nothing happens; a second self-serve Free workspace for `jo+2@example.org` while `jo@example.org` owns one returns `workspace_limit` ([W44](../edge-cases.md), FR-CON-18) |
-| `it::console::w43_hosted_address_refused` | Sign-up (email, Google), the waitlist, an invitation (`400 invalid_request`, path `email`) and `POST /v1/tenants` with `owner` (path `owner.email`) refuse an address on the platform domain and an identity's `active` address; creating an identity address equal to a console user's sign-in address → `409 address_taken` ([W43](../edge-cases.md), FR-CON-17) |
+| `it::abuse::w44_system_mail_budgets` | The 11th system email of a day to one address (sign-in and invitations together), the 21st sign-in email from one IPv4 address or IPv6 /64 (also when the address part rotates), and the 201st from one ASN send nothing while the page stays identical; a tenant's 51st invitation of the day → `429 daily_cap_reached` with `details.cap: "invitations"`; `invitation` and `notification` mail stop at 20% and 50% of the system identity's day while sign-in mail still goes out; a sign-up `POST` without a valid ticket, with one issued under 2 seconds before, or from another network sends nothing ([W44](../edge-cases.md), FR-CON-18) |
+| `it::abuse::w46_shared_domain_breaker` | With `PM_DAILY_SEND_QUOTA` set and today's `usage_daily` sends at 60%, the cron writes stage 1: a Free or ramped workspace's send → `429 daily_cap_reached` with `details.cap: "shared_domain"` and `resets_at` at 00:00 UTC, a paid workspace still sends; at 90% every tenant is refused and sign-in mail still goes out; at 00:00 UTC the row is deleted; without the variable nothing happens; a second self-serve Free workspace for `jo+2@example.org` while `jo@example.org` owns one returns `workspace_limit` ([W46](../edge-cases.md), FR-CON-18) |
+| `it::console::w45_hosted_address_refused` | Sign-up (email, Google), the waitlist, an invitation (`400 invalid_request`, path `email`) and `POST /v1/tenants` with `owner` (path `owner.email`) refuse an address on the platform domain and an identity's `active` address; creating an identity address equal to a console user's sign-in address → `409 address_taken` ([W45](../edge-cases.md), FR-CON-17) |
 | `it::abuse::ramp_evaluator` | On day 7 the daily evaluation lifts the ramp when the rates are under the thresholds; outcomes of an identity deleted before the evaluation still count (the tenant's per-day counters, not the identity's `outcomes` rows); with a complaint rate above them the ramp stays and is evaluated again daily, and the third failure fires `signup_ramp_review` without suspending the tenant ([W30](../edge-cases.md)) |
 | `it::abuse::partner_ramp` | A tenant created by a partner key is ramped (51st send of the day → `429 daily_cap_reached`) with billing mode `exempt` and with billing `disabled` on the deployment, and the daily evaluation lifts it on day 7 as for a Free workspace; with the partner's `ramp_exempt` set by a platform key its tenants are not ramped, including ones already ramped; a tenant without a partner in billing mode `exempt` is still never ramped ([W30](../edge-cases.md), §10.1) |
 | `it::hosts::console_api_split` | With two hosts, console paths 404 on the API host and API paths 404 on the console host; no `Set-Cookie` on the API host |
