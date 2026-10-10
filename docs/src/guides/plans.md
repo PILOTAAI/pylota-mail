@@ -59,7 +59,14 @@ on every plan as an abuse backstop.
 **New workspaces on Free** can send at most 50 messages a day for their first 7 days
 (`429 daily_cap_reached` above that). From day 7 a daily check lifts the ramp once bounce and complaint
 rates are under the automatic-pause thresholds; until then the limit stays. Moving to a paid plan lifts
-it at once, for good.
+it once the plan's first payment succeeds, and a later downgrade does not bring it back (a disputed
+payment does).
+
+**Shared limits.** Every Cloud workspace sends from shared infrastructure. If the whole service nears its
+daily sending quota, sends from Free and new workspaces pause until 00:00 UTC (`429 daily_cap_reached`
+with `details.cap: "shared_domain"`), and near the very end of the quota every workspace's do, so that
+sign-in email keeps working. Retrying with the same `Idempotency-Key` after the reset is safe. One person
+can own one Free workspace.
 
 Agentic search is not a plan allowance. It is rate-limited per key (20 a minute) and capped per workspace
 per day (`search.agentic_daily_cap`, 500 by default).
@@ -95,7 +102,7 @@ plan each month while it is subscribed. Top-ups are available on Developer and T
 seats have no top-up: they come with the plan.
 
 For example, Developer with two send top-ups has 12,000 sends a month. A top-up counts from the moment
-Stripe confirms it, in the current month.
+its invoice is paid, in the current month. A workspace can hold up to 100 units of each kind.
 
 ## When allowances reset
 
@@ -176,17 +183,22 @@ Plans are managed on the console's **Plan and usage** page (`/console/plan`). Ev
 Only the workspace **owner** can change the plan, and the console asks the owner to confirm with a code if
 they last signed in more than 10 minutes ago.
 
-- **Upgrade from Free.** Choose Developer or Team. The console sends you to a Stripe Checkout page to pay.
-  The plan applies as soon as Stripe confirms the payment, usually within seconds, and a new billing period
+- **Upgrade from Free.** Choose Developer or Team. The console sends you to a Stripe Checkout page to pay
+  by card. The plan applies once the payment is confirmed, usually within seconds, and a new billing period
   starts.
 - **Add top-ups.** On Developer or Team, choose how many units of inboxes, sends or triage analyses to add.
   The first purchase of each kind goes through Checkout.
-- **Change plan, change top-ups, update the card, see invoices, cancel.** **Manage billing** opens the
-  Stripe Customer Portal. A change applies when Stripe confirms it; Stripe prorates the price.
+- **Change plan, change top-ups, update the card, see invoices, cancel.** The buttons on **Plan and usage**
+  open the Stripe Customer Portal. A move to a dearer plan, or more top-up units, is charged at once for
+  the rest of the period, and the new allowances apply when that payment succeeds, not before. A move to
+  a cheaper plan applies at once, and the unused part of the dearer plan becomes a credit on your next
+  invoices. Fewer top-up units take effect at the end of the period you paid for.
 - **Cancel.** The plan stays until the end of the period you paid for, then the workspace moves to Free.
 - **Delete the workspace.** Deleting a workspace (owner only, at **Settings**) stops its mail, then cancels
-  its plan and every top-up at once, with no proration and no refund, before anything else is erased
-  ([Privacy](privacy.md#console-accounts)).
+  its plan and every top-up at once, with no proration credit and no refund (anything not yet invoiced is
+  invoiced then), before anything else is erased ([Privacy](privacy.md#console-accounts)).
+- **A disputed payment.** If a payment is disputed with your bank, the workspace moves to Free limits and
+  its sends stop until the dispute is closed. If it closes in your favour, the plan and sending come back.
 
 **A downgrade never deletes data.** If you have more identities, custom domains or members than the new
 plan allows, all of them are kept and keep working: identities still send and receive, domains still

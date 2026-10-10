@@ -52,7 +52,7 @@ increases strictly per owner: per identity for mailbox events (`message.*`, `ide
 per job for `erasure.*` and `export.*` events, and for `identity.deleted`, which the erasure job emits
 after the mailbox is gone (it still carries `identity_id`, so identity-filtered endpoints receive it). Use it to discard stale updates, for example a
 `message.deferred` arriving after `message.delivered`. Platform events (`webhook.disabled`,
-`webhook.test`, `member.*` and `billing.*`) have `sequence: null`.
+`webhook.test`, `member.*`, `billing.*`, `tenant.policy_updated` and `account.*`) have `sequence: null`.
 
 ## Envelope
 
@@ -75,16 +75,22 @@ events); `identity.deleted` is the one job event that sets it. `tenant_id` is `n
 Payloads are **thin**. They carry IDs, a summary, verdicts and up to `policy.webhook_text_bytes` of
 `extracted_text` (default 16 KB, maximum 64 KB). Fetch anything else through the API.
 
+Because the `message.*` and `verification.received` payloads carry mail, an endpoint that receives them
+can only be created, re-pointed or replayed by a key that also holds `messages:read` (and
+`quarantine:review` for `message.quarantined`) ([REST API › Webhooks](api.md#webhooks),
+[J29](../project/edge-cases.md)). Events of the deployment's system identity go to platform endpoints
+only.
+
 ## Event types
 
 ### Messages
 
 | Type | When | `data` |
 |---|---|---|
-| `message.received` | An inbound message is stored and visible | `message` (summary, see below), `thread_id`, `trust`, `extracted_text`, `extracted_text_truncated`, `attachments[]` (id, filename, content type, size) |
-| `message.quarantined` | An inbound message is stored but quarantined | as `message.received`, plus `quarantine_reason`. No `extracted_text` |
+| `message.received` | An inbound message is stored and visible | `message` (summary, see below), `thread_id`, `trust`, `extracted_text`, `extracted_text_truncated`, `attachments[]` (id, filename, content type, size); plus `reprocessed: true` when a re-parse emits it again ([J3](../project/edge-cases.md)): it is not new mail |
+| `message.quarantined` | An inbound message is stored but quarantined | as `message.received`, plus `quarantine_reason`. No `extracted_text`. `reprocessed: true` as for `message.received` |
 | `message.released` | A quarantined message was released | `message`, `released_by_key_id` (API release) or `released_by_user_id` (console release; the other is `null`), `reason` |
-| `message.triaged` | Triage finished (or failed) | `message_id`, `thread_id`, `triage` |
+| `message.triaged` | Triage finished (or failed) | `message_id`, `thread_id`, `triage` (with `version`, the triage logic version, and `run`, which counts completed runs) |
 | `message.sent` | The transport accepted an outbound message, or a person resolved an uncertain send as `sent` | `message`, `provider`, `provider_message_id` (`null` after a resolve), `sent_via_fallback` |
 | `message.delivered` | A recipient's server accepted it | `message_id`, `recipient`, `smtp_code` |
 | `message.deferred` | A temporary failure; the provider is retrying | `message_id`, `recipient`, `smtp_code`, `smtp_response` |
@@ -92,11 +98,11 @@ Payloads are **thin**. They carry IDs, a summary, verdicts and up to `policy.web
 | `message.complained` | A recipient reported spam | `message_id`, `recipient`, `suppressed: true` |
 | `message.rejected` | The transport refused it, at submission or, for some recipients, when the recipient's server rejected it after submission | `message_id`, `reason`, `detail` |
 | `message.failed` | It could not be sent | `message_id`, `reason` |
-| `message.uncertain` | The outcome is unknown; never resent automatically | `message_id`, `reason`, `fix` |
+| `message.uncertain` | The outcome is unknown; never resent automatically | `message_id`, `reason` (`transport_timeout`, `transport_connection_lost` or `provider_outcome_unknown`), `fix` |
 | `message.reconciled` | An uncertain send was matched to a provider event | `message_id`, `status` |
 | `message.suppressed` | Every recipient is suppressed | `message_id`, `recipients[]` |
 | `message.canceled` | Cancelled while queued | `message_id` |
-| `verification.received` | A verification code or link was found in authenticated mail | `message_id`, `sender_domain`, `kind` (`code` or `link`). The value itself is only available through `wait` |
+| `verification.received` | A verification code or link was found in authenticated mail | `message_id`, `sender_domain`, `kind` (`code` or `link`), `account_id` (the approved service-ledger entry that matched, or `null` when the tenant does not require approval). The value itself is only available through `wait` |
 
 The **message summary** used in `data.message` is:
 
@@ -138,15 +144,15 @@ The **message summary** used in `data.message` is:
 | `domain.failing` | `domain_id`, `issues[]`, `fallback_active` |
 | `domain.suspended` | `domain_id`, `reason` (`failing_14_days`, `nameservers_changed`, `ownership_record_missing` or `registration_changed`) |
 | `domain.recovered` | `domain_id`, `from_state` |
-| `domain.reminder` | `domain_id`, `state`, `hours_in_state` (sent at 24 h, 72 h and 7 days; a `nameservers` domain still `pending` also gets a final one at 21 days, 504 h, before Cloudflare deletes the zone at 28 days) |
-| `domain.removed` | `domain_id`, `reason`: `requested` (removed through `DELETE /v1/domains/{id}`) or `zone_expired` (a `nameservers` zone was never activated and Cloudflare deleted it; the domain can be added again) |
+| `domain.reminder` | `domain_id`, `state`, `hours_in_state` (sent at 24 h, 72 h and 7 days; a domain never verified also gets one at 12 days, 288 h, two days before its unverified expiry; a `nameservers` domain still `pending` also gets a final one at 21 days, 504 h, before Cloudflare deletes the zone at 28 days) |
+| `domain.removed` | `domain_id`, `reason`: `requested` (removed through `DELETE /v1/domains/{id}`), `zone_expired` (a `nameservers` zone was never activated and Cloudflare deleted it; the domain can be added again), `evicted` (the domain was never verified, and another tenant proved control of its DNS with a claim record) or `unverified_expired` (the domain was never verified within 14 days of being added, or of its zone's activation) |
 
 ### Privacy, platform and webhooks
 
 | Type | `data` |
 |---|---|
 | `erasure.completed` | `erasure_request` (with receipt) |
-| `erasure.failed` | `erasure_request_id`, `step`, `error`. Retried by the job runner before this is sent |
+| `erasure.failed` | `erasure_request_id`, `step`, `error`. Sent only after the job runner retried the step until 20 hours after the first request; submit the erasure again to restart it (a tenant erasure resumes at the failed step) |
 | `export.completed` | `export_id`, `expires_at` (fetch the download link from the API) |
 | `suppression.created` | `address_hint`, `reason`, `source_message_id` |
 | `quota.warning` | `metric` (`sends` in v1), `used`, `limit`, `scope` (tenant or identity). Sent at 80% and at 100% of a daily send cap |
@@ -161,9 +167,23 @@ The **message summary** used in `data.message` is:
 | `member.joined` | `user_id`, `role` |
 | `member.role_changed` | `user_id`, `from`, `to` |
 | `member.removed` | `user_id` |
-| `billing.plan_changed` | `from_plan`, `to_plan`, `reason` (`checkout`, `portal`, `payment_failed_grace_ended`, `payment_recovered` (the plan was restored after a late payment), `canceled`, `operator`) |
+| `billing.plan_changed` | `from_plan`, `to_plan`, `reason` (`checkout`, `portal`, `payment_failed_grace_ended`, `payment_recovered` (the plan was restored after a late payment, or when a dispute closed in the workspace's favour), `canceled`, `operator`, `dispute` (a payment was disputed: the default plan applies and sends stop until the dispute closes)) |
 | `billing.payment_failed` | `grace_until` |
 | `billing.limit_reached` | `feature`, `granted`, `resets_at` (sent once per feature per period, when the first `402` is returned) |
+| `tenant.policy_updated` | `fields` (the dotted paths written), `by` (`platform`, `partner`, `tenant` or `console`), `actor_key_id`, `actor_user_id` (one of them `null`), `policy_version`. Sent for every policy write except a tenant's creation, to the tenant's, its partner's and platform endpoints ([Workspace policy](../project/design/workspace-policy.md#7-audit-and-events)) |
+
+### Service accounts
+
+Platform events with `tenant_id` and `identity_id` set, so an endpoint's identity filter applies
+([Service sign-up ledger](../project/design/service-accounts.md#6-events)). `account` is the
+[service account](api.md#service-accounts) as the API returns it.
+
+| Type | When | `data` |
+|---|---|---|
+| `account.requested` | An agent recorded that it wants an account at a service | `account` |
+| `account.approved` | An operator approved the entry | `account` |
+| `account.rejected` | An operator rejected it, or it stayed undecided for 7 days | `account`, `reason` (`operator` or `expired`) |
+| `account.closed` | The entry was closed, or deleted while it was pending or approved | `account` |
 
 ## Versioning
 

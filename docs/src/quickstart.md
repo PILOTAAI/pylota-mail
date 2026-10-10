@@ -188,24 +188,33 @@ Add the SDK, pinned to the same version as your deployment (`GET /health` return
 pylota-mail = "=X.Y.Z"   # replace with your deployment's version
 ```
 
-```rust
-use pylota_mail::Client;
+```rust,no_run
+use pylota_mail::{Client, IdempotencyKey};
+use pylota_mail::types::{Recipient, SendRequest};
 
 async fn confirm_booking(key: String) -> Result<(), pylota_mail::Error> {
-    let client = pylota_mail::Client::new("https://mail.example.com", key);
-    let sent = client
-        .identity("idn_01J9Z3K8V4")
-        .send()
-        .to("renter@example.org")
-        .subject("Your booking BK-2291")
-        .text("Your car is ready at 9:00.")
-        .idempotency_key("bk-2291-confirm")
-        .await?;
+    let client = Client::builder()
+        .base_url("https://mail.example.com")
+        .api_key(key)
+        .build()?;
+    let request = SendRequest {
+        to: vec![Recipient::from("renter@example.org")],
+        subject: "Your booking BK-2291".into(),
+        text: Some("Your car is ready at 9:00.".into()),
+        ..Default::default()
+    };
+    let key = IdempotencyKey::new("bk-2291-confirm")?;
     // a retry with the same key returns this same message
-    println!("{} deduplicated={}", sent.id, sent.deduplicated);
+    let sent = client.send_message("idn_01J9Z3K8V4", &request, &key).await?;
+    println!("{} deduplicated={}", sent.message.id, sent.deduplicated);
     Ok(())
 }
 ```
+
+Every SDK method is named after an operation of the [REST API](reference/api.md) (`sendMessage` →
+`send_message`), and the request and response types carry the schema names of `openapi.yaml`
+([Rust workspace § 11](project/design/rust-workspace.md#11-the-rust-sdk-fr-sdk-1)). This example is
+compiled in CI, so it matches the SDK.
 
 ### With the CLI
 
@@ -311,13 +320,13 @@ the space) and has an attachment. Each hit has a `snippet`, a `why` list explain
 example `ref:AB12CDE (attachment p.1)`) and the sender's `trust`.
 
 Vehicle plates and PCNs come from the optional `uk_vehicle` reference pack. The tenant policy is
-changed with a platform key that holds `tenants:manage`, so ask your deployment's operator, or run
-this yourself if you deployed it:
+changed by the workspace itself: on the console's policy page (owners and admins), or with a tenant key
+that holds `policy:write`:
 
 ```bash
-curl -X PATCH https://mail.example.com/v1/tenants/ten_01J9… \
-  -H "Authorization: Bearer $PLATFORM_KEY" -H "Content-Type: application/json" \
-  -d '{"policy":{"search":{"refs_packs":["core","uk_vehicle"]}}}'
+curl -X PATCH https://mail.example.com/v1/tenants/ten_01J9…/policy \
+  -H "Authorization: Bearer $TENANT_KEY" -H "Content-Type: application/json" \
+  -d '{"search":{"refs_packs":["core","uk_vehicle"]}}'
 ```
 
 References are extracted when mail arrives, so turn the pack on before the mail you want to find

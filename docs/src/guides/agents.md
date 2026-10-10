@@ -51,7 +51,14 @@ Rules:
   someone else's mail ([F2](../project/edge-cases.md)). If it needs a fact from mail, have a trusted
   agent look it up and pass on only the answer.
 - **Keep human permissions away from agents.** `quarantine:review`, `erasure:manage`, `keys:manage`,
-  `suppressions:manage` and `tenants:manage` belong to people and back-office services.
+  `suppressions:manage`, `policy:write`, `accounts:approve` and `tenants:manage` belong to people and
+  back-office services.
+- **Ask before signing up anywhere.** An agent that creates an account at a third-party service with its
+  address requests it first (`POST /v1/identities/{identity_id}/accounts`, MCP `mail_request_account`,
+  permission `accounts:request`), waits until a person approves it, then signs up and uses `wait` with
+  `kind: "verification"` for the code. Where the workspace requires approval (always on Pylota Mail
+  Cloud), codes from a service without an approved entry are held for review
+  ([Service sign-up ledger](../project/design/service-accounts.md)).
 - **Give `identities:sign` only to an agent that signs, on its own identity key.** It lets a key speak
   for an identity to the outside world: an identity key only for its own identity, a tenant key for
   every identity of the tenant. Platform and partner keys cannot hold it: creating one that lists it is
@@ -176,6 +183,9 @@ decision. Useful patterns:
 An agent that signs up to a service needs the code it emails back. Use `wait` (MCP `mail_wait`)
 ([E4](../project/edge-cases.md)):
 
+0. Where the workspace requires approval of sign-ups (`accounts.require_approval`, always on Pylota Mail
+   Cloud), request the account first and wait until it is `approved`; until then the next step fails with
+   `403 policy_denied` (`account_not_approved`) and the service's codes are held for review.
 1. Start `wait` with `from=@service.example`, `kind=verification` and a timeout (at most 60
    seconds), **before or in parallel with** triggering the email.
 2. Trigger the sign-up.
@@ -226,9 +236,11 @@ and the token is never stored or logged.
 
 **What the audience learns.** The token's claims are `iss` (your deployment's API origin, for example
 `https://mail.example.com`), `sub` (the identity ID), `aud`, `iat`, `nbf`, `exp`, `jti` (a unique ID),
-`email` (the identity's primary address) with `email_verified: true`, `name` (the display name), `org`
-(the workspace name), `accountable_human` (`true` when the identity has an accountable owner),
-`ai_agent: true`, and your `nonce` and `ext`. The owner's name and address are never included.
+`email` (the identity's primary address) with `email_verified: true`, `unverified` (the display name as
+`name`, the workspace name as `org`, and `accountable_human`, `true` when the identity has owner fields
+set: statements your workspace made, which the deployment does not check), `ai_agent: true`, and your
+`nonce` and `ext`. The owner's name and address are never included. Services should rely only on `iss`,
+`sub` and `email`; anyone can name a workspace anything.
 
 **The identity's key** is created on its first signing request (or with
 `POST /v1/identities/{identity_id}/keys`), sealed, and never leaves the Worker. Rotate it with
@@ -241,18 +253,22 @@ against any plan allowance.
 
 ### Verifying an assertion
 
-If you run the service on the other side, check every assertion in these six steps
+If you run the service on the other side, check every assertion in these seven steps
 ([Agent signing keys §4.3](../project/design/agent-keys.md#43-how-a-verifier-checks-it)):
 
 1. Decode the header. `alg` must be `EdDSA` and `typ` must be `agent-assertion+jwt`. Reject anything
    else: no `none`, no algorithm switching.
 2. `iss` must be an issuer you trust, for example `https://mail.example.com`. Never fetch keys from a URL
    the token supplies.
-3. Fetch `{iss}/.well-known/jwks/{sub}.json` (cache it for at most 5 minutes) and pick the key whose
-   `kid` matches. No match: reject. A `404` means the identity is unknown, paused or deleted: reject.
-4. Verify the Ed25519 signature over the JWS signing input.
-5. `aud` must equal your own audience. Check `nbf` and `exp`, allowing 60 seconds of clock skew.
-6. Keep `jti` until `exp` and reject a repeat.
+3. `sub` must match `^idn_[0-9A-HJKMNP-TV-Z]{26}$`. Reject anything else before you build a URL: the
+   token is not verified yet, and a `sub` such as `../../v1/links/<token>?` would make you fetch another
+   page of the issuer, which could be a file someone else controls.
+4. Fetch `{iss}/.well-known/jwks/{sub}.json` without following redirects, and accept only a `200` with
+   `Content-Type: application/jwk-set+json` (cache it for at most 5 minutes). Pick the key whose `kid`
+   matches. No match: reject. A `404` means the identity is unknown, paused or deleted: reject.
+5. Verify the Ed25519 signature over the JWS signing input.
+6. `aud` must equal your own audience. Check `nbf` and `exp`, allowing 60 seconds of clock skew.
+7. Keep `jti` until `exp` and reject a repeat. Do not grant access on anything under `unverified`.
 
 The Rust SDK follows these steps in `verify_assertion`, and
 `pmail assertions verify <token> --audience <audience>` runs them on your machine with no API key

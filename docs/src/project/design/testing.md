@@ -9,7 +9,7 @@ pipeline; this page adds what they must contain.
 
 | | |
 |---|---|
-| Requirements | PRD release criteria 1–6, NFR-QUAL-1, NFR-QUAL-2, NFR-QUAL-3, NFR-SEC-1, NFR-SEC-2, NFR-OPS-1 |
+| Requirements | PRD release criteria 1–7, NFR-QUAL-1, NFR-QUAL-2, NFR-QUAL-3, NFR-SEC-1, NFR-SEC-2, NFR-OPS-1 |
 | Edge cases | Every row marked `S` or `S+I` in the [edge-case register](../edge-cases.md) |
 | Code | `crates/core/src/**` (`#[cfg(test)]` modules), `crates/conformance/`, `crates/worker/tests/it/`, `crates/worker/tests/browser/`, `crates/worker/tests/live/`, `fuzz/`, `xtask/` |
 
@@ -156,9 +156,14 @@ As defined in [Rust workspace](rust-workspace.md#9-xtask), plus the details belo
 
 1. Build the Worker with `worker-build --release` and the `itest-hooks` cargo feature.
 2. Render `deploy/wrangler.itest.toml`: the production bindings, local resources, `PM_ENV = "local"`,
-   `PM_PLATFORM_DOMAIN = "agents.example"`, `PM_API_HOST = "localhost"`,
-   `PM_CONSOLE_HOST = "console.localhost"` (the test client sends that `Host` header on console paths),
-   `PM_SIGNUP = "open"`, `PM_WEB_BOT_AUTH = "on"` (local only: the S13 gate applies to real deployments), the SES variables (`PM_SES_REGION = "eu-west-2"`, `PM_SES_INBOUND_*`) and the
+   `PM_PLATFORM_DOMAIN = "agents.example"`, `PM_API_HOST = "localhost:8799"`,
+   `PM_CONSOLE_HOST = "console.localhost:8799"` (hosts with the port, so the console's `Origin` rule and
+   the host split work unchanged: [Console › CSRF](console.md#csrf)),
+   `PM_SIGNUP = "open"` with the four values it requires (`PM_TERMS_URL = "https://agents.example/terms"`,
+   `PM_PRIVACY_URL = "https://agents.example/privacy"`, `PM_DPA_URL = "https://agents.example/dpa"` and
+   `PM_TERMS_VERSION = "itest-1"`; without them the configuration is `config_invalid`,
+   [Rust workspace § 6.1](rust-workspace.md#61-errors-and-configuration)), `PM_WEB_BOT_AUTH = "on"`
+   (local only: the S13 gate applies to real deployments), the SES variables (`PM_SES_REGION = "eu-west-2"`, `PM_SES_INBOUND_*`) and the
    Google, GitHub and Stripe client settings naming resources on the fake server, random test secrets
    written to `.dev.vars` in a temporary directory, `PM_ITEST_FAKES_URL = "http://127.0.0.1:8798"`, a random
    `PM_ITEST_TOKEN`, queue consumers with `max_batch_timeout = 1`, and no `AI` or `VECTORS` binding (both
@@ -168,13 +173,24 @@ As defined in [Rust workspace](rust-workspace.md#9-xtask), plus the details belo
    --persist-to target/itest/state --config deploy/wrangler.itest.toml` (a fresh directory per run). The
    rendered file sets `migrations_dir = "../migrations/d1"`, because Wrangler resolves it against the
    file's own directory, `deploy/`. Until v1.0 there is one file, `0001_init.sql`.
-4. Start `npx --yes wrangler@4.139.0 dev --local --port 8799 --persist-to target/itest/state
-   --test-scheduled --config deploy/wrangler.itest.toml`, write its PID to `target/itest/wrangler.pid`, and
-   capture stdout and stderr to `target/itest/worker.log`. Wait for `GET /health`.
+4. Write a throwaway TLS certificate for the run: `openssl req -x509 -newkey ec -pkeyopt
+   ec_paramgen_curve:P-256 -nodes -days 2 -subj /CN=localhost -addext
+   "subjectAltName=DNS:localhost,DNS:console.localhost,IP:127.0.0.1"` into `target/itest/tls/`. Then start
+   `npx --yes wrangler@4.139.0 dev --local --port 8799 --local-protocol https --https-key-path
+   target/itest/tls/key.pem --https-cert-path target/itest/tls/cert.pem --persist-to target/itest/state
+   --test-scheduled --config deploy/wrangler.itest.toml` (Wrangler's `dev` options `--local-protocol`,
+   `--https-key-path` and `--https-cert-path`, Cloudflare "Wrangler commands", read 2026-10-10), write its
+   PID to `target/itest/wrangler.pid`, and capture stdout and stderr to `target/itest/worker.log`. Wait
+   for `GET https://localhost:8799/health`. The console needs HTTPS locally because its cookies are
+   `__Host-` and `Secure` and its `Origin` must be `https://…` ([Console › CSRF](console.md#csrf)).
 5. Seed exactly what `pmail setup` writes in steps 19–22 ([CLI and setup §6.3](cli.md#63-steps)), in the
    same way:
    - one platform key (step 19, the bootstrap key) with `wrangler d1 execute --local`; the harness knows
-     `PM_KEY_PEPPER` because it generated it;
+     `PM_KEY_PEPPER` because it generated it. The bootstrap key expires after 24 hours, which tests that
+     advance the fake clock pass, so the harness at once uses it to mint, through `POST /v1/keys`, a
+     platform key with every platform-level permission and no `expires_at`, and runs the suite with that
+     key. Tenant and identity keys that sign are minted from it with `identities:sign` granted
+     ([Security §4.6](security.md#46-creating-keys-fr-key-1));
    - the platform domain row for `agents.example` (step 20) with `wrangler d1 execute --local`, with
      `records_json` matching the DNS fake's zone for it and `monitor_do_id = ''`. Until M13 builds the
      `DomainMonitor`, the row is written with `state = 'healthy'`. From M13 it is written `pending`, as
@@ -188,9 +204,13 @@ As defined in [Rust workspace](rust-workspace.md#9-xtask), plus the details belo
 
    Every other fixture (tenants, identities, domains, keys) is created through the public API.
 6. Run `cargo test -p pylota-mail-worker --features itest-hooks --test it -- --test-threads=1` with
-   `PM_ITEST_URL=http://127.0.0.1:8799`. The `it` test target declares
+   `PM_ITEST_URL=https://localhost:8799` and `PM_ITEST_CA=target/itest/tls/cert.pem`. The test client
+   (`reqwest`) trusts that certificate as its only extra root and pins `localhost` and
+   `console.localhost` to `127.0.0.1` (`ClientBuilder::resolve`), so console requests go to
+   `https://console.localhost:8799` with no `Host` override. The `it` test target declares
    `required-features = ["itest-hooks"]`, so `cargo test --workspace` never builds it.
-7. Stop wrangler; delete `target/itest/state` unless `--keep` was passed.
+7. From M21, run the browser suite (section 6.8) while wrangler and the fake server are still up.
+8. Stop wrangler and the fake server; delete `target/itest/state` unless `--keep` was passed.
 
 ### 6.2 Test hooks
 
@@ -225,7 +245,7 @@ traits that call it:
 | `Ai::run` (planner) | Scripted tool-call sequences per question from `crates/conformance/golden/questions.toml`, including a hostile script that tries to widen scope ([F10](../edge-cases.md)) |
 | `Ai::to_markdown` | Text from a sidecar fixture, or a scripted failure or timeout ([B12](../edge-cases.md)) |
 | `VectorIndex` | In-memory namespaces with metadata filters (equality and `sent_at` ranges), mutation IDs, a configurable processing lag and `processedUpToDatetime`; `describe()` with the vector count, which tests can offset for the drift check; scriptable failures ([F14](../edge-cases.md)) and a "keep one vector" mode for probe tests ([F6](../edge-cases.md)) |
-| `MailSender` (live tenants) | Records every `StructuredEmail`; scripted outcomes: accepted with a `messageId`, a coded error (`E_RATE_LIMIT_EXCEEDED`, `E_DAILY_LIMIT_EXCEEDED`, `E_HEADER_NOT_ALLOWED`, `E_RECIPIENT_SUPPRESSED`, …), an exception, or a timeout |
+| `MailSender` (live tenants) | Records every `StructuredEmail`; scripted outcomes: accepted with a `messageId`, a coded error (`E_RATE_LIMIT_EXCEEDED`, `E_DAILY_LIMIT_EXCEEDED`, `E_HEADER_NOT_ALLOWED`, `E_RECIPIENT_SUPPRESSED`, …), an exception, or a timeout. The recorded mail is also readable over HTTP, for the browser suite: `GET {PM_ITEST_FAKES_URL}/__fakes/mail?to={address}&last=1` answers the last message to that address (headers, text and HTML parts), from which a Playwright test reads a sign-in code or link. The route exists only in the fake server, never in the Worker |
 | `HttpClient` | Routes requests by host to fake handlers: Cloudflare API (zones, including zone creation with scriptable error `1105` and zone-hold refusals; routing rules with the 200-rule limit; sending subdomains including `preview_enabled`; event subscriptions), SES (`SendEmail`, which checks the SigV4 signature against test credentials; email identities with scriptable DKIM and MAIL FROM status; the account's sending status; receipt rules with the 200-rule and 500-recipient caps), S3 (`GetObject` and `DeleteObject` on the inbound bucket, with SigV4 checks and scriptable `NoSuchKey`), SQS (`ReceiveMessage` and `DeleteMessage` on the backstop queue), SNS certificates, Google and GitHub OAuth (token, user and email endpoints with scriptable claims and unverified addresses), Stripe (creating and retrieving Checkout Sessions, the objects billing reads, and subscription cancellation, with scriptable failures), RDAP, the scanner, and webhook receivers. Any other host gets `HttpError::Connect`: integration tests never reach the internet |
 | SNS push | The fake server signs SES notifications with a test key (`SignatureVersion` 2, or 1 and tampered variants on request) and `POST`s them to the Worker's `/hooks/ses/inbound` and `/hooks/ses`. A test can skip the push and leave the notification only in the SQS fake, for the backstop cron ([N1](../edge-cases.md)–[N3](../edge-cases.md)) |
 | TCP sockets (the `platform` wrapper over `connect()`) | Routes by host name to a scripted SMTP server in the fake process on ports 465 and 587. Scripts can omit `STARTTLS`, answer `535`, refuse some `RCPT TO` with `4xx` or `5xx`, close the connection after the final `.`, or exceed each timeout. Accepted messages can be handed to the platform domain's inbound path, unchanged or with a rewritten `From` or a foreign DKIM `d=`, for alignment probes and DSNs. TLS is simulated; certificate checking is proved by spike S12 and live, not here ([N14](../edge-cases.md)–[N20](../edge-cases.md)) |
@@ -253,15 +273,15 @@ traits that call it:
   `failing`).
 - **Another value of a deployment variable or secret.** A test that needs one (`PM_CONSOLE=off` for
   `it::console::disabled`, `PM_WEB_BOT_AUTH=off` for `it::http_signatures::disabled_and_policy`,
-  `PM_BILLING=off` for `it::notify::billing_off_no_usage_alerts`, `PM_NOTIFICATIONS=off`, or the secret
-  `PM_MASTER_KEY_NEXT` for the master-key rotation tests) calls `restart_runtime_with(&[(name, value)])`,
-  which restarts wrangler like `restart_runtime()` (section 6.6) with the value overridden in the
+  `PM_BILLING=off` for `it::notify::billing_off_no_usage_alerts`, `PM_NOTIFICATIONS=off`, or the secrets
+  `PM_MASTER_KEY_B` and `PM_MASTER_KEY_ACTIVE` for the master-key rotation tests) calls
+  `restart_runtime_with(&[(name, value)])`, which restarts wrangler like `restart_runtime()` (section 6.6) with the value overridden in the
   rendered `wrangler.itest.toml` or `.dev.vars`, and restores the original on exit.
 
 ### 6.4 Injecting inbound mail
 
 The default path is the endpoint `wrangler dev` provides for email handlers (Cloudflare docs, read
-2026-10-09): `POST http://127.0.0.1:8799/cdn-cgi/local/email?from=<envelope from>&to=<envelope to>` with
+2026-10-09): `POST https://localhost:8799/cdn-cgi/local/email?from=<envelope from>&to=<envelope to>` with
 the raw RFC 5322 message as the body; the message must have a `Message-ID` header. One call per envelope
 recipient, as Email Routing invokes the handler once per recipient ([A9](../edge-cases.md)). The
 documentation does not say how a `setReject` is reported to the caller, so tests read the outcome from
@@ -323,6 +343,14 @@ From M21 on, `cargo xtask itest` runs the Playwright suite in `crates/worker/tes
 Playwright release, which the CI job installs). `--suite it` and `--suite browser` run one suite alone.
 The test titles carry the `browser::` names, which `cargo xtask trace` collects like the Rust ones.
 
+The suite's base URL is `https://console.localhost:8799`, with `ignoreHTTPSErrors: true` for the
+throwaway certificate; Chromium resolves `*.localhost` to the loopback address. It signs in the way a
+person does: it submits the sign-in form, reads the code from the mail-sender fake
+(`/__fakes/mail?to=…&last=1`, section 6.3) and enters it, and it waits 2 seconds before submitting a form
+that carries a form ticket ([Cloud sign-up §6.2](cloud-signup.md#62-after-launch-open-sign-up)). It
+seeds its owner and viewer through the public API with the bootstrap platform key, like every other
+fixture.
+
 | Test | Proves |
 |---|---|
 | `browser::console::no_js` | With `javaScriptEnabled: false`, every route of the console's route table (read from `GET /__test/routes`) renders, and every form on it submits and reaches its result page, for a signed-in owner and a viewer; the run fails on any request to another origin |
@@ -356,11 +384,13 @@ created B, and C was created by a platform key, so it has no partner. A's domain
 zone of `PM_PLATFORM_DOMAIN`.
 
 "Every permission valid at that level" follows [Security §4.6](security.md#46-creating-keys-fr-key-1):
-a tenant key holds every permission except `tenants:manage`, `partners:manage` and `platform:ops`, so it holds
-`identities:sign`; an identity key holds the same set without the tenant-only permissions
-(`members:read`, `members:manage`, `suppressions:manage`, `audit:read`, `usage:read`), plus
-`usage:read` implicitly for its own workspace. A partner key holds every permission except
-`platform:ops`, `partners:manage` and `identities:sign`.
+a tenant key holds every permission except `tenants:manage`, `partners:manage`, `platform:ops` and
+`tenants:erase` (which only the workspace owner's keys hold; the fixture mints keys through the API), so it
+holds `identities:sign`, granted by the platform key that mints it; an identity key holds the same set
+without the tenant-only permissions (`members:read`, `members:manage`, `suppressions:manage`,
+`audit:read`, `usage:read`, `policy:write`,
+`accounts:approve`), plus `usage:read` implicitly for its own workspace. A partner key holds every
+permission except `platform:ops`, `partners:manage` and `identities:sign`, so it holds `tenants:erase`.
 
 **Attacker key classes** (each with full permissions for its level):
 
@@ -382,7 +412,12 @@ identities; the scope check answers before any signing rule, so they give the sa
 ID of the same type. It asserts:
 
 1. The status is `404` with the route's `*_not_found` code, or `403 scope_denied` for a route above the
-   key's level on its own tenant, or `401` for revoked and expired keys.
+   key's level on its own tenant, or `401` for revoked and expired keys, or `403 permission_denied` when
+   the control call gets the same body. The last case is a route needing a permission the key's level
+   can never hold (`tenants:manage` for a tenant key), or `foreign_permissions` on
+   `GET /v1/tenants/{tenant_id}`: section 5.2 of Security checks permissions, `foreign_permissions`
+   included, before it resolves the owner, comparing the path's tenant ID with the key's own without a
+   D1 read, so a foreign ID and a random one get the same `403`. Any other `403` fails the test.
 2. The attack response equals the control response byte for byte, except `request_id` and the
    `Request-Id` and `RateLimit-*` headers (indistinguishability).
 3. No side effect: D1 row counts for A, A's mailbox state (via a platform key), A's outbox and A's
@@ -467,16 +502,33 @@ is synthetic, on reserved domains, under the repository's licence (FSL-1.1-ALv2)
 
 `cargo xtask eval-search`, `eval-agentic` and `eval-triage`:
 
-1. Start `wrangler dev` without `--local`, with the `AI` binding (always remote) and the Vectorize
-   binding set to `remote = true` against a dedicated index `pm-mail-chunks-eval` in the CI Cloudflare
-   account; D1, R2, Durable Objects and queues stay local. If the pinned Wrangler cannot bind Vectorize
-   remotely, the Worker uses the Vectorize REST fallback with `PM_CF_API_TOKEN`
-   ([Rust workspace](rust-workspace.md#7-wasm-bindgen-externs)).
-2. Generate the golden mailbox and inject it through the local email endpoint (section 6.4); wait until
+1. `cargo xtask eval-setup` provisions the index: in the evaluation account (`PM_EVAL_CF_ACCOUNT_ID`,
+   a Cloudflare account of its own, never the production account) it deletes `pm-mail-chunks-eval` if
+   it exists, creates it again (1,024 dimensions, cosine, the eight metadata indexes of
+   [Data model § 5](data-model.md#5-vectorize)) and waits until `GET …/vectorize/v2/indexes/pm-mail-chunks-eval/info`
+   answers. Every nightly run starts from an empty index.
+2. Start the Worker with `wrangler dev --local` and `PM_ENV = "local"`, `PM_EVAL_REST = "on"`,
+   `PM_VECTORS_INDEX = "pm-mail-chunks-eval"`, `PM_CF_ACCOUNT_ID` = the evaluation account and
+   `PM_CF_API_TOKEN` = `PM_EVAL_CF_API_TOKEN`. `PM_EVAL_REST` (read only when `PM_ENV = "local"`) sends
+   every Workers AI and Vectorize call through the REST paths of
+   [Rust workspace § 7](rust-workspace.md#7-wasm-bindgen-externs), so no remote binding is used: the
+   permissions a remote binding needs are not documented (Cloudflare "Local development" page, read
+   2026-10-10). D1, R2, Durable Objects and queues stay local. The binding paths themselves are proven
+   on staging by the `live::` suite.
+3. The token `PM_EVAL_CF_API_TOKEN` holds exactly: Account · Workers AI · Read and Workers AI · Edit
+   (the Workers AI REST page asks a custom token for both to run a model; the "Run model" API reference
+   accepts either), and Account · Vectorize · Edit (index create, insert and `delete_by_ids` accept only
+   Vectorize Write; query and info accept Read or Write), all on the evaluation account only, with no
+   Workers, D1, R2, Queues or zone permission (Cloudflare API reference pages for these calls and
+   "API token permissions", read 2026-10-10). A separate account is required because Vectorize
+   permissions are account-wide: in the production account the same token could delete
+   `pm-mail-chunks`.
+4. Generate the golden mailbox and inject it through the local email endpoint (section 6.4); wait until
    `semantic_coverage = 1.0` for every identity.
-3. Run every query, question or labelled message through the public API (triage through
-   `POST …/messages/{id}/triage`); write `target/eval/<suite>.json` with per-item results and totals.
-4. Compare with the baseline in `quality.md` and fail on a gate.
+5. Run every query, question or labelled message through the public API (triage through
+   `POST …/messages/{id}/triage`) three times (the repeat policy in section 9.3); write
+   `target/eval/<suite>.json` with per-item results per run and the totals.
+6. Compare the median with the baseline in `quality.md` and fail on a gate.
 
 ### 9.3 Metrics and gates
 
@@ -485,6 +537,16 @@ is synthetic, on reserved domains, under the repository's licence (FSL-1.1-ALv2)
 | search (`eval::search`) | Hybrid recall@10 ≥ 0.90 and no drop of more than 0.01 against the baseline (NFR-QUAL-1); keyword zero-result rate 0 on exact-reference queries | [Search §13.2](search.md#132-labelled-queries-and-metrics) |
 | agentic (`eval::agentic`) | Citation precision after verification ≥ 0.98 (NFR-QUAL-2); steering failures 0; no `answered` status on unanswerable questions (FR-SRCH-9) | [Search §13.3](search.md#133-agentic-evaluation) |
 | triage (`eval::triage`) | Category accuracy ≥ 0.85 (NFR-QUAL-3) and no drop of more than 0.01 against the baseline | [Triage §13](triage.md#13-evaluation-set-and-nfr-qual-3) |
+
+**Repeat policy.** Model output varies between runs. Every model call in an evaluation uses the
+production parameters: triage `temperature: 0` with its fixed `seed` ([Triage](triage.md)), the planner's
+`temperature: 0.2` ([Search](search.md)). Workers AI accepts `seed` and `temperature` on its
+text-generation models (model pages, read 2026-10-10), but the documentation does not promise identical
+output for a seed, so each suite runs three times on the same index and its score is the **median** of
+the three. When the spread (highest minus lowest) exceeds 0.02, three more runs follow and the median of
+six is used; a spread still above 0.02 fails the job as `unstable`, and the report lists the items whose
+result changed between runs. A gate's "drop of more than 0.01" compares that median with the baseline.
+The baseline recorded in `quality.md` is the median of five runs on the commit that sets it.
 
 Pull requests run the same pipelines with the scripted fake model, so prompts, fencing, budgets, the
 verifier and schema validation are checked without network access. In addition,
@@ -509,7 +571,7 @@ deployment (its own zone, platform domain, D1, R2, Vectorize and queues, [Archit
 | `live::delivery::ses_simulator` | On an SES-transport domain, `bounce@`, `complaint@` and `success@simulator.amazonses.com` produce bounce, complaint (with suppression and abuse counting) and delivery (SES mailbox simulator, AWS docs read 2026-10-09) |
 | `live::delivery::complaint_event_path` | Publish a `cf.email.sending.message.complained` payload for a real sent message to staging's `pm-delivery-events` through the Queues HTTP API; the recipient becomes `complained` and suppressed |
 | `live::domains::change_and_reply_via_retiring` | Move an identity from its platform address to a zone subdomain, then to a zone apex, then roll back by promoting the retiring address; reply to an old thread through the retiring address at each step ([C3](../edge-cases.md), build plan M20) |
-| `live::domains::failure_fallback_recovery` | Delete the DKIM record of a staging tenant zone through the Cloudflare DNS API, verify twice, assert `failing` and a `sent_via_fallback` send with thread continuity; restore the record and assert `domain.recovered` |
+| `live::domains::failure_fallback_recovery` | Delete one SES DKIM CNAME of the external `dns_records` test domain through the external DNS provider's API (a Cloudflare zone's sending DKIM record is locked by Email Sending and cannot be deleted), verify twice, assert `dkim_missing`, `failing` and a `sent_via_fallback` send with thread continuity; restore the record and assert `domain.recovered` (build plan M20 step 6) |
 | `live::transport::j5_ses_failover` | Switch a staging domain to SES per the runbook and send ([J5](../edge-cases.md)) |
 | `live::domains::dns_records_external_host` | Connect a staging domain hosted at a DNS provider other than Cloudflare with `dns_records`, publish its records through that provider's API, wait for `healthy`, receive from the Gmail test mailbox through SES, and send with aligned DKIM and SPF (build plan M20) |
 | `live::erasure::counterparty_live` | Counterparty erasure of the Gmail test address with one held thread: the receipt lists the hold, probes are zero, and no object is left under the erased keys (checked through the Cloudflare R2 API) |
@@ -517,7 +579,7 @@ deployment (its own zone, platform domain, D1, R2, Vectorize and queues, [Archit
 | `live::ops::metrics_reach_analytics_engine`, `live::ops::restore_drill` | [Observability](observability.md#10-tests) |
 | `live::slo::inbound_to_webhook` | M20 step 13, NFR-REL-3: mail from the Gmail and Outlook test mailboxes to a staging webhook endpoint over the live run, p95 ≤ 30 s and p99 ≤ 120 s ([Observability](observability.md#10-tests)) |
 | `live::ops::idle_cost_review` | M20 step 13, NFR-COST-1: after a week of idling on staging, the Cloudflare usage report shows no compute beyond the cron and alarm invocations; the figures are recorded in the release notes ([Observability](observability.md#10-tests)) |
-| `live::ops::fresh_deploy_rehearsal` | NFR-OPS-1: a person who did not build the service deploys a fresh Cloudflare account from `self-hosting.md` alone; the hands-on time is recorded and must be at most 15 minutes ([Build plan › M20](../build-plan.md), step 12) |
+| `live::ops::fresh_deploy_rehearsal` | NFR-OPS-1: a fresh agent session with no checkout, memory or context but `self-hosting.md` and a new Cloudflare account's credentials deploys from that page alone; the hands-on time it reports is at most 15 minutes, and its transcript, timings and every point it had to guess are recorded ([Build plan › M20](../build-plan.md), step 12; [ADR 0015](../adr/0015-solo-operator.md)) |
 | `live::console::magic_link_invite_release` | M20 step 9. Reads the sign-in email from the Gmail test mailbox through its API and posts the console forms with an HTTP client (the console needs no JavaScript); invites the Outlook test mailbox, which accepts; releases a message quarantined as `otp_unsolicited`; the audit log shows `member.invite`, `member.join` and `quarantine.release` |
 | `live::signup::google_to_checkout` | **Manual.** M20 step 10, with `PM_SIGNUP=open`: a person signs up with a dedicated Google test account at `/console/sign-up?plan=developer` and pays on the Checkout page with Stripe's test card; the harness then checks through the API that the account and workspace exist, the Overview shows the first-run checklist, and the plan is `developer` once the webhook arrives |
 | `live::billing::upgrade_spend_topup_retry` | **Manual** for the two Checkout pages, scripted otherwise. M20 step 11 with the staging catalog: a person upgrades Free to Developer and later buys a sends top-up in Stripe Checkout; the harness sends until `402 billing_limit` (Developer's 20 sends), and after the top-up retries the refused send with the same `Idempotency-Key` and gets one `202` and one email |
@@ -539,8 +601,9 @@ through the API exactly as an automated test would, and records the result per t
 price IDs and small allowances (Free 10 sends, Developer 20 sends, a sends top-up of 5 units), so step 11
 reaches `402` and step 15 crosses 80% within a few sends.
 
-**Secrets.** Live tests read credentials only from the GitHub Environment `staging`, which requires a
-reviewer and is limited to `main` and release tags; forks never receive them. The environment holds: a
+**Secrets.** Live tests read credentials only from the GitHub Environment `staging`, which requires the
+owner's approval (the owner may approve their own runs: there is no second person, [ADR 0015](../adr/0015-solo-operator.md))
+and is limited to `main` and release tags; forks never receive them. The environment holds: a
 Cloudflare API token scoped to the staging account, a staging platform key with a 90-day expiry, OAuth
 credentials limited to the two dedicated test mailboxes (Google Workspace and Microsoft 365, holding only
 synthetic mail), AWS credentials for the staging SES resources, and an API token for the external DNS
@@ -586,7 +649,19 @@ lines from the source tree (including generated `conf::` names), and fails when:
 - a `P0` requirement has no test with it in `Covers:` (PRD release criterion 1);
 - a `Covers:` line names an unknown row or requirement.
 
-It prints the traceability matrix as Markdown into the CI summary.
+It also collects every test named in a design page's Tests table, and every test named in a milestone's
+acceptance.
+
+**Landed milestones.** A file `MILESTONES` at the repository root lists the milestones that have landed,
+one ID per line; each milestone's pull request adds its own line. Until `M20` is listed, `trace` checks
+only what has landed: the tests named in the acceptance of each listed milestone (directly, through a
+wildcard, or through an edge row its acceptance lists) must exist, and only those `P0` requirements whose
+tests are named there need one. Rows and requirements of later milestones are printed as `pending` and
+do not fail. Once `M20` is listed (and always in `release.yml`), the full check above runs, and every test
+named in a design page's Tests table must exist too. So the required `trace` check is green on every
+milestone's pull request and complete at release.
+
+It prints the traceability matrix as Markdown into the CI summary, with the milestone of each row.
 
 ### 11.3 How rows are exercised
 
@@ -606,7 +681,7 @@ It prints the traceability matrix as Markdown into the CI summary.
 | J7 | `d1.query` fault on the directory lookup |
 | J8 | Forced dead-letter delivery (a consumer fault beyond `max_retries`); fake clock for the 15-minute alert |
 | J9 | `/__test/mailbox-schema` |
-| J10–J19 | The two partners of the attack-suite fixture (section 7), each with a partner key and a partner endpoint, and the webhook receiver fake; `restart_runtime_with` setting `PM_QUARANTINE_KEY_RELEASE=off` for J16; fake clock for the 15-minute delivery hold of J13 and the `RL_PARTNER` minute of J18; concurrent tenant creations for J18; the abuse auto-pause driven by simulator complaints for J17 |
+| J10–J22 | The two partners of the attack-suite fixture (section 7), each with a partner key and a partner endpoint, and the webhook receiver fake; `restart_runtime_with` setting `PM_QUARANTINE_KEY_RELEASE=off` for J16; fake clock for the 15-minute delivery hold of J13 and the `RL_PARTNER` minute of J18; concurrent tenant creations for J18; the abuse auto-pause driven by simulator complaints for J17; keys of every level and a seeded owner's key for J20; the `do.call` fault on the first `Init` or `EmitEvent` and cron runs through the scheduled endpoint for J21; several tenant and partner keys sending in one minute, and concurrent mints, for J22 |
 | L1–L4 | Test tenants with the real simulator and loopback paths |
 | B1, C7, J5 | Live (B1 and J5 also need real providers). C7 has an `it::` part too, and J5's API part is `it::domains::transport_patch` |
 | N1–N7, N10, N11, N26–N29 | SNS push and SQS fakes; S3 fake with `NoSuchKey`; SES fake identity, account and receipt-rule state; a generated 39 MB message for N5; seeded domain rows for the identity count |
@@ -618,7 +693,7 @@ It prints the traceability matrix as Markdown into the CI summary.
 | W24–W26 | Stripe fake and signed webhook payloads; the return page's refresh loop |
 | W27, W28, W30 | Fake clock (TOTP steps, key rotation plus 8 days, the 7-day ramp); the `*/15` cron through the scheduled endpoint at 03:00 UTC for the daily ramp evaluation |
 | W29, W31–W34 | Plain requests; W33 sends two concurrent creates |
-| O1–O13 | Fake clock for `verify_until` and signature expiry; the Rust SDK verifier run against the JWKS served by workerd; tenant policy per test; `restart_runtime_with` for `PM_WEB_BOT_AUTH=off` (O9); `restart_runtime_with` setting the secret `PM_MASTER_KEY_NEXT` for O8 |
+| O1–O13, O27, O28 | Signing keys minted by the harness's platform key with `identities:sign` granted; fake clock for `verify_until` and signature expiry; concurrent first signs from one test (O28); a recording HTTP client under the SDK verifier, to prove no request for a crafted `sub` (O27); the Rust SDK verifier run against the JWKS served by workerd; tenant policy per test; `restart_runtime_with` for `PM_WEB_BOT_AUTH=off` (O9); `restart_runtime_with` setting the secrets `PM_MASTER_KEY_B` and `PM_MASTER_KEY_ACTIVE` for O8 |
 | O14–O26 | Fake clock for the 2-minute hold, the 10-minute windows, the hourly and 09:00 runs, time-zone changes and the 24-hour cooldowns; `/__test/alarm` with class `notifier`; notification emails observed like console sign-in mail; `/__test/delivery-event` for a hard bounce on one (O17); the DNS fake for a `failing` platform domain (O25); `restart_runtime_with` for `PM_BILLING=off` (O23) |
 
 ### 11.4 Coverage
@@ -638,8 +713,11 @@ adds the security and traceability jobs:
 |---|---|---|
 | `ci.yml` | `fmt`, `clippy`, `test` (with coverage), `layering`, `wasm`, `itest` (`cargo xtask itest --suite it`; includes the attack suite and the deterministic keyword recall), `browser` (`cargo xtask itest --suite browser`: the console without JavaScript and the axe scan, section 6.8), `fuzz-smoke`, `deny`, `audit` (`cargo audit`), `openapi`, `docs`, `trace` (`cargo xtask trace`) | Every pull request and push to `main` |
 | `codeql.yml` | CodeQL for Rust | Every pull request, weekly |
+| `heartbeat.yml` | `pmail doctor --json --check health --check alerts` against production, and once a day `--mail-test`, with the keys of the `ops` environment ([Observability § 5.5](observability.md#55-alert-email-and-the-external-heartbeat)) | Every 15 minutes, and by hand |
 | `nightly.yml` | All fuzz targets for 10 minutes each; property tests at 65,536 cases; `eval-search`, `eval-agentic`, `eval-triage`; the large benchmarks (`it::bench::*`, section 6.9); `live::` suite; `cargo audit` on `main` | Nightly |
-| `release.yml` | The full `ci.yml` gate; the three evaluations; CLI binaries; `cargo xtask release`; SBOM (`cargo cyclonedx --format json` for the Worker and the CLI); signed `SHA256SUMS`; build provenance (`actions/attest@v4`); deploy to staging; the `live::` suite; then the GitHub Release, `cargo publish`, and the production rollout (10% → 50% → 100%, [Architecture](../architecture.md)) | Tag `v*` |
+| `release.yml` | Builds a release, exactly as defined in [Rust workspace › CI pipeline](rust-workspace.md#10-ci-pipeline): version check; the full `ci.yml` gate and the three evaluations; CLI binaries; `cargo xtask release` (bundle, unsigned `SHA256SUMS`, SBOMs, provenance) into a draft GitHub Release, then stops for the owner's offline signature (`cargo xtask release sign`, [Security § 11](security.md#11-supply-chain)). It never deploys Pylota Mail Cloud | Tag `v*` |
+| `release-publish.yml` | Verifies `SHA256SUMS.sig` against the public keys compiled into `pmail` and marks the draft a pre-release; a staging deploy of that release and the `live::` suite; then `cargo xtask release-gate` and, for a version without a pre-release part, promotion to a full release and `cargo publish` | Manual (`workflow_dispatch` on the tag, started by `cargo xtask release sign`) |
+| `cloud-deploy.yml` | Rolls a published release out to Pylota Mail Cloud: `pmail deploy --version <v> --gradual` (10% → 50% → 100%, [Architecture](../architecture.md)) with the `production` environment's secrets; refuses a pre-release | Manual (`workflow_dispatch`, input `version`) |
 
 **Required checks to merge into `main`:** `fmt`, `clippy`, `test`, `layering`, `wasm`, `itest`,
 `browser`, `fuzz-smoke`, `deny`, `audit`, `openapi`, `docs`, `trace`, `codeql`. The milestone gate's
@@ -648,7 +726,9 @@ adds the security and traceability jobs:
 **Required to publish a release:** all of the above on the tagged commit; the three evaluation gates
 (section 9.3); the `live::` suite green on staging with that commit deployed, including a passing manual
 run (`cargo xtask live --manual`, section 10); no open crash from the
-nightly fuzz run; the [security pre-release checklist](security.md#16-pre-release-checklist).
+nightly fuzz run; the [security pre-release checklist](security.md#16-pre-release-checklist). They are
+enforced, not only listed: `cargo xtask release-gate` in the `publish` job of `release-publish.yml` refuses to promote the release
+until each holds ([Rust workspace › xtask](rust-workspace.md#9-xtask)).
 
 GitHub Actions are pinned to full commit SHAs and each job declares least-privilege `permissions`
 ([Security › Supply chain](security.md#11-supply-chain)).
@@ -657,7 +737,8 @@ GitHub Actions are pinned to full commit SHAs and each job declares least-privil
 
 | Test | Proves |
 |---|---|
-| `xtask::trace_detects_missing_test` | A fixture register naming a non-existent test fails `cargo xtask trace` |
+| `xtask::eval_median_policy` | From recorded per-run results, an evaluation scores the median of three runs, adds three runs when the spread exceeds 0.02, fails as `unstable` when the six still spread more than 0.02, and fails a gate only when the median drops more than 0.01 below the baseline (section 9.3) |
+| `xtask::trace_detects_missing_test` | A fixture register naming a non-existent test fails `cargo xtask trace`; with a `MILESTONES` file that lists only `M5`, a missing test of an `M9` row is `pending` and passes, and the same file with `M9` added fails |
 | `xtask::itest_refuses_release_hooks` | `cargo xtask build-worker` fails when `itest-hooks` is enabled or the bundle contains `/__test/` |
 | `it::harness::hooks_need_token` | Hooks without `x-pm-test-token` return `404` |
 | `it::harness::no_internet_egress` | A request to an unregistered host fails with `HttpError::Connect` |

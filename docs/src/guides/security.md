@@ -25,13 +25,19 @@ Every request is authenticated with an API key: `Authorization: Bearer pmk_live_
 
 A key also holds a list of permissions ([REST API › Permissions](../reference/api.md#permissions)).
 Both must allow a request. A key can never create a key wider than itself in level, tenant, identity
-or permissions (`403 key_scope_exceeded`) ([FR-KEY-1](../project/prd.md#61-tenancy-and-access)).
+or permissions, nor read, rotate or revoke one (`403 key_scope_exceeded`)
+([FR-KEY-1](../project/prd.md#61-tenancy-and-access)). Keys minted in the console are traced to the
+person who minted them and are revoked when that person leaves the workspace.
 
 Some permissions belong to particular levels. `platform:ops` and `partners:manage` are for platform keys
 only, and `tenants:manage` for platform and partner keys. `members:read`, `members:manage`,
-`suppressions:manage`, `audit:read` and `usage:read` cannot be listed on identity keys (an identity key
+`suppressions:manage`, `audit:read`, `usage:read`, `policy:write` and `accounts:approve` cannot be listed on
+identity keys (an identity key
 still reads its own workspace's `GET /v1/usage`, as every tenant and identity key does).
-`identities:sign` cannot be held by platform or partner keys. Creating a key that
+`identities:sign` cannot be held by platform or partner keys, but they can grant it to the tenant and
+identity keys they create (the audit log records the grant). `tenants:erase`, which deleting a workspace
+needs, is held by platform keys, partner keys and only those tenant keys the workspace owner created in
+the console; never by an admin or a key an admin created. Creating a key that
 lists a permission its level cannot hold is refused with `400 invalid_request` and
 `details.reason: "permission_not_allowed_for_level"`. Creating a platform key also needs an explicit,
 non-empty `permissions` list (`400 invalid_request` without one): there is no implicit full set.
@@ -50,11 +56,14 @@ non-empty `permissions` list (`400 invalid_request` without one): there is no im
 | A privacy tool for data requests | `tenant` | `erasure:manage` |
 | Suppression and list management | `tenant` | `suppressions:manage` |
 | Dashboards | `tenant` or `platform` | `usage:read`, `audit:read` |
+| An agent that signs up for third-party services | `identity` | What it otherwise needs, plus `accounts:request` and `search:read` (for `wait`) ([Service sign-up ledger](../project/design/service-accounts.md)) |
+| Your approval screen for service sign-ups | `tenant` | `accounts:approve` (approval by a key also needs the workspace to allow keys to take people's decisions) |
+| Policy automation for your own workspace | `tenant` | `policy:write` |
 | An integrator provisioning its customers on a shared deployment (for example Pylota on Pylota Mail Cloud) | `partner` | `tenants:manage`, `keys:manage`, `webhooks:manage` and what its back end needs; `quarantine:review` only for its human review screen |
 | Deployment administration | `platform` | `tenants:manage`, `keys:manage` and what the task needs |
 
-Never give `quarantine:review`, `erasure:manage`, `keys:manage`, `suppressions:manage` or
-`tenants:manage` to an agent. Never give any mailbox permission to a public or customer-facing agent
+Never give `quarantine:review`, `erasure:manage`, `keys:manage`, `suppressions:manage`, `policy:write`,
+`accounts:approve` or `tenants:manage` to an agent. Never give any mailbox permission to a public or customer-facing agent
 ([F2](../project/edge-cases.md)).
 
 ### What a partner key cannot change
@@ -67,6 +76,9 @@ A partner key manages its own tenants, but the deployment's operator keeps the l
   `domains.allow_create_zone` or `domains.cloudflare_zones`
   ([Configuration › Who may change a field](../reference/configuration.md#who-may-change-a-field));
 - it cannot lift a suspension the operator made, or resume an identity paused for abuse;
+- the values it sets on lower-only fields bind its tenants in turn: a tenant's own keys and people may
+  lower them, never raise them above the partner's value
+  ([Workspace policy](../project/design/workspace-policy.md#8-a-partners-tenants));
 - it has at most `max_tenants` tenants (25 by default), creates tenants and invitations at most 10 a
   minute, and its new tenants follow the send ramp unless the operator exempts the partner;
 - when the operator suspends the partner, its keys and every key of its tenants stop at once, and webhook
@@ -183,12 +195,21 @@ logged; only daily counts are kept.
 People who use the console never have a password:
 
 - **Email link or code.** One request sends a link and a six-digit code, each valid for 10 minutes and
-  usable once. An address can ask 3 times in 10 minutes, and a code allows 10 tries.
+  usable once. An address can ask 3 times in 10 minutes, a code allows 10 tries, and after 30 wrong codes
+  in a day only the link works until midnight UTC; you get an email when that happens.
 - **Continue with Google or GitHub**, where the deployment has turned them on. Only an address the
-  provider has verified is accepted, and it signs you in to the account with that same address.
-- **Two-step verification.** Add an authenticator app under **Settings › Security**. You get ten recovery
-  codes, shown once; keep them somewhere safe, because each works once and they are the way back in if
-  you lose the app. A workspace owner can require two-step verification for everyone in the workspace.
+  provider has verified is accepted. The first time you use a provider with an address that already has
+  an account, a code sent to that address confirms the link. You can unlink a provider under
+  **Settings › Security**.
+- **Two-step verification.** Add an authenticator app under **Settings › Security**. Once it is on, no
+  sign-in creates a session without it, accepting an invitation included. You get ten recovery codes,
+  shown once; keep them somewhere safe, because each works once and they are the only way back in if you
+  lose the app: there is no support route around two-step verification. A workspace owner can require it
+  for everyone in the workspace.
+- **Invitations** are accepted only with a click on **Accept**, never by signing in.
+- **Addresses that this deployment receives mail for** (on the shared mail domain, or an agent's own
+  address) cannot be console sign-in addresses, because any key that reads that mailbox could read the
+  codes.
 - **Confirming it is you.** Creating keys, changing members or domains, releasing quarantined mail and
   billing need a sign-in within the last 10 minutes, so an unattended browser cannot do them.
 
@@ -246,9 +267,9 @@ What you should do:
   ```
 
   Delimiting helps, but it is not a defence on its own. The defences are the next three points.
-- **Limit what the agent can do.** An agent that reads untrusted mail should hold a narrow key. Use
-  `send_policy.require_known_recipient` so it cannot write to an address it has never exchanged mail
-  with ([E2](../project/edge-cases.md)).
+- **Limit what the agent can do.** An agent that reads untrusted mail should hold a narrow key. Keep
+  `send_policy.require_known_recipient` on (the default), so it cannot write to an address it has never
+  written to, even one that sent it mail first ([E2](../project/edge-cases.md)).
 - **Keep approvals on risky actions.** Payments, changes to bank details, sharing documents with a
   new party and anything flagged by triage go to a person.
 - **Never act on links or attachments automatically.** Pylota Mail never fetches remote content in

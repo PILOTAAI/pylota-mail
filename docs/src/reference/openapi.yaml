@@ -29,19 +29,26 @@ info:
     - **Hosts.** The console answers on `PM_CONSOLE_HOST`, which defaults to `PM_API_HOST`. When the two
       differ, console paths answer only on `PM_CONSOLE_HOST`, and the API host `PM_API_HOST` serves only
       the REST API (`/v1/*`), MCP (`/mcp`), `/openapi.json`, `/health`, `/.well-known/*`, signed links
-      (`/v1/links/*`), `/hooks/*` and `/billing/stripe/webhook`; anything else returns `404`, and no
-      cookie is set or read on the API host.
+      (`/v1/links/*`), `/hooks/*` and `/billing/stripe/webhook`; anything else returns
+      `404 route_not_found`, and no cookie is set or read on the API host. A route called with a method
+      it does not have returns `405 method_not_allowed` with an `Allow` header.
     - **Format.** JSON (`application/json; charset=utf-8`). Times are RFC 3339 UTC strings. Sizes are bytes.
     - **IDs** are a type prefix, an underscore and a 26-character upper-case Crockford base32 ULID
-      (`ten_ idn_ adr_ dom_ thr_ msg_ att_ whk_ dlv_ evt_ key_ era_ exp_ job_ aud_ req_ usr_ inv_ dlq_ hld_ prb_ ptn_`).
+      (`ten_ idn_ adr_ dom_ thr_ msg_ att_ whk_ dlv_ evt_ key_ era_ exp_ job_ aud_ req_ usr_ inv_ dlq_ hld_ prb_ ptn_ sac_`).
     - **Pagination.** List endpoints take `limit` (default 25, max 100) and `cursor`, and return
       `{ "data": [...], "next_cursor": "…" | null }`. Cursors are opaque and expire after 24 hours
-      (`410 cursor_expired`).
+      (`410 cursor_expired`). A list cursor is keyset-based (`created_at`, then `id`, newest first),
+      MACed under the deployment's cursor key and bound to the operation, its filters and the calling key;
+      one used elsewhere, altered, or signed by an unknown key is `400 invalid_request` (path `cursor`).
     - **Idempotency.** `Idempotency-Key` is required on send, reply, reply-all and forward (except on a
       dry run, `dry_run=true`, where it is optional and never recorded), and optional on every other
-      `POST` except four (`x-idempotency: none`), which ignore it and never record it: the two signing
-      endpoints (`…/assertions` and `…/http-signatures`) and the two SNS endpoints (`/hooks/ses` and
-      `/hooks/ses/inbound`). Keys are kept for 30 days, scoped per
+      `POST` except six (`x-idempotency: none`), which ignore it and never record it: the two search
+      endpoints (`/identities/{identity_id}/search` and `/tenants/{tenant_id}/search`, which return mail
+      and change nothing, so no record ever stores their results), the two signing endpoints
+      (`…/assertions` and `…/http-signatures`) and the two SNS endpoints (`/hooks/ses` and
+      `/hooks/ses/inbound`). No stored replay ever holds mail content: a replayed response that carries a
+      message or thread (release, cancel, resolve, hold) re-reads the resource with the caller's
+      visibility. Keys are kept for 30 days, scoped per
       identity for mail, and per calling API key and tenant (or partner, or deployment, when the request
       names no tenant) for everything else. A replay returns the original response with the header
       `Idempotent-Replayed: true` (and `"deduplicated": true` in mail responses); a response that carried
@@ -69,6 +76,7 @@ info:
     | `x-rate-limit-buckets` | operation | Rate-limit buckets the request counts against (`api`, `search`, `agentic`, `send`, `sign`, `partner`; `partner` only for a partner key's calls) |
     | `x-idempotency` | operation | `required`, `optional` or `none` for the `Idempotency-Key` header. `required` means a request without it fails with `400 idempotency_key_required`, except a dry run (`dry_run=true`). `none` means the header is ignored and never recorded |
     | `x-error-codes` | response | The `error.code` values this operation can return with that status |
+    | `x-sdk` | operation | `false` when the Rust SDK has no method for the operation: the SES hooks, which only Amazon SNS calls, and `security.txt`. Every other operation has exactly one SDK method |
 
     ## Licence
 
@@ -93,7 +101,8 @@ tags:
   - name: Tenants
     description: >-
       Tenants and their policy. Keys with `tenants:manage`: platform keys for every tenant, partner keys for
-      the tenants their partner's keys created.
+      the tenants their partner's keys created. The tenant's own policy route also takes tenant keys with
+      `policy:write`.
   - name: Partners
     description: >-
       Partners: integrators whose partner keys create tenants and act only on those tenants. Platform keys
@@ -106,6 +115,10 @@ tags:
     description: >-
       An identity's Ed25519 signing keys, agent assertions (signed JWTs) and signed HTTP requests (Web Bot
       Auth). Private keys never leave the Worker and no endpoint returns them.
+  - name: Service accounts
+    description: >-
+      The service sign-up ledger: third-party accounts an agent asks to create with its identity's address,
+      and the operator's approvals (FR-IDN-10). `accounts:request` and `accounts:approve`.
   - name: Domains
     description: The platform domain and tenant domains, DNS records and health.
   - name: Threads
@@ -164,8 +177,13 @@ paths:
       tags: [Meta]
       summary: Health check
       description: >-
-        No authentication. Reports that the Worker is serving, with its version, commit and `env`
-        (`PM_ENV`). With an invalid configuration it returns `503 unavailable`.
+        No authentication. Reports that the Worker is serving, with its version and commit (compiled into
+        the release bundle) and `env` (`PM_ENV`); also `ses_region` when SES is configured, `frozen: true` while the deployment is frozen
+        for a restore, and `status: degraded` with `ses` or `billing` when a feature is off. `status` is `degraded`, still with `200`, when a feature
+        is off because of the
+        configuration; a field per feature (`ses`, `billing`, `cf_api_token`) says
+        why. A missing required variable or secret, or a malformed optional one, returns
+        `503 unavailable` with `details.config_invalid` naming the variable.
       security: []
       x-rate-limit-buckets: []
       x-idempotency: none
@@ -177,13 +195,59 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Health'}
+              examples:
+                ok:
+                  value:
+                    status: ok
+                    version: '1.0.0'
+                    commit: abc1234
+                    env: production
+                degraded:
+                  value:
+                    status: degraded
+                    version: '1.0.0'
+                    commit: abc1234
+                    env: production
+                    ses: sns_topic_missing
+        '405':
+          description: Any method other than `GET` on this path. `Allow` lists `GET`.
+          x-error-codes: [method_not_allowed]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            Allow:
+              description: The methods this path has.
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
               example:
-                status: ok
-                version: '1.0.0'
-                commit: abc1234
-                env: production
+                error:
+                  code: method_not_allowed
+                  message: This path does not accept POST.
+                  retryable: false
+                  fix: Use one of the methods in the Allow header.
+                  request_id: req_01J9Z4K8V4QW7X2M5N6P8R0T1Y
         '500': {$ref: '#/components/responses/InternalError'}
-        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+        '503':
+          description: >-
+            The configuration is invalid: a required variable or secret is missing or malformed, or an
+            optional variable is malformed. `details.config_invalid` names it. Every other route answers
+            `503 unavailable` too until the configuration is fixed.
+          x-error-codes: [unavailable]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+              example:
+                error:
+                  code: unavailable
+                  message: The deployment's configuration is invalid.
+                  retryable: true
+                  fix: Set PM_DOH_RESOLVERS to exactly two https URLs and redeploy.
+                  request_id: req_01J9Z4K8V4QW7X2M5N6P8R0T1Y
+                  details:
+                    config_invalid: PM_DOH_RESOLVERS
 
   /openapi.json:
     servers:
@@ -268,7 +332,9 @@ paths:
         made by `pmail setup`) can have an empty suffix. `policy` is merged over the defaults (built-in
         defaults, then `PM_DEFAULT_POLICY`). `owner` (optional) creates the workspace's console owner and
         emails them a sign-in link; without it, a platform or partner key can add an owner later with an invitation
-        and an ownership transfer in the console. `billing.mode` defaults to `metered` (plan `free`) on a
+        and an ownership transfer in the console. An owner address that this deployment hosts (on the
+        platform domain, or an identity's address) gets `400 invalid_request` with
+        `details.errors[0].path = "owner.email"`. `billing.mode` defaults to `metered` (plan `free`) on a
         deployment with billing on, and to `disabled` otherwise. With a partner key, the tenant's
         `partner_id` is the key's partner, for good, and its billing mode is the partner's
         `default_billing_mode`; `billing` is platform-only. A partner key's `policy` is checked field by
@@ -315,7 +381,16 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Tenant'}
-        '400': {$ref: '#/components/responses/BadRequest'}
+        '400':
+          description: >-
+            As `BadRequest`, plus `address_reserved` when the address suffix folds to a reserved name
+            (`details.field = "address_suffix"`, [D12]).
+          x-error-codes: [invalid_request, invalid_idempotency_key, address_reserved]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403':
           description: >-
@@ -337,7 +412,9 @@ paths:
                   details:
                     max_tenants: 25
         '409':
-          description: The slug or address suffix is taken, or the idempotency key is in use.
+          description: >-
+            The slug or address suffix is taken (`suffix_taken` also when the suffix folds to another tenant's,
+            for example `.acrne` beside `.acme`, [D12]), or the idempotency key is in use.
           x-error-codes: [slug_taken, suffix_taken, idempotency_conflict, request_in_progress]
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
@@ -437,15 +514,19 @@ paths:
         key, `404 tenant_not_found` for any other key). `partner_id` and `mode` never change. Only a
         platform key, or the partner key of the tenant's own partner, can set
         `policy.quarantine.key_release` (a tenant key cannot call this operation: it can never hold
-        `tenants:manage`). A value a platform key sets on a lower-only policy field becomes that field's
-        ceiling for partner keys.
+        `tenants:manage`, and on `updateTenantPolicy` the field is not writable for it). A value a platform key
+        sets on a lower-only policy field becomes that field's ceiling for partner keys and the tenant's own
+        writers, and a value the tenant's partner key sets becomes its partner ceiling for the tenant's own
+        writers. Every policy write is a compare-and-set (`503 unavailable` after three lost attempts),
+        writes the audit row `tenant.policy_update` and emits `tenant.policy_updated`.
       x-required-permission: ['tenants:manage']
       x-key-levels: [platform, partner]
       x-permission-notes: >-
         A partner key updates only the tenants its partner's keys created. Each policy field present is
         checked by its class (see `TenantPolicy`): a platform-only field, or a lower-only field above
-        min(deployment default, platform ceiling), gets `403 scope_denied` with `details.field`, and so does
-        `status: "active"` on a tenant a platform key suspended (`details.field = "status"`).
+        min(deployment default, platform ceiling), gets `403 scope_denied` with `details.field` and
+        `details.reason` (`not_writable` or `above_ceiling`), and so does `status: "active"` on a tenant a
+        platform key suspended (`details.field = "status"`).
       x-rate-limit-buckets: [api]
       x-idempotency: none
       requestBody:
@@ -472,8 +553,11 @@ paths:
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
         '409':
-          description: A platform key changed the `status` of a tenant that is `erasing` or `erased`.
-          x-error-codes: [tenant_erased]
+          description: >-
+            A platform key changed the `status` of a tenant that is `erasing` or `erased` (`tenant_erased`),
+            or dropped a zone from `policy.domains.cloudflare_zones` while the tenant still has domains in it
+            (`domain_in_use`, `details.reason = "zone_has_domains"`, `details.domain_ids`; [H13]).
+          x-error-codes: [tenant_erased, domain_in_use]
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
           content:
@@ -483,6 +567,124 @@ paths:
         '429': {$ref: '#/components/responses/TooManyRequests'}
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
+
+  /tenants/{tenant_id}/policy:
+    parameters:
+      - $ref: '#/components/parameters/TenantIdPath'
+    get:
+      operationId: getTenantPolicy
+      tags: [Tenants]
+      summary: Read a tenant's policy with the caller's limits
+      description: >-
+        The tenant's full effective policy and, for every field, what the calling key may do with it: its
+        class, whether it may write it at all, the loosest value it may set on a lower-only field
+        (`ceiling`, and which bound decided it), and whether loosening a guard field needs a person.
+        Changes nothing and writes no audit row. Docs › Workspace policy.
+      x-required-permission: ['policy:write']
+      x-key-levels: [platform, partner, tenant]
+      x-permission-notes: >-
+        A tenant key reads only its own tenant, a partner key only the tenants its partner's keys created.
+        Identity keys can never hold `policy:write`.
+      x-rate-limit-buckets: [api]
+      x-idempotency: none
+      responses:
+        '200':
+          description: The policy view for the calling key.
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TenantPolicyView'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    patch:
+      operationId: updateTenantPolicy
+      tags: [Tenants]
+      summary: Change a tenant's policy
+      description: >-
+        Deep-merges a partial policy (`null` resets a field to its default; arrays replace) and checks each
+        field sent by the caller's level (docs › Configuration › Who may change a field). For a tenant key:
+        free fields take any valid value; a lower-only field may be set at most to its workspace ceiling,
+        the strictest of the deployment default, the platform ceiling and the partner ceiling; a guard field
+        (`send_allowlist_only`, `quarantine.on_auth_fail`, `quarantine.spam_threshold`,
+        `quarantine.unsolicited_otp`) may only be tightened unless API keys may take decisions reserved for
+        people on this tenant; platform-only fields and `quarantine.key_release` are refused. One refused
+        field refuses the whole write. Every write is a compare-and-set on the tenant's `policy_version`,
+        writes the audit row `tenant.policy_update` and emits `tenant.policy_updated`. A platform key's
+        value on a lower-only field becomes its platform ceiling, and the tenant's partner key's value its
+        partner ceiling.
+      x-required-permission: ['policy:write']
+      x-key-levels: [platform, partner, tenant]
+      x-permission-notes: >-
+        A tenant key writes only its own tenant, a partner key only its own tenants. A refused field gets
+        `403 scope_denied` with `details.field` and `details.reason` (`not_writable`, or `above_ceiling` with
+        `details.ceiling` and `details.ceiling_source`); a tenant key loosening a guard field where keys may
+        not take decisions reserved for people (`PM_QUARANTINE_KEY_RELEASE=off` and no
+        `quarantine.key_release`) gets `403 permission_denied` with `details.field` and
+        `details.reason = "person_required"`. A non-platform write to an `erasing` or `erased` tenant gets
+        `404 tenant_not_found`.
+      x-rate-limit-buckets: [api]
+      x-idempotency: none
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/TenantPolicyPatch'}
+            example:
+              retention:
+                message_days: 365
+              search:
+                custom_refs:
+                  - name: booking
+                    pattern: 'BK-\d{4,6}'
+                    normalise: upper
+      responses:
+        '200':
+          description: The policy view after the write.
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TenantPolicyView'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403':
+          description: >-
+            The key lacks `policy:write`, or a field may not be written by the key's level
+            (`scope_denied`), or a tenant key tried to loosen a guard field where only people may
+            (`permission_denied` with `details.reason = "person_required"`), or the key's partner is
+            suspended.
+          x-error-codes: [permission_denied, scope_denied, partner_suspended]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+              example:
+                error:
+                  code: scope_denied
+                  message: tenant_daily_send_cap may be at most 1000 for this workspace.
+                  retryable: false
+                  fix: Send a value at or below 1000, or ask the provider that set it to raise it.
+                  request_id: req_01J9Z4K8V4QW7X2M5N6P8R0T1Y
+                  details:
+                    field: tenant_daily_send_cap
+                    reason: above_ceiling
+                    ceiling: 1000
+                    ceiling_source: partner
+        '404': {$ref: '#/components/responses/NotFound'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+          description: A dependency is unavailable, or the write lost the compare-and-set on `policy_version` three times to concurrent writes; retry.
 
   # ──────────────────────────────────────────── Partners ──────────────────────────────────────────
 
@@ -912,6 +1114,10 @@ paths:
       operationId: getIdentity
       tags: [Identities]
       summary: Get an identity
+      description: >-
+        Returns the identity in any status, `deleting` and `deleted` included. Once its erasure has run, a
+        `deleted` identity has its personal fields scrubbed (empty `display_name`, `owner` and `signature`
+        `null`, `metadata` `{}`).
       x-required-permission: ['identities:read']
       x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
@@ -941,7 +1147,9 @@ paths:
         `identity_paused` (FR-IDN-3). Setting `status: "active"` on an identity paused for
         `abuse_threshold` needs a platform, partner or tenant key and is audit-logged; on a tenant a
         partner's key created it needs a platform key. A `send_policy.daily_cap` above the tenant's
-        effective `identity_daily_send_cap` needs a platform key.
+        effective `identity_daily_send_cap` needs a platform key. A `deleting` or `deleted` identity returns
+        `404 identity_not_found` and is not changed, as on every write by identity ID except the legal-hold
+        routes.
       x-required-permission: ['identities:write']
       x-key-levels: [platform, partner, tenant, identity]
       x-permission-notes: >-
@@ -983,7 +1191,9 @@ paths:
         Starts an identity-scope erasure (FR-IDN-4). The identity's addresses are tombstoned and can never
         be assigned to another identity; later mail to them gets `550 5.1.1`. Its signing keys are deleted
         and their key IDs tombstoned, so they are never published again ([O7]). While the identity is
-        `deleting` or `deleted`, signing and its JWK Set return `404 identity_not_found`.
+        `deleting` or `deleted`, signing and its JWK Set return `404 identity_not_found`. A second `DELETE`
+        of a `deleting` or `deleted` identity starts nothing and returns `200` with its existing
+        identity-scope erasure request.
       x-required-permission: ['identities:write', 'erasure:manage']
       x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
@@ -991,6 +1201,14 @@ paths:
       responses:
         '202':
           description: The erasure request of scope `identity`.
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErasureRequest'}
+        '200':
+          description: The identity was already `deleting` or `deleted`; its existing identity-scope erasure request, unchanged.
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
@@ -1460,9 +1678,10 @@ paths:
         Creates a new `active` key at once and moves the previous active key to `retiring`, with
         `verify_until` = now + `PM_IDENTITY_KEY_OVERLAP_DAYS` (default 7 days). The retiring key stays in
         the JWK Set and does not sign, so an assertion signed just before the rotation still verifies until
-        then ([O2]); new assertions use the new key. With no active key, it creates the first one and
-        `previous` is `null`. No body. Emits `identity.key_rotated`; the audit action is
-        `identity_key.rotate`. Available while the identity is paused; a `deleting` or `deleted` identity
+        then ([O2]); new assertions use the new key. With no active key (none yet, or the active key was
+        revoked), it creates one, `previous` is `null` and it emits `identity.key_created`; otherwise it
+        emits `identity.key_rotated`. Concurrent creations end with one active key ([O28]). No body. The
+        audit action is `identity_key.rotate`. Available while the identity is paused; a `deleting` or `deleted` identity
         returns `404 identity_not_found`.
       x-required-permission: ['identities:write']
       x-key-levels: [platform, partner, tenant, identity]
@@ -1600,9 +1819,11 @@ paths:
         - **Header**: `{"alg":"EdDSA","typ":"agent-assertion+jwt","kid":"<thumbprint>"}`.
         - **Claims**: `iss` (`https://{PM_API_HOST}`), `sub` (the identity ID), `aud` (the requested
           audience), `iat` and `nbf` (now), `exp` (now + `expires_in`), `jti` (a new ULID), `email` (the
-          identity's primary address), `email_verified` (`true`), `name` (the display name), `org` (the
-          workspace name), `accountable_human` (`true` when the identity has an accountable owner; the
-          owner's name and address are never included), `ai_agent` (`true`), and `nonce` and `ext` when given.
+          identity's primary address), `email_verified` (`true`), `unverified` (an object of statements the
+          workspace made and the deployment does not check: `name`, the display name; `org`, the workspace
+          name; `accountable_human`, `true` when the identity has owner fields set; a verifier must not grant
+          access on them, and the owner's name and address are never included), `ai_agent` (`true`), and
+          `nonce` and `ext` when given.
         - **Not stored.** Each call mints a new token, so `Idempotency-Key` is ignored and never recorded.
           The token is never stored or logged; only a count is kept (`usage_daily` metric `assertions`).
           Signing is not metered against any plan allowance.
@@ -1819,6 +2040,379 @@ paths:
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
 
+  # ──────────────────────────────────────── Service accounts ───────────────────────────────────────
+
+  /identities/{identity_id}/accounts:
+    parameters:
+      - $ref: '#/components/parameters/IdentityIdPath'
+    post:
+      operationId: requestServiceAccount
+      tags: [Service accounts]
+      summary: Request approval for a third-party account
+      description: >-
+        Records that the identity's agent wants to create an account at a third-party service with one of the
+        identity's addresses (FR-IDN-10). The entry starts `pending_approval` and expires after 7 days. Where
+        the tenant's `accounts.require_approval` is `true`, the service's verification mail reaches the agent
+        only once an operator approved the entry. `service_domain` and `sender_domains` are reduced to their
+        organisational domains. Emits `account.requested`; audit `account.request`.
+      x-required-permission: ['accounts:request']
+      x-key-levels: [platform, partner, tenant, identity]
+      x-permission-notes: An identity key requests only for its own identity.
+      x-rate-limit-buckets: [api]
+      x-idempotency: optional
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyOptional'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ServiceAccountCreateRequest'}
+            example:
+              service_domain: github.com
+              account_identifier: brightwell-bookings
+              purpose: Open issues on the booking widget's repository.
+              sender_domains: [github.com]
+              address: bookings.brightwell@pylotamail.com
+      responses:
+        '201':
+          description: The entry, `pending_approval`.
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
+            Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ServiceAccount'}
+        '400':
+          description: >-
+            The request is invalid: a service or sender domain that is a public suffix, an IP literal or not
+            a DNS name, an `address` that is not an active or retiring address of the identity, or this
+            deployment's own platform, API or console domain (`details.reason = "own_deployment"`, [E14]).
+          x-error-codes: [invalid_request, invalid_idempotency_key]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409':
+          description: >-
+            A pending or approved entry exists for the same service and account identifier
+            (`account_exists`, with `details.account_id` and `details.status`); the identity is paused
+            (`identity_paused`); or the idempotency key is in use.
+          x-error-codes: [account_exists, identity_paused, idempotency_conflict, request_in_progress]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '422':
+          description: The identity already has 10 pending entries, or 200 in any state (`details.limit`, `details.status`, [E12]).
+          x-error-codes: [account_limit_reached]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    get:
+      operationId: listIdentityServiceAccounts
+      tags: [Service accounts]
+      summary: List an identity's service-ledger entries
+      x-required-permission: ['accounts:request']
+      x-key-levels: [platform, partner, tenant, identity]
+      x-permission-notes: '`accounts:approve` includes `accounts:request`.'
+      x-rate-limit-buckets: [api]
+      x-idempotency: none
+      parameters:
+        - name: status
+          in: query
+          description: Only entries with this status.
+          schema: {$ref: '#/components/schemas/ServiceAccountStatus'}
+        - name: service_domain
+          in: query
+          description: Only entries for this service (its organisational domain).
+          schema:
+            type: string
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: A page of entries, newest first.
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ServiceAccountPage'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '410': {$ref: '#/components/responses/CursorExpired'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+
+  /tenants/{tenant_id}/accounts:
+    parameters:
+      - $ref: '#/components/parameters/TenantIdPath'
+    get:
+      operationId: listTenantServiceAccounts
+      tags: [Service accounts]
+      summary: List a tenant's service-ledger entries
+      description: The approval queue of a tenant (`status=pending_approval`), or every entry. An identity key gets `403 scope_denied`.
+      x-required-permission: ['accounts:request']
+      x-key-levels: [platform, partner, tenant]
+      x-rate-limit-buckets: [api]
+      x-idempotency: none
+      parameters:
+        - name: status
+          in: query
+          description: Only entries with this status.
+          schema: {$ref: '#/components/schemas/ServiceAccountStatus'}
+        - name: identity_id
+          in: query
+          description: Only entries of this identity.
+          schema: {$ref: '#/components/schemas/IdentityId'}
+        - name: service_domain
+          in: query
+          description: Only entries for this service (its organisational domain).
+          schema:
+            type: string
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: A page of entries, oldest pending first, then newest first.
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ServiceAccountPage'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '410': {$ref: '#/components/responses/CursorExpired'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+
+  /identities/{identity_id}/accounts/{account_id}:
+    parameters:
+      - $ref: '#/components/parameters/IdentityIdPath'
+      - $ref: '#/components/parameters/AccountIdPath'
+    get:
+      operationId: getServiceAccount
+      tags: [Service accounts]
+      summary: Get a service-ledger entry
+      x-required-permission: ['accounts:request']
+      x-key-levels: [platform, partner, tenant, identity]
+      x-rate-limit-buckets: [api]
+      x-idempotency: none
+      responses:
+        '200':
+          description: The entry.
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ServiceAccount'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    delete:
+      operationId: deleteServiceAccount
+      tags: [Service accounts]
+      summary: Delete a service-ledger entry
+      description: >-
+        Removes the entry. A pending or approved entry is closed first in the same batch, with
+        `account.closed`. Audit `account.delete`, which keeps the entry's ID, service domain and final status.
+      x-required-permission: ['accounts:approve']
+      x-key-levels: [platform, partner, tenant]
+      x-rate-limit-buckets: [api]
+      x-idempotency: none
+      responses:
+        '204':
+          description: Deleted.
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+
+  /identities/{identity_id}/accounts/{account_id}/approve:
+    parameters:
+      - $ref: '#/components/parameters/IdentityIdPath'
+      - $ref: '#/components/parameters/AccountIdPath'
+    post:
+      operationId: approveServiceAccount
+      tags: [Service accounts]
+      summary: Approve a service-ledger entry
+      description: >-
+        Approves a `pending_approval` entry, so verification mail from its sender domains to its address can
+        reach the agent. A decision reserved for people: an API key may approve only when
+        `PM_QUARANTINE_KEY_RELEASE` is `on`, `PM_CONSOLE` is `off`, or the tenant's policy has
+        `quarantine.key_release: true` ([E11]). Approving an approved entry returns it unchanged. Mail already
+        quarantined as `account_unapproved` is not released. Emits `account.approved`; audit `account.approve`.
+      x-required-permission: ['accounts:approve']
+      x-key-levels: [platform, partner, tenant]
+      x-permission-notes: >-
+        Otherwise `403 permission_denied` with `details.reason = "person_required"`: a signed-in person
+        approves in the console. Identity keys can never hold `accounts:approve`.
+      x-rate-limit-buckets: [api]
+      x-idempotency: optional
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyOptional'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ServiceAccountNoteRequest'}
+            example:
+              note: Approved for the widget repository only.
+      responses:
+        '200':
+          description: The entry, `approved`.
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
+            Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ServiceAccount'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403':
+          description: >-
+            The key lacks `accounts:approve`, API keys may not take decisions reserved for people on this
+            tenant (`permission_denied`, `details.reason = "person_required"`), or the key's partner is
+            suspended.
+          x-error-codes: [permission_denied, scope_denied, partner_suspended]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409':
+          description: The entry is no longer `pending_approval`, or it expired (`details.status`); or the idempotency key is in use.
+          x-error-codes: [account_not_pending, idempotency_conflict, request_in_progress]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+
+  /identities/{identity_id}/accounts/{account_id}/reject:
+    parameters:
+      - $ref: '#/components/parameters/IdentityIdPath'
+      - $ref: '#/components/parameters/AccountIdPath'
+    post:
+      operationId: rejectServiceAccount
+      tags: [Service accounts]
+      summary: Reject a service-ledger entry
+      description: >-
+        Rejects a `pending_approval` entry (`rejected_reason: "operator"`). Always allowed for a key that holds
+        `accounts:approve`. Rejecting a rejected entry returns it unchanged. Emits `account.rejected`; audit
+        `account.reject`.
+      x-required-permission: ['accounts:approve']
+      x-key-levels: [platform, partner, tenant]
+      x-rate-limit-buckets: [api]
+      x-idempotency: optional
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyOptional'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ServiceAccountNoteRequest'}
+      responses:
+        '200':
+          description: The entry, `rejected`.
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
+            Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ServiceAccount'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409':
+          description: The entry was already approved or closed (`details.status`); or the idempotency key is in use.
+          x-error-codes: [account_not_pending, idempotency_conflict, request_in_progress]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+
+  /identities/{identity_id}/accounts/{account_id}/close:
+    parameters:
+      - $ref: '#/components/parameters/IdentityIdPath'
+      - $ref: '#/components/parameters/AccountIdPath'
+    post:
+      operationId: closeServiceAccount
+      tags: [Service accounts]
+      summary: Close a service-ledger entry
+      description: >-
+        A pending or approved entry becomes `closed`; no mail matches it afterwards ([E13]). Closing a closed
+        or rejected entry returns it unchanged. It does not close the account at the service. Emits
+        `account.closed`; audit `account.close`.
+      x-required-permission: ['accounts:request']
+      x-key-levels: [platform, partner, tenant, identity]
+      x-rate-limit-buckets: [api]
+      x-idempotency: optional
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyOptional'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/ServiceAccountNoteRequest'}
+      responses:
+        '200':
+          description: The entry, `closed` (or unchanged).
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
+            Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ServiceAccount'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/IdempotencyConflict'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+
   # ──────────────────────────────────────────── Domains ───────────────────────────────────────────
 
   /tenants/{tenant_id}/domains:
@@ -1848,8 +2442,20 @@ paths:
           the console host, is refused, as is a `nameservers` or `delegated_subdomain` name inside such a
           zone: `403 scope_denied` with `details.reason = "zone_not_allowed"` ([H8]). Platform keys may use
           any zone.
-        - **`nameservers`** creates the zone. Tenant keys need the policy `domains.allow_create_zone: true`
-          (`422 transport_unavailable`, `zone_creation_not_allowed`). A name with A, AAAA or MX records, or a
+        - **Name taken** ([H10], [H14]): `409 domain_exists`. For a domain of the caller's own tenant,
+          `details.domain_id` names it. Otherwise the body is the same whoever holds the name, in whatever
+          state, and also when a zone or provider object of that name exists that this deployment did not
+          create for this tenant (it is never adopted); `details.claim` is a TXT record to publish before
+          repeating the request with `claim: true`, which evicts a holder that never verified the domain
+          (`409 domain_claim_pending` until its removal finishes). A tenant or partner key's tenant may hold
+          5 domains that were never verified (`422 unverified_domain_limit`); an unverified domain is removed
+          14 days after it was added.
+        - **Mail domains per zone** ([H15]): a Cloudflare zone holds at most 30, routing and sending
+          together; the 31st returns `422 zone_domain_limit` before anything is created.
+        - **`nameservers`** creates the zone, never using one that already exists in the account. Tenant keys
+          need the policy `domains.allow_create_zone: true` (`422 transport_unavailable`,
+          `zone_creation_not_allowed`, also returned when Cloudflare refuses the create for the Worker
+          token's scope); Pylota Mail Cloud does not offer the method. A name with A, AAAA or MX records, or a
           `www` CNAME, A or AAAA record, needs `confirm_dedicated: true` (`409 domain_not_dedicated`, with
           `details.records`) ([N21]). The response's `records` are the zone's `NS` records for the
           registrar. A zone not activated within 28 days is deleted by Cloudflare and the domain becomes
@@ -1970,13 +2576,15 @@ paths:
         '404': {$ref: '#/components/responses/NotFound'}
         '409':
           description: >-
-            The domain is already registered in this deployment; the name already has MX records and
-            `replace_mx` is not `true`; a `nameservers` name is not dedicated to mail and
-            `confirm_dedicated` is not `true` (`details.records`); Cloudflare refused the zone because of a
-            zone hold; or the idempotency key is in use.
-          x-error-codes: [domain_exists, existing_mx, domain_not_dedicated, zone_hold, idempotency_conflict, request_in_progress]
+            The name is not available (`domain_exists`, with `details.claim` unless the domain is the
+            caller's own); a proved claim is evicting the previous holder (`domain_claim_pending`, with
+            `Retry-After`); the name already has MX records and `replace_mx` is not `true`; a `nameservers`
+            name is not dedicated to mail and `confirm_dedicated` is not `true` (`details.records`); Cloudflare
+            refused the zone because of a zone hold; or the idempotency key is in use.
+          x-error-codes: [domain_exists, domain_claim_pending, existing_mx, domain_not_dedicated, zone_hold, idempotency_conflict, request_in_progress]
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
+            Retry-After: {$ref: '#/components/headers/Retry-After'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Error'}
@@ -2001,8 +2609,9 @@ paths:
             The deployment or the method cannot add this domain (`transport_unavailable`, with
             `details.reason`); the SMTP relay does not offer TLS (`smtp_tls_required`) or refused the
             credentials (`smtp_auth_failed`); or the method needs `PM_CF_API_TOKEN`, which is not set
-            (`cf_token_required`).
-          x-error-codes: [transport_unavailable, smtp_tls_required, smtp_auth_failed, cf_token_required]
+            (`cf_token_required`); the tenant holds 5 unverified domains (`unverified_domain_limit`); or the
+            Cloudflare zone holds 30 mail domains (`zone_domain_limit`).
+          x-error-codes: [transport_unavailable, smtp_tls_required, smtp_auth_failed, cf_token_required, unverified_domain_limit, zone_domain_limit]
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
           content:
@@ -2110,7 +2719,8 @@ paths:
           `ses_not_configured`) and an SES identity for the domain (`ses_region` set): a `cloudflare_zone`,
           `nameservers` or `delegated_subdomain` domain gets one, with its three DKIM records, during
           onboarding when the SES transport is configured; a domain onboarded without one gets
-          `422 transport_unavailable`. `dns_records` and `send_only`
+          `422 transport_unavailable`. The switch also needs SES to report the identity as verified for
+          sending with DKIM `SUCCESS` at that moment (`ses_identity_not_verified` otherwise). `dns_records` and `send_only`
           domains send only through `ses`, `smtp_relay` domains only through `smtp`, and the platform domain
           only through `cloudflare`; another value returns `422 transport_unavailable`,
           `method_not_supported`. The change applies to sends that reach the transport after it and starts
@@ -2169,8 +2779,10 @@ paths:
         '422':
           description: >-
             The domain cannot use the requested transport or has no SMTP relay (`transport_unavailable`,
-            `method_not_supported`), the transport is not configured (`ses_not_configured`), or the new
-            relay does not offer TLS (`smtp_tls_required`) or refused the credentials (`smtp_auth_failed`).
+            `method_not_supported`), the transport is not configured (`ses_not_configured`), SES does not
+            report the domain's identity as verified for sending with DKIM `SUCCESS`
+            (`ses_identity_not_verified`), or the new relay does not offer TLS (`smtp_tls_required`) or
+            refused the credentials (`smtp_auth_failed`).
           x-error-codes: [transport_unavailable, smtp_tls_required, smtp_auth_failed]
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
@@ -2209,18 +2821,22 @@ paths:
       tags: [Domains]
       summary: Remove a domain
       description: >-
-        Fails with `409 domain_in_use` while any address on the domain is `active` or `retiring`.
-        Otherwise starts removal: routing rules, sending onboarding and the event subscription are deleted,
-        and for a domain with an SES identity, the SES identity and the domain's addresses in the
-        retired-address receipt rules (`pm-retired-{n}`). The domain moves to `removing`, then `removed`,
-        and `domain.removed` is emitted with `reason: requested`.
+        Fails with `409 domain_in_use` while any address on the domain is `active` or `retiring`, and with
+        `403 scope_denied` on the platform domain ([H9]). Otherwise starts removal of the provider objects
+        that onboarding created for this domain, and only those ([H10], [H11]): routing rules, this name's
+        routing records (the zone-wide routing disable only for the zone's last routing domain, at its
+        apex), sending onboarding and the event subscription, and for a domain with an SES identity, the SES
+        identity and the domain's addresses in the retired-address receipt rules (`pm-retired-{n}`). The
+        domain moves to `removing`, then `removed`, and `domain.removed` is emitted with `reason: requested`.
+        On a domain that is already `removing` because its removal job failed after 10 attempts, the call
+        restarts the job from the first step not done and answers `202` ([H12]).
       x-required-permission: ['domains:write']
       x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
         '202':
-          description: Removal started. The domain is returned in state `removing`.
+          description: Removal started, or a failed removal restarted. The domain is returned in state `removing`.
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
@@ -2688,7 +3304,9 @@ paths:
       summary: Place a legal hold on a thread
       description: >-
         A held thread is skipped by retention and erasure, and erasure receipts list it (FR-PRV-4).
-        Replaces any existing hold on the thread. Audit-logged.
+        Replaces any existing hold on the thread. Audit-logged. On a tenant that is `erasing` with held
+        threads, this and `removeThreadHold` are the one write a partner key (or a platform key) can still
+        make.
       x-required-permission: ['erasure:manage']
       x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
@@ -2994,6 +3612,7 @@ paths:
                   risk_flags: []
                   model: '@cf/openai/gpt-oss-20b'
                   version: 3
+                  run: 1
                 refs:
                   - kind: uk_plate
                     value: AB12CDE
@@ -3204,7 +3823,10 @@ paths:
       operationId: rerunTriage
       tags: [Messages]
       summary: Re-run triage on a message
-      description: Queues triage again. A `message.triaged` event follows when it finishes (or fails).
+      description: >-
+        Queues triage again (FR-TRI-5). A `message.triaged` event follows when it finishes (or fails); the
+        record then has the same `version` and a `run` one higher. A message that ingest never triages gets
+        `409 triage_not_eligible`: release a quarantined message instead, which triages it.
       x-required-permission: ['messages:write']
       x-key-levels: [platform, partner, tenant, identity]
       x-permission-notes: A `quarantined`, `hidden` or `throttled` message needs `quarantine:review` as well; without it the message is `404 message_not_found`, as if it did not exist.
@@ -3223,7 +3845,17 @@ paths:
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
-        '409': {$ref: '#/components/responses/IdempotencyConflict'}
+        '409':
+          description: >-
+            The message is never triaged (quarantined, hidden, throttled, a delivery report or read receipt, or a
+            message of the system identity; `details.reason` is `quarantined` or `not_eligible`), or the
+            idempotency key is in use.
+          x-error-codes: [triage_not_eligible, idempotency_conflict, request_in_progress]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
         '429': {$ref: '#/components/responses/TooManyRequests'}
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
@@ -3597,9 +4229,7 @@ paths:
       x-key-levels: [platform, partner, tenant, identity]
       x-permission-notes: '`mode: "agentic"` needs `search:agentic`. `include_quarantined: true` returns quarantined mail only if the key also holds `quarantine:review`.'
       x-rate-limit-buckets: [api, search, agentic]
-      x-idempotency: optional
-      parameters:
-        - $ref: '#/components/parameters/IdempotencyKeyOptional'
+      x-idempotency: none
       requestBody:
         required: true
         content:
@@ -3642,7 +4272,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
               schema:
@@ -3698,7 +4327,9 @@ paths:
                       sentences:
                         - text: Yes. Admiral accepted claim 7781 on 2 October, after the photos sent on 28 September.
                           citations: [msg_01JA2B3C4D5E6F7G8H9J0K1M2N, msg_01JB2B3C4D5E6F7G8H9J0K1M2N]
+                          citation_trust: authenticated
                       confidence: 0.86
+                      untrusted: true
                     evidence:
                       - message_id: msg_01JA2B3C4D5E6F7G8H9J0K1M2N
                         thread_id: thr_01JA2B3C4D5E6F7G8H9J0K1M2N
@@ -3718,6 +4349,7 @@ paths:
                           known_sender: true
                           quarantined: false
                         quotes: [we are pleased to confirm claim 7781 has been accepted]
+                        steering_suspected: false
                     trace:
                       - step: 1
                         action: search
@@ -3767,7 +4399,6 @@ paths:
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
-        '409': {$ref: '#/components/responses/IdempotencyConflict'}
         '410': {$ref: '#/components/responses/CursorExpired'}
         '413': {$ref: '#/components/responses/PayloadTooLarge'}
         '422':
@@ -3803,9 +4434,7 @@ paths:
       x-key-levels: [platform, partner, tenant]
       x-permission-notes: '`mode: "agentic"` needs `search:agentic`. `include_quarantined: true` returns quarantined mail only if the key also holds `quarantine:review`.'
       x-rate-limit-buckets: [api, search, agentic]
-      x-idempotency: optional
-      parameters:
-        - $ref: '#/components/parameters/IdempotencyKeyOptional'
+      x-idempotency: none
       requestBody:
         required: true
         content:
@@ -3828,7 +4457,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
               schema:
@@ -3881,7 +4509,6 @@ paths:
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
-        '409': {$ref: '#/components/responses/IdempotencyConflict'}
         '410': {$ref: '#/components/responses/CursorExpired'}
         '413': {$ref: '#/components/responses/PayloadTooLarge'}
         '422':
@@ -4001,7 +4628,11 @@ paths:
         `timeout`. A timeout is not an error: it returns `200` with `timed_out: true` and `message: null`.
         A verification code or link is released only when `from` names the expected sender domain and the
         message passed authentication (`verdict: pass`) ([E4]). An active `wait` also marks OTP mail from
-        that sender domain as solicited for 30 minutes ([E5]).
+        that sender domain as solicited for 30 minutes ([E5]). When the tenant's
+        `accounts.require_approval` is `true`, `kind=verification` also needs an approved service-ledger
+        entry whose sender domains include the domain of `from`: without one the request gets
+        `403 policy_denied` (`details.reason = "account_not_approved"`) at once, and a code is released only
+        while its entry is still approved ([E9]).
       x-required-permission: ['search:read']
       x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
@@ -4055,7 +4686,26 @@ paths:
               schema: {$ref: '#/components/schemas/WaitResponse'}
         '400': {$ref: '#/components/responses/BadRequest'}
         '401': {$ref: '#/components/responses/Unauthorized'}
-        '403': {$ref: '#/components/responses/Forbidden'}
+        '403':
+          description: >-
+            As `Forbidden`, plus `policy_denied` for `kind=verification` when the tenant requires approval and
+            no approved service-ledger entry covers the sender domain ([E9]).
+          x-error-codes: [permission_denied, scope_denied, tenant_suspended, partner_suspended, policy_denied]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+              example:
+                error:
+                  code: policy_denied
+                  message: No approved service account covers service.example for this identity.
+                  retryable: false
+                  fix: Request an entry with POST /v1/identities/{identity_id}/accounts and wait for its approval before signing up.
+                  request_id: req_01J9Z4K8V4QW7X2M5N6P8R0T1Y
+                  details:
+                    reason: account_not_approved
+                    service_domain: service.example
         '404': {$ref: '#/components/responses/NotFound'}
         '429': {$ref: '#/components/responses/TooManyRequests'}
         '500': {$ref: '#/components/responses/InternalError'}
@@ -4114,6 +4764,11 @@ paths:
         HTTPS; private, loopback and reserved addresses are refused (FR-WH-5).
       x-required-permission: ['webhooks:manage']
       x-key-levels: [platform, partner]
+      x-permission-notes: >-
+        Mail events need more than `webhooks:manage` ([J29]): when the endpoint's `events` include `*`, any
+        `message.*` type or `verification.received`, the key must also hold `messages:read`, and when they
+        include `*` or `message.quarantined`, `quarantine:review` as well; otherwise `403 permission_denied`
+        with `details.required`.
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -4200,6 +4855,11 @@ paths:
         reserved addresses are refused (FR-WH-5).
       x-required-permission: ['webhooks:manage']
       x-key-levels: [platform, partner, tenant]
+      x-permission-notes: >-
+        Mail events need more than `webhooks:manage` ([J29]): when the endpoint's `events` include `*`, any
+        `message.*` type or `verification.received`, the key must also hold `messages:read`, and when they
+        include `*` or `message.quarantined`, `quarantine:review` as well; otherwise `403 permission_denied`
+        with `details.required`.
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -4305,9 +4965,16 @@ paths:
       summary: Update a webhook endpoint
       description: >-
         Accepts `url`, `events`, `identity_ids`, `description` and `enabled`. `enabled: true` re-enables a
-        disabled endpoint; `enabled: false` disables it with `disabled_reason: manual`.
+        disabled endpoint; `enabled: false` disables it with `disabled_reason: manual`. A changed `url`
+        disables the endpoint with `disabled_reason: url_changed` until a test delivery to the new URL
+        succeeds; `enabled: true` on such an endpoint gets `400 invalid_request`.
       x-required-permission: ['webhooks:manage']
       x-key-levels: [platform, partner, tenant]
+      x-permission-notes: >-
+        Mail events need more than `webhooks:manage` ([J29]): when the endpoint's `events` include `*`, any
+        `message.*` type or `verification.received`, the key must also hold `messages:read`, and when they
+        include `*` or `message.quarantined`, `quarantine:review` as well; otherwise `403 permission_denied`
+        with `details.required`.
       x-rate-limit-buckets: [api]
       x-idempotency: none
       requestBody:
@@ -4407,7 +5074,7 @@ paths:
       operationId: testWebhook
       tags: [Webhooks]
       summary: Send a test event
-      description: Sends a `webhook.test` event straight away and returns the delivery attempt.
+      description: Sends a `webhook.test` event straight away and returns the delivery attempt. A `2xx` re-enables an endpoint disabled with `url_changed`.
       x-required-permission: ['webhooks:manage']
       x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
@@ -4491,6 +5158,11 @@ paths:
         Returns the number of events queued.
       x-required-permission: ['webhooks:manage']
       x-key-levels: [platform, partner, tenant]
+      x-permission-notes: >-
+        Mail events need more than `webhooks:manage` ([J29]): when the endpoint's `events` include `*`, any
+        `message.*` type or `verification.received`, the key must also hold `messages:read`, and when they
+        include `*` or `message.quarantined`, `quarantine:review` as well; otherwise `403 permission_denied`
+        with `details.required`.
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -4791,8 +5463,10 @@ paths:
       summary: Create an API key
       description: >-
         The new key's level, tenant, identity and permissions must all lie within the caller's own,
-        otherwise `403 key_scope_exceeded` (FR-KEY-1). A tenant or identity key's `mode` follows its tenant;
-        platform and partner keys are `live`.
+        otherwise `403 key_scope_exceeded` (FR-KEY-1). The one exception: a platform or partner key may grant
+        `identities:sign`, which it cannot hold, to a tenant or identity key it mints; the `key.create`
+        audit row records it in `details.granted_without_holding`. A tenant or identity key's `mode` follows
+        its tenant; platform and partner keys are `live`.
         The response carries `secret` (`pmk_live_…` or `pmk_test_…`), **shown only once**; only a keyed
         hash is stored (FR-KEY-2).
 
@@ -4803,14 +5477,22 @@ paths:
           and `partners:manage` on any key but a platform key; `tenants:manage` on a tenant or identity key;
           `members:read`, `members:manage`, `suppressions:manage`, `audit:read` and `usage:read` on an
           identity key (an identity key holds `usage:read` implicitly for its own workspace's
-          `GET /v1/usage`); `identities:sign` on a platform or partner key. The table is under `Permission`.
+          `GET /v1/usage`); `identities:sign` on a platform or partner key; `tenants:erase` on an identity
+          key. The table is under `Permission`.
+        - **Owner-only permission.** `tenants:erase` on a tenant key needs a caller whose
+          `created_by_role` is `owner` (the workspace owner's console session, or a key it minted):
+          otherwise `400 invalid_request` with `details.reason = "permission_owner_only"`.
         - **Partner keys** (FR-KEY-4). `level: partner` needs `partner_id` and no `tenant_id` or
           `identity_id`, and only a platform key may ask for it (an unknown partner is
           `404 partner_not_found`); other levels refuse `partner_id`. A partner key mints only `tenant` and
           `identity` keys of the tenants its partner's keys created; a `partner` or `platform` key, or another
           tenant, is `403 key_scope_exceeded`.
-        - **Order.** These two checks run first; the scope check (`403 key_scope_exceeded`) comes after them.
-          Minting is audit-logged (`key.create`, with `level` and, for a partner key, `partner_id`).
+        - **Order.** These checks run first; the scope check (`403 key_scope_exceeded`) comes after them,
+          then the active-key cap: at most 100 active tenant and identity keys per tenant and 10 partner
+          keys per partner (`422 key_limit_reached`). Minting is audit-logged (`key.create`, with `level`
+          and, for a partner key, `partner_id`).
+        - **Who minted it.** `created_by_user_id` is the console user whose session minted the key, copied
+          to every key minted with it; removing that person, or lowering their role, revokes their keys.
       x-required-permission: ['keys:manage']
       x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
@@ -4844,7 +5526,8 @@ paths:
             The request is invalid (`details.errors[]` holds `{path, message}`): for example `permissions`
             missing or empty, or `tenant_id` or `identity_id` missing for the level. A permission the new
             key's level cannot hold is `invalid_request` with `details.reason =
-            "permission_not_allowed_for_level"`.
+            "permission_not_allowed_for_level"`; `tenants:erase` from a caller that is not the workspace
+            owner's session or one of its keys, `details.reason = "permission_owner_only"`.
           x-error-codes: [invalid_request, invalid_idempotency_key]
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
@@ -4865,8 +5548,8 @@ paths:
                         message: identities:sign cannot be held by a platform key
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403':
-          description: The key lacks `keys:manage`, the target is out of scope, the new key would be wider than the caller, or the partner is suspended.
-          x-error-codes: [permission_denied, scope_denied, key_scope_exceeded, tenant_suspended, partner_suspended]
+          description: The key lacks `keys:manage`, the target is out of scope, the new key would be wider than the caller, or the partner is suspended. A suspended tenant does not stop key management.
+          x-error-codes: [permission_denied, scope_denied, key_scope_exceeded, partner_suspended]
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
           content:
@@ -4875,6 +5558,25 @@ paths:
         '404': {$ref: '#/components/responses/NotFound'}
         '409': {$ref: '#/components/responses/IdempotencyConflict'}
         '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '422':
+          description: >-
+            The tenant already has 100 active tenant and identity keys, or the partner 10 partner keys
+            (`details.limit`). Revoked and expired keys do not count.
+          x-error-codes: [key_limit_reached]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+              example:
+                error:
+                  code: key_limit_reached
+                  message: This tenant already has 100 active API keys.
+                  retryable: false
+                  fix: Revoke keys you no longer use, then create the new one.
+                  request_id: req_01J9Z4K8V4QW7X2M5N6P8R0T1Y
+                  details:
+                    limit: 100
         '429': {$ref: '#/components/responses/TooManyRequests'}
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
@@ -4883,8 +5585,9 @@ paths:
       tags: [Keys]
       summary: List API keys
       description: >-
-        Keys within the caller's scope (never with secrets). A partner key lists only tenant and identity
-        keys of its own tenants.
+        Keys the caller may read (never with secrets): those it reaches and is not narrower than, as for
+        `GET /v1/keys/{key_id}`. A partner key lists only tenant and identity keys of its own tenants; an
+        identity key, only identity keys of its own identity.
       x-required-permission: ['keys:manage']
       x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
@@ -4916,6 +5619,15 @@ paths:
       operationId: getKey
       tags: [Keys]
       summary: Get an API key
+      description: >-
+        The key, never with its secret.
+        Two checks apply to the target key ([J20]). **Reach:** a platform key reaches every key; a partner
+        key, the tenant and identity keys of its own tenants; a tenant key, the keys of its tenant; an
+        identity key, only the identity keys of its own identity. A key out of reach is
+        `404 key_not_found`, like a missing one. **Not wider:** the target's level must be at most the
+        caller's and each of its permissions one the caller holds (or, for a platform or partner caller,
+        `identities:sign`); otherwise `403 key_scope_exceeded` and nothing is changed or returned. A key
+        always passes for itself.
       x-required-permission: ['keys:manage']
       x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
@@ -4930,7 +5642,7 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/ApiKey'}
         '401': {$ref: '#/components/responses/Unauthorized'}
-        '403': {$ref: '#/components/responses/Forbidden'}
+        '403': {$ref: '#/components/responses/KeyManageForbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
         '429': {$ref: '#/components/responses/TooManyRequests'}
         '500': {$ref: '#/components/responses/InternalError'}
@@ -4939,7 +5651,15 @@ paths:
       operationId: revokeKey
       tags: [Keys]
       summary: Revoke an API key
-      description: Revokes the key immediately. Later requests with it get `401 key_revoked`.
+      description: >-
+        Revokes the key immediately. Later requests with it get `401 key_revoked`.
+        Two checks apply to the target key ([J20]). **Reach:** a platform key reaches every key; a partner
+        key, the tenant and identity keys of its own tenants; a tenant key, the keys of its tenant; an
+        identity key, only the identity keys of its own identity. A key out of reach is
+        `404 key_not_found`, like a missing one. **Not wider:** the target's level must be at most the
+        caller's and each of its permissions one the caller holds (or, for a platform or partner caller,
+        `identities:sign`); otherwise `403 key_scope_exceeded` and nothing is changed or returned. A key
+        always passes for itself.
       x-required-permission: ['keys:manage']
       x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
@@ -4951,7 +5671,7 @@ paths:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
         '401': {$ref: '#/components/responses/Unauthorized'}
-        '403': {$ref: '#/components/responses/Forbidden'}
+        '403': {$ref: '#/components/responses/KeyManageForbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
         '429': {$ref: '#/components/responses/TooManyRequests'}
         '500': {$ref: '#/components/responses/InternalError'}
@@ -4966,7 +5686,15 @@ paths:
       summary: Rotate an API key
       description: >-
         Issues a new secret for the same key and returns it once. The old secret keeps working until the
-        overlap ends (0–168 hours, default 24).
+        overlap ends (0–168 hours, default 24). Because the response carries the secret, no key may rotate
+        a key wider than itself.
+        Two checks apply to the target key ([J20]). **Reach:** a platform key reaches every key; a partner
+        key, the tenant and identity keys of its own tenants; a tenant key, the keys of its tenant; an
+        identity key, only the identity keys of its own identity. A key out of reach is
+        `404 key_not_found`, like a missing one. **Not wider:** the target's level must be at most the
+        caller's and each of its permissions one the caller holds (or, for a platform or partner caller,
+        `identities:sign`); otherwise `403 key_scope_exceeded` and nothing is changed or returned. A key
+        always passes for itself.
       x-required-permission: ['keys:manage']
       x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
@@ -4992,7 +5720,7 @@ paths:
               schema: {$ref: '#/components/schemas/ApiKeyCreated'}
         '400': {$ref: '#/components/responses/BadRequest'}
         '401': {$ref: '#/components/responses/Unauthorized'}
-        '403': {$ref: '#/components/responses/Forbidden'}
+        '403': {$ref: '#/components/responses/KeyManageForbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
         '409': {$ref: '#/components/responses/IdempotencyConflict'}
         '413': {$ref: '#/components/responses/PayloadTooLarge'}
@@ -5020,15 +5748,29 @@ paths:
         | `thread` | `identity_id`, `thread_id` | Every message in the thread |
         | `counterparty` | `counterparty_address` | Every message to or from that address, in every identity of the tenant |
         | `identity` | `identity_id` | The whole mailbox. Its addresses are tombstoned |
-        | `tenant` | none | Everything in the tenant. Then the tenant is marked `erased` |
+        | `tenant` | none | Everything in the tenant. Then the tenant is marked `erased`, once no held thread remains |
 
-        A `tenant` request for a tenant that is already `erasing` returns the existing request with `200`
-        (the same `era_` ID) and starts nothing; for an `erased` tenant it returns `409 tenant_erased`. Any
-        other erasure request naming an `erasing` or `erased` tenant, like every write to such a tenant,
-        gets `404 tenant_not_found` from a non-platform key.
+        A failing step is retried automatically until `deadline_at` − 4 hours (20 hours after the first
+        request); then the request ends `failed`, and a new request for the same scope and target resumes it
+        at its failed step (`resumes_id` names it, `deadline_at` is copied), for every scope. At most one
+        request resumes a given request; a second one racing it gets `200` with the first.
+
+        A `tenant` request also needs `tenants:erase` (`403 permission_denied` with
+        `details.required = ["tenants:erase"]` otherwise), which workspace admins and the keys they mint never
+        hold ([W35]).
+
+        A `tenant` request for a tenant that is already `erasing` depends on the tenant's latest
+        tenant-scope request: `queued` or `running` returns it with `200` (the same `era_` ID) and starts
+        nothing; `failed` returns `202` with a new request that resumes the failed job at its failed step
+        (`resumes_id` names the failed request, `deadline_at` is copied); `completed_with_holds` returns
+        `202` with a continuation request that finishes the erasure once no hold remains. For an `erased`
+        tenant it returns `409 tenant_erased`. A tenant erasure never deletes a held thread: while one
+        remains the request ends `completed_with_holds` and the tenant stays `erasing`. Any other erasure
+        request naming an `erasing` or `erased` tenant, like every write to such a tenant, gets
+        `404 tenant_not_found` from a non-platform key (the hold routes excepted, on a tenant with holds).
       x-required-permission: ['erasure:manage']
       x-key-levels: [platform, partner, tenant, identity]
-      x-permission-notes: An identity key can only erase within its own identity (`message`, `thread` and `identity` scopes). `counterparty` needs a tenant, partner or platform key; `tenant` needs a platform key, the partner key of the tenant's own partner, or the tenant's own key.
+      x-permission-notes: An identity key can only erase within its own identity (`message`, `thread` and `identity` scopes). `counterparty` needs a tenant, partner or platform key; `tenant` needs a platform key, the partner key of the tenant's own partner, or the tenant's own key, and in every case `tenants:erase` as well as `erasure:manage`.
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -5045,7 +5787,10 @@ paths:
               reason: Data subject request DSR-1182
       responses:
         '202':
-          description: The erasure request. It completes asynchronously (within 24 hours, NFR-PRV-1).
+          description: >-
+            The erasure request. It completes asynchronously (within 24 hours, NFR-PRV-1). When the latest request with the
+            same scope and target `failed`, or the tenant's latest tenant-scope request ended
+            `completed_with_holds`, a new request with `resumes_id` set.
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
@@ -5055,7 +5800,9 @@ paths:
               schema: {$ref: '#/components/schemas/ErasureRequest'}
         '200':
           description: >-
-            A `tenant` request for a tenant already being erased: the existing tenant-scope request, unchanged.
+            A `tenant` request for a tenant already being erased whose latest tenant-scope request is still
+            `queued` or `running`: that request, unchanged. Also the resumption of a failed request that a
+            concurrent request created first.
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
@@ -5142,7 +5889,11 @@ paths:
                 tenant_id: ten_01J9Z3K8V4QW7X2M5N6P8R0T1Y
                 scope: counterparty
                 status: completed_with_holds
+                identity_id: null
+                target_id: null
+                resumes_id: null
                 created_at: '2026-10-09T10:00:00Z'
+                deadline_at: '2026-10-10T10:00:00Z'
                 completed_at: '2026-10-09T10:04:12Z'
                 receipt:
                   messages_deleted: 14
@@ -5175,8 +5926,9 @@ paths:
         Builds a ZIP holding one `.eml` per message plus `messages.json`. `scope` is `counterparty` (with
         `counterparty_address`: every message to or from it across the tenant's identities, FR-PRV-5) or
         `identity` (with `identity_id`: the whole mailbox). Returns `202` with the export
-        (`status: "queued"`). When finished, the export has a `download_url` (a signed link valid until
-        `expires_at`, 7 days) and an `export.completed` event is emitted.
+        (`status: "queued"`). When finished, the export has a `download_url` (a signed link valid for one
+        hour, minted again on each `getExport`) until `expires_at`, 7 days later, and an `export.completed`
+        event is emitted.
       x-required-permission: ['erasure:manage']
       x-key-levels: [platform, partner, tenant, identity]
       x-permission-notes: '`counterparty` scope needs a tenant, partner or platform key. An identity key can export only its own identity.'
@@ -5221,9 +5973,10 @@ paths:
       tags: [Privacy]
       summary: Get an export
       description: >-
-        `status` is `queued`, `running`, `completed`, `failed` or `expired`. A `completed` export has
-        `download_url`, a signed link (`getSignedLink`) valid until `expires_at`. The link is minted again on
-        each `GET`.
+        `status` is `queued`, `running`, `completed`, `failed`, `canceled` or `expired`. A `completed`
+        export has `download_url`, a signed link (`getSignedLink`) minted on each `GET` and valid for one
+        hour from it, or until `expires_at` if that is sooner. An earlier link stops working when its hour
+        ends, or at once when the export is deleted (`deleteExport`).
       x-required-permission: ['erasure:manage']
       x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
@@ -5246,6 +5999,33 @@ paths:
                 created_at: '2026-10-09T10:00:00Z'
                 expires_at: '2026-10-16T10:00:00Z'
                 download_url: https://mail.example.com/v1/links/bDE6Mz
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    delete:
+      operationId: deleteExport
+      tags: [Privacy]
+      summary: Delete an export and revoke its links
+      description: >-
+        Revokes every download link of the export at once. A `completed` export's ZIP is deleted and its
+        status becomes `expired`; a `queued` or `running` export is stopped and becomes `canceled`; an
+        export that is already `expired`, `failed` or `canceled` is left as it is. Returns `204` in every
+        case. A signed link of a deleted export answers `404 export_not_found`. Audit-logged
+        (`export.delete`).
+      x-required-permission: ['erasure:manage']
+      x-key-levels: [platform, partner, tenant, identity]
+      x-permission-notes: An identity key can delete only exports of its own identity.
+      x-rate-limit-buckets: [api]
+      x-idempotency: none
+      responses:
+        '204':
+          description: The export is deleted or stopped, and its links no longer work.
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
@@ -5517,17 +6297,31 @@ paths:
       tags: [Audit]
       summary: List audit events
       description: >-
-        Audit entries, newest first. They never hold message content or clear-text addresses. Audit rows
-        cover administrative actions: keys (`key.create`, `key.rotate`, `key.revoke`), partners
-        (`partner.create`, `partner.update`, `partner.delete`), tenants (`tenant.create`, with the
-        `partner_id` when a partner key created it), identity status, identity signing keys
-        (`identity_key.create`, `identity_key.rotate`, `identity_key.revoke`), quarantine releases, holds,
-        suppression removals, erasure, resolve, members, billing and platform operations. **Sends are not
-        audit rows**: each send is recorded by its message, its events (`message.sent` and the delivery
-        events) and its per-recipient delivery log. To review what a key sent, list the outbound messages
-        of the identities it reaches for the period; request logs also carry the key ID for 7 days. A partner
-        key reads the rows of its own tenants only; rows about a partner itself have no `tenant_id` and are
-        for platform keys.
+        Audit entries, newest first. They never hold message content or clear-text addresses. Audit rows cover
+        administrative actions; the `action` values are keys: `key.create`, `key.rotate`, `key.revoke`; identity
+        signing keys `identity_key.create`, `identity_key.rotate`, `identity_key.revoke`; deployment signing
+        keys `signing_key.rotate`; partners: `partner.create`, `partner.update`, `partner.delete`; tenants:
+        `tenant.create` (with the `partner_id` when a partner key created it), `tenant.policy_update` (every
+        policy write), `tenant.ramp_held`, `tenant.ramp_lifted`; identities: `identity.create`,
+        `identity.update` (a status change by a key or a person, with `details.from` and `details.to`),
+        `identity.delete`, `identity.auto_pause`; domains: `domain.create` (with any MX records `replace_mx`
+        deleted), `domain.transport`, `domain.evict`; service accounts: `account.request`, `account.approve`,
+        `account.reject`, `account.close`, `account.delete`; mail: `quarantine.release`, `message.cancel`,
+        `message.resolve`, `suppression.remove` (only for a `complaint` suppression); privacy: `erasure.create`,
+        `hold.set`, `hold.removed`, `hold.expired`, `export.delete`; people: `member.invite`,
+        `member.invite_resend`, `member.invite_revoke`, `member.join`, `member.role_change`, `member.leave`,
+        `member.remove`, `member.ownership_transfer`, `user.delete`, `user.notifications_resume`,
+        `user.oauth_unlink`, `waitlist.invite`; billing: `billing.checkout_started`, `billing.portal_opened`,
+        `billing.mode_change`, `billing.plan_set`, `billing.plan_changed`, `billing.duplicate_cancelled`,
+        `billing.dispute_opened`, `billing.dispute_closed`, `billing.refund_recorded`; platform operations:
+        `ops.switch`, `mailbox.restore`, `master_key.activated`, `master_key.resealed`; automatic containment:
+        `partner.auto_suspend`, `tenant.auto_pause`, `domain.auto_pause`; and `mail.read`, one row per request
+        by a platform or partner key to a route that returns mail content, written before the response. **Sends
+        are not audit rows**: each send is recorded by its message, its events (`message.sent` and the delivery
+        events) and its per-recipient delivery log. To review what a key sent, list the outbound messages of the
+        identities it reaches for the period; request logs also carry the key ID for 7 days. A partner key reads
+        the rows of its own tenants only; rows about a partner itself have no `tenant_id` and are for platform
+        keys.
       x-required-permission: ['audit:read']
       x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
@@ -5641,11 +6435,17 @@ paths:
       tags: [Members]
       summary: Invite a member
       description: >-
-        Sends an invitation email from the deployment's platform identity. A pending invitation uses a seat;
+        Sends an invitation email from the deployment's system identity. A pending invitation uses a seat;
         with no seat left the request fails with `402 billing_limit` (`details.feature: "seats"`). Roles:
         `admin`, `member`, `viewer`. The owner is set at workspace creation (`owner` in `createTenant`) or by
         an ownership transfer in the console. A partner key's invitations count in the `partner` bucket
-        (`RL_PARTNER`, 10 a minute per partner, shared with tenant creation).
+        (`RL_PARTNER`, 10 a minute per partner, shared with tenant creation). A tenant sends at most 50
+        invitation emails (new and re-sent) per UTC day: past that, `429 daily_cap_reached` with
+        `details.cap: "invitations"` and `details.resets_at`, before anything is written. An address that
+        this deployment hosts (on the platform domain, or an identity's address) cannot be invited:
+        `400 invalid_request` with `details.errors[0].path = "email"`. Accepting an invitation is always an
+        explicit click in the console, and a person enrolled in two-step verification passes it before the
+        membership exists.
       x-required-permission: ['members:manage']
       x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api, partner]
@@ -5679,7 +6479,18 @@ paths:
         '404': {$ref: '#/components/responses/NotFound'}
         '409': {$ref: '#/components/responses/IdempotencyConflict'}
         '413': {$ref: '#/components/responses/PayloadTooLarge'}
-        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '429':
+          description: >-
+            The `partner` or `api` rate limit (`rate_limited`, with `Retry-After`), or the tenant's 50
+            invitation emails a day (`daily_cap_reached`, `details.cap: "invitations"`, with
+            `details.resets_at`).
+          x-error-codes: [rate_limited, daily_cap_reached]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            Retry-After: {$ref: '#/components/headers/Retry-After'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
 
@@ -5945,6 +6756,7 @@ paths:
         | `reparse` | Re-parses messages from raw MIME with the deployed parser and re-emits their events with `reprocessed: true`. Messages past `raw_days` are skipped and counted |
         | `reembed` | Re-chunks and re-embeds messages into Vectorize, for example after a model change |
         | `reindex` | Rebuilds the keyword index (FTS5 and references) of each mailbox |
+        | `restore_reconcile` | After a mailbox restore: re-queues inbound mail received after `after` whose raw MIME is still in R2, and re-inserts sends made after it as `uncertain` with their idempotency records. Needs `after` and `identity_ids`; runs even while the deployment is frozen |
 
         `tenant_id` is required; `identity_ids` (default: every identity of the tenant), `after` and
         `before` narrow it.
@@ -6002,7 +6814,9 @@ paths:
       summary: Get a maintenance job
       description: >-
         `status` is `queued`, `running`, `completed`, `failed` or `canceled`; `result` holds counts once the
-        job ends. Audit-logged.
+        job ends. Returns any job except erasure and export jobs, which are read through their own
+        requests: the jobs started with `createJob`, and the `retention`, `backup` and `domain_remove`
+        jobs that a `job_failed:{kind}` alert names.
       x-required-permission: ['platform:ops']
       x-key-levels: [platform]
       x-rate-limit-buckets: [api]
@@ -6019,6 +6833,170 @@ paths:
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+
+  /platform/status:
+    get:
+      operationId: getPlatformStatus
+      tags: [Platform]
+      summary: Get the deployment's operational state
+      description: |
+        The freeze flag, the switches, whether an alert email address is configured, the firing state
+        alerts, the master-key slots with the re-seal progress, and capacity. Read by `pmail doctor`,
+        `pmail ops status` and the external heartbeat, whose key holds only `audit:read`. Key IDs are not
+        secret (every ciphertext carries one); key material is never returned.
+      x-required-permission: ['audit:read']
+      x-key-levels: [platform]
+      x-rate-limit-buckets: [api]
+      x-idempotency: none
+      responses:
+        '200':
+          description: The operational state.
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PlatformStatus'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+
+  /platform/switches:
+    put:
+      operationId: setSwitch
+      tags: [Platform]
+      summary: Set a deployment-wide switch
+      description: |
+        `read_only` refuses every write from a non-platform key and holds outbound sends;
+        `free_sending` `off` stops sends from workspaces on the Free plan or still in the send ramp;
+        `emergency_prune` `on` shortens the retention of `event_index` and `webhook_deliveries` to 7 days.
+        The automatic containment rules set them too. Readers cache a switch for 60 seconds. Audit action
+        `ops.switch`.
+      x-required-permission: ['platform:ops']
+      x-key-levels: [platform]
+      x-rate-limit-buckets: [api]
+      x-idempotency: optional
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyOptional'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/SwitchUpdate'}
+            example:
+              name: read_only
+              state: 'off'
+              reason: rpc_owner_mismatch fixed in 1.0.3
+      responses:
+        '200':
+          description: The switch as stored.
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
+            Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Switch'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/IdempotencyConflict'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+
+  /platform/identities/{identity_id}/restore:
+    parameters:
+      - $ref: '#/components/parameters/IdentityIdPath'
+    post:
+      operationId: restoreMailbox
+      tags: [Platform]
+      summary: Restore an identity's mailbox to a point in time
+      description: |
+        Durable Object point-in-time recovery of one mailbox, to `at` (within the last 30 days), or back to
+        the state an earlier restore replaced (`bookmark`). Only while the deployment is frozen
+        (`PM_FREEZE = "on"`); otherwise `409 not_frozen`. The response and the audit row
+        `mailbox.restore` carry the undo bookmark. Part of the restore runbook (Observability, Restore
+        from PITR); follow it with a `restore_reconcile` job.
+      x-required-permission: ['platform:ops']
+      x-key-levels: [platform]
+      x-rate-limit-buckets: [api]
+      x-idempotency: none
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/MailboxRestoreRequest'}
+            example:
+              at: '2026-10-09T09:00:00Z'
+      responses:
+        '200':
+          description: The mailbox was restored; the object restarted with the restored state.
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MailboxRestoreResult'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/NotFrozen'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+
+  /platform/erasure-requests/{erasure_id}/reapply:
+    parameters:
+      - $ref: '#/components/parameters/ErasureIdPath'
+    post:
+      operationId: reapplyErasureRequest
+      tags: [Platform]
+      summary: Re-apply a stored erasure after a restore
+      description: |
+        Creates a new erasure request that repeats the stored one: the same tenant, scope, `identity_id`
+        and `target_id`, reason `reapply_after_restore:{erasure_id}` and its own `deadline_at`. A
+        counterparty erasure matches by the stored keyed hash of the address, which is never needed in
+        clear. No body. Runs even while the deployment is frozen. Only a request that ended `completed` or
+        `completed_with_holds` can be re-applied (`409 erasure_not_completed` otherwise). A tenant-scope
+        request is re-applied although the tenant is `erased`: the job erases the mailboxes of the
+        identities in the source receipt's `identities_affected` and sweeps the tenant's objects and
+        vectors.
+      x-required-permission: ['platform:ops', 'erasure:manage']
+      x-key-levels: [platform]
+      x-rate-limit-buckets: [api]
+      x-idempotency: optional
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyOptional'
+      responses:
+        '202':
+          description: The new erasure request, `queued`.
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
+            Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErasureRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409':
+          description: >-
+            The request did not end `completed` or `completed_with_holds` (`erasure_not_completed`), or the
+            idempotency key is in use.
+          x-error-codes: [erasure_not_completed, idempotency_conflict, request_in_progress]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
         '429': {$ref: '#/components/responses/TooManyRequests'}
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
@@ -6121,6 +7099,7 @@ paths:
             description: The deployment's API host (`PM_API_HOST`).
     post:
       operationId: receiveSesNotification
+      x-sdk: false
       tags: [Links and hooks]
       summary: Amazon SES delivery events (SNS)
       description: >-
@@ -6168,6 +7147,7 @@ paths:
             description: The deployment's API host (`PM_API_HOST`).
     post:
       operationId: receiveSesInboundNotification
+      x-sdk: false
       tags: [Links and hooks]
       summary: Amazon SES inbound mail notifications (SNS)
       description: >-
@@ -6221,6 +7201,7 @@ paths:
             description: The deployment's API host (`PM_API_HOST`).
     get:
       operationId: getSecurityTxt
+      x-sdk: false
       tags: [Well-known]
       summary: Security contact
       description: RFC 9116 `security.txt`, built from `PM_SECURITY_CONTACT`. `404` when the variable is unset.
@@ -7228,7 +8209,7 @@ webhooks:
       operationId: onDomainRemoved
       tags: [Events]
       summary: 'domain.removed'
-      description: 'A domain was removed, on request (`reason: requested`) or because Cloudflare deleted a `nameservers` zone that was never activated (`reason: zone_expired`).'
+      description: 'A domain was removed: on request (`reason: requested`), because Cloudflare deleted a `nameservers` zone that was never activated (`reason: zone_expired`), because another tenant proved control of the DNS of a domain this tenant never verified (`reason: evicted`), or because it was never verified within 14 days (`reason: unverified_expired`).'
       security: []
       parameters:
         - $ref: '#/components/parameters/WebhookIdHeader'
@@ -7563,6 +8544,116 @@ webhooks:
         '410': {$ref: '#/components/responses/WebhookGone'}
         default: {$ref: '#/components/responses/WebhookFailed'}
 
+  tenant.policy_updated:
+    post:
+      operationId: onTenantPolicyUpdated
+      tags: [Events]
+      summary: 'tenant.policy_updated'
+      description: 'A tenant''s policy was changed (any route, any writer, except a tenant''s creation).'
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/WebhookIdHeader'
+        - $ref: '#/components/parameters/WebhookTimestampHeader'
+        - $ref: '#/components/parameters/WebhookSignatureHeader'
+        - $ref: '#/components/parameters/WebhookUserAgentHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/TenantPolicyUpdatedEvent'}
+      responses:
+        '2XX': {$ref: '#/components/responses/WebhookAccepted'}
+        '410': {$ref: '#/components/responses/WebhookGone'}
+        default: {$ref: '#/components/responses/WebhookFailed'}
+
+  account.requested:
+    post:
+      operationId: onAccountRequested
+      tags: [Events]
+      summary: 'account.requested'
+      description: 'An agent recorded that it wants an account at a third-party service.'
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/WebhookIdHeader'
+        - $ref: '#/components/parameters/WebhookTimestampHeader'
+        - $ref: '#/components/parameters/WebhookSignatureHeader'
+        - $ref: '#/components/parameters/WebhookUserAgentHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AccountRequestedEvent'}
+      responses:
+        '2XX': {$ref: '#/components/responses/WebhookAccepted'}
+        '410': {$ref: '#/components/responses/WebhookGone'}
+        default: {$ref: '#/components/responses/WebhookFailed'}
+
+  account.approved:
+    post:
+      operationId: onAccountApproved
+      tags: [Events]
+      summary: 'account.approved'
+      description: 'An operator approved a service-ledger entry.'
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/WebhookIdHeader'
+        - $ref: '#/components/parameters/WebhookTimestampHeader'
+        - $ref: '#/components/parameters/WebhookSignatureHeader'
+        - $ref: '#/components/parameters/WebhookUserAgentHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AccountApprovedEvent'}
+      responses:
+        '2XX': {$ref: '#/components/responses/WebhookAccepted'}
+        '410': {$ref: '#/components/responses/WebhookGone'}
+        default: {$ref: '#/components/responses/WebhookFailed'}
+
+  account.rejected:
+    post:
+      operationId: onAccountRejected
+      tags: [Events]
+      summary: 'account.rejected'
+      description: 'A service-ledger entry was rejected by an operator, or expired after 7 days undecided.'
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/WebhookIdHeader'
+        - $ref: '#/components/parameters/WebhookTimestampHeader'
+        - $ref: '#/components/parameters/WebhookSignatureHeader'
+        - $ref: '#/components/parameters/WebhookUserAgentHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AccountRejectedEvent'}
+      responses:
+        '2XX': {$ref: '#/components/responses/WebhookAccepted'}
+        '410': {$ref: '#/components/responses/WebhookGone'}
+        default: {$ref: '#/components/responses/WebhookFailed'}
+
+  account.closed:
+    post:
+      operationId: onAccountClosed
+      tags: [Events]
+      summary: 'account.closed'
+      description: 'A service-ledger entry was closed, or deleted while pending or approved.'
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/WebhookIdHeader'
+        - $ref: '#/components/parameters/WebhookTimestampHeader'
+        - $ref: '#/components/parameters/WebhookSignatureHeader'
+        - $ref: '#/components/parameters/WebhookUserAgentHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/AccountClosedEvent'}
+      responses:
+        '2XX': {$ref: '#/components/responses/WebhookAccepted'}
+        '410': {$ref: '#/components/responses/WebhookGone'}
+        default: {$ref: '#/components/responses/WebhookFailed'}
+
 components:
 
   securitySchemes:
@@ -7626,8 +8717,9 @@ components:
       name: tenant_id
       in: query
       description: >-
-        Platform and partner keys only (a partner key, one of its own tenants). Restrict to one tenant. Other
-        keys are always restricted to their own tenant.
+        Restrict to one tenant. A platform key may name any tenant; a partner key, one of its own tenants;
+        a tenant or identity key, only its own (a list is always restricted to it). A tenant outside the
+        key's scope returns `404 tenant_not_found`, never an empty page, as for a missing tenant.
       schema: {$ref: '#/components/schemas/TenantId'}
     IdempotencyKeySend:
       name: Idempotency-Key
@@ -7678,6 +8770,11 @@ components:
       in: path
       required: true
       schema: {$ref: '#/components/schemas/TenantId'}
+    AccountIdPath:
+      name: account_id
+      in: path
+      required: true
+      schema: {$ref: '#/components/schemas/ServiceAccountId'}
     PartnerIdPath:
       name: partner_id
       in: path
@@ -7994,11 +9091,30 @@ components:
               request_id: req_01J9Z4K8V4QW7X2M5N6P8R0T1Y
               details:
                 required: 'messages:send'
+    KeyManageForbidden:
+      description: >-
+        As `Forbidden`, plus `key_scope_exceeded` when the target key is wider than the caller: a higher
+        level, or a permission the caller does not hold ([J20]).
+      x-error-codes: [permission_denied, scope_denied, key_scope_exceeded, partner_suspended]
+      headers:
+        Request-Id: {$ref: '#/components/headers/Request-Id'}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+          example:
+            error:
+              code: key_scope_exceeded
+              message: This key cannot manage a key that holds permissions it does not hold.
+              retryable: false
+              fix: Use a key that holds every permission of the target key, or a key of a higher level.
+              request_id: req_01J9Z4K8V4QW7X2M5N6P8R0T1Y
     SendForbidden:
       description: >-
-        As `Forbidden`, plus `test_mode_recipient` when a test tenant sends outside `*@simulator.invalid`
-        and this deployment ([L1]).
-      x-error-codes: [permission_denied, scope_denied, tenant_suspended, partner_suspended, test_mode_recipient]
+        As `Forbidden`, plus `test_mode_recipient` when a test tenant sends to an address that is neither
+        `*@simulator.invalid` nor an identity of its own tenant or of a tenant with the same partner ([L1], [L3]), and `policy_denied` with `details.reason = "free_sending_off"` when the
+        operator's `free_sending` switch is off and the workspace is on the Free plan or still in its send
+        ramp.
+      x-error-codes: [permission_denied, scope_denied, tenant_suspended, partner_suspended, test_mode_recipient, policy_denied]
       headers:
         Request-Id: {$ref: '#/components/headers/Request-Id'}
       content:
@@ -8008,8 +9124,9 @@ components:
       description: >-
         The resource does not exist **or** is outside the key's scope (deliberately indistinguishable). A
         `404` always carries one of this service's own codes; a `404` without this envelope came from
-        something else and must not be read as "already deleted".
-      x-error-codes: [tenant_not_found, identity_not_found, address_not_found, domain_not_found, thread_not_found, message_not_found, attachment_not_found, webhook_not_found, key_not_found, erasure_not_found, export_not_found, suppression_not_found, list_entry_not_found, member_not_found, invitation_not_found, job_not_found, dlq_item_not_found, partner_not_found]
+        something else and must not be read as "already deleted". `route_not_found` means the path is no
+        route on this host, which says nothing about any resource.
+      x-error-codes: [route_not_found, tenant_not_found, identity_not_found, address_not_found, domain_not_found, thread_not_found, message_not_found, attachment_not_found, webhook_not_found, key_not_found, erasure_not_found, export_not_found, suppression_not_found, list_entry_not_found, member_not_found, invitation_not_found, job_not_found, dlq_item_not_found, partner_not_found, account_not_found]
       headers:
         Request-Id: {$ref: '#/components/headers/Request-Id'}
       content:
@@ -8036,10 +9153,11 @@ components:
       description: >-
         The send conflicts with the idempotency record or with the identity, thread or domain state.
         `idempotency_conflict` carries `details.original_message_id` when known; `identity_paused` carries
-        `details.reason`; `thread_busy` carries `details.retry_after`. A recipient refused by
-        `send_policy.require_known_recipient` is not an error: its delivery is `suppressed` with
-        `policy: unknown_recipient` ([E2]).
-      x-error-codes: [idempotency_conflict, request_in_progress, identity_paused, identity_owner_required, thread_busy, domain_not_ready, auto_reply_not_allowed]
+        `details.reason`; `thread_busy` carries `details.retry_after`; `loop_detected` carries `details.hop`
+        ([N13]); `sending_paused` carries `details.scope` (`tenant` or `domain`), `details.reason` and, for a
+        domain, `details.domain_id` ([G12]). A recipient refused by `send_policy.require_known_recipient` is
+        not an error: its delivery is `suppressed` with `policy: unknown_recipient` ([E2]).
+      x-error-codes: [idempotency_conflict, request_in_progress, identity_paused, identity_owner_required, thread_busy, domain_not_ready, auto_reply_not_allowed, loop_detected, sending_paused]
       headers:
         Request-Id: {$ref: '#/components/headers/Request-Id'}
       content:
@@ -8176,8 +9294,10 @@ components:
                 retry_after: 12
     SendTooManyRequests:
       description: >-
-        A per-key or per-identity rate limit (`rate_limited`, with `Retry-After`), or a tenant or identity
-        daily cap (`daily_cap_reached`, with `details.resets_at`). Retry with the same `Idempotency-Key`.
+        A per-key or per-identity rate limit (`rate_limited`, with `Retry-After`), or a daily cap
+        (`daily_cap_reached`, with `details.cap` and `details.resets_at`): the tenant or identity cap, the
+        shared-domain breaker, or a workspace whose payment is disputed (`resets_at` null). Retry with the
+        same `Idempotency-Key`.
       x-error-codes: [rate_limited, daily_cap_reached]
       headers:
         Request-Id: {$ref: '#/components/headers/Request-Id'}
@@ -8200,6 +9320,14 @@ components:
       content:
         application/json:
           schema: {$ref: '#/components/schemas/Error'}
+    NotFrozen:
+      description: The call is allowed only while the deployment is frozen for a restore (`pmail ops freeze`).
+      x-error-codes: [not_frozen]
+      headers:
+        Request-Id: {$ref: '#/components/headers/Request-Id'}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
     InternalError:
       description: A bug. It is logged with the `request_id`. Retry with backoff.
       x-error-codes: [internal_error]
@@ -8217,7 +9345,11 @@ components:
         application/json:
           schema: {$ref: '#/components/schemas/Error'}
     ServiceUnavailable:
-      description: A dependency is temporarily unavailable (D1, an overloaded Durable Object). Retry with backoff.
+      description: >-
+        A dependency is temporarily unavailable (D1, an overloaded Durable Object). Retry with backoff.
+        `details.reason` says when the operator caused it: `frozen` (a restore is in progress; `Retry-After`
+        is 300), `read_only` (an automatic containment rule refused writes) or `storage_full` (the D1
+        database is full).
       x-error-codes: [unavailable]
       headers:
         Request-Id: {$ref: '#/components/headers/Request-Id'}
@@ -8459,6 +9591,10 @@ components:
             `permission_not_allowed_for_level` when `permissions` lists one the new key's level cannot hold.
             `scope_denied` on a domain create: `zone_not_allowed` when a non-platform key names a Cloudflare
             zone its tenant may not use (`cloudflare_zone`, `replace_mx`; see `TenantPolicy.domains`).
+            `scope_denied` on a policy write: `not_writable` or `above_ceiling`. `permission_denied`:
+            `person_required` when only a signed-in person may take the decision (a guard-field loosening by a
+            tenant key, a service-account approval by an API key). `policy_denied` on `wait`:
+            `account_not_approved`. `invalid_request` on `requestServiceAccount`: `own_deployment`.
           anyOf:
             - $ref: '#/components/schemas/PauseReason'
             - $ref: '#/components/schemas/TransportUnavailableReason'
@@ -8466,6 +9602,8 @@ components:
               const: permission_not_allowed_for_level
             - type: string
               const: zone_not_allowed
+            - type: string
+              enum: [not_writable, above_ceiling, person_required, account_not_approved, own_deployment]
         field:
           type: string
           description: >-
@@ -8478,6 +9616,26 @@ components:
           type: integer
           minimum: 0
           description: '`partner_tenant_limit`: the partner''s `max_tenants`.'
+        ceiling:
+          type: [number, boolean]
+          description: '`scope_denied` with `above_ceiling`: the loosest value the caller may set on `field`.'
+        ceiling_source:
+          type: string
+          description: '`scope_denied` with `above_ceiling`: which bound decided the ceiling.'
+          enum: [deployment, platform, partner]
+        service_domain:
+          type: string
+          description: '`policy_denied` with `account_not_approved`: the organisational domain that has no approved entry.'
+        account_id:
+          description: '`account_exists`: the existing entry.'
+          $ref: '#/components/schemas/ServiceAccountId'
+        status:
+          description: '`account_exists`, `account_not_pending` and `account_limit_reached`: the state of the entry, or the state that hit the limit.'
+          $ref: '#/components/schemas/ServiceAccountStatus'
+        limit:
+          type: integer
+          minimum: 1
+          description: '`account_limit_reached`: the limit that was reached (10 pending, or 200 in any state).'
         records:
           type: array
           description: >-
@@ -8506,7 +9664,15 @@ components:
         resets_at:
           type: [string, 'null']
           format: date-time
-          description: '`daily_cap_reached` and `billing_limit`: when the cap or allowance resets (`null` for counts such as `inboxes`).'
+          description: '`daily_cap_reached` and `billing_limit`: when the cap or allowance resets (`null` for counts such as `inboxes`, and for `daily_cap_reached` with `cap: billing_dispute`, which ends when the dispute does).'
+        cap:
+          type: string
+          description: >-
+            `daily_cap_reached`: which cap refused the request. `identity` and `tenant` are the daily send
+            caps of tenant policy (the tenant one lowered by the new-workspace ramp); `invitations` is the
+            tenant's 50 invitation emails a day; `shared_domain` is the deployment's shared-domain breaker;
+            `billing_dispute` stops a workspace's sends while one of its payments is disputed.
+          enum: [identity, tenant, invitations, shared_domain, billing_dispute]
         feature:
           description: '`billing_limit`: the spent allowance.'
           $ref: '#/components/schemas/UsageFeatureName'
@@ -8586,6 +9752,9 @@ components:
         - job_not_found
         - dlq_item_not_found
         - partner_not_found
+        - route_not_found
+        - method_not_allowed
+        - account_not_found
         - idempotency_conflict
         - request_in_progress
         - client_id_conflict
@@ -8607,15 +9776,23 @@ components:
         - domain_not_ready
         - domain_in_use
         - domain_exists
+        - domain_claim_pending
         - identity_paused
         - identity_owner_required
         - thread_busy
         - not_cancelable
         - not_uncertain
         - auto_reply_not_allowed
+        - account_exists
+        - account_not_pending
+        - loop_detected
+        - sending_paused
+        - triage_not_eligible
         - raw_expired
         - cursor_expired
         - legal_hold
+        - not_frozen
+        - erasure_not_completed
         # Policy and limits
         - all_recipients_suppressed
         - recipient_blocked
@@ -8625,7 +9802,11 @@ components:
         - cf_token_required
         - agentic_disabled
         - address_limit_reached
+        - unverified_domain_limit
+        - zone_domain_limit
+        - account_limit_reached
         - webhook_limit_reached
+        - key_limit_reached
         - web_bot_auth_disabled
         - billing_limit
         - rate_limited
@@ -8649,10 +9830,11 @@ components:
         | `ses_receiving_not_configured` | `dns_records`, or `smtp_relay` with `inbound: ses`, without `PM_SES_INBOUND_TOPIC_ARN` (and the bucket and queue) |
         | `ses_identity_limit` | The SES region already has 10,000 identities, and the method needs one (`dns_records`, `send_only`, `smtp_relay` with `inbound: ses`) |
         | `subdomain_setup_disabled` | `delegated_subdomain` while `PM_CF_SUBDOMAIN_SETUP` is not `on` |
-        | `zone_creation_not_allowed` | `nameservers` by a tenant or partner key whose tenant's policy lacks `domains.allow_create_zone: true` |
+        | `zone_creation_not_allowed` | `nameservers` by a tenant or partner key whose tenant's policy lacks `domains.allow_create_zone: true`, or a zone create that Cloudflare refused for the Worker token's scope (a token limited to named zones, as on Pylota Mail Cloud) |
+        | `ses_identity_not_verified` | `PATCH` with `transport: ses` while SES does not report the domain's identity as verified for sending with DKIM `SUCCESS` (`details.dkim_status`) |
         | `method_not_supported` | The domain's method does not support the operation: `PATCH` with a transport it cannot use, `probe` on a domain whose transport is not `smtp`, `test-forwarding` on an address whose domain does not use `inbound: forward` |
         | `marketing_needs_ses` | A `kind: marketing` send or reply from a domain whose transport is `cloudflare`, the platform domain included: Cloudflare Email Service is for transactional mail only. Use a domain with the `ses` or `smtp` transport |
-      enum: [ses_not_configured, ses_receiving_not_configured, ses_identity_limit, subdomain_setup_disabled, zone_creation_not_allowed, method_not_supported, marketing_needs_ses]
+      enum: [ses_not_configured, ses_receiving_not_configured, ses_identity_limit, subdomain_setup_disabled, zone_creation_not_allowed, ses_identity_not_verified, method_not_supported, marketing_needs_ses]
 
     # ── Keys and access ──────────────────────────────────────────────────────────────────────────
 
@@ -8665,7 +9847,7 @@ components:
         |---|---|
         | `tenants:manage` | Create, update and suspend tenants, and their billing accounts. Platform keys, for every tenant; partner keys, for the tenants their partner's keys created, without changing billing |
         | `identities:read`, `identities:write` | Read, and create, update, pause or delete identities and addresses, and test forwarding; read, and create, rotate or revoke identity signing keys. Deleting an identity also needs `erasure:manage`, because it starts an identity-scope erasure |
-        | `identities:sign` | Mint agent assertions and Web Bot Auth HTTP signatures as an identity. Tenant and identity keys (an identity key only for its own identity); platform and partner keys cannot hold it |
+        | `identities:sign` | Mint agent assertions and Web Bot Auth HTTP signatures as an identity. Tenant and identity keys (an identity key only for its own identity); platform and partner keys cannot hold it, but may grant it to the tenant and identity keys they mint |
         | `domains:read`, `domains:write` | Read, and add, update, verify, probe or remove domains |
         | `messages:read` | Threads, messages, raw MIME, deliveries |
         | `messages:send` | Send, reply, reply-all, forward, cancel |
@@ -8677,10 +9859,14 @@ components:
         | `webhooks:read` | Read webhook endpoints and their deliveries |
         | `webhooks:manage` | Create, change, test, rotate and delete webhook endpoints, and replay. Includes `webhooks:read` |
         | `keys:manage` | API keys within the caller's scope. A partner key manages only tenant and identity keys of its own tenants |
-        | `erasure:manage` | Erasure requests, legal holds, exports |
+        | `erasure:manage` | Erasure requests, legal holds, exports. A `tenant`-scope erasure request also needs `tenants:erase` |
+        | `tenants:erase` | Delete the workspace (a `tenant`-scope erasure request, with `erasure:manage`). Platform keys, partner keys for their own tenants, and tenant keys minted by the workspace owner's console session or by a key descended from one |
         | `suppressions:manage` | Suppressions and allow or block lists |
         | `usage:read` | Plan, allowances and usage figures. Every tenant and identity key holds it implicitly for its own workspace; platform and partner keys must hold it explicitly and pass `tenant_id` |
         | `audit:read` | Audit log |
+        | `policy:write` | Read the per-field limits of, and change, the tenant's policy (`getTenantPolicy`, `updateTenantPolicy`) within the key level's rules |
+        | `accounts:request` | Request, list, read and close service-ledger entries |
+        | `accounts:approve` | Approve, reject and delete service-ledger entries; includes `accounts:request`. Approval by an API key is a decision reserved for people |
         | `members:read` | List console members and pending invitations (tenant, partner and platform keys; every console role holds it) |
         | `members:manage` | Invite, revoke, change roles and remove console members (tenant, partner and platform keys). Includes `members:read` |
         | `partners:manage` | Create, list, read, update and delete partners (platform keys only) |
@@ -8693,11 +9879,13 @@ components:
         |---|---|
         | `platform:ops`, `partners:manage` | platform |
         | `tenants:manage` | platform, partner |
-        | `members:read`, `members:manage`, `suppressions:manage`, `audit:read`, `usage:read` | platform, partner, tenant |
-        | `identities:sign` | tenant, identity |
+        | `members:read`, `members:manage`, `suppressions:manage`, `audit:read`, `usage:read`, `policy:write`, `accounts:approve` | platform, partner, tenant |
+        | `tenants:erase` | platform, partner, and tenant keys minted by the workspace owner or its keys (otherwise `details.reason = "permission_owner_only"`) |
+        | `identities:sign` | tenant, identity (platform and partner keys may grant it without holding it) |
         | Every other permission | platform, partner, tenant, identity |
       enum:
         - 'tenants:manage'
+        - 'tenants:erase'
         - 'partners:manage'
         - 'identities:read'
         - 'identities:write'
@@ -8720,6 +9908,9 @@ components:
         - 'audit:read'
         - 'members:read'
         - 'members:manage'
+        - 'policy:write'
+        - 'accounts:request'
+        - 'accounts:approve'
         - 'platform:ops'
     KeyLevel:
       type: string
@@ -8773,7 +9964,26 @@ components:
       properties:
         status:
           type: string
-          enum: [ok]
+          description: >-
+            `ok`, or `degraded` when a feature is off because of the configuration; the fields below name
+            it.
+          enum: [ok, degraded]
+        ses:
+          type: string
+          description: Present when the SES transport is off because `PM_SES_SNS_TOPIC_ARN` is missing.
+          enum: [sns_topic_missing]
+        billing:
+          type: string
+          description: Present when `PM_BILLING=stripe` lacks `PM_STRIPE_SECRET_KEY` or `PM_STRIPE_WEBHOOK_SECRET`, so billing has not started.
+          enum: [stripe_secrets_missing]
+        cf_api_token:
+          type: string
+          description: Present when a Cloudflare REST fallback is in use (a spike S6 result) and `PM_CF_API_TOKEN` is not set.
+          enum: [missing]
+        ses_region:
+          type: string
+          description: '`PM_SES_REGION`, present when SES is configured, so anyone can see where AWS processes mail.'
+          examples: [eu-west-2]
         version:
           type: string
           description: The deployed release, for example `1.0.0`.
@@ -8784,6 +9994,9 @@ components:
           type: string
           description: '`PM_ENV` of the deployment.'
           enum: [production, staging, local]
+        frozen:
+          type: boolean
+          description: 'Present and `true` while the deployment is frozen for a restore (`PM_FREEZE = "on"`).'
 
     # ── Tenants ──────────────────────────────────────────────────────────────────────────────────
 
@@ -8799,12 +10012,14 @@ components:
       type: string
       description: >-
         Appended to usernames on the platform domain (`bookings` + `.acme` → `bookings.acme@agents.example`).
-        Defaults to `"." + slug`. Only the default tenant made by `pmail setup` can have an empty suffix.
+        Defaults to `"." + slug`. Only the default tenant made by `pmail setup` can have an empty suffix. A
+        suffix that folds to a reserved name gets `400 address_reserved`, and one that folds to another
+        tenant's suffix gets `409 suffix_taken` ([D12]).
       pattern: '^(\.[a-z0-9][a-z0-9-]{1,31})?$'
       examples: [.acme]
     Tenant:
       type: object
-      required: [id, slug, name, mode, status, suspended_by, partner_id, address_suffix, timezone, policy, created_at, updated_at]
+      required: [id, slug, name, mode, status, suspended_by, partner_id, address_suffix, timezone, policy, sending_paused_at, created_at, updated_at]
       properties:
         id: {$ref: '#/components/schemas/TenantId'}
         slug: {$ref: '#/components/schemas/TenantSlug'}
@@ -8834,6 +10049,15 @@ components:
           examples: [Europe/London]
         policy:
           $ref: '#/components/schemas/TenantPolicy'
+        sending_paused_at:
+          type: [string, 'null']
+          format: date-time
+          description: >-
+            When the tenant's sending was paused automatically because its complaint or bounce rate reached
+            the provider's review level over 7 days (FR-DLV-6, [G12]) or one of its domains had a burst far
+            above it ([J33]); `null` while it may send. Every send then gets `409 sending_paused`, whose
+            `details.reason` (`abuse_threshold` or `abuse_burst`) says which. Only a platform key can resume
+            it (`sending_paused: false`).
         created_at:
           type: string
           format: date-time
@@ -8895,6 +10119,12 @@ components:
             `suspended` suspends the tenant (FR-TEN-3) and records `suspended_by`; `active` resumes it, except
             that a partner key cannot resume a tenant a platform key suspended (`403 scope_denied`).
           enum: [active, suspended]
+        sending_paused:
+          type: boolean
+          const: false
+          description: >-
+            `false` lifts an automatic sending pause ([G12]), audit-logged. Platform keys only: any other key
+            gets `403 scope_denied` with `details.field = "sending_paused"`. A pause is never set by hand.
 
     TenantPolicy:
       type: object
@@ -8905,13 +10135,22 @@ components:
         `domains.allow_create_zone` and `domains.cloudflare_zones` are platform-only;
         `quarantine.key_release` is allowed on its own tenants; the lower-only fields
         (`identity_daily_send_cap`, `tenant_daily_send_cap`, `max_recipients`, `auto_reply.allowed`,
-        `auto_reply.max_automatic_exchanges`, `inbound.per_sender_per_hour`, `inbound.extract_image_text`,
-        `retention.raw_days`, `retention.events_days`, `triage.enabled`, `search.agentic_enabled`,
+        `auto_reply.max_automatic_exchanges`, `inbound.per_sender_per_hour`,
+        `inbound.unauthenticated_per_hour`, `inbound.per_tenant_per_hour`, `inbound.extract_image_text`,
+        `retention.raw_days`, `retention.events_days`, `triage.enabled`, `triage.daily_model_cap`,
+        `search.agentic_enabled`,
         `search.agentic_daily_cap`, `search.agentic_max_steps`, `search.agentic_max_seconds` and the `abuse`
         thresholds) may be set at most to min(deployment default, platform ceiling), a switch to `true`
-        only when both allow it; every other field is free. A refused field gets `403 scope_denied` with
-        `details.field` and nothing is stored. Tenant and identity keys cannot write the policy.
-      required: [identity_daily_send_cap, tenant_daily_send_cap, max_recipients, send_allowlist_only, large_attachments, link_ttl_hours, ai_disclosure, auto_reply, quarantine, inbound, retention, triage, search, webhook_text_bytes, abuse, domains, domain_fallback, web_bot_auth]
+        only when both allow it (for `accounts.require_approval`, `false` is the looser value); every other
+        field is free. A tenant key with `policy:write` (`updateTenantPolicy`) may set free fields, lower a
+        lower-only field to at most its workspace ceiling (the strictest of the deployment default, the
+        platform ceiling and the partner ceiling), and only tighten the guard fields `send_allowlist_only`,
+        `quarantine.on_auth_fail`, `quarantine.spam_threshold` and `quarantine.unsolicited_otp` unless API
+        keys may take decisions reserved for people on the tenant; platform-only fields and
+        `quarantine.key_release` are not writable for it. A refused field gets `403 scope_denied` with
+        `details.field` (or `403 permission_denied` with `details.reason = "person_required"` for a guard
+        field) and nothing is stored. Identity keys cannot write the policy.
+      required: [identity_daily_send_cap, tenant_daily_send_cap, max_recipients, send_allowlist_only, large_attachments, link_ttl_hours, ai_disclosure, auto_reply, quarantine, inbound, retention, triage, search, webhook_text_bytes, abuse, domains, domain_fallback, web_bot_auth, accounts]
       properties:
         identity_daily_send_cap:
           type: integer
@@ -9011,13 +10250,30 @@ components:
             key_release: false
         inbound:
           type: object
-          required: [per_sender_per_hour, extract_attachment_text, extract_image_text, ses_bounce_retired]
+          required: [per_sender_per_hour, unauthenticated_per_hour, per_tenant_per_hour, extract_attachment_text, extract_image_text, ses_bounce_retired]
           properties:
             per_sender_per_hour:
               type: integer
               minimum: 1
               default: 60
-              description: Inbound messages per sender per identity per hour; the excess is stored `throttled` ([D5]).
+              description: >-
+                Inbound messages per sender per identity per hour; the excess is stored `throttled` ([D5]). A
+                sender whose mail does not pass authentication is counted under `unauth:` + its address, so a
+                forged `From` never uses a real correspondent's allowance.
+            unauthenticated_per_hour:
+              type: integer
+              minimum: 1
+              default: 120
+              description: >-
+                Inbound messages per identity per hour, across all senders whose mail does not pass
+                authentication and who are not known correspondents; the excess is stored `throttled` ([D13]).
+            per_tenant_per_hour:
+              type: integer
+              minimum: 1
+              default: 2000
+              description: >-
+                Inbound messages per tenant per hour, across its identities, from senders who are not known
+                correspondents; the excess is stored `throttled` ([D13]).
             extract_attachment_text:
               type: array
               uniqueItems: true
@@ -9038,6 +10294,8 @@ components:
                 receipt rules; `false` drops it without a bounce.
           default:
             per_sender_per_hour: 60
+            unauthenticated_per_hour: 120
+            per_tenant_per_hour: 2000
             extract_attachment_text: [pdf, office, text, html]
             extract_image_text: false
             ses_bounce_retired: true
@@ -9071,11 +10329,19 @@ components:
             events_days: 30
         triage:
           type: object
-          required: [enabled, categories, rules]
+          required: [enabled, daily_model_cap, categories, rules]
           properties:
             enabled:
               type: boolean
               default: true
+            daily_model_cap:
+              type: integer
+              minimum: 0
+              default: 2000
+              description: >-
+                Model-backed triage runs per day in the tenant's time zone. Past it, triage is rules-only
+                (`model: "rules"`) until the next local midnight. It applies whatever the billing mode, so an
+                `exempt` workspace still has a ceiling on model spend ([D13]).
             categories:
               type: [array, 'null']
               maxItems: 20
@@ -9090,6 +10356,7 @@ components:
               description: Deterministic rules that run before the model (FR-TRI-2), at most 50.
           default:
             enabled: true
+            daily_model_cap: 2000
             categories: null
             rules: []
         search:
@@ -9146,7 +10413,7 @@ components:
           description: Bytes of `extracted_text` included in `message.received` payloads.
         abuse:
           type: object
-          required: [complaint_rate_pause, bounce_rate_pause]
+          required: [complaint_rate_pause, bounce_rate_pause, tenant_complaint_rate_pause, tenant_bounce_rate_pause]
           properties:
             complaint_rate_pause:
               type: number
@@ -9160,9 +10427,26 @@ components:
               maximum: 1
               default: 0.05
               description: Pause an identity whose bounce rate over its last 200 sends exceeds this (FR-DLV-3).
+            tenant_complaint_rate_pause:
+              type: number
+              minimum: 0
+              maximum: 1
+              default: 0.001
+              description: >-
+                Pause the tenant's sending, or one of its sending domains, when its complaint rate over the last
+                7 UTC days, with at least 500 outcomes, reaches this (FR-DLV-6, [G12]). The default is Amazon
+                SES's review rate.
+            tenant_bounce_rate_pause:
+              type: number
+              minimum: 0
+              maximum: 1
+              default: 0.05
+              description: As `tenant_complaint_rate_pause`, for the bounce rate (FR-DLV-6, [G12]).
           default:
             complaint_rate_pause: 0.003
             bounce_rate_pause: 0.05
+            tenant_complaint_rate_pause: 0.001
+            tenant_bounce_rate_pause: 0.05
         domains:
           type: object
           required: [allow_create_zone, cloudflare_zones]
@@ -9173,8 +10457,9 @@ components:
               description: >-
                 Lets the tenant's own keys, and its partner key, use the `nameservers` method, which creates a
                 Cloudflare zone. Without it, they get `422 transport_unavailable` (`zone_creation_not_allowed`).
-                Platform keys may always use it. Pylota Mail Cloud sets it to `true` in `PM_DEFAULT_POLICY`.
-                Platform-only.
+                Platform keys may always use it, when the Worker's Cloudflare token can create zones. Pylota Mail
+                Cloud keeps it `false` (its Worker token, in a Cloudflare account shared with Pylota, cannot create
+                zones). Platform-only.
             cloudflare_zones:
               type: array
               maxItems: 50
@@ -9189,7 +10474,9 @@ components:
                 deployment created for the tenant (`nameservers`, `delegated_subdomain`). A zone created for
                 another tenant, or under the zones of the deployment's platform domain, API host or console
                 host, is refused even when listed (`403 scope_denied`, `details.reason = "zone_not_allowed"`).
-                Platform keys may use any zone. Platform-only.
+                Platform keys may use any zone. The zone must also be among the zones of the Worker's
+                Cloudflare token. Dropping a zone while the tenant still has domains in it is refused
+                (`409 domain_in_use`, `zone_has_domains`). Platform-only.
           default:
             allow_create_zone: false
             cloudflare_zones: []
@@ -9210,6 +10497,21 @@ components:
                 deployment has `PM_WEB_BOT_AUTH=off`. Agent assertions do not depend on it. Platform-only.
           default:
             allowed: false
+        accounts:
+          type: object
+          required: [require_approval]
+          properties:
+            require_approval:
+              type: boolean
+              default: false
+              description: >-
+                `true` turns on the service sign-up ledger gate: a verification code or link from a service
+                reaches the tenant's agents only when an approved ledger entry matches the mail; other such
+                mail is quarantined `account_unapproved`, and `wait` with `kind=verification` needs an approved
+                entry (`403 policy_denied`). Pylota Mail Cloud sets `true` in `PM_DEFAULT_POLICY`. Lower-only,
+                with `false` as the looser value.
+          default:
+            require_approval: false
 
     TenantPolicyPatch:
       type: object
@@ -9273,6 +10575,12 @@ components:
             per_sender_per_hour:
               type: [integer, 'null']
               minimum: 1
+            unauthenticated_per_hour:
+              type: [integer, 'null']
+              minimum: 1
+            per_tenant_per_hour:
+              type: [integer, 'null']
+              minimum: 1
             extract_attachment_text:
               type: [array, 'null']
               uniqueItems: true
@@ -9301,6 +10609,9 @@ components:
           properties:
             enabled:
               type: [boolean, 'null']
+            daily_model_cap:
+              type: [integer, 'null']
+              minimum: 0
             categories:
               type: [array, 'null']
               maxItems: 20
@@ -9350,6 +10661,14 @@ components:
               type: [number, 'null']
               minimum: 0
               maximum: 1
+            tenant_complaint_rate_pause:
+              type: [number, 'null']
+              minimum: 0
+              maximum: 1
+            tenant_bounce_rate_pause:
+              type: [number, 'null']
+              minimum: 0
+              maximum: 1
         domains:
           type: [object, 'null']
           properties:
@@ -9373,6 +10692,59 @@ components:
           properties:
             allowed:
               type: [boolean, 'null']
+        accounts:
+          type: [object, 'null']
+          properties:
+            require_approval:
+              type: [boolean, 'null']
+    TenantPolicyView:
+      type: object
+      description: >-
+        A tenant's effective policy and, for each field, what the calling key may do with it
+        (docs › Workspace policy). Clients build forms from `fields` so they never send a value the write
+        would refuse.
+      required: [tenant_id, policy_version, policy, fields]
+      properties:
+        tenant_id: {$ref: '#/components/schemas/TenantId'}
+        policy_version:
+          type: integer
+          minimum: 0
+          description: Rises by one with every policy write; the console uses it to detect a stale form.
+        policy: {$ref: '#/components/schemas/TenantPolicy'}
+        fields:
+          type: array
+          items: {$ref: '#/components/schemas/PolicyFieldAccess'}
+    PolicyFieldAccess:
+      type: object
+      required: [field, class, writable, ceiling, ceiling_source, person_required_to_loosen]
+      properties:
+        field:
+          type: string
+          description: The dotted path of the field.
+          examples: [tenant_daily_send_cap, quarantine.on_auth_fail]
+        class:
+          type: string
+          description: >-
+            `platform_only`, `partner_or_platform` (`quarantine.key_release`), `lower_only`, `guard` or `free`
+            (docs › Configuration › Who may change a field).
+          enum: [platform_only, partner_or_platform, lower_only, guard, free]
+        writable:
+          type: boolean
+          description: Whether the calling key may set the field to any value at all.
+        ceiling:
+          description: >-
+            For a lower-only field, the loosest value the calling key may set (a number, or a boolean for a
+            switch); `null` when no ceiling binds the key or the field is not lower-only.
+          type: [number, boolean, 'null']
+        ceiling_source:
+          type: [string, 'null']
+          description: Which bound decided `ceiling`.
+          enum: [deployment, platform, partner, null]
+        person_required_to_loosen:
+          type: boolean
+          description: >-
+            For a guard field: `true` when the calling key may only tighten it, because API keys may not take
+            decisions reserved for people on this tenant.
     TriageCategoryDefinition:
       type: object
       description: A custom triage category. The description is given to the triage model.
@@ -9539,6 +10911,145 @@ components:
           description: How matched values are normalised before storage and comparison.
           examples: [upper]
 
+    # ── Service accounts ─────────────────────────────────────────────────────────────────────────
+
+    ServiceAccountId:
+      type: string
+      description: Service-ledger entry ID (`sac_` + ULID).
+      pattern: '^sac_[0-9A-HJKMNP-TV-Z]{26}$'
+      examples: [sac_01JA2B3C4D5E6F7G8H9J0K1M2N]
+    ServiceAccountStatus:
+      type: string
+      description: '`pending_approval` (expires after 7 days), `approved`, `rejected` or `closed`.'
+      enum: [pending_approval, approved, rejected, closed]
+    ServiceAccount:
+      type: object
+      description: >-
+        An entry of the service sign-up ledger: a third-party account an identity's agent asked to create
+        (FR-IDN-10). `purpose` and `account_identifier` were written by an agent: show them as untrusted text.
+      required: [id, tenant_id, identity_id, service_domain, sender_domains, account_identifier, address, purpose, status, rejected_reason, note, requested_by_key_id, decided_by_key_id, decided_by_user_id, decided_at, closed_by_key_id, closed_by_user_id, closed_at, expires_at, created_at, updated_at]
+      properties:
+        id: {$ref: '#/components/schemas/ServiceAccountId'}
+        tenant_id: {$ref: '#/components/schemas/TenantId'}
+        identity_id: {$ref: '#/components/schemas/IdentityId'}
+        service_domain:
+          type: string
+          description: The service's organisational domain (A-label, lower case).
+          examples: [github.com]
+        sender_domains:
+          type: array
+          description: Organisational domains the service's verification mail may come from; always includes `service_domain`.
+          minItems: 1
+          maxItems: 6
+          items:
+            type: string
+          examples: [[github.com]]
+        account_identifier:
+          type: string
+          minLength: 1
+          maxLength: 254
+          examples: [brightwell-bookings]
+        address: {$ref: '#/components/schemas/EmailAddress'}
+        purpose:
+          type: string
+          minLength: 1
+          maxLength: 500
+        status: {$ref: '#/components/schemas/ServiceAccountStatus'}
+        rejected_reason:
+          type: [string, 'null']
+          description: 'While `rejected`: `operator`, or `expired` after 7 days undecided.'
+          enum: [operator, expired, null]
+        note:
+          type: [string, 'null']
+          maxLength: 500
+          description: The note given with the decision or the closure.
+        requested_by_key_id:
+          oneOf:
+            - $ref: '#/components/schemas/KeyId'
+            - type: 'null'
+        decided_by_key_id:
+          oneOf:
+            - $ref: '#/components/schemas/KeyId'
+            - type: 'null'
+        decided_by_user_id:
+          description: The person who decided in the console, or `null`.
+          oneOf:
+            - $ref: '#/components/schemas/UserId'
+            - type: 'null'
+        decided_at:
+          type: [string, 'null']
+          format: date-time
+        closed_by_key_id:
+          oneOf:
+            - $ref: '#/components/schemas/KeyId'
+            - type: 'null'
+        closed_by_user_id:
+          oneOf:
+            - $ref: '#/components/schemas/UserId'
+            - type: 'null'
+        closed_at:
+          type: [string, 'null']
+          format: date-time
+        expires_at:
+          type: [string, 'null']
+          format: date-time
+          description: While `pending_approval`, when it is rejected as `expired`; otherwise `null`.
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    ServiceAccountCreateRequest:
+      type: object
+      required: [service_domain, account_identifier, purpose]
+      additionalProperties: false
+      properties:
+        service_domain:
+          type: string
+          minLength: 1
+          maxLength: 253
+          description: The service's domain; it is reduced to its organisational domain. A public suffix or this deployment's own domain is refused.
+          examples: [github.com]
+        sender_domains:
+          type: array
+          maxItems: 5
+          uniqueItems: true
+          description: Other domains the service's mail comes from, each reduced to its organisational domain.
+          items:
+            type: string
+            minLength: 1
+            maxLength: 253
+        account_identifier:
+          type: string
+          minLength: 1
+          maxLength: 254
+          description: The username or account email the agent will use at the service.
+        purpose:
+          type: string
+          minLength: 1
+          maxLength: 500
+          description: Why the agent needs the account, shown to the operator.
+        address:
+          description: An active or retiring address of the identity; defaults to its primary address.
+          $ref: '#/components/schemas/EmailAddress'
+    ServiceAccountNoteRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        note:
+          type: string
+          maxLength: 500
+    ServiceAccountPage:
+      type: object
+      required: [data, next_cursor]
+      properties:
+        data:
+          type: array
+          items: {$ref: '#/components/schemas/ServiceAccount'}
+        next_cursor:
+          type: [string, 'null']
+
     # ── Partners ─────────────────────────────────────────────────────────────────────────────────
 
     PartnerStatus:
@@ -9693,8 +11204,14 @@ components:
             `policy.auto_reply.allowed` and the exchange cap.
         require_known_recipient:
           type: boolean
-          default: false
-          description: Refuse recipients the identity has never exchanged mail with ([E2]).
+          default: true
+          description: >-
+            Suppress recipients that are not known ([E2], FR-OUT-13): a recipient is known when the identity has
+            sent to it before (a delivery that was not suppressed), when a send-allow entry of the tenant names
+            it or its domain, or, for a reply or reply-all, when it is the reply target of a `received`
+            message whose verdict is `pass`. Mail received from an address does not make it known. On by
+            default for every identity; the system identity is created with `false`. Turn it off for an
+            identity that sends to new people by design (booking confirmations).
     Identity:
       type: object
       required: [id, tenant_id, username, display_name, purpose, status, pause_reason, primary_address, addresses, owner, signature, send_policy, metadata, client_id, created_at, updated_at]
@@ -9754,6 +11271,12 @@ components:
           minLength: 1
           description: Makes the create idempotent within the tenant.
           examples: ['acme:bookings']
+        send_policy:
+          description: >-
+            The identity's own send policy, as on update. From any key but a platform key, a `daily_cap` above
+            the tenant's effective `identity_daily_send_cap` gets `403 scope_denied` with
+            `details.field = "send_policy.daily_cap"`, and nothing is created.
+          $ref: '#/components/schemas/IdentitySendPolicy'
         metadata: {$ref: '#/components/schemas/Metadata'}
     IdentityUpdateRequest:
       type: object
@@ -9964,7 +11487,7 @@ components:
           enum: [pass, smtp_unaligned, smtp_from_rewritten, smtp_probe_timeout, smtp_auth_failed, smtp_tls_required, null]
     Domain:
       type: object
-      required: [id, tenant_id, name, method, kind, inbound, transport, is_apex, routing_mode, reply_token, receiving, sending, ses_region, mail_from_domain, smtp, probe, state, state_reason, state_changed_at, delivery_events, details, records, created_at]
+      required: [id, tenant_id, name, method, kind, inbound, transport, is_apex, routing_mode, reply_token, receiving, sending, ses_region, mail_from_domain, smtp, probe, state, state_reason, state_changed_at, sending_paused_at, delivery_events, details, records, created_at]
       properties:
         id: {$ref: '#/components/schemas/DomainId'}
         tenant_id:
@@ -10016,17 +11539,25 @@ components:
         state: {$ref: '#/components/schemas/DomainState'}
         state_reason:
           type: [string, 'null']
-          description: Machine code for the state, for example `dkim_missing`, or `zone_expired` on a `nameservers` domain whose zone Cloudflare deleted.
+          description: Machine code for the state, for example `dkim_missing`; `zone_expired` on a `nameservers` domain whose zone Cloudflare deleted; `evicted` or `unverified_expired` on a never-verified domain that is being or was removed.
         state_changed_at:
           type: string
           format: date-time
+        sending_paused_at:
+          type: [string, 'null']
+          format: date-time
+          description: >-
+            When sending from this tenant domain was paused automatically (FR-DLV-6, [G12]); `null` while it
+            may send, and always `null` for the platform domain. Sends from it get `409 sending_paused` and never
+            fall back to the platform domain. Only a platform key can resume it (`sending_paused: false`).
         delivery_events:
           type: string
           enum: [active, manual, none]
           description: >-
             `active`: provider delivery events reach the service. `manual`: a Cloudflare-transport domain was
-            created without an Email Sending event subscription (spike S9 fallback); delivery statuses stop at
-            `submitted` until `pmail domains subscribe <domain>` has run. `none`: `sending` is false.
+            created without an Email Sending event subscription (spike S9 fallback); until
+            `pmail domains subscribe <domain>` has run, its sends go out from each identity's platform address
+            (`sent_via_fallback`), whose delivery events are seen ([H17]). `none`: `sending` is false.
         details:
           description: '`null`, or the operator step that remains while `delivery_events` is `manual`.'
           oneOf:
@@ -10064,6 +11595,7 @@ components:
           state: pending
           state_reason: null
           state_changed_at: '2026-10-09T10:00:00Z'
+          sending_paused_at: null
           delivery_events: active
           details: null
           records:
@@ -10128,6 +11660,15 @@ components:
           description: >-
             `nameservers` only. Confirms that a website or mail on the name may stop. Without it, a name with
             A, AAAA or MX records, or a `www` CNAME, A or AAAA record, returns `409 domain_not_dedicated` ([N21]).
+        claim:
+          type: boolean
+          default: false
+          description: >-
+            Claims a name that another tenant holds but never verified ([H14]). Publish the TXT record from
+            `details.claim` of the earlier `409 domain_exists` answer, then repeat the request with this set to
+            `true`. When both resolvers show it and the holder never verified the domain, the holder is evicted
+            and the answer is `409 domain_claim_pending` until its removal finishes; then the same request
+            succeeds. Otherwise the answer is the same `409 domain_exists`.
         inbound:
           type: string
           description: '`smtp_relay` only, and required there: `forward` (the customer''s mailbox forwards) or `ses` (they also publish the SES MX and DKIM records).'
@@ -10143,9 +11684,15 @@ components:
         required: [inbound, smtp]
     DomainUpdateRequest:
       type: object
-      description: '`transport` (platform keys only), `smtp` (`smtp_relay` domains), or both.'
+      description: '`transport` (platform keys only), `smtp` (`smtp_relay` domains), `sending_paused` (platform keys only), or several.'
       minProperties: 1
       properties:
+        sending_paused:
+          type: boolean
+          const: false
+          description: >-
+            `false` lifts an automatic sending pause of this domain ([G12]), audit-logged. Platform keys only:
+            any other key gets `403 scope_denied` with `details.field = "sending_paused"`.
         transport:
           type: string
           description: >-
@@ -10386,7 +11933,7 @@ components:
       type: string
       description: >-
         Inbound: `received`, `quarantined`, `throttled` (over the per-sender limit, hidden from agents) and
-        `hidden` (receive-blocked or suppressed sender, kept for audit). Outbound: see `OutboundStatus`.
+        `hidden` (receive-blocked sender, or a delivery report, kept for audit). Outbound: see `OutboundStatus`.
       enum: [received, quarantined, throttled, hidden, queued, submitted, delivered, deferred, bounced, complained, rejected, failed, uncertain, suppressed, canceled]
     OutboundStatus:
       type: string
@@ -10419,11 +11966,15 @@ components:
         `sent_via_fallback` (sent from the platform address because the domain was failing), `parse_degraded`,
         `encrypted`, `message_id_conflict`, `reprocessed`, `reconciled`, `bcc` (the identity was BCC'd),
         `loopback` (delivered inside the deployment for a test tenant, [L3]) and `body_truncated` (a stored
-        body was cut at its storage cap; the full message is in the raw MIME).
-      enum: [sent_via_fallback, parse_degraded, encrypted, message_id_conflict, reprocessed, reconciled, bcc, loopback, body_truncated]
+        body was cut at its storage cap; the full message is in the raw MIME), `sender_suppressed` (the sender
+        is on the tenant's suppression list; the message is stored as usual, [D7]), `body_redacted` (links and
+        codes in a system-identity message were replaced by `[link]` and `[code]`, [A15]) and `dsn_untrusted`
+        (a delivery report that could not be tied to a send of ours by a trusted path, so it changed no
+        delivery, [D11]).
+      enum: [sent_via_fallback, parse_degraded, encrypted, message_id_conflict, reprocessed, reconciled, bcc, loopback, body_truncated, sender_suppressed, body_redacted, dsn_untrusted]
     QuarantineReason:
       type: string
-      enum: [auth_failed, auth_unverified, spam, risky_attachment, blocked_sender, otp_unsolicited]
+      enum: [auth_failed, auth_unverified, spam, risky_attachment, blocked_sender, otp_unsolicited, account_unapproved]
     MessageHeader:
       type: object
       description: One header field as received, in order (untrusted content).
@@ -10494,8 +12045,11 @@ components:
           type: [string, 'null']
           description: Sanitised HTML, never rendered by the service. Included with `include=html`, otherwise `null`.
         headers:
-          type: array
-          description: The original header fields. Present only with `include=headers`.
+          type: [array, 'null']
+          description: >-
+            The original header fields. Present only with `include=headers`; `null` there when the raw MIME
+            they are read from is gone (past `retention.raw_days`, or an outbound message whose sent copy was
+            deleted).
           items: {$ref: '#/components/schemas/MessageHeader'}
         attachments:
           type: array
@@ -10673,7 +12227,12 @@ components:
       enum: [pass, fail, softfail, neutral, none, temperror, permerror, policy]
     TrustFlag:
       type: string
-      enum: [hidden_text, display_name_spoof, lookalike_domain, reply_to_mismatch, thread_join_unverified]
+      description: >-
+        `thread_join_unverified`: the message joined a thread without a valid thread token, either by a token
+        that failed verification or by `In-Reply-To`/`References` from a sender who is not a participant of
+        the thread ([C9]); a `wait` with `kind=reply` does not match it. `shared_domain_sender`: the sender is
+        an address on the shared platform domain that belongs to another workspace ([D12]).
+      enum: [hidden_text, display_name_spoof, lookalike_domain, reply_to_mismatch, thread_join_unverified, shared_domain_sender]
     Trust:
       type: object
       description: Authentication and trust metadata (FR-IN-4).
@@ -10722,7 +12281,7 @@ components:
     Triage:
       type: object
       description: Advisory triage (FR-TRI-1). It never sends, deletes or releases anything.
-      required: [status, category, needs_reply, urgency, summary, language, risk_flags, model, version]
+      required: [status, category, needs_reply, urgency, summary, language, risk_flags, model, version, run]
       properties:
         status: {$ref: '#/components/schemas/TriageStatus'}
         category:
@@ -10755,15 +12314,24 @@ components:
           examples: ['@cf/openai/gpt-oss-20b']
         version:
           type: integer
+          minimum: 1
+          description: >-
+            The triage logic version (`TRIAGE_VERSION`) that produced the record: the prompt, schema, built-in
+            rules and merge logic of the release. It does not change when triage is re-run.
+        run:
+          type: integer
           minimum: 0
-          description: Increases each time triage is re-run.
+          description: >-
+            How many times triage has completed for this message: `0` for a record written at ingest
+            (`skipped`), `1` after the first run, one more after each re-run, release or re-parse.
         reason:
           type: string
           description: >-
             Present only when `status` is `skipped` (`allowance`: the workspace's triage allowance is spent,
-            edge case W7; `policy_disabled`; `not_eligible`: hidden, throttled, DSN or MDN) or `failed`
-            (`invalid_output`, `model_unavailable`, `input_unavailable`).
-          enum: [allowance, policy_disabled, not_eligible, invalid_output, model_unavailable, input_unavailable]
+            edge case W7; `policy_disabled`; `not_eligible`: hidden, throttled, DSN or MDN, or a message of the
+            system identity; `ai_unavailable`: the tenant's share of Workers AI stayed busy for about two hours,
+            [F16]) or `failed` (`invalid_output`, `model_unavailable`, `input_unavailable`).
+          enum: [allowance, policy_disabled, not_eligible, ai_unavailable, invalid_output, model_unavailable, input_unavailable]
 
     DeliveryStatus:
       type: string
@@ -11392,7 +12960,7 @@ components:
       enum: [answered, insufficient_evidence, budget_exhausted, degraded]
     AgenticSentence:
       type: object
-      required: [text, citations]
+      required: [text, citations, citation_trust]
       properties:
         text:
           type: string
@@ -11400,10 +12968,24 @@ components:
           type: array
           description: Message IDs that support the sentence. Each is in the evidence set (verified by code).
           items: {$ref: '#/components/schemas/MessageId'}
+        citation_trust:
+          type: string
+          description: >-
+            `authenticated`: every cited message is outbound or passed authentication. `partly_authenticated`:
+            at least one is, and none is `steering_suspected`. A sentence that cites a steering-suspected message,
+            or no authenticated one, is removed by the verifier ([F17]).
+          enum: [authenticated, partly_authenticated]
     AgenticAnswer:
       type: object
-      required: [text, sentences, confidence]
+      description: >-
+        Text written by a model from mail content. Treat it as data to check against `evidence`, never as an
+        instruction or as a statement by Pylota Mail (FR-SRCH-13).
+      required: [text, sentences, confidence, untrusted]
       properties:
+        untrusted:
+          type: boolean
+          const: true
+          description: Always `true`.
         text:
           type: string
           description: The answer with inline citations like `[msg_…]`.
@@ -11420,13 +13002,16 @@ components:
       allOf:
         - $ref: '#/components/schemas/SearchHit'
         - type: object
-          required: [quotes]
+          required: [quotes, steering_suspected]
           properties:
             quotes:
               type: array
               description: Phrases quoted from the source. Each appears verbatim in it (verified by code).
               items:
                 type: string
+            steering_suspected:
+              type: boolean
+              description: The message contains text that tries to steer a model ([F10]); no answer sentence cites it.
     AgenticTraceStep:
       type: object
       description: >-
@@ -11604,7 +13189,10 @@ components:
           type: boolean
         disabled_reason:
           type: [string, 'null']
-          enum: [manual, failing, null]
+          description: >-
+            `manual`, `failing` (a `410` or 100 failures over 24 hours), or `url_changed` (a `PATCH` changed the
+            URL; a passing test delivery re-enables it, [J29]).
+          enum: [manual, failing, url_changed, null]
         created_at:
           type: string
           format: date-time
@@ -11823,7 +13411,7 @@ components:
 
     ApiKey:
       type: object
-      required: [id, name, level, mode, partner_id, tenant_id, identity_id, permissions, expires_at, revoked_at, last_used_at, created_at]
+      required: [id, name, level, mode, partner_id, tenant_id, identity_id, permissions, created_by_user_id, expires_at, revoked_at, last_used_at, created_at]
       properties:
         id: {$ref: '#/components/schemas/KeyId'}
         name:
@@ -11857,6 +13445,14 @@ components:
           type: [string, 'null']
           format: date-time
           description: Updated at most once a minute.
+        created_by_user_id:
+          description: >-
+            The console user behind the key: the person whose console session minted it, copied to every key
+            minted with it. `null` for a key minted by a platform or partner key with no person behind it.
+            Removing that person from the workspace, or lowering their role, revokes the key ([W36]).
+          oneOf:
+            - $ref: '#/components/schemas/UserId'
+            - type: 'null'
         created_at:
           type: string
           format: date-time
@@ -11914,7 +13510,7 @@ components:
       enum: [message, thread, counterparty, identity, tenant]
     ErasureStatus:
       type: string
-      description: '`completed_with_holds`: the erasure finished but skipped held threads, listed in the receipt''s `held`. `canceled`: a tenant erasure superseded it.'
+      description: '`completed_with_holds`: the erasure finished but skipped held threads, listed in the receipt''s `held` (a tenant then stays `erasing` until no hold remains). `failed`: a step still failed 20 hours after the first request. `canceled`: a tenant erasure superseded it.'
       enum: [queued, running, completed, completed_with_holds, failed, canceled]
     ErasureRequestCreate:
       description: An erasure request. `scope` selects which other fields are required.
@@ -12046,15 +13642,32 @@ components:
               minimum: 0
     ErasureRequest:
       type: object
-      required: [id, tenant_id, scope, status, created_at, completed_at, receipt]
+      required: [id, tenant_id, scope, status, identity_id, target_id, resumes_id, created_at, deadline_at, completed_at, receipt]
       properties:
         id: {$ref: '#/components/schemas/ErasureRequestId'}
         tenant_id: {$ref: '#/components/schemas/TenantId'}
         scope: {$ref: '#/components/schemas/ErasureScope'}
         status: {$ref: '#/components/schemas/ErasureStatus'}
+        identity_id:
+          description: Set for message, thread and identity scope.
+          oneOf:
+            - $ref: '#/components/schemas/IdentityId'
+            - type: 'null'
+        target_id:
+          type: [string, 'null']
+          description: The `msg_` or `thr_` ID, for message and thread scope. The counterparty address is never stored or returned.
+        resumes_id:
+          description: The failed request this one resumes, or the `completed_with_holds` request it continues.
+          oneOf:
+            - $ref: '#/components/schemas/ErasureRequestId'
+            - type: 'null'
         created_at:
           type: string
           format: date-time
+        deadline_at:
+          type: string
+          format: date-time
+          description: When the 24 hours of NFR-PRV-1 end, counted from the first request (copied when resuming a failed one).
         completed_at:
           type: [string, 'null']
           format: date-time
@@ -12071,7 +13684,7 @@ components:
       enum: [counterparty, identity]
     ExportStatus:
       type: string
-      description: '`expired` once the download is no longer available (7 days after creation). `canceled`: a tenant erasure superseded it.'
+      description: '`expired` once the download is no longer available (7 days after creation, or earlier when an erasure of the tenant expired it). `canceled`: a tenant erasure superseded it.'
       enum: [queued, running, completed, failed, canceled, expired]
     ExportCreate:
       description: A subject-access export. `scope` selects which other field is required.
@@ -12108,6 +13721,11 @@ components:
         id: {$ref: '#/components/schemas/ExportId'}
         tenant_id: {$ref: '#/components/schemas/TenantId'}
         scope: {$ref: '#/components/schemas/ExportScope'}
+        identity_id:
+          description: The identity, for identity scope.
+          oneOf:
+            - $ref: '#/components/schemas/IdentityId'
+            - type: 'null'
         status: {$ref: '#/components/schemas/ExportStatus'}
         size:
           type: [integer, 'null']
@@ -12117,12 +13735,13 @@ components:
           type: [string, 'null']
           format: uri
           description: >-
-            Set when `completed`: a signed link (`getSignedLink`), valid until `expires_at` (7 days), to a ZIP
-            holding one `.eml` per message plus `messages.json`. Minted again on each `GET`.
+            Set when `completed`: a signed link (`getSignedLink`) to a ZIP holding one `.eml` per message
+            plus `messages.json`. Minted again on each `GET`, and valid for one hour from it, or until
+            `expires_at` if that is sooner.
         expires_at:
           type: [string, 'null']
           format: date-time
-          description: When the download link expires.
+          description: When the export and its ZIP are deleted (7 days after it completed). No link works after it.
         created_at:
           type: string
           format: date-time
@@ -12533,8 +14152,10 @@ components:
       type: string
       description: >-
         `reparse` (re-parse messages from raw MIME and re-emit their events with `reprocessed: true`),
-        `reembed` (re-chunk and re-embed into Vectorize) or `reindex` (rebuild the keyword index).
-      enum: [reparse, reembed, reindex]
+        `reembed` (re-chunk and re-embed into Vectorize), `reindex` (rebuild the keyword index) or
+        `restore_reconcile` (after a mailbox restore) can be started with `createJob`. `getJob` also
+        returns the jobs the system runs itself: `retention`, `backup` and `domain_remove`.
+      enum: [reparse, reembed, reindex, restore_reconcile, retention, backup, domain_remove]
     JobStatus:
       type: string
       enum: [queued, running, completed, failed, canceled]
@@ -12542,7 +14163,10 @@ components:
       type: object
       required: [kind, tenant_id]
       properties:
-        kind: {$ref: '#/components/schemas/JobKind'}
+        kind:
+          type: string
+          description: '`restore_reconcile` needs `after` and `identity_ids`.'
+          enum: [reparse, reembed, reindex, restore_reconcile]
         tenant_id: {$ref: '#/components/schemas/TenantId'}
         identity_ids:
           type: [array, 'null']
@@ -12563,7 +14187,11 @@ components:
       properties:
         id: {$ref: '#/components/schemas/JobId'}
         kind: {$ref: '#/components/schemas/JobKind'}
-        tenant_id: {$ref: '#/components/schemas/TenantId'}
+        tenant_id:
+          description: The tenant; `null` for a deployment-wide job (`backup`, the global `retention` job).
+          oneOf:
+            - $ref: '#/components/schemas/TenantId'
+            - type: 'null'
         status: {$ref: '#/components/schemas/JobStatus'}
         created_at:
           type: string
@@ -12573,13 +14201,175 @@ components:
           format: date-time
         result:
           type: [object, 'null']
-          description: Counts, once the job ends (for `reparse`, including the messages skipped past `raw_days`).
+          description: >-
+            Counts, once the job ends (for `reparse`, including the messages skipped past `raw_days`); for
+            a `failed` job also `failed_step` and `error` (strings).
           additionalProperties:
-            type: integer
-            minimum: 0
+            type: [integer, string]
         created_by_key_id:
           type: [string, 'null']
           description: The API key that started the job, or `null` for a job the system started itself (for example the `reembed` job that the cron creates during an embedding-model change).
+    SwitchName:
+      type: string
+      enum: [read_only, free_sending, emergency_prune]
+    SwitchUpdate:
+      type: object
+      required: [name, state, reason]
+      properties:
+        name: {$ref: '#/components/schemas/SwitchName'}
+        state:
+          type: string
+          enum: ['on', 'off']
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 200
+    Switch:
+      type: object
+      required: [name, state, set_by, reason, set_at]
+      properties:
+        name: {$ref: '#/components/schemas/SwitchName'}
+        state:
+          type: string
+          enum: ['on', 'off']
+        set_by:
+          type: string
+          description: '`auto` when an automatic containment rule set it, `platform` when a platform key did.'
+          enum: [auto, platform]
+        reason:
+          type: string
+        set_at:
+          type: string
+          format: date-time
+    PlatformStatus:
+      type: object
+      required: [frozen, frozen_since, switches, alert_email, firing, master_key, capacity]
+      properties:
+        frozen:
+          type: boolean
+          description: '`true` while `PM_FREEZE = "on"` (a restore is in progress).'
+        frozen_since:
+          type: [string, 'null']
+          format: date-time
+        switches:
+          type: object
+          required: [read_only, free_sending, emergency_prune]
+          properties:
+            read_only:
+              type: string
+              enum: ['on', 'off']
+            free_sending:
+              type: string
+              enum: ['on', 'off']
+            emergency_prune:
+              type: string
+              enum: ['on', 'off']
+        alert_email:
+          type: string
+          description: '`missing` when neither `PM_ALERT_EMAIL` nor a `mailto:` `PM_SECURITY_CONTACT` is set.'
+          enum: [configured, missing]
+        firing:
+          type: array
+          items:
+            type: object
+            required: [alert, severity, fired_at]
+            properties:
+              alert:
+                type: string
+                description: The alert key, for example `dlq:pm-inbound`.
+              severity:
+                type: string
+                enum: [page, ticket]
+              fired_at:
+                type: string
+                format: date-time
+        master_key:
+          type: object
+          required: [active_slot, slots, remaining, activated_at, resealed_at]
+          properties:
+            active_slot:
+              type: string
+              enum: [a, b]
+            slots:
+              type: array
+              items:
+                type: object
+                required: [slot, present, kid]
+                properties:
+                  slot:
+                    type: string
+                    enum: [a, b]
+                  present:
+                    type: boolean
+                  kid:
+                    type: [string, 'null']
+                    description: First 8 bytes of SHA-256 of the key, lower-case hex.
+            remaining:
+              type: integer
+              minimum: 0
+              description: Sealed values whose key ID is not the active key's; 0 once a rotation's re-seal is done.
+            activated_at:
+              type: [string, 'null']
+              format: date-time
+              description: When the Worker first saw the active key.
+            resealed_at:
+              type: [string, 'null']
+              format: date-time
+              description: When `remaining` first reached 0 under the active key; a next rotation is allowed without `--discard-previous` 30 days later.
+        capacity:
+          type: object
+          required: [d1_bytes, d1_pct, vectors, vectors_pct, tenants, namespaces_pct, measured_at]
+          properties:
+            d1_bytes:
+              type: [integer, 'null']
+              minimum: 0
+            d1_pct:
+              type: [number, 'null']
+            vectors:
+              type: [integer, 'null']
+              minimum: 0
+            vectors_pct:
+              type: [number, 'null']
+            tenants:
+              type: integer
+              minimum: 0
+              description: Tenants that are not erased (one Vectorize namespace each).
+            namespaces_pct:
+              type: number
+            measured_at:
+              type: [string, 'null']
+              format: date-time
+    MailboxRestoreRequest:
+      description: Exactly one of `at` and `bookmark`.
+      oneOf:
+        - type: object
+          required: [at]
+          properties:
+            at:
+              type: string
+              format: date-time
+              description: The point in time, within the last 30 days.
+          additionalProperties: false
+        - type: object
+          required: [bookmark]
+          properties:
+            bookmark:
+              type: string
+              minLength: 1
+              description: An undo bookmark returned by an earlier restore.
+          additionalProperties: false
+    MailboxRestoreResult:
+      type: object
+      required: [identity_id, restored_to, undo_bookmark]
+      properties:
+        identity_id: {$ref: '#/components/schemas/IdentityId'}
+        restored_to:
+          type: [string, 'null']
+          format: date-time
+          description: The `at` asked for, or `null` when a bookmark was restored.
+        undo_bookmark:
+          type: string
+          description: Restores the state this call replaced.
     WaitlistInviteRequest:
       type: object
       required: [count]
@@ -12807,7 +14597,7 @@ components:
             registered or Pylota claim name, so a claim the service sets is never overwritten ([O6]).
           propertyNames:
             not:
-              enum: [iss, sub, aud, iat, nbf, exp, jti, email, email_verified, name, org, accountable_human, ai_agent, nonce, ext]
+              enum: [iss, sub, aud, iat, nbf, exp, jti, email, email_verified, unverified, ai_agent, nonce, ext]
           examples:
             - booking_ref: BK-2291
     AssertionResponse:
@@ -12819,8 +14609,9 @@ components:
           type: string
           description: >-
             The token, a compact JWS (RFC 7519) with header `{"alg":"EdDSA","typ":"agent-assertion+jwt","kid":…}`
-            and the claims `iss`, `sub`, `aud`, `iat`, `nbf`, `exp`, `jti`, `email`, `email_verified`, `name`,
-            `org`, `accountable_human`, `ai_agent`, and `nonce` and `ext` when given.
+            and the claims `iss`, `sub`, `aud`, `iat`, `nbf`, `exp`, `jti`, `email`, `email_verified`,
+            `unverified` (`name`, `org`, `accountable_human`: set by the workspace, not checked), `ai_agent`,
+            and `nonce` and `ext` when given.
           pattern: '^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$'
         kid: {$ref: '#/components/schemas/IdentityKeyKid'}
         expires_at:
@@ -13120,6 +14911,11 @@ components:
         - billing.plan_changed
         - billing.payment_failed
         - billing.limit_reached
+        - tenant.policy_updated
+        - account.requested
+        - account.approved
+        - account.rejected
+        - account.closed
 
     Event:
       description: Any webhook event. `type` selects the payload schema.
@@ -13174,6 +14970,11 @@ components:
         - $ref: '#/components/schemas/BillingPlanChangedEvent'
         - $ref: '#/components/schemas/BillingPaymentFailedEvent'
         - $ref: '#/components/schemas/BillingLimitReachedEvent'
+        - $ref: '#/components/schemas/TenantPolicyUpdatedEvent'
+        - $ref: '#/components/schemas/AccountRequestedEvent'
+        - $ref: '#/components/schemas/AccountApprovedEvent'
+        - $ref: '#/components/schemas/AccountRejectedEvent'
+        - $ref: '#/components/schemas/AccountClosedEvent'
       discriminator:
         propertyName: type
         mapping:
@@ -13227,6 +15028,11 @@ components:
           billing.plan_changed: '#/components/schemas/BillingPlanChangedEvent'
           billing.payment_failed: '#/components/schemas/BillingPaymentFailedEvent'
           billing.limit_reached: '#/components/schemas/BillingLimitReachedEvent'
+          tenant.policy_updated: '#/components/schemas/TenantPolicyUpdatedEvent'
+          account.requested: '#/components/schemas/AccountRequestedEvent'
+          account.approved: '#/components/schemas/AccountApprovedEvent'
+          account.rejected: '#/components/schemas/AccountRejectedEvent'
+          account.closed: '#/components/schemas/AccountClosedEvent'
 
     MessageReceivedEvent:
       description: '`message.received`: An inbound message is stored and visible.'
@@ -13614,7 +15420,7 @@ components:
             data: {$ref: '#/components/schemas/DomainReminderData'}
 
     DomainRemovedEvent:
-      description: '`domain.removed`: A domain was removed (`reason`: `requested` or `zone_expired`).'
+      description: '`domain.removed`: A domain was removed (`reason`: `requested`, `zone_expired`, `evicted` or `unverified_expired`).'
       allOf:
         - $ref: '#/components/schemas/EventBase'
         - type: object
@@ -13778,6 +15584,61 @@ components:
               const: billing.limit_reached
             data: {$ref: '#/components/schemas/BillingLimitReachedData'}
 
+    TenantPolicyUpdatedEvent:
+      description: '`tenant.policy_updated`: A tenant''s policy was changed (any route, any writer, except a tenant''s creation).'
+      allOf:
+        - $ref: '#/components/schemas/EventBase'
+        - type: object
+          required: [type, data]
+          properties:
+            type:
+              const: tenant.policy_updated
+            data: {$ref: '#/components/schemas/TenantPolicyUpdatedData'}
+
+    AccountRequestedEvent:
+      description: '`account.requested`: An agent recorded that it wants an account at a third-party service.'
+      allOf:
+        - $ref: '#/components/schemas/EventBase'
+        - type: object
+          required: [type, data]
+          properties:
+            type:
+              const: account.requested
+            data: {$ref: '#/components/schemas/AccountEventData'}
+
+    AccountApprovedEvent:
+      description: '`account.approved`: An operator approved a service-ledger entry.'
+      allOf:
+        - $ref: '#/components/schemas/EventBase'
+        - type: object
+          required: [type, data]
+          properties:
+            type:
+              const: account.approved
+            data: {$ref: '#/components/schemas/AccountEventData'}
+
+    AccountRejectedEvent:
+      description: '`account.rejected`: A service-ledger entry was rejected by an operator, or expired after 7 days undecided.'
+      allOf:
+        - $ref: '#/components/schemas/EventBase'
+        - type: object
+          required: [type, data]
+          properties:
+            type:
+              const: account.rejected
+            data: {$ref: '#/components/schemas/AccountRejectedData'}
+
+    AccountClosedEvent:
+      description: '`account.closed`: A service-ledger entry was closed, or deleted while pending or approved.'
+      allOf:
+        - $ref: '#/components/schemas/EventBase'
+        - type: object
+          required: [type, data]
+          properties:
+            type:
+              const: account.closed
+            data: {$ref: '#/components/schemas/AccountEventData'}
+
     # ── Event envelope and payloads ──────────────────────────────────────────────────────────────
 
     EventBase:
@@ -13815,7 +15676,8 @@ components:
             Increases strictly per owner: per identity for mailbox events (`message.*`, `identity.*`,
             `verification.received`, `suppression.created`, `quota.warning`), per domain for `domain.*`
             events, and per job for `erasure.*` and `export.*` events. `null` for platform events
-            (`webhook.disabled`, `webhook.test`, `member.*` and `billing.*`).
+            (`webhook.disabled`, `webhook.test`, `member.*`, `billing.*`, `tenant.policy_updated` and
+            `account.*`).
         data:
           type: object
           description: The payload; its schema depends on `type`.
@@ -13829,14 +15691,15 @@ components:
         |---|---|---|
         | `provider_validation` | `rejected` | The transport refused the content (header, size, format) |
         | `sender_domain_unavailable` | `rejected` | The domain is not onboarded with the transport |
-        | `recipient_suppressed_by_provider` | per recipient `suppressed` | The provider's own suppression list; synced into ours |
+        | `recipient_suppressed_by_provider` | per recipient `suppressed` | The provider's own suppression list; synced into ours, except a suppression scoped to the shared platform domain, which may come from another workspace and is not copied ([G4]) |
         | `quota_exhausted` | `failed` | The provider's daily limit, still exhausted after 24 hours of backoff, or an SMTP relay still unavailable after 24 hours of retries |
         | `transport_timeout` | `uncertain` | No answer from the transport. It may have been sent |
         | `transport_connection_lost` | `uncertain` | The connection dropped after the request was written |
+        | `provider_outcome_unknown` | `uncertain` | The transport reported a delivery failure for a message with several recipients without saying which; some may have received it ([G2]) |
         | `resolved_not_sent` | `failed` | A human resolved an uncertain send as not sent |
         | `domain_failing_no_fallback` | `failed` | The domain failed and fallback was disabled by policy |
         | `marketing_needs_ses` | `rejected` | A `kind: marketing` message whose sending domain uses the `cloudflare` transport when it reached the transport (the domain's transport changed, or fallback moved it to the platform domain, after it was accepted). Cloudflare Email Service is for transactional mail only |
-      enum: [provider_validation, sender_domain_unavailable, recipient_suppressed_by_provider, quota_exhausted, transport_timeout, transport_connection_lost, resolved_not_sent, domain_failing_no_fallback, marketing_needs_ses]
+      enum: [provider_validation, sender_domain_unavailable, recipient_suppressed_by_provider, quota_exhausted, transport_timeout, transport_connection_lost, provider_outcome_unknown, resolved_not_sent, domain_failing_no_fallback, marketing_needs_ses]
     EventAttachment:
       type: object
       required: [id, filename, content_type, size]
@@ -13865,6 +15728,10 @@ components:
         attachments:
           type: array
           items: {$ref: '#/components/schemas/EventAttachment'}
+        reprocessed:
+          type: boolean
+          const: true
+          description: Present only on an event re-emitted by a re-parse ([J3]); it is not new mail.
     MessageQuarantinedData:
       type: object
       description: As `message.received`, plus `quarantine_reason`, and without `extracted_text`.
@@ -13877,6 +15744,10 @@ components:
           type: array
           items: {$ref: '#/components/schemas/EventAttachment'}
         quarantine_reason: {$ref: '#/components/schemas/QuarantineReason'}
+        reprocessed:
+          type: boolean
+          const: true
+          description: Present only on an event re-emitted by a re-parse ([J3]).
     MessageReleasedData:
       type: object
       required: [message, released_by_key_id, released_by_user_id, reason]
@@ -14010,7 +15881,7 @@ components:
     VerificationReceivedData:
       type: object
       description: The code or link itself is only available through `wait`.
-      required: [message_id, sender_domain, kind]
+      required: [message_id, sender_domain, kind, account_id]
       properties:
         message_id: {$ref: '#/components/schemas/MessageId'}
         sender_domain:
@@ -14018,6 +15889,11 @@ components:
         kind:
           type: string
           enum: [code, link]
+        account_id:
+          description: The approved service-ledger entry that matched, or `null` when the tenant does not require approval.
+          oneOf:
+            - $ref: '#/components/schemas/ServiceAccountId'
+            - type: 'null'
 
     IdentityCreatedData:
       type: object
@@ -14136,8 +16012,8 @@ components:
         state: {$ref: '#/components/schemas/DomainState'}
         hours_in_state:
           type: integer
-          description: 24, 72 and 168 (7 days); `504` (21 days) is the final reminder for a `nameservers` domain still `pending` before Cloudflare deletes its zone at 28 days.
-          enum: [24, 72, 168, 504]
+          description: 24, 72 and 168 (7 days); `288` (12 days) for a domain never verified, two days before its unverified expiry; `504` (21 days) is the final reminder for a `nameservers` domain still `pending` before Cloudflare deletes its zone at 28 days.
+          enum: [24, 72, 168, 288, 504]
     DomainRemovedData:
       type: object
       required: [domain_id, reason]
@@ -14147,8 +16023,11 @@ components:
           type: string
           description: >-
             `requested`: removed through `DELETE /v1/domains/{domain_id}`. `zone_expired`: a `nameservers`
-            zone was never activated and Cloudflare deleted it; the domain can be added again.
-          enum: [requested, zone_expired]
+            zone was never activated and Cloudflare deleted it; the domain can be added again. `evicted`: the
+            domain was never verified, and another tenant proved control of its DNS with a claim record.
+            `unverified_expired`: the domain was never verified within 14 days of being added (or of its
+            zone's activation).
+          enum: [requested, zone_expired, evicted, unverified_expired]
 
     ErasureCompletedData:
       type: object
@@ -14162,7 +16041,7 @@ components:
         erasure_request_id: {$ref: '#/components/schemas/ErasureRequestId'}
         step:
           type: string
-          description: The job step that failed, for example `delete_vectors`.
+          description: The job step that failed, for example `erase_mailboxes`. The step was retried until 20 hours after the first request.
         error:
           type: string
     ExportCompletedData:
@@ -14259,8 +16138,8 @@ components:
           examples: [developer]
         reason:
           type: string
-          description: '`payment_recovered`: the plan was restored after a late payment.'
-          enum: [checkout, portal, payment_failed_grace_ended, payment_recovered, canceled, operator]
+          description: '`payment_recovered`: the plan was restored after a late payment, or when a dispute was closed in the workspace''s favour. `dispute`: a payment was disputed, so the default plan applies until the dispute closes.'
+          enum: [checkout, portal, payment_failed_grace_ended, payment_recovered, canceled, operator, dispute]
     BillingPaymentFailedData:
       type: object
       required: [grace_until]
@@ -14280,3 +16159,42 @@ components:
         resets_at:
           type: [string, 'null']
           format: date-time
+    TenantPolicyUpdatedData:
+      type: object
+      required: [fields, by, actor_key_id, actor_user_id, policy_version]
+      properties:
+        fields:
+          type: array
+          description: The dotted paths of the fields written.
+          items:
+            type: string
+          examples: [[retention.message_days, search.custom_refs]]
+        by:
+          type: string
+          description: Who wrote it.
+          enum: [platform, partner, tenant, console]
+        actor_key_id:
+          oneOf:
+            - $ref: '#/components/schemas/KeyId'
+            - type: 'null'
+        actor_user_id:
+          description: The person, for a console save.
+          oneOf:
+            - $ref: '#/components/schemas/UserId'
+            - type: 'null'
+        policy_version:
+          type: integer
+          minimum: 1
+    AccountEventData:
+      type: object
+      required: [account]
+      properties:
+        account: {$ref: '#/components/schemas/ServiceAccount'}
+    AccountRejectedData:
+      type: object
+      required: [account, reason]
+      properties:
+        account: {$ref: '#/components/schemas/ServiceAccount'}
+        reason:
+          type: string
+          enum: [operator, expired]

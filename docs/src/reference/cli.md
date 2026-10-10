@@ -96,7 +96,9 @@ other pages link here.
 | [`deploy`](#deploy), [`upgrade`](#upgrade) | Applies D1 migrations, deploys with Wrangler, and manages Vectorize index generations |
 | [`doctor`](#doctor) | The Cloudflare checks: DNS, routing, sending, event subscriptions, bindings, secret names, dead-letter items, quota and the zone count |
 | [`destroy`](#destroy) | Disables routing, tears down the platform domain, deletes the Worker, the storage and the D1 database |
-| [`secrets rotate-master`](#secrets-rotate-master) | Uploads the new master key and follows the re-seal through D1 |
+| [`secrets rotate-master`](#secrets-rotate-master) | Writes the new master key into the free slot and switches the Worker to it (the re-seal is followed through the API) |
+| [`ops freeze`, `ops unfreeze`](#ops-freeze-and-ops-unfreeze) | Changes `PM_FREEZE` and redeploys the deployed version |
+| [`ops restore d1`](#ops-restore) | Exports, restores (D1 Time Travel) and re-applies changes to the D1 database |
 | [`domains add --local-token`](#domains-add) | Onboards a zone apex itself, when the deployment has no `PM_CF_API_TOKEN`, and registers it in D1 |
 | [`domains subscribe`](#domains-subscribe) | Creates a domain's Email Sending event subscription and records it in D1 |
 
@@ -106,8 +108,12 @@ other pages link here.
   `account_id` (which `setup` stores), else `PM_CF_ACCOUNT_ID` in `deploy/wrangler.toml`.
 - The permissions the token needs, and those of the Worker's own `PM_CF_API_TOKEN`, are in one table:
   [Deploy to Cloudflare › Create a Cloudflare API token](../self-hosting.md#2-create-a-cloudflare-api-token).
+  The first `setup` creates the Worker and its Custom Domains, so it needs a short-lived first-run token
+  (Workers Admin at product scope); every later command works with a deploy token that holds Workers
+  Editor on the Worker `pylota-mail` only, and `destroy` needs Workers Admin on that Worker.
 - Every other command needs only an API key, including the platform operations (`dlq`,
-  `keys rotate thread|link|cursor|web_bot_auth`, `jobs`, `waitlist invite`). `assertions verify` and
+  `keys rotate thread|link|cursor|web_bot_auth`, `jobs`, `waitlist invite`, `ops status`, `ops switch`,
+  `ops restore mailbox|reconcile`). `assertions verify` and
   `webhooks verify` need neither a key nor a token.
 
 ## Global flags
@@ -165,6 +171,7 @@ Errors print the API's error envelope: in human mode as `error: <code> (<status>
 | 12 | `doctor` found at least one failure |
 | 13 | Timed out: `wait` returned nothing, or a polling step passed its deadline |
 | 14 | `setup ses` or `destroy --include-ses`: an AWS API call failed, or the AWS account has no SES production access |
+| 15 | A precondition is not met: `secrets rotate-master` with an unfinished rotation (use `--resume`) or within 30 days of the last re-seal (use `--discard-previous`), or `ops restore d1` while the deployment is not frozen |
 | 130 | Interrupted (Ctrl-C) |
 
 ## Naming identities and tenants
@@ -276,16 +283,19 @@ pmail setup ses --region <aws-region> [--allow-non-eu] [--prefix <prefix>] [--di
 |---|---|---|
 | `--region` | required | The SES region (`PM_SES_REGION`). It must be a region where SES receives mail |
 | `--allow-non-eu` | off | Accept a region outside the EU and the UK on a deployment with `PM_JURISDICTION = "eu"`. Without it such a region is refused. For the SES region, `eu` means "EU or UK" (the UK has an EU GDPR adequacy decision), so `eu-west-2` (London) needs no flag; Cloudflare's own `eu` jurisdiction for D1, R2 and Durable Objects means the EU only |
-| `--prefix` | `pylota-mail-` + your AWS account ID | Prefix of the S3 bucket that holds incoming mail until it is ingested (`{prefix}-inbound`) |
+| `--prefix` | `pylota-mail-{aws-account-id}-{dep}`, where `{dep}` is 8 hex characters derived from the API host | Prefix of the S3 bucket that holds incoming mail until it is ingested (`{prefix}-inbound`) |
 | `--yes` | off | Apply the IAM policy without asking. Without it, the policy is printed and you are asked first |
 
 What it does, reading each resource first and changing only what is missing or different: checks the
 region and that your SES account has production access (if it does not, it prints the AWS console steps
-to request it and stops, having created nothing); warns if the account is on the Essentials plan; creates
+to request it and stops, having created nothing); warns if the account is on the Essentials plan; stops,
+having created nothing, if the account and region already serve another deployment (a `pm-deliver` rule
+writing to another bucket, or a resource of its names tagged for another API host); creates
 the inbound S3 bucket, the SNS topic, the SQS backstop queue, the receipt rule `pm-deliver` (in your
 active rule set if you already have one), the configuration set and its event topic, and the SES
-identity of the platform domain; sets `SignatureVersion = 2` on both SNS topics; prints the IAM policy of
-the user `pylota-mail-worker` for review and applies it; creates that user's access key and uploads it
+identity of the platform domain, each tagged `pylota-mail:api-host` with your API host where AWS accepts
+tags; sets `SignatureVersion = 2` on both SNS topics; prints the IAM policy of
+the user `pylota-mail-worker-{dep}` for review and applies it; creates that user's access key and uploads it
 with `wrangler secret put` as `PM_SES_ACCESS_KEY_ID` and `PM_SES_SECRET_ACCESS_KEY` (never written to
 disk or printed); writes `PM_SES_REGION`, `PM_SES_INBOUND_BUCKET`, `PM_SES_INBOUND_TOPIC_ARN`,
 `PM_SES_INBOUND_QUEUE_URL`, `PM_SES_RULE_SET` and `PM_SES_SNS_TOPIC_ARN` into `deploy/wrangler.toml`;
@@ -297,7 +307,8 @@ Exit codes: 2 for a region that cannot receive mail, a region outside the EU and
 review you declined or (without `--yes`) could not be asked; 3 without AWS or Cloudflare credentials, or
 without `deploy/wrangler.toml` (run `pmail setup` first); 9 when the Worker's `/health` does not answer;
 10 when Wrangler or the Cloudflare API fails; 13 when the subscriptions are not confirmed within 5
-minutes; 14 when an AWS call fails or the account has no production access.
+minutes; 14 when an AWS call fails, the account has no production access, or the account and region hold
+another deployment's rule or resources (use a separate AWS account).
 
 ```bash
 pmail setup ses --region eu-west-2
@@ -384,8 +395,8 @@ pass  mail_test                    delivered in 6 s, verdict pass; authserv-id: 
 
 Some checks only warn:
 
-- `secrets` warns while `PM_MASTER_KEY_NEXT` is set, which means a `secrets rotate-master` did not
-  finish.
+- `secrets` warns while a `secrets rotate-master` has not finished re-sealing (run it again with
+  `--resume` to follow it).
 - `quota` warns when `PM_DAILY_SEND_QUOTA` is not set, and when your Cloudflare token lacks Account
   Analytics · Read, which it needs to read the quota errors
   ([Self-hosting › step 2](../self-hosting.md#2-create-a-cloudflare-api-token)).
@@ -425,7 +436,7 @@ pmail destroy [--dry-run] [--confirm <platform-domain>] [--skip-erasure] [--keep
 | `--include-ses` | Also delete the AWS resources that [`setup ses`](#setup-ses) created, with your local AWS credentials, in the reverse order of setup |
 
 If you ran `setup ses`, the plan lists its AWS resources (the S3 bucket, SNS topic, SQS queue, receipt
-rule, configuration set, the platform domain's SES identity, and the IAM user `pylota-mail-worker` with
+rule, configuration set, the platform domain's SES identity, and the IAM user `pylota-mail-worker-{dep}` with
 its access key). Without `--include-ses` they are left in place and listed again at the end: delete them
 in the AWS console, because the IAM user's access key stays valid until you do. With `--include-ses`,
 `destroy` deletes them itself; an active receipt rule set that was yours before `setup ses` is kept,
@@ -444,31 +455,31 @@ pmail destroy --confirm agents.example
 
 ### `secrets rotate-master`
 
-Rotates `PM_MASTER_KEY` without downtime: uploads a new key as `PM_MASTER_KEY_NEXT`, waits until the
-Worker has re-sealed every stored secret with it, then makes it `PM_MASTER_KEY`.
+Rotates the master key without downtime. The key has two slots: the command writes a new key into the
+slot that is not in use, switches the Worker to it, and waits while the Worker re-seals every stored
+secret with it (about 500 a minute). The previous key stays in its slot, so a D1 restore from the last
+30 days can still open what it sealed.
 
 ```text
-pmail secrets rotate-master [--resume] [--dir <path>]
+pmail secrets rotate-master [--resume] [--discard-previous] [--yes] [--dir <path>]
 ```
 
-`--resume` continues an interrupted rotation. Identity signing keys and the Web Bot Auth key are re-sealed
-with everything else; their public keys do not change. The thread, link, cursor and Web Bot Auth signing
-keys are rotated with
+`--resume` follows an interrupted rotation to its end; nothing is generated again. A second rotation
+within 30 days of the end of the previous rotation's re-seal is refused (exit 15) unless `--discard-previous` is given (after a suspected
+leak of the previous key), because it would overwrite the key that a restore to before the last rotation
+needs. Needs your Cloudflare token and a platform key with `audit:read`. Identity signing keys and the
+Web Bot Auth key are re-sealed with everything else; their public keys do not change. The thread, link,
+cursor and Web Bot Auth signing keys are rotated with
 [`keys rotate thread|link|cursor|web_bot_auth`](#keys-rotate-threadlinkcursorweb_bot_auth). `PM_CF_API_TOKEN` and the SES keys are
 rotated with `wrangler secret put`, as described in
 [Security](../project/design/security.md#62-rotation-procedures).
 
-```bash
-pmail secrets rotate-master
-```
-
----
-
 ## Platform operations
 
-Platform keys with `platform:ops`. These commands call the
-[platform API](api.md#platform-operations) only; they need no Cloudflare credentials. Every call is
-audit-logged.
+Platform keys with `platform:ops` (`ops status`: `audit:read`). These commands call the
+[platform API](api.md#platform-operations) only and need no Cloudflare credentials, except
+`ops freeze`, `ops unfreeze` and `ops restore d1`, which also use your Cloudflare token. Every call that
+changes something is audit-logged.
 
 ### `dlq list`
 
@@ -587,6 +598,64 @@ pmail waitlist invite --count 50 --plan developer
 ```text
 Invited 50; 262 still waiting.
 ```
+
+### `ops status`
+
+Shows the deployment's operational state from `GET /v1/platform/status` (a platform key with
+`audit:read`): whether it is frozen, the switches, whether an alert email address is configured, the
+firing alerts, the master-key slots with the rotation's progress, and the D1, vector and tenant counts
+against their limits.
+
+```bash
+pmail ops status
+```
+
+### `ops switch`
+
+Sets a deployment-wide switch (`PUT /v1/platform/switches`, a platform key with `platform:ops`).
+`read_only` refuses writes from every key but platform keys and holds outbound sends; `free_sending off`
+stops sends from workspaces on the Free plan or still in the send ramp; `emergency_prune` shortens the
+retention of event and delivery logs to 7 days. The automatic containment rules set these switches too
+([Observability › Automatic containment](../project/design/observability.md#56-automatic-containment)).
+
+```text
+pmail ops switch read_only|free_sending|emergency_prune on|off [--reason <text>]
+```
+
+### `ops freeze` and `ops unfreeze`
+
+Freezes the whole deployment for a restore, or ends the freeze. `freeze` sets `PM_FREEZE = "on"` in
+`deploy/wrangler.toml` and redeploys the deployed version; `unfreeze` sets it back to `off`. While frozen,
+inbound mail gets a temporary failure (senders retry), queued work waits, and only platform keys can use the API. Uses your Cloudflare token.
+
+```bash
+pmail ops freeze
+pmail ops unfreeze
+```
+
+### `ops restore`
+
+Runs the restore steps of the
+[restore runbook](../project/design/observability.md#restore-from-pitr). Every subcommand refuses unless
+the deployment is frozen.
+
+```text
+pmail ops restore d1 --at <time> [--exclude <table>[.<column>]]… [--exclude-row <table>:<key>]… [--yes]
+pmail ops restore d1 --replay-only <dir>
+pmail ops restore mailbox <identity> (--at <time> | --bookmark <bookmark>)
+pmail ops restore reconcile --tenant <tenant> --identity <identity>… --after <time>
+pmail ops restore cleanup
+```
+
+- `d1` exports the database, restores it with D1 Time Travel, exports it again, and re-applies every
+  change made after `--at` except the excluded tables, columns and rows. It prints a summary and the
+  bookmark that undoes the restore, and asks before it applies the changes. Uses your Cloudflare token.
+- `mailbox` restores one identity's mailbox to `--at` (or undoes a restore with `--bookmark`) through
+  `POST /v1/platform/identities/{identity_id}/restore`.
+- `reconcile` starts the `restore_reconcile` job for the restored mailboxes and then re-applies every
+  erasure that completed after `--after` (`POST /v1/platform/erasure-requests/{erasure_id}/reapply`),
+  waiting until all of them complete.
+- `cleanup` deletes the working files the restore wrote (they hold every D1 row).
 
 ---
 
@@ -710,6 +779,28 @@ above its ceiling, is refused with `403 scope_denied` (exit 4) and the field nam
 ```bash
 pmail tenants update acme --policy '{"search":{"agentic_daily_cap":200}}'
 pmail tenants update acme --policy '{"quarantine":{"key_release":true}}'
+```
+
+### `tenants policy`
+
+Shows the tenant's policy with what your key may change, or changes it, through
+`GET`/`PATCH /v1/tenants/{tenant_id}/policy`. Needs `policy:write` (platform, partner or tenant keys;
+never identity keys). Without `--set` or `--set-file` it prints each field with its class, its ceiling for
+your key and where the ceiling comes from.
+
+```text
+pmail tenants policy <tenant> [--set <json> | --set-file <file>]
+```
+
+With a tenant key, a lower-only field above its ceiling is refused with `403 scope_denied` (exit 4, the
+field, ceiling and source printed), loosening a guard field where only people may is refused with
+`403 permission_denied` (`person_required`, exit 4), and platform-only fields and
+`quarantine.key_release` are refused with `403 scope_denied` (`not_writable`, exit 4)
+([Configuration › Who may change a field](configuration.md#who-may-change-a-field)).
+
+```bash
+pmail tenants policy acme
+pmail tenants policy acme --set '{"retention":{"message_days":365},"search":{"refs_packs":["core","uk_vehicle"]}}'
 ```
 
 ### `tenants suspend` and `tenants resume`
@@ -960,7 +1051,7 @@ has the full table.
 
 ```text
 pmail domains add <name> --method <method> [--tenant <tenant>] [--no-receiving] [--no-sending]
-                  [--replace-mx] [--confirm-dedicated]
+                  [--replace-mx] [--confirm-dedicated] [--claim]
                   [--inbound forward|ses] [--smtp-host <host>] [--smtp-port 465|587]
                   [--smtp-username <name>] [--smtp-password-stdin] [--probe-from <address>]
                   [--local-token]
@@ -969,7 +1060,7 @@ pmail domains add <name> --method <method> [--tenant <tenant>] [--no-receiving] 
 | `--method` | Use it for | You change at your DNS host | Needs on the deployment |
 |---|---|---|---|
 | `cloudflare_zone` | A domain already on Cloudflare in the deployment's account | Nothing | `PM_CF_API_TOKEN` (an apex works without it with `--local-token`, see below) |
-| `nameservers` | A new domain used only for mail | Two NS records at your registrar | `PM_CF_API_TOKEN`; a platform key, or a tenant whose policy allows zone creation |
+| `nameservers` | A new domain used only for mail | Two NS records at your registrar | `PM_CF_API_TOKEN` that can create zones; a platform key, or a tenant whose policy allows zone creation. Not offered on Pylota Mail Cloud |
 | `dns_records` | A subdomain (or domain) whose DNS stays where it is, both directions | One MX, three DKIM CNAMEs, a MAIL FROM MX and TXT, an ownership TXT | [`setup ses`](#setup-ses) |
 | `send_only` | Sending as your existing addresses; your mailbox forwards to the agent | Three DKIM CNAMEs, a MAIL FROM MX and TXT, an ownership TXT | [`setup ses`](#setup-ses) |
 | `smtp_relay` | Sending through your own mail provider's SMTP server | An ownership TXT | Your relay's credentials; a passing alignment probe |
@@ -984,6 +1075,7 @@ pmail domains add <name> --method <method> [--tenant <tenant>] [--no-receiving] 
 | `--smtp-password-stdin` | `smtp_relay` (required) | Read the SMTP password from stdin. **The password is never accepted on the command line.** On a terminal, `pmail` asks for it with hidden input |
 | `--probe-from` | `smtp_relay` | The sender address of the alignment probe. Defaults to `postmaster@{domain}` |
 | `--no-receiving`, `--no-sending` | all | Onboard only one direction |
+| `--claim` | all | Claim a name another workspace holds but never verified, after publishing the TXT record printed by the earlier `409 domain_exists` (`details.claim`). The CLI prints that record and this flag as the fix of every `domain_exists` that carries `details.claim` |
 | `--local-token` | `cloudflare_zone` (apex) | If the deployment has no `PM_CF_API_TOKEN`, onboard the zone apex with your own `CLOUDFLARE_API_TOKEN` (below) |
 
 A flag that the method does not use is refused (exit 2). Needs `domains:write`.
@@ -1615,7 +1707,8 @@ can create every other key (`setup` prints this command for you):
 
 ```bash
 pmail keys create --level platform --name first-key --permissions \
-tenants:manage,partners:manage,platform:ops,keys:manage,identities:read,identities:write,domains:read,\
+tenants:manage,tenants:erase,partners:manage,platform:ops,keys:manage,identities:read,identities:write,\
+domains:read,\
 domains:write,messages:read,messages:send,messages:write,attachments:read,search:read,search:agentic,\
 quarantine:review,webhooks:read,webhooks:manage,erasure:manage,suppressions:manage,usage:read,\
 audit:read,members:read,members:manage
@@ -1630,9 +1723,9 @@ A partner key for an integrator such as Pylota, created with a platform key:
 
 ```bash
 pmail keys create --level partner --partner ptn_01JA2B3C4D5E6F7G8H9J0K1M2N --name pylota-backend \
-  --permissions tenants:manage,keys:manage,webhooks:manage,quarantine:review,usage:read,identities:read,\
-identities:write,domains:read,domains:write,messages:read,messages:send,messages:write,attachments:read,\
-search:read,members:manage
+  --permissions tenants:manage,tenants:erase,keys:manage,webhooks:manage,quarantine:review,usage:read,\
+audit:read,identities:read,identities:write,domains:read,domains:write,messages:read,messages:send,\
+messages:write,attachments:read,search:read,search:agentic,erasure:manage,suppressions:manage,members:manage
 ```
 
 ### `keys list` and `keys get`
@@ -1667,6 +1760,38 @@ The first argument decides what is rotated: a `key_…` ID rotates that API key,
 `cursor` or `web_bot_auth` rotates a signing key
 ([`keys rotate thread|link|cursor|web_bot_auth`](#keys-rotate-threadlinkcursorweb_bot_auth)).
 `--overlap-hours` with a signing key, or `--revoke-previous` with an API key, is refused (exit 2).
+
+---
+
+## Service accounts
+
+The service sign-up ledger ([API › Service accounts](api.md#service-accounts)): an agent asks before it
+creates an account at a third-party service, and an operator approves or rejects. `request`, `list`, `get`
+and `close` need `accounts:request`; `approve`, `reject` and `delete` need `accounts:approve`, which identity
+keys cannot hold.
+
+```text
+pmail accounts request --identity <identity> --service <domain> --account <identifier> --purpose <text>
+                       [--sender-domain <domain>]… [--address <address>]
+pmail accounts list (--identity <identity> | --tenant <tenant>) [--status pending_approval|approved|rejected|closed]
+                    [--service <domain>] [--limit <n>] [--all]
+pmail accounts get <account_id> --identity <identity>
+pmail accounts approve|reject|close <account_id> --identity <identity> [--note <text>]
+pmail accounts delete <account_id> --identity <identity> [--yes]
+```
+
+`approve` with an API key works only where keys may take decisions reserved for people
+(`PM_QUARANTINE_KEY_RELEASE = "on"`, or the tenant's `quarantine.key_release: true`); otherwise the API
+answers `403 permission_denied` (`person_required`, exit 4) and a person approves in the console.
+`approve` or `reject` on an entry that is no longer pending exits 6 (`409 account_not_pending`); a
+request beyond the limits exits 7 (`422 account_limit_reached`).
+
+```bash
+pmail accounts request --identity bookings@acme.example.com --service github.com \
+  --account acme-bookings --purpose "File issues on the booking widget repository"
+pmail accounts list --tenant acme --status pending_approval
+pmail accounts approve sac_01JA2B3C4D5E6F7G8H9J0K1M2N --identity bookings@acme.example.com
+```
 
 ---
 
@@ -1733,9 +1858,10 @@ published until it resumes.
 
 ### `assertions create`
 
-Mints an agent assertion: a JWT signed with the identity's key, naming the identity's address, display
-name and workspace, for one audience. Needs `identities:sign` on a tenant or identity key (platform and
-partner keys cannot hold it).
+Mints an agent assertion: a JWT signed with the identity's key, naming the identity's address (and,
+marked `unverified`, its display name and workspace), for one audience. Needs `identities:sign` on a
+tenant or identity key (platform and partner keys cannot hold it, but can grant it to the keys they
+create).
 
 ```text
 pmail assertions create --identity <identity> --audience <audience> [--expires-in <60-600>]
@@ -1912,6 +2038,28 @@ pmail erasure get era_01JA9M0R6AW7X2M5N6P8R0T1YW
 pmail erasure list --tenant acme --status completed --json
 ```
 
+### `erasure retry`
+
+Restarts a `failed` erasure: it submits the same scope and target again, and the new request resumes
+the failed job at the step that failed and keeps the original 24-hour deadline, for every scope. A
+counterparty erasure needs the address again, because it is never stored.
+
+```text
+pmail erasure retry <erasure-id> [--address <counterparty-address>] [--wait]
+```
+
+### `erasure reapply`
+
+Platform keys only (`platform:ops`). Runs a completed erasure again from its stored record, after a
+restore brought erased data back. A counterparty erasure is matched by the address's keyed hash, so the
+address is not needed. `pmail ops restore reconcile` calls it for every erasure after the restore point.
+A request that did not complete is refused (`409 erasure_not_completed`, exit 6): resume a failed one with
+`erasure retry`.
+
+```bash
+pmail erasure reapply era_01JA9M0R6AW7X2M5N6P8R0T1YW
+```
+
 ### `export create`
 
 A subject-access export: one `.eml` per message plus `messages.json`, in a ZIP.
@@ -2071,6 +2219,7 @@ pmail audit --tenant acme --action quarantine.release
 ```text
 Deployment   setup · setup ses · deploy · upgrade · doctor · destroy · secrets rotate-master
 Platform     dlq list|redrive · keys rotate thread|link|cursor|web_bot_auth · jobs start|get · waitlist invite
+             ops status|switch|freeze|unfreeze · ops restore d1|mailbox|reconcile|cleanup
 Profiles     login · config show|set · mcp config
 Tenants      tenants create|list|get|update|suspend|resume
 Partners     partners create|list|get|update|delete
@@ -2084,7 +2233,7 @@ Webhooks     webhooks create|list|get|update|delete|rotate|test|deliveries|repla
 Keys         keys create|list|get|revoke|rotate
 Signing      identity-keys list|create|rotate|revoke · assertions create|verify · http-sign
 Lists        suppressions list|add|remove · lists list|add|remove
-Privacy      erasure create|get|list · export create|get
+Privacy      erasure create|get|list|retry|reapply · export create|get
 Members      members list|invite|remove · invitations revoke
 Billing      plans list · billing get|set
 Usage        usage · usage daily · audit

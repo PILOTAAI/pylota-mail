@@ -18,8 +18,8 @@ and the API; this page is about the humans behind them.
 |---|---|---|---|
 | `usage` | An allowance reached 80% or 100% of its limit (FR-BILL-13) | Owner and admins | Yes, per person |
 | `new_mail` | New mail arrived in inboxes the person follows (FR-CON-14) | Nobody (opt-in) | Yes |
-| `needs_person` | Daily list of quarantined mail, uncertain sends, failing domains and failing webhooks (FR-CON-15) | Owner and admins, daily | Yes |
-| `account` | Security and billing events, one value of `AccountEvent` each: `two_factor_disabled` (two-step verification turned off), `sign_in_method_linked` (a Google or GitHub identity linked), `ownership_transferred` (sent to the previous and the new owner) and `payment_failed` (sent to the owner) | The person concerned, or the owner for billing | No (transactional) |
+| `needs_person` | Daily list of quarantined mail, uncertain sends, failing domains and failing webhooks (FR-CON-15), and service sign-ups waiting for approval ([Service sign-up ledger §8](service-accounts.md#8-console)) | Owner and admins, daily | Yes |
+| `account` | Security and billing events, one value of `AccountEvent` each: `two_factor_disabled` (two-step verification turned off), `sign_in_method_linked` (a Google or GitHub identity linked), `ownership_transferred` (sent to the previous and the new owner), `payment_failed` (sent to the owner) and `sign_in_codes_locked` (30 wrong sign-in codes for the person's address today; code sign-in is locked until 00:00 UTC, [Console › Using the code](console.md#using-the-code)) | The person concerned, or the owner for billing | No (transactional) |
 | `digest` | The items held back that day by a daily cap ([Caps and the daily digest](#caps-and-the-daily-digest)) | A person whose items were held back | Yes: its unsubscribe turns off `usage`, `new_mail` and `needs_person` |
 
 There are no browser or desktop alerts: the console has no JavaScript (FR-CON-1). The Overview banners
@@ -65,7 +65,7 @@ is SQLite-backed like the other objects.
 | `message.received`, `message.released` and `message.triaged` events | The webhook dispatcher (`consumers/webhooks.rs`) already reads every outbox event. For these three types it also sends `NotifierRequest::Event { tenant_id, identity_id, message_id, flags }` whenever the tenant has any `new_mail` preference that is not `off`, whatever its filter (cached for 60 seconds). `message.triaged` therefore reaches the Notifier for `filter = all` too, which is where `needs_reply_count` comes from. Events re-emitted by a re-parse (`reprocessed: true`) are never handed over, so a re-parse never notifies ([Webhooks › Handing new mail to the Notifier](webhooks.md#handing-new-mail-to-the-notifier)) |
 | An allowance crossing 80% or 100% | `TenantQuota` calls `NotifierRequest::UsageThreshold { feature, threshold, used, granted, period }` when a confirmed hold first crosses the threshold in a period ([§4](#4-usage-alerts)) |
 | "Needs a person" items | The Notifier's daily alarm at 09:00 in the tenant's time zone reads the counts the Overview uses |
-| Account events | The code that performs the action calls `NotifierRequest::Account { user_id, event }` after its D1 batch commits: the console handlers for `two_factor_disabled`, `sign_in_method_linked` and `ownership_transferred` ([Console › Account emails](console.md#account-emails)), and the billing webhook for `payment_failed` ([Billing › Applying state](billing.md#applying-state)). One rule picks the Notifier: the one of the person's last-used workspace (`users.last_tenant_id`); when that is unset or names a workspace that is gone, the one of the workspace where the event happened; for an event in no workspace (a sign-in method linked before any session exists), the default tenant's. The email names the workspace concerned, whichever Notifier sends it |
+| Account events | The code that performs the action calls `NotifierRequest::Account { user_id, event }` after its D1 batch commits: the console handlers for `two_factor_disabled`, `sign_in_method_linked`, `ownership_transferred` and `sign_in_codes_locked` ([Console › Account emails](console.md#account-emails)), and the billing webhook for `payment_failed` ([Billing › Applying state](billing.md#applying-state)). One rule picks the Notifier: the one of the person's last-used workspace (`users.last_tenant_id`); when that is unset or names a workspace that is gone, the one of the workspace where the event happened; for an event in no workspace (a sign-in method linked before any session exists, or a code lock), the default tenant's. The email names the workspace concerned, whichever Notifier sends it |
 | Member removal | The member-removal handler (and a member leaving) calls `NotifierRequest::MemberRemoved { user_id }` after the D1 batch that deleted their `notification_prefs` rows; the Notifier drops their `pending`, `held` and `windows` rows ([O19](../edge-cases.md)) |
 
 **Which messages count for `new_mail`.** Only messages that become visible in the inbox: status
@@ -152,6 +152,22 @@ settings page says so.
   kind to `off` for that person and workspace, without sign-in (for `digest`, the three kinds it
   summarises). An expired or foreign token changes nothing and shows a page linking to settings
   ([O18](../edge-cases.md)). `account` emails have no unsubscribe header; they link to settings instead.
+- **Token encoding.** The same construction as signed links
+  ([Security § 7.3](security.md#73-signed-links)), with its own prefix so neither can be used as the
+  other:
+
+  ```text
+  token   = base64url(payload || HMAC-SHA256(link key {kid}, payload)[0..16])    -- no padding
+  payload = "u1:{kid}:{user_id}:{tenant_id}:{kind}:{expires_unix_s}"
+  kind    = usage | new_mail | needs_person | digest
+  expires = the time the email is composed + 90 days, in whole seconds
+  ```
+
+  The handler decodes the token (at most 256 characters), splits the payload on `:` into exactly six
+  fields, requires the `u1` prefix, a known kind and IDs of the `usr_` and `ten_` forms, looks up the link
+  key named by `kid` (current, or inside its 7-day verify window), recomputes the 16-byte MAC and compares
+  it in constant time, then checks `expires`. Any failure gives the same expired-token page. The token
+  holds IDs, not the address, so it reveals nothing that the email does not already show.
 - **The unsubscribe routes** (`GET` shows a confirmation page with a one-click form, `POST` turns the kind
   off) need no session and are exempt from the console's CSRF token and `Origin` check
   ([W16](../edge-cases.md)): a mail provider sends the RFC 8058 `POST` without either. The token is their
@@ -181,15 +197,25 @@ change, 09:00 local is computed for each day with the time-zone database.
 ## 7. When system mail cannot be sent
 
 System mail uses the platform domain, which has no fallback ([Fallback behaviour](identity-domains.md#fallback-behaviour)).
-While the platform domain is `failing`, notification sends fail like any other send from it. The Notifier
-keeps the items and retries hourly for 24 hours, and the operator is alerted by the existing platform
-domain alert ([O25](../edge-cases.md)).
+A send from a `failing` platform domain is accepted with `202` and fails later in the delivery path, and a
+retry with the same `Idempotency-Key` would only replay that `202`, so the Notifier must not submit while
+the domain is broken ([O25](../edge-cases.md)). Before each submit it reads the platform domain's
+`domains.state` (cached for 60 seconds): while it is `failing` or `suspended`, it submits nothing, keeps
+the item in `pending` (`attempts` + 1, `due_at` one hour later) and retries hourly for 24 hours, then drops
+it and counts `notifications_failed_total`. The operator is alerted by the existing platform-domain
+alert. Because nothing was submitted, the retry that follows recovery is the first submit under that
+key, and the email goes out once. A domain that turns `failing` between the check and the transport
+still loses that one email (`domain_failing_no_fallback`); `notifications_deferred_total{reason="platform_domain"}`
+counts the items held back.
 
 The system identity is exempt from the tenant daily cap and from abuse auto-pause
 ([Identities and domains › The system identity](identity-domains.md#the-system-identity)), so a submit
 through it is refused for only three reasons: `429 daily_cap_reached` (its own `send_policy.daily_cap`
 of 50,000 is spent), `409 identity_paused` (an operator paused it by hand) and `409 domain_not_ready`
-(the platform domain is not verified yet). The Notifier handles each one as in O25: it keeps the item in
+(the platform domain is not verified yet). The Notifier also holds an item back without submitting when
+the `notification` class has used its share of the system identity's day
+([Cloud sign-up § 10.2](cloud-signup.md#102-system-mail-budgets)), which keeps sign-in mail flowing. The
+Notifier handles each case as in O25: it keeps the item in
 `pending` (`attempts` + 1, `due_at` one hour later), retries hourly for 24 hours and then drops it,
 counting `notifications_failed_total`. `account` items are kept the same way. On the first such refusal,
 and again after each hour in which they continue, it reports the state alert `system_mail_blocked`
@@ -240,7 +266,8 @@ would be refused as `409 idempotency_conflict`).
 | `it::notify::timezone_change` | No day sent twice or skipped ([O22](../edge-cases.md)) |
 | `it::notify::billing_off_no_usage_alerts` | `PM_BILLING=off`: sends past every amount that would cross 80% or 100% on a plan send no `usage` email and no `UsageThreshold`; a daily send cap still returns `429` and emits `quota.warning` ([O23](../edge-cases.md)) |
 | `it::notify::daily_caps` | 51st email for a person, or the workspace's 201st, → folded into the person's `digest`; the next 09:00 sends one `digest` email with counts and no mail content, not counted against the caps; its one-click unsubscribe turns `usage`, `new_mail` and `needs_person` off ([O24](../edge-cases.md)) |
-| `it::notify::platform_domain_failing_retries` | Platform domain `failing`: items kept and retried hourly for 24 hours; the platform domain alert fires ([O25](../edge-cases.md)) |
+| `it::notify::platform_domain_failing_retries` | Platform domain `failing` (DNS fake): no submit reaches the system identity's mailbox (no message row, nothing recorded by the mail-sender fake) while items are kept and retried hourly; after the domain is `healthy` again, the next retry sends each email exactly once under its original key; past 24 hours an item is dropped; the platform domain alert fires ([O25](../edge-cases.md)) |
+| `it::notify::unsubscribe_token_format` | A token for each kind round-trips; an altered byte, a `u1` payload with five or seven fields, an unknown kind, a signed-link token (`l1:` prefix) and a token past `expires` all give the same expired-token page and change nothing ([O18](../edge-cases.md)) |
 | `it::notify::system_mail_blocked_retries` | A notification submit refused with `429 daily_cap_reached` (system identity's cap lowered), `409 identity_paused` (paused by a platform key) or `409 domain_not_ready`: the item is kept and retried hourly for 24 hours, then dropped; `system_mail_blocked` fires with the code; the default tenant's `tenant_daily_send_cap` never refuses it |
 | `it::notify::suspended_tenant_account_only` | A suspended tenant's people get `account` emails and nothing else ([O26](../edge-cases.md)) |
 | `core::notify::no_content_in_body` | A rendered notification contains no subject, sender, snippet or attachment name from the source message |

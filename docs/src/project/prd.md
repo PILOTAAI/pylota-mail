@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Product | Pylota Mail |
-| Document owner | Pylota engineering |
+| Document owner | TREFT LTD (the owner, who is the sole developer and the Cloud operator) |
 | Status | Approved for build (v1.0) |
 | Last reviewed | 2026-10-10 |
 | Licence | FSL-1.1-ALv2 (Fair Source; each release becomes Apache-2.0 two years after it ships) |
@@ -93,7 +93,7 @@ Pylota's own experience showed the cost of these gaps:
 - Bulk marketing campaigns. Marketing mail is supported per message with consent and unsubscribe
   headers, but there are no list-management or campaign features.
 - Scheduled send and server-side drafts (planned for v1.1).
-- OAuth 2.1 for the MCP endpoint (planned for v1.1; v1.0 uses API keys as bearer tokens).
+- OAuth 2.1 for the MCP endpoint (planned for v1.1; v1.0 uses API keys as bearer tokens; [ADR 0016](adr/0016-plan-items-changed-for-v1.md)).
 - Running on platforms other than Cloudflare Workers.
 
 ### Unique selling propositions
@@ -142,8 +142,8 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
 
 | Area | P0 | P1 | P2 |
 |---|---|---|---|
-| Tenancy and keys | Tenants (live and test), API keys at four levels, partner keys for integrators on a shared deployment (FR-KEY-4) | – | – |
-| Identities | CRUD, idempotent create, pause, accountable human; agent signing keys and assertions (JWKS) | Signed HTTP requests (Web Bot Auth, spike S13) | – |
+| Tenancy and keys | Tenants (live and test), API keys at four levels, partner keys for integrators on a shared deployment (FR-KEY-4), workspace policy self-service within ceilings (FR-TEN-4) | – | – |
+| Identities | CRUD, idempotent create, pause, accountable human; agent signing keys and assertions (JWKS); the service sign-up ledger (FR-IDN-10) | Signed HTTP requests (Web Bot Auth, spike S13) | – |
 | Addresses | Platform domain, aliases, promote, retire, rollback | – | – |
 | Domains | Platform domain; `cloudflare_zone`; `nameservers` | `dns_records` (spike S11); `send_only` (S8); `smtp_relay` (S12); `delegated_subdomain` behind `PM_CF_SUBDOMAIN_SETUP` (S10) | Mailgun and SendGrid inbound sources |
 | Inbound | Parse, verdicts, quarantine, loops, attachments, extracted text | Malware scanner hook | – |
@@ -170,7 +170,11 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
   that receive through SES, which accepts mail before the Worker sees it, inbound mail is held for the same
   five days and then dropped without a bounce (FR-DOM-9).
 - **FR-KEY-1** API keys **must** be scoped at one of four levels: `platform`, `partner`, `tenant` or `identity`.
-  Each key holds a list of permissions. A key can never create a key wider than itself.
+  Each key holds a list of permissions. A key can never create, read, rotate or revoke a key wider than
+  itself. The one exception: a platform or partner key **may** grant `identities:sign`, which it cannot
+  hold, to a tenant or identity key it mints, and the grant is audit-logged. Deleting a workspace (a
+  tenant-scope erasure) **must** need its own permission, `tenants:erase`, which a workspace admin and the
+  keys an admin mints never hold.
 - **FR-KEY-2** Key secrets **must** be shown once, stored only as a keyed hash, support expiry, and
   support rotation with an overlap window. No stored record, an idempotency record included, **may** hold
   a secret: an idempotent replay of a response that carried one returns it without the secret
@@ -191,6 +195,20 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
   still stored. A partner **must not** be deletable while it has a tenant that is not erased, and deletion
   **must** keep the row (soft delete), so a tenant's `partner_id` never changes
   ([REST API › Partners](../reference/api.md#partners), [Security › Partner keys](design/security.md#partner-keys)).
+- **FR-KEY-5** A key **must** record the console user behind it, if any, and keys minted from it **must**
+  inherit that record. Removing that person from a workspace **must** revoke their keys of that workspace,
+  and lowering their role **must** revoke those holding a permission the new role lacks. However many keys
+  one tenant or one partner mints, its request rate **must** stay bounded by a shared per-tenant or
+  per-partner limit, and the number of its active keys by a cap
+  ([Security › Who minted a key](design/security.md#who-minted-a-key), [Security § 10](design/security.md#10-rate-limiting-and-abuse)).
+- **FR-TEN-4** A workspace **must** be able to change its own tenant policy: a tenant key holding
+  `policy:write`, and a console owner or admin, **may** set the free fields and lower the lower-only fields,
+  never above the strictest of the deployment default, the platform operator's value and, for a partner's
+  tenant, the partner's value. Platform-only fields and `quarantine.key_release` **must** stay out of its
+  reach, identity keys **must not** hold `policy:write`, and a key **must not** loosen a guard field
+  (allow-list only, quarantine on authentication failure, the spam threshold, unsolicited-code quarantine)
+  where only people may release quarantined mail (FR-CON-6). Every policy write **must** be audited and
+  evented, and concurrent writes **must not** lose one another ([Workspace policy](design/workspace-policy.md)).
 
 ### 6.2 Identities and addresses
 
@@ -247,6 +265,16 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
   - homoglyph look-alikes of the names reserved on that domain.
 - **FR-ADR-7** Internationalised (SMTPUTF8) local parts **must** be refused with a clear error, because
   Cloudflare Email Routing cannot route them. Unicode display names are allowed.
+- **FR-IDN-10** An agent **must** create a third-party account with its identity's address only through
+  the **service sign-up ledger**: it records the service, the account identifier, the address and the
+  purpose, and an operator approves or rejects each entry, in the console or with a key holding
+  `accounts:approve`, which identity keys **must not** hold; approval by an API key follows the rule of
+  FR-CON-6. Where the tenant's `accounts.require_approval` is on (the default on Pylota Mail Cloud, which no
+  workspace or partner can turn off), a verification code or link **must** reach an agent only when an
+  approved entry matches the mail (the authenticated sender's organisational domain and the receiving
+  address); other such mail **must** be held for review, never dropped. Entries **must** emit
+  `account.requested`, `account.approved`, `account.rejected` and `account.closed`, expire when undecided,
+  and be deleted with the identity or tenant ([Service sign-up ledger](design/service-accounts.md)).
 
 ### 6.3 Domains
 
@@ -297,6 +325,15 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
   `409 domain_not_dedicated` unless the request carries `"confirm_dedicated": true`. A tenant key **may**
   use it only when its policy has `domains.allow_create_zone: true`. `delegated_subdomain` **must** stay
   off unless `PM_CF_SUBDOMAIN_SETUP=on`, the Cloudflare account is Enterprise, and spike S10 has passed.
+- **FR-DOM-13** Onboarding **must never** take over, change or delete a provider object (a Cloudflare zone,
+  sending domain, routing setup or catch-all, or an SES identity) that the deployment did not create for
+  that tenant's domain: a tenant's add that finds one is refused with `409 domain_exists`. The deployment
+  **must** record the provider IDs it creates for each domain, and removal and cleanup **must** act on
+  those IDs only. Removing one mail domain **must not** stop mail to the other mail domains of its zone.
+- **FR-DOM-14** A domain that has never been verified **must** be removed 14 days after it was added, and
+  **must** be evictable by another tenant that proves control of its DNS with a claim record; a tenant
+  **may** hold at most 5 such domains. The answer to a name held by someone else **must** be the same
+  whoever holds it and in whatever state, so it reveals nothing about other tenants.
 
 ### 6.4 Inbound
 
@@ -326,6 +363,14 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
   and text formats, and for images when the tenant enables it.
 - **FR-IN-9** Hidden text (zero-width characters, CSS-hidden content, white-on-white) **must** be removed
   from agent-facing text and raised as a risk flag.
+- **FR-IN-10** Messages and threads **must** be listable and readable through the API, MCP and console.
+  Thread lists and their counts show only visible mail (never quarantined, hidden or throttled
+  messages). Labels, read state and archiving **must** be settable per message and per thread, and
+  `is:unread` **must** follow the read state.
+- **FR-IN-11** An agent **must** be able to wait for new mail (`wait`, a long poll with filters), and
+  verification codes and links in received mail **must** be extracted into a structured field.
+- **FR-IN-12** Unsolicited inbound mail **must** be capped per identity and per tenant by source, so that
+  mail nobody asked for cannot exhaust storage, triage or model spend.
 
 ### 6.5 Outbound
 
@@ -360,8 +405,18 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
 - **FR-OUT-12** Test tenants **must** use the simulator transport:
   - mail to `*@simulator.invalid` produces a scripted outcome (`delivered`, `bounce`, `softbounce`,
     `complaint`, `deferred`, `reject`, `timeout`);
-  - mail to addresses on this deployment is delivered internally;
+  - mail to identities of the same tenant, or of a tenant with the same partner, is delivered internally;
   - all other recipients are refused with `test_mode_recipient`.
+- **FR-OUT-13** By default an identity **must** send only to recipients it has written to before, to
+  addresses on the tenant's send-allow list, or to the authenticated sender of mail it is answering.
+  Other recipients are suppressed unless the identity's `require_known_recipient` is turned off.
+- **FR-OUT-14** Any send whose computed hop count reaches the loop limit **must** be refused with
+  `loop_detected`, whatever its `kind`.
+- **FR-OUT-15** Marketing mail **must** leave through the SES or SMTP transport, never through Cloudflare
+  Email Service (transactional only). A marketing send that would use Cloudflare is refused with
+  `marketing_needs_ses`, at submit and again before transport.
+- **FR-OUT-16** Tenants **must** be able to manage allow and block lists for sending and receiving, by
+  address or by domain.
 
 ### 6.6 Delivery
 
@@ -376,6 +431,10 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
 - **FR-DLV-4** Uncertain sends **should** be reconciled from provider events by matching sender,
   recipient and subject within 30 minutes. A match moves the send to its real status with `reconciled: true`.
 - **FR-DLV-5** DSNs that do not match a message we sent (backscatter) **must** be dropped and counted.
+- **FR-DLV-6** A tenant or a tenant sending domain whose complaint or bounce rate reaches the provider's
+  review rate **must** be paused automatically, and a paused tenant or domain **must never** fall back to
+  the platform domain.
+- **FR-DLV-7** A person **must** be able to resolve an `uncertain` send as `sent` or `not_sent`.
 
 ### 6.7 Threading
 
@@ -422,6 +481,10 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
 - **FR-SRCH-10** Tenant scope (all of a tenant's identities) **must** require a tenant-level key.
 - **FR-SRCH-11** Erasure **must** remove keyword rows, references and vectors together. A probe query
   after erasure **must** return nothing.
+- **FR-SRCH-12** Search **should** offer a contacts lookup and a find-related lookup for a message.
+- **FR-SRCH-13** An agentic answer **must** be marked as untrusted, model-written text. Each citation
+  **must** carry the trust of its source, and a sentence that cites only unauthenticated or
+  steering-suspected mail **must** be removed.
 
 ### 6.9 Triage
 
@@ -437,6 +500,8 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
 - **FR-TRI-3** Triage is advisory. It **must never** send, delete or release a message.
 - **FR-TRI-4** The triage model **must** receive mail content as fenced, untrusted data. Its output
   **must** be validated against a schema, and invalid output is recorded as `failed`, never guessed.
+- **FR-TRI-5** Triage **may** be re-run on a stored, visible message. A re-run on a quarantined, hidden,
+  throttled or delivery-report message **must** be refused with `triage_not_eligible`.
 
 ### 6.10 Events and webhooks
 
@@ -490,6 +555,10 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
 - **FR-OPS-3** `pmail doctor` **must** check DNS, routing, sending, event subscriptions, bindings, secrets
   and quota, and print a fix for each failure.
 - **FR-OPS-4** Every queue **must** have a dead-letter queue with a consumer that records and alerts.
+- **FR-OPS-5** Pylota Mail Cloud production **must** be commissioned from the written
+  [Cloud commissioning](cloud-commissioning.md) page: its full configuration, scoped and short-lived
+  credentials, the partner bootstrap, the checks, and three gated phases (partner-only, waitlist, open),
+  so that Pylota's integration runs on Cloud before public sign-up opens.
 
 ### 6.14 Console and workspaces
 
@@ -500,9 +569,11 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
   [Console design](design/console.md#roles). Ownership can be transferred to an admin.
 - **FR-CON-3** Sign-in **must** be passwordless: a single-use magic link or a six-digit code sent by email,
   valid for 10 minutes. It **must** be rate-limited: 3 link or code requests per 10 minutes per address;
-  10 attempts per code (the token is burned after 10 failures); and `RL_SIGNIN`, 10 requests per 60 s per
-  client IP on the sign-in, sign-up and waitlist routes. Passkeys (WebAuthn) are P2: they need browser
-  JavaScript, which the console does not use (FR-CON-1).
+  10 attempts per code (the token is burned after 10 failures); 30 failed codes per address per UTC day,
+  after which only the link works until the next UTC day; and `RL_SIGNIN`, 10 requests per 60 s per
+  client network (an IPv6 /64 counts as one) on the sign-in, sign-up, waitlist and pending-step routes
+  and the OAuth start. Passkeys (WebAuthn) are P2: they need browser JavaScript, which the console does
+  not use (FR-CON-1).
 - **FR-CON-4** Members are invited by email. A pending invitation **must** count against the seat limit and
   expire after 7 days. Removing a member **must** end their sessions immediately.
 - **FR-CON-5** Sensitive actions **must** require a sign-in within the last 10 minutes and be written to the
@@ -524,7 +595,8 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
   **must** be created only when the link or code is used.
 - **FR-CON-9** Sign-in with Google and GitHub **must** be available when their client credentials are
   configured (on Pylota Mail Cloud). It **must** accept only a verified email address, use PKCE and a
-  `state` bound to the browser by a cookie, and link to an existing person with the same verified email.
+  `state` bound to the browser by a cookie, and link to an existing person with the same verified email
+  only as FR-CON-17 allows.
 - **FR-CON-10** A person **must** be able to enrol two-step verification with an authenticator app (TOTP,
   RFC 6238) and ten single-use recovery codes. Once enrolled, it is asked for after every first factor and
   at re-authentication. A workspace owner **may** set `require_two_factor`; a member without two-step
@@ -538,9 +610,9 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
 - **FR-CON-13** Returning from Stripe Checkout **must** never change the plan: Stripe webhooks are the only
   source of plan state (FR-BILL-10), and another workspace's Checkout session changes nothing. Pylota Mail
   Cloud **must** apply abuse controls: `RL_SIGNIN`, a new-workspace send ramp (a tenant daily cap of at
-  most 50 for the first 7 days on Free, lifted by a daily evaluation of bounce and complaint rates or at
-  once by a paid plan), refusal of disposable addresses (`PM_SIGNUP_BLOCKED_DOMAINS`), and system mail
-  sent from `PM_SYSTEM_FROM`.
+  most 50 for the first 7 days on Free, lifted by a daily evaluation of bounce and complaint rates or by a
+  paid plan once its invoice is paid), refusal of disposable addresses (`PM_SIGNUP_BLOCKED_DOMAINS`), and
+  system mail sent from `PM_SYSTEM_FROM`.
 - **FR-CON-14** A person **may** opt in, per workspace, to email notifications of new mail in the inboxes
   they choose (`instant`, `hourly` or `daily`). Notifications **must** be coalesced (one email per person
   and inbox per window), **must** count only mail that becomes visible in the inbox, and **must never**
@@ -552,6 +624,21 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
   other notification **must** carry RFC 8058 one-click unsubscribe. Notification email is capped at 50 per
   person and 200 per workspace a day, beyond which items go into one daily digest email (itself
   unsubscribable and not capped).
+- **FR-CON-16** A first factor **must never** create a session while a second step is outstanding: the
+  pending step expires within 10 minutes and can be finished once. Accepting an invitation **must** be an
+  explicit action by the invited person, never automatic at sign-in, and a person enrolled in two-step
+  verification **must** pass it before the membership and the session exist. A workspace's
+  `require_two_factor` **must** be checked on every console request
+  ([Cloud sign-up §5.1](design/cloud-signup.md#51-the-pending-step)).
+- **FR-CON-17** A Google or GitHub identity **must** be linked to an existing person only after a code
+  emailed to that person's address is entered, and a person **must** be able to unlink one. A console
+  sign-in address (an account, an invitation or a workspace owner) **must not** be a mailbox that the
+  deployment itself receives, and an identity address **must not** equal a console sign-in address.
+- **FR-CON-18** Pylota Mail Cloud **must** protect its shared system mail and shared domain: budgets for
+  system mail per recipient, per client network and ASN, and per inviting tenant, with a share of each
+  day kept for sign-in mail; one self-serve Free workspace per person; and, when the account's daily
+  sending quota is configured, a breaker that stops Free and ramped workspaces at 60% of it and every
+  tenant at 90% until 00:00 UTC ([Cloud sign-up §10](design/cloud-signup.md#10-abuse-and-safety-on-cloud)).
 
 ### 6.15 Plans, metering and billing
 
@@ -593,6 +680,12 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
   for allowances that reset, and at most once a day per feature and threshold for counts that do not.
   With billing off, no usage alert is sent. Webhook events (`quota.warning`, `billing.limit_reached`) are
   unchanged.
+- **FR-BILL-14** An allowance **must** rise only after the payment for it succeeded: a plan or top-up
+  increase applies when its invoice is paid, never on a subscription's status alone, and decreases apply
+  at once. A disputed payment **must** stop the workspace's sends and apply the default plan until the
+  dispute closes; a lost dispute cancels the workspace's subscriptions. A workspace **must** have at most
+  one Stripe customer and one subscription per plan or top-up feature; a duplicate is cancelled with its
+  unused time credited ([Billing › Disputes and refunds](design/billing.md#disputes-and-refunds)).
 
 ## 7. Non-functional requirements
 
@@ -616,6 +709,7 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
 | NFR-PRV-1 | Erasure completes | ≤ 24 h, receipt always produced |
 | NFR-OPS-1 | Fresh deploy, hands-on time | ≤ 15 minutes |
 | NFR-OPS-2 | Recovery point / time objectives | RPO ≤ 1 min (indexes); ≤ 15 min (blobs) against infrastructure loss, from R2's durability. R2 has no versioning or replication, so blobs deleted by a bug are recoverable only with the optional nightly backup bucket (RPO 24 h, off by default); RTO ≤ 4 h |
+| NFR-OPS-3 | Operator alerting with one operator | Every page alert reaches the operator through two independent channels (alert email from the deployment, and an external scheduled heartbeat that fails when the deployment does not answer or a page alert fires) within 15 minutes; a stopped deployment or a stopped heartbeat is detected within 1 hour; conditions that need a safe action at once are contained automatically ([Observability § 5.5–5.6](design/observability.md#55-alert-email-and-the-external-heartbeat)) |
 | NFR-COST-1 | Idle deployment cost beyond Workers Paid | ≈ 0 (no always-on compute) |
 | NFR-BILL-1 | Metered actions allowed beyond a granted allowance | 0 (holds are atomic per workspace) |
 | NFR-BILL-2 | Metered actions failed because a billing provider was unreachable | 0 (metering is in-process; Stripe is only needed to change plans) |
@@ -625,7 +719,7 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
 
 - Pylota cut over from AgentMail. Every operator has four identities, inbound mail works end to end,
   and none of the edge-case register's `S` rows fails in production for 30 days.
-- A third party deploys from the README alone, with no help, inside 15 minutes (measured in usability runs).
+- A fresh agent session deploys from the self-hosting page alone, with no help, inside 15 minutes of hands-on time (measured by the M20 rehearsal, [ADR 0015](adr/0015-solo-operator.md)).
 - Agents in Pylota's eval suite find and cite the right email in at least 90% of mail-retrieval tasks.
 - Zero duplicate sends attributed to retries.
 
@@ -639,6 +733,9 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
 4. Search quality gates (NFR-QUAL-1/2) and triage gate (NFR-QUAL-3) pass.
 5. A threat model is written, and the findings rated high are fixed.
 6. A fresh-account deploy rehearsal has been run from the docs.
+7. The release gate passes: `release-gates/v{version}.md` ticks every item of the
+   [pre-release checklist](design/security.md#16-pre-release-checklist) with a link to its evidence, and
+   the release carries SBOMs, signed checksums and build provenance (`cargo xtask release-gate`).
 
 ## 10. Risks
 

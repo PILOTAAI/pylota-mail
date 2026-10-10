@@ -4,7 +4,7 @@
 |---|---|
 | Status | Accepted |
 | Date | 2026-10-09 |
-| Deciders | Pylota engineering |
+| Deciders | The owner (TREFT LTD) |
 | Related | FR-SRCH-1, FR-SRCH-7, FR-SRCH-11, NFR-QUAL-1, NFR-PERF-4, NFR-COST-1; [Search](../design/search.md); [Privacy](../design/privacy.md); spike S6 |
 
 ## Context

@@ -20,13 +20,23 @@ Pylota Mail. Cloudflare's and Amazon's were read from their documentation on 202
 | Archive expansion checked | ratio ≤ 100:1, ≤ 100 MB | Pylota Mail | Larger means `risk: archive_bomb`, quarantined |
 | Local part length | 64 characters, including the thread token | RFC 5321 | Username plus suffix at most 40 |
 | References kept on our replies | 20: the first plus the 19 most recent | Pylota Mail | The ones between are trimmed ([C2](../project/edge-cases.md)) |
-| Daily sending | Account quota, set and raised by Cloudflare. It is not exposed to the Worker | Cloudflare | Queue backs off for up to 24 hours. An alert fires at 80% of `PM_DAILY_SEND_QUOTA` when you set it to your quota, otherwise on the first quota error ([G3](../project/edge-cases.md)) |
+| Daily sending | Account quota, set and raised by Cloudflare. It is not exposed to the Worker, and the limits page does not say whether it counts messages or recipients, so the alert counts accepted recipients plus the strategy-B journal copy (`cf_recipients`) | Cloudflare | Queue backs off for up to 24 hours. An alert fires at 80% of `PM_DAILY_SEND_QUOTA` when you set it to your quota, otherwise on the first quota error ([G3](../project/edge-cases.md)) |
+| Stored message row (Durable Object SQLite) | 1,900,000 bytes per message row, inbound and outbound: `text` 512 KiB, `html_sanitized` 1 MiB, `extracted_text` 256 KiB, `references_json` 200 msg-ids and 32 KiB, `to` and `cc` 200 addresses each, DSN recipients 100; when the sum would pass the budget, `html_sanitized` is cut first, then `text`, then `extracted_text` | Cloudflare (2 MB per row, string or BLOB; 100 bound parameters per query; 100 KB per statement; 100 columns per table: [Durable Objects limits](https://developers.cloudflare.com/durable-objects/platform/limits/), read 2026-10-10) / Pylota Mail | Flag `body_truncated`; the full message stays in the raw MIME ([Inbound › Storage caps](../project/design/inbound.md#storage-caps)) |
+| Inbound volume per identity | 60 an hour per sender (`unauth:` + address when authentication fails), 120 an hour across unauthenticated senders who are not known correspondents | Policy (`inbound.*`) | Stored `throttled`: not triaged, embedded or evented, not counted in `storage_gb` ([D5](../project/edge-cases.md), [D13](../project/edge-cases.md)) |
+| Inbound volume per tenant | 2,000 an hour from senders who are not known correspondents | Policy (`inbound.per_tenant_per_hour`) | As above |
+| Unknown recipients per domain | 20 misses a second | Pylota Mail | Further mail to unknown addresses on the domain gets a temporary failure for the rest of the second ([A16](../project/edge-cases.md)) |
+| Role mail relayed (`postmaster@`, `abuse@` and the other RFC 2142 names) | 30 an hour per domain, 5 an hour per envelope sender | Pylota Mail | A temporary failure; the sender's server retries ([D14](../project/edge-cases.md)) |
+| Hop count of a send (`X-Pylota-Mail-Hop`) | Below 10, for every `kind` | Pylota Mail | `409 loop_detected` ([N13](../project/edge-cases.md)) |
+| Unknown transport outcomes in a row | 3 per transport (Cloudflare account, SES region, SMTP relay) | Pylota Mail | The transport's breaker opens for 5 minutes, doubling to at most 1 hour; queued messages wait unclaimed instead of becoming `uncertain` ([J28](../project/edge-cases.md)) |
+| Tenant and domain complaint and bounce rates | Complaints 0.1%, bounces 5%, over 7 UTC days with at least 500 outcomes | Policy (`abuse.tenant_*`); the complaint default is Amazon SES's review rate ([SES sending review FAQ](https://docs.aws.amazon.com/ses/latest/dg/faqs-enforcement.html), read 2026-10-10) | Sending paused: `409 sending_paused`, no fallback; a platform key resumes ([G12](../project/edge-cases.md)) |
 
 ## Domains and addresses
 
 | Limit | Value | Source |
 |---|---|---|
-| Mail domains per zone (routing + sending, including apex) | 30 | Cloudflare |
+| Mail domains per zone (routing + sending, including apex) | 30 | Cloudflare ([subdomains](https://developers.cloudflare.com/email-service/configuration/subdomains/), read 2026-10-10). The 31st returns `422 zone_domain_limit` before anything is created |
+| Unverified domains per tenant | 5 | Pylota Mail. Domains never verified, including adds in progress; the 6th returns `422 unverified_domain_limit`. Platform keys are not limited |
+| Time to verify a new domain | 14 days | Pylota Mail. A domain never verified 14 days after it was added (or after its created zone became active) is removed with `reason: "unverified_expired"`; a reminder is sent on day 12. Until it is verified, another tenant that publishes its claim TXT can evict it |
 | Literal routing rules per domain (subdomain mail domains) | 200 | Cloudflare. So at most 200 addresses per subdomain mail domain. Apex domains use catch-all and have no limit |
 | Literal routing rule matcher | 90 characters | Cloudflare (Email Routing rules API, read 2026-10-09). An address on a subdomain mail domain longer than 90 characters is refused with `400 address_invalid` |
 | Catch-all | apex domains only | Cloudflare. This is why the platform domain must be a zone apex |
@@ -43,9 +53,10 @@ Applies to domains connected with `dns_records`, `send_only`, or `smtp_relay` wi
 | Limit | Value | Source | What happens |
 |---|---|---|---|
 | Inbound message size | 40 MB, including headers | [SES quotas](https://docs.aws.amazon.com/ses/latest/dg/quotas.html), read 2026-10-09 | Larger messages are not stored in S3 and never reach the Worker |
-| Verified identities per region | 10,000 (raised only through the AWS account manager) | [SES quotas](https://docs.aws.amazon.com/ses/latest/dg/quotas.html), read 2026-10-09 | At 9,000 the operator alert `ses_identities_90pct` fires and `pmail doctor` warns. At 10,000, adding a domain that needs an SES identity gets `422 transport_unavailable` with `details.reason = "ses_identity_limit"`. The count is the `domains` rows with `ses_region` set and not `removed`, plus the platform identity |
+| Verified identities per region | 10,000 (raised only through the AWS account manager) | [SES quotas](https://docs.aws.amazon.com/ses/latest/dg/quotas.html), read 2026-10-09 | At 9,000 the operator alert `ses_identities_90pct` fires and `pmail doctor` warns. At 10,000, adding a domain that needs an SES identity gets `422 transport_unavailable` with `details.reason = "ses_identity_limit"`. The count is the `domains` rows with `ses_region` set and not `removed`, plus adds in progress that hold an SES identity, plus the platform identity, or the region's total from the daily `ListEmailIdentities` when that is larger |
 | Rules per receipt rule set | 200, not adjustable | [SES quotas](https://docs.aws.amazon.com/ses/latest/dg/quotas.html), read 2026-10-09 | Pylota Mail uses at most 150 `pm-retired-{n}` rules |
-| Recipients per receipt rule | 500, not adjustable | [SES quotas](https://docs.aws.amazon.com/ses/latest/dg/quotas.html), read 2026-10-09 | When a `pm-retired-{n}` rule is full, the domain monitor opens the next one |
+| Recipients per receipt rule | 500, not adjustable | [SES quotas](https://docs.aws.amazon.com/ses/latest/dg/quotas.html), read 2026-10-10 | When a `pm-retired-{n}` rule is full, `SesControl`, the rules' only writer, opens the next one |
+| Receiving deployments per AWS account and region | 1 | Pylota Mail (`pm-deliver` has no recipient condition) | `pmail setup ses` refuses a second deployment in the same account and region; use a separate AWS account for staging |
 | Retired addresses bounced per deployment | 75,000 (150 rules × 500) | Pylota Mail | Beyond it the oldest retired addresses leave the rules, and their mail is dropped without a bounce, like mail to an unknown address |
 | SES API requests other than sends | 1 per second per account and region; not adjustable | [SES quotas](https://docs.aws.amazon.com/ses/latest/dg/quotas.html) (SES API sending quotas), read 2026-10-09 | One deployment-wide token bucket (the `SesControl` Durable Object) admits one control-plane call per second. Domain create, `PATCH` and removal wait up to 5 s, then get `429 upstream_rate_limited` with `Retry-After`; background checks wait up to 60 s, then retry later. Each SES domain's daily identity check runs at a fixed time of day derived from a hash of its ID, so checks spread across the day ([Domains on any DNS host §4.8](../project/design/domain-connections.md#48-ses-api-rate-one-request-per-second)) |
 | Sending from the SES sandbox | 200 messages per 24 hours, 1 per second, to verified addresses only | [SES quotas](https://docs.aws.amazon.com/ses/latest/dg/quotas.html), read 2026-10-09 | `pmail setup ses` stops until production access is enabled |
@@ -69,8 +80,13 @@ Applies to domains connected with `smtp_relay`.
 |---|---|
 | Request body | 7 MiB (a 5 MiB message after base64 decoding, plus JSON) |
 | Requests per API key | 600 per minute |
+| Requests per tenant, all its tenant and identity keys together (`RL_TENANT`) | 1,800 per minute (`429 rate_limited`, `details.bucket: "tenant"`) |
+| Requests per partner, all its partner keys together (`RL_PARTNER_API`) | 1,800 per minute (`429 rate_limited`, `details.bucket: "partner"`) |
+| Active API keys | 100 tenant and identity keys per tenant, 10 partner keys per partner; revoked and expired keys do not count (`422 key_limit_reached`). Platform keys are not capped |
 | Search per key | 120 per minute |
-| Agentic search per key | 20 per minute. Tenant daily cap 500 by default |
+| Agentic search per key | 20 per minute. Tenant daily cap 500 by default, counted once per validated request |
+| Workers AI per tenant (`RL_AI`, `RL_EMBED`) | 60 text-generation calls (triage, agentic planning and answers) and 600 embedding requests a minute; the account's limits, shared by every tenant, are 300 and 3,000 a minute ([Workers AI limits](https://developers.cloudflare.com/workers-ai/platform/limits/), read 2026-10-10). Triage and embedding jobs over the share wait and retry; interactive search degrades ([F16](../project/edge-cases.md)) |
+| Model-backed triage per tenant | 2,000 a day by default (`triage.daily_model_cap`); then rules-only until local midnight |
 | Sends per identity | 120 per minute. Daily caps from policy |
 | Signing per identity (`RL_SIGN`): agent assertions and signed HTTP requests together | 600 per minute. Not counted against any plan allowance |
 | Tenant creation and invitations per partner (`RL_PARTNER`) | 10 per minute together, across all of the partner's keys |
@@ -105,6 +121,21 @@ range gets `400 invalid_request`.
 | HTTP signature components | Always `@authority`, `signature-agent` and `from`; optionally `@method`, `@path` and `@query`. ASCII values only |
 | Web Bot Auth key directory | At most 3 keys (one active, two retiring); a rotated deployment key stays listed for 7 days. `Cache-Control: max-age=86400` |
 
+## Service sign-up ledger
+
+From [Service sign-up ledger](../project/design/service-accounts.md).
+
+| Limit | Value |
+|---|---|
+| Pending entries per identity | 10; the next request gets `422 account_limit_reached` |
+| Entries per identity, any status | 200; the next request gets `422 account_limit_reached` |
+| Pending entry lifetime | 7 days, then `rejected` with reason `expired` |
+| Rejected and closed entries | Deleted 90 days after the decision or closure |
+| `sender_domains` | The service domain plus at most 5 more organisational domains |
+| `account_identifier` | 1–254 characters |
+| `purpose` | 1–500 characters |
+| `note` (approve, reject, close) | At most 500 characters |
+
 ## Notifications
 
 From [Notifications and usage alerts](../project/design/notifications.md).
@@ -126,9 +157,9 @@ From [Notifications and usage alerts](../project/design/notifications.md).
 | Limit | Value | Source |
 |---|---|---|
 | Durable Object SQLite per identity | 10 GB | Cloudflare. Alert at 70%. Raw MIME and attachments live in R2, so this is mostly text and index |
-| D1 database | 10 GB | Cloudflare. Control plane only. Event and delivery logs are pruned after the tenant's `retention.events_days` (default 30) |
-| Vectorize vectors per index | 20,000,000 | Cloudflare. About 4,000–10,000 vectors per 1,000 messages |
-| Vectorize namespaces per index | 50,000 | Cloudflare. One per tenant, so at most 50,000 tenants per index |
+| D1 database | 10 GB; it cannot be raised ([D1 limits](https://developers.cloudflare.com/d1/platform/limits/), read 2026-10-10) | Cloudflare. One database for the whole deployment: control plane only. Event and delivery logs are pruned after the tenant's `retention.events_days` (default 30). Alerts at 70% (ticket) and 80% (page); at 90% event and delivery logs are kept 7 days for every tenant. When full, D1 refuses writes ("Exceeded maximum DB size", [Debug D1](https://developers.cloudflare.com/d1/observability/debug-d1/), read 2026-10-10): API writes get `503 unavailable` (`storage_full`), inbound mail is still accepted and outbox events wait in their mailboxes ([J30](../project/edge-cases.md)). 70% is the trigger to write the sharding ADR |
+| Vectorize vectors per index | 20,000,000 ([Vectorize limits](https://developers.cloudflare.com/vectorize/platform/limits/), last updated 2026-08-05, read 2026-10-10) | Cloudflare. About 4,000–10,000 vectors per 1,000 messages, so roughly 2–5 million messages per deployment. Alerts at 70% and 80% of the count the nightly reconciliation reads. When full, new messages stay keyword-searchable and semantic search reports `degraded` ([J31](../project/edge-cases.md)) |
+| Vectorize namespaces per index | 50,000 | Cloudflare. One per tenant, so at most 50,000 tenants per index. Alerts at 70% and 80% of tenants that are not erased ([J31](../project/edge-cases.md)) |
 | Queue message | 128 KB | Cloudflare. Queues carry pointers only |
 | Queue delay per retry | 24 hours | Cloudflare |
 | Queue retention | 14 days | Cloudflare. Dead-letter items are kept at most 14 days |
@@ -139,7 +170,14 @@ On a deployment with billing on (Pylota Mail Cloud), the plan sets allowances fo
 analyses, custom domains, storage and seats. The table and the rules (holds, `402 billing_limit`, top-ups,
 resets) are in [Plans and billing](../guides/plans.md). Read your workspace's live numbers with
 `GET /v1/usage`. Self-hosted deployments have no plan limits; only the daily caps in tenant policy apply
-(see [API](#api)).
+(see [API](#api)). A workspace can hold at most 100 units of each top-up feature (`topup.max_quantity`).
+A plan or top-up increase counts from the moment its invoice is paid.
+
+| Shared limit (Pylota Mail Cloud, or any deployment with `PM_DAILY_SEND_QUOTA` set) | Value |
+|---|---|
+| Shared-domain breaker, stage 1 | At 60% of the account's daily Email Sending quota, sends from Free and ramped workspaces get `429 daily_cap_reached` (`details.cap: "shared_domain"`) until 00:00 UTC |
+| Shared-domain breaker, stage 2 | At 90%, every tenant's sends get the same refusal until 00:00 UTC; sign-in mail still goes out |
+| A disputed payment | The workspace's sends get `429 daily_cap_reached` (`details.cap: "billing_dispute"`) until the dispute closes |
 
 ## Console
 
@@ -147,15 +185,24 @@ resets) are in [Plans and billing](../guides/plans.md). Read your workspace's li
 |---|---|
 | Sign-in link or code requests | 3 per 10 minutes per address |
 | Code verification attempts | 10 per code; the token is burned after 10 failures |
-| Sign-in requests per client IP (`RL_SIGNIN`) | 10 per minute, keyed by `CF-Connecting-IP`, across sign-in, sign-up and waitlist requests |
+| Failed sign-in codes per address | 30 per UTC day; then sign-in by code is locked for that address until 00:00 UTC (links still work) |
+| Sign-in requests per client network (`RL_SIGNIN`) | 10 per minute, keyed by `CF-Connecting-IP` (an IPv6 address by its /64 prefix), across sign-in, sign-up, waitlist, pending-step and OAuth-start requests |
+| System mail per recipient | 10 a UTC day (sign-in, sign-up, waitlist and invitation mail together) |
+| Sign-in mail per client network | 20 a UTC day per IPv4 address or IPv6 /64, and 200 per ASN |
+| Invitation emails per workspace | 50 a UTC day, new and re-sent; then `429 daily_cap_reached` (`details.cap: "invitations"`) |
+| Self-serve Free workspaces | One per person; `+tag` variants of an address count as the same person |
+| Pending sign-in step (second factor, or the code that confirms a Google or GitHub link) | 5 minutes (10 when it starts with the emailed link code), single use |
+| Two-step enrolment | The secret shown must be confirmed within 10 minutes |
+| Form ticket (sign-in, sign-up and waitlist forms) | Submitted at least 2 seconds and at most 30 minutes after the page was served, from the same network |
 | Link and code lifetime | 10 minutes, single use |
 | Two-step verification codes | 5 attempts a minute per person. 10 failures in a row lock two-step sign-in for 15 minutes |
 | Recovery codes | 10 per person, each single use. Generating new ones invalidates the old |
 | Google or GitHub sign-in | 10 minutes from start to callback, single use |
 | Waitlist | An entry is written only when its confirmation link is used; an unused confirmation link expires after 10 minutes. An invite link (`/console/sign-up?invite=…`) is valid for 7 days, for the waitlisted address only. Entries are deleted 30 days after invitation |
-| New workspace on Free (Pylota Mail Cloud) | At most 50 messages a day (the effective `tenant_daily_send_cap` is the policy value or 50, whichever is lower) for the first 7 days. A daily evaluation lifts the ramp from day 7 if bounce and complaint rates are under the auto-pause thresholds; otherwise it stays and is evaluated again each day. A paid plan lifts it at once. Above it: `429 daily_cap_reached` |
+| New workspace on Free (Pylota Mail Cloud) | At most 50 messages a day (the effective `tenant_daily_send_cap` is the policy value or 50, whichever is lower) for the first 7 days. A daily evaluation lifts the ramp from day 7 if bounce and complaint rates are under the auto-pause thresholds; otherwise it stays and is evaluated again each day. A paid plan lifts it once its first invoice is paid, and a disputed payment restores it. Above it: `429 daily_cap_reached` |
 | Session lifetime | 7 days rolling, 30 days absolute |
 | Re-authentication for sensitive actions | signed in within the last 10 minutes |
+| Workspace policy saves | Owner and admin only; each save needs a sign-in within the last 10 minutes, and a change that deletes mail needs a second, confirmed `POST` ([Workspace policy §6](../project/design/workspace-policy.md#6-the-console-page)) |
 | Invitation lifetime | 7 days |
 
 ## Webhooks

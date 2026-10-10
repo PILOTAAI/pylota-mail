@@ -78,7 +78,7 @@ Some data has a fixed lifetime regardless of policy:
 | Data | Kept for |
 |---|---|
 | Verification codes and links found by `wait` | 24 hours |
-| Unrouted inbound mail in R2 staging | 1 day |
+| Unrouted inbound mail in R2 staging | At most 15 days (normally seconds) |
 | Raw incoming mail in Amazon S3 (SES domains) | Deleted as soon as it is taken in (normally seconds); never more than 14 days |
 | "Mail arrived" notices in Amazon SQS (SES domains) | Deleted once handled, normally within a minute; never more than 14 days |
 | Subject-access export files | 7 days |
@@ -136,8 +136,11 @@ searches run afterwards:
   ([NFR-PRV-1](../project/prd.md#7-non-functional-requirements)).
 
 Check progress with `GET /v1/erasure-requests/{id}` (`pmail erasure get`). An `erasure.completed`
-event carries the request with its receipt. If a step keeps failing after the job runner's retries, an
-`erasure.failed` event names the step. Keep receipts (or the events) outside the deployment: they are
+event carries the request with its receipt. A step that fails is retried automatically until 20 hours
+after the request; if it still fails, the request ends `failed` and an `erasure.failed` event names the
+step. Restart it with `pmail erasure retry <id>`: a workspace (tenant) erasure then continues from the
+step that failed and keeps the original deadline; other scopes run again (a counterparty erasure needs
+the address again, because it is never stored). Keep receipts (or the events) outside the deployment: they are
 your evidence that the request was carried out, and you need them after a restore (see
 [Backups and residual retention](#backups-and-residual-retention)).
 
@@ -148,6 +151,13 @@ your evidence that the request was carried out, and you need them after a restor
 - **Mail already delivered** to recipients' own mailboxes.
 - **Suppressions**, which are kept on purpose, as a hash (see below).
 - **Point-in-time backups** for up to 30 days (see below).
+- **Provider suppression lists**: the address stays on Amazon SES's account-level list, and on
+  Cloudflare's list where the entry is account-wide or managed by Cloudflare; entries for your own
+  sending domains on Cloudflare's list are deleted. Your hashed suppression keeps the address from being
+  mailed either way. The operator can remove a remaining entry by hand when a person asks.
+- **Provider logs**: Cloudflare keeps sender, recipient and subject of received mail in its Email
+  Routing logs for 31 days, and its Email Sending activity log for 30 days.
+- **Unrouted staged mail**, kept at most 15 days while the address lookup was failing.
 - **Mail still waiting in Amazon S3** on an SES domain. It is normally taken in and deleted within
   seconds, and never stays more than 14 days.
 
@@ -175,8 +185,8 @@ recovery codes are stored encrypted.
 ## What agents and notifications disclose
 
 **Agent assertions.** An [agent assertion](agents.md#agent-assertions) shows its audience, the service
-it was made for, the identity's address, display name and workspace name, and whether a person is
-accountable for the identity (`accountable_human`). That is its purpose. It never contains the owner's
+it was made for, the identity's address, and, marked `unverified`, its display name, workspace name and
+whether a person is accountable for the identity (`accountable_human`). That is its purpose. It never contains the owner's
 name, address or any other personal data of the owner. A
 [signed HTTP request](agents.md#signed-http-requests) shows the identity's address to the site, in its
 `From` header. Neither tokens nor signatures are stored or logged; only daily counts are kept.
@@ -201,6 +211,10 @@ curl -X POST https://mail.example.com/v1/identities/idn_01J9Z3K8V4/threads/thr_0
   `pmail threads hold` and `pmail threads unhold`.
 - Erasure skips held threads and lists them in the receipt. Other operations that would delete held
   data are refused with `423 legal_hold`.
+- Deleting a whole workspace keeps its held threads too: everything else is erased, the workspace
+  stays `erasing` (no keys, no addresses, no sending) with the held mail readable by the platform
+  operator and by the partner that created it, and the erasure finishes by itself the day after the
+  last hold is removed or expires.
 - A thread's `hold` field shows the current hold.
 
 Place holds before running an erasure that could reach a disputed thread.
@@ -248,17 +262,23 @@ D1 and Durable Object storage keep 30 days of point-in-time recovery. After an e
 still exists in that recovery history until it ages out, and a restore to a point before the erasure
 would bring it back ([I6](../project/edge-cases.md)). Document this as residual retention.
 
-If you ever restore:
+If you ever restore, follow the restore runbook
+([Observability › Restore from PITR](../project/design/observability.md#restore-from-pitr)), which
+`pmail ops` automates:
 
-1. Restore to the latest point that fixes the problem.
-2. Re-run every erasure request that completed after the restore point. Your stored receipts or
-   `erasure.completed` events tell you which ones; the deployment's own records of them may have been
-   rolled back.
+1. Freeze the deployment, so nothing is accepted that the restore could lose.
+2. Restore to the latest point that fixes the problem. The tooling exports the database first and
+   re-applies afterwards every change made after the restore point that the restore is not meant to
+   undo, including erasure records, suppressions and removals.
+3. Re-apply every erasure request that completed after the restore point, from its stored record (a
+   counterparty erasure by the address's keyed hash; the address is not needed). Keep your receipts or
+   `erasure.completed` events anyway: they are your own evidence.
 
 R2, which holds raw mail and attachments, has no point-in-time recovery, versioning or replication. An
 object deleted by retention or erasure is gone, which is what erasure needs; an object deleted by a bug
-is gone too. If you set `PM_BACKUP_BUCKET`, a nightly job copies new objects to a second bucket in the
-same jurisdiction, and every retention and erasure delete removes the copy as well
+is gone too. If you set `PM_BACKUP_BUCKET` (Pylota Mail Cloud does), a nightly job copies new objects to
+a second bucket in the same jurisdiction, and every retention and erasure delete removes the copy as
+well, including a copy that was being made while the erasure ran
 ([Privacy design](../project/design/privacy.md#54-optional-r2-backup-copy)). If you copy the bucket any
 other way, erasure must purge that copy too.
 

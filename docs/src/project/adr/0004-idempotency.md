@@ -4,7 +4,7 @@
 |---|---|
 | Status | Accepted |
 | Date | 2026-10-09 |
-| Deciders | Pylota engineering |
+| Deciders | The owner (TREFT LTD) |
 | Related | FR-OUT-1, FR-OUT-2, FR-DLV-4, PRD goal 3; [Outbound](../design/outbound.md); [Errors](../../reference/errors.md); [G1](../edge-cases.md), [G2](../edge-cases.md) |
 
 ## Context
@@ -27,7 +27,8 @@ timeout or a dropped connection after the request was written leaves the outcome
    2026-10-10 with the exceptions this item omitted; see [Amendments](#amendments).)
 2. **Reservation in the mailbox transaction.** The mailbox stores the key with a fingerprint
    (`sha256(operation, target, canonical body)`) in the same transaction that stores the message as
-   `queued`. Keys are kept for 30 days, scoped per identity for mail and per tenant for other `POST`s.
+   `queued`. Keys are kept for 30 days, scoped per identity for mail and, for other `POST`s, per calling
+   API key and tenant (amended 2026-10-10; see [Amendments](#amendments)).
 3. **Replays.** Same key and same request: the original response, with `"deduplicated": true` and the
    header `Idempotent-Replayed: true`. Same key, different request: `409 idempotency_conflict`. Same key
    while the first request is running: `409 request_in_progress` (retryable).
@@ -74,3 +75,10 @@ timeout or a dropped connection after the request was written leaves the outcome
   call signs anew and a replay record would have to store what was signed; and the two Amazon SNS
   endpoints (`/hooks/ses` and `/hooks/ses/inbound`), which SNS calls without the header. The rest of the
   decision is unchanged.
+- **2026-10-10.** Decision 2 said non-mail keys were scoped per tenant. They are scoped per **calling API
+  key** and tenant (or, for a request that names no tenant, per partner for a partner key and per
+  deployment for a platform key), as [REST API › Idempotency](../../reference/api.md#idempotency) and the
+  `idempotency_records` primary key `(scope, key_id, idem_key)` already state
+  ([Data model](../design/data-model.md#1-d1-control-plane)). A tenant scope let a second key of the same
+  tenant receive the first key's stored response, including a one-time secret before secrets were
+  stripped from stored responses ([J19](../edge-cases.md)). Mail keys stay scoped per identity.

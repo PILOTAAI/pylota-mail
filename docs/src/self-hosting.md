@@ -77,66 +77,91 @@ CLI and the deployment on the same version.
 listed in [CLI › Commands that use your Cloudflare token](reference/cli.md#commands-that-use-your-cloudflare-token):
 `setup`, `deploy` and `doctor` among them. It is never written to the CLI's config file. The Worker can
 hold a second token, the secret `PM_CF_API_TOKEN`, so that tenants can add domains on Cloudflare through
-the API ([Domains on Cloudflare](#domains-on-cloudflare)). This table is the one list of what each token
+the API ([Domains on Cloudflare](#domains-on-cloudflare)). This section is the one list of what each token
 needs; other pages link here.
 
-Create the token in the Cloudflare dashboard, either as an account token (**Manage account** >
-**Account API tokens**) or as a user token (**My Profile** > **API Tokens**), with these permissions.
-Names are as the dashboard shows them; the API tab of Cloudflare's
+Create each token in the Cloudflare dashboard, either as an account token (**Manage account** >
+**Account API tokens**) or as a user token (**My Profile** > **API Tokens**). Names are as the dashboard
+shows them; the API tab of Cloudflare's
 [permissions reference](https://developers.cloudflare.com/fundamentals/api/reference/permissions/)
 shows *Write* where the dashboard shows *Edit* (for example "DNS Write"), and they are the same
 permission.
 
-| Scope | Permission | Your token (`CLOUDFLARE_API_TOKEN`) | Worker token (`PM_CF_API_TOKEN`) | Used for |
-|---|---|---|---|---|
-| Account | Workers Scripts · Edit | Yes | – | Uploading the Worker, its secrets, cron triggers and Durable Object migrations; reading secret names (`doctor`); deleting the Worker (`destroy`) |
-| Account | D1 · Edit | Yes | – | Creating the `pylota-mail` database, applying migrations, and the CLI's D1 queries (setup, `doctor`, `secrets rotate-master`, `domains add --local-token`, `domains subscribe`) |
-| Account | Workers R2 Storage · Edit | Yes | – | Creating the `pylota-mail-blobs` bucket (and the backup bucket) and its lifecycle rule |
-| Account | Queues · Edit | Yes | Yes | Creating the five work queues and their dead-letter queues (your token); listing queues and creating each domain's Email Sending event subscription to `pm-delivery-events` (both) |
-| Account | Vectorize · Edit | Yes | Only if spike S6 fails | Creating the `pm-mail-chunks` index, its metadata indexes and later index generations; the Worker's REST fallback |
-| Account | Workers AI · Read and Workers AI · Edit | Yes | Only if spike S6 fails | Checking that the configured models exist, and the embedding probe when you change `PM_EMBED_MODEL`; the Worker's REST fallback. Cloudflare's Workers AI REST page asks a custom token for both to run a model (read 2026-10-09) |
-| Account | Email Sending · Edit | Yes | Yes | Onboarding domains for sending and reading their DNS records |
-| Account | Account Settings · Read | Yes | – | Used by `wrangler` to read the account |
-| Account | Account Analytics · Read | Yes | – | The doctor's `quota` check (Workers Analytics Engine SQL API). Without it that check warns instead of reading the quota errors |
-| Zone | Zone · Read | Yes | Yes | Finding zones, checking the mail domain is an apex, reading zone status, counting zones (`doctor`) |
-| Zone | Zone · Edit | Only for `destroy` when `nameservers` or `delegated_subdomain` domains still exist | Yes, for `nameservers` and `delegated_subdomain` | Creating a zone for a domain used only for mail, and deleting it when the domain is removed (by the Worker, or by `pmail destroy --skip-erasure`, which deletes the zones this deployment created) |
-| Zone | DNS · Edit | Yes | Yes | Mail DNS records: the ownership TXT, removing MX records with `--replace-mx`, the platform domain's SES DKIM records (`setup ses`) |
-| Zone | Zone Settings · Edit | Yes | Yes | Enabling Email Routing and sub-addressing, reading the routing DNS records, and turning routing off when a domain is removed (`POST /zones/{zone_id}/email/routing/dns` accepts Zone Settings Write, [API reference](https://developers.cloudflare.com/api/resources/email_routing/subresources/dns/methods/create/), read 2026-10-09) |
-| Zone | Email Routing Rules · Edit | Yes | Yes | The catch-all rule to the Worker, and the per-address rules on subdomains |
-| Zone | Workers Routes · Edit | Yes | – | Attaching the API host, and the console host if it differs, to the Worker as Custom Domains |
-| User (user tokens only) | User Details · Read, Memberships · Read | Yes | – | Token verification and account lookup by `wrangler` with a user token |
+**Workers roles, not account-wide Workers edit.** Workers access is granted as a role (*Metadata
+Read-Only*, *Content Read-Only*, *Editor*, *Admin*) at a scope: the Workers product (every Worker in the
+account) or selected Workers. The legacy permission *Workers Scripts · Edit* is *Editor at the Workers
+product scope*, so a token holding it can change every Worker in the account. A per-Worker role cannot be
+granted for a Worker that does not exist yet: creating one needs *Admin* at the Workers product scope.
+Custom Domains do not support per-Worker roles yet, and adding one needs *Workers Routes · Edit* on each
+affected zone; once it exists, deploys that do not change it need only *Editor* on the Worker (Cloudflare
+[Workers roles and permissions](https://developers.cloudflare.com/workers/authorization/workers/), read
+2026-10-10). Pylota Mail therefore uses two tokens of your own:
 
-**Which zones.** Choose **All zones** in the account for the zone permissions; this is the
-recommended setting, because the CLI writes to several zones: the platform mail domain's zone, the zones
-of the API host and the console host, and the zone of every tenant domain you add with
-`pmail domains add --local-token`. The Worker's token likewise needs every zone that tenants add with
-`cloudflare_zone`, and a zone it creates for `nameservers` or `delegated_subdomain` exists in no list of
-specific zones. A tenant or partner key can use a zone through `cloudflare_zone` only when this
-deployment created it for that tenant or a platform key listed it in the tenant's policy
-`domains.cloudflare_zones` (then only for names under it, never its apex); the zones of your mail domain, API host and console host are refused to every
-key but a platform key ([Identities and domains › Zone permission](project/design/identity-domains.md#zone-permission)).
-For least privilege, give your own token **specific zones** instead: the mail domain's
-zone, the API host's zone, the console host's zone, and each tenant zone you will add with
-`--local-token` (add a zone to the token before you add its domain).
+- a **first-run token**, used once for the first `pmail setup` (and again only if you change the API or
+  console host): it creates the Worker `pylota-mail` and its Custom Domains. Delete it afterwards;
+- your **deploy token**, `CLOUDFLARE_API_TOKEN` for every later command, with *Editor* on the Worker
+  `pylota-mail` only.
+
+| Scope | Permission | First-run token | Deploy token (`CLOUDFLARE_API_TOKEN`) | Worker token (`PM_CF_API_TOKEN`) | Used for |
+|---|---|---|---|---|---|
+| Workers product | Workers · Admin | Yes | – | – | Creating the Worker `pylota-mail` (setup step 13) |
+| The Worker `pylota-mail` | Workers · Editor | (covered by Admin) | Yes | – | Uploading new versions, its secrets, cron triggers and Durable Object migrations; reading secret names (`doctor`) |
+| The Worker `pylota-mail` | Workers · Admin | – | Only for `destroy` | – | Deleting the Worker (`destroy`) |
+| Workers product | Workers · Metadata Read-Only | Yes | Yes | – | Reading other Workers' rate-limit namespace IDs, so setup picks unused ones (setup step 10) |
+| Account | D1 · Edit | Yes | Yes | – | Creating the `pylota-mail` database, applying migrations, the CLI's D1 queries (setup, `doctor`, `domains add --local-token`, `domains subscribe`), and the export, Time Travel restore and replay of `pmail ops restore d1` |
+| Account | Workers R2 Storage · Edit | Yes | Yes | – | Creating the `pylota-mail-blobs` bucket (and the backup bucket) and its lifecycle rule |
+| Account | Queues · Edit | Yes | Yes | Yes | Creating the five work queues and their dead-letter queues (your tokens); listing queues and creating each domain's Email Sending event subscription to `pm-delivery-events` (all) |
+| Account | Vectorize · Edit | Yes | Yes | Only if spike S6 fails | Creating the `pm-mail-chunks` index, its metadata indexes and later index generations; the Worker's REST fallback |
+| Account | Workers AI · Read and Workers AI · Edit | Yes | Yes | Only if spike S6 fails | Checking that the configured models exist, and the embedding probe when you change `PM_EMBED_MODEL`; the Worker's REST fallback. Cloudflare's Workers AI REST page asks a custom token for both to run a model (read 2026-10-09) |
+| Account | Email Sending · Edit | Yes | Yes | Yes | Onboarding domains for sending and reading their DNS records |
+| Account | Account Settings · Read | Yes | Yes | – | Used by `wrangler` to read the account |
+| Account | Account Analytics · Read | – | Yes | – | The doctor's `quota` check (Workers Analytics Engine SQL API). Without it that check warns instead of reading the quota errors |
+| Zone (specific zones) | Zone · Read | Yes | Yes | Yes | Finding zones, checking the mail domain is an apex, reading zone status, counting zones (`doctor`) |
+| Zone (All zones) | Zone · Edit | – | Only for `destroy` when `nameservers` or `delegated_subdomain` domains still exist | Only for `nameservers` and `delegated_subdomain` | Creating a zone for a domain used only for mail, and deleting it when the domain is removed (by the Worker, or by `pmail destroy --skip-erasure`, which deletes the zones this deployment created) |
+| Zone (specific zones) | DNS · Edit | Yes | Yes | Yes | Mail DNS records: the ownership TXT, removing MX records with `--replace-mx`, the platform domain's SES DKIM records (`setup ses`), a removed subdomain's routing records |
+| Zone (specific zones) | Zone Settings · Edit | Yes | Yes | Yes | Enabling Email Routing and sub-addressing, reading and unlocking the routing DNS records, and turning routing off when a domain is removed (`POST /zones/{zone_id}/email/routing/dns` accepts Zone Settings Write, [API reference](https://developers.cloudflare.com/api/resources/email_routing/subresources/dns/methods/create/), read 2026-10-10) |
+| Zone (specific zones) | Email Routing Rules · Edit | Yes | Yes | Yes | The catch-all rule to the Worker, and the per-address rules on subdomains |
+| Zone (the API host's and console host's zones) | Workers Routes · Edit | Yes | – | – | Attaching the API host, and the console host if it differs, to the Worker as Custom Domains |
+| User (user tokens only) | User Details · Read, Memberships · Read | Yes | Yes | – | Token verification and account lookup by `wrangler` with a user token |
+
+**Which zones.** Give every token **specific zones**, never All zones, unless a row above says so:
+
+- the first-run and deploy tokens: the mail domain's zone, the API host's zone, the console host's zone,
+  and each tenant zone you will add with `pmail domains add --local-token` (add a zone to the token before
+  you add its domain);
+- the Worker token: the mail domain's zone and every zone that you list in a tenant's policy
+  `domains.cloudflare_zones` (add the zone to the token first). A tenant or partner key can use a zone
+  through `cloudflare_zone` only when this deployment created it for that tenant or a platform key listed it
+  (then only for names under it, never its apex); the zones of your mail domain, API host and console host
+  are refused to every key but a platform key ([Identities and domains › Zone permission](project/design/identity-domains.md#zone-permission)).
+
+Only a deployment that offers `nameservers` or `delegated_subdomain` gives the Worker token **All zones**
+for its zone permissions, because those methods create zones that no list can name in advance (whether a
+zone-scoped grant can create a zone is not stated by Cloudflare and is verified at build time). Then run
+the deployment in a Cloudflare account of its own: that token can change every zone in the account.
+Pylota Mail Cloud does not offer these methods: it runs in Pylota's existing account with a Worker token
+limited to two zones ([ADR 0010](project/adr/0010-cloud-in-the-existing-cloudflare-account.md)).
 
 Notes:
 
-- If your account uses **Workers roles**, creating a Worker needs the *Admin* role at the Workers
-  product scope (later deploys need only *Editor*), and changing Routes or Custom Domains needs
-  *Workers Routes Write* on each affected zone.
 - Cloudflare's documentation names the permission for sending (**Email Sending: Edit**, which is not on
   the permissions page; its scope is verified at build time) and for enabling Email Routing
   (**Zone Settings Write**), but not the one for creating Queues event subscriptions. `Queues · Edit` is
   assumed to cover it. `pmail doctor` checks that the event subscription and the catch-all rule exist
   and tells you if either is missing
   (spike [S9](project/build-plan.md#m1--spikes-each-one-gates-design-choices)).
-- Whether a zone-scoped grant can create new zones (Zone · Edit for `nameservers`) is not stated by
-  Cloudflare; it is verified at build time.
+- *Queues · Edit*, *Email Sending · Edit* and the D1, R2 and Vectorize permissions are account-wide in this
+  table. In an account you share with other services, they reach those services' queues and databases too;
+  Cloudflare's Developer Platform roles may allow narrower scopes, which this guide has not verified.
+- Email Sending's daily quota is per account, so in a shared account it is shared with every other sender;
+  set `--daily-send-quota` so the quota alert fires early.
 - Neither token needs permission to manage tokens, billing, members or Email Routing destination
   addresses (setup registers none). Do not add them.
 
-Export the token, and the account ID if you prefer it to the `--account-id` flag. Setup also stores the
-account ID (not the token) in your CLI profile, so later commands find it:
+Export the first-run token for the first `pmail setup`, and the account ID if you prefer it to the
+`--account-id` flag. After setup has finished, delete the first-run token in the dashboard and export the
+deploy token instead. Setup also stores the account ID (not the token) in your CLI profile, so later
+commands find it:
 
 ```bash
 export CLOUDFLARE_API_TOKEN=…
@@ -182,7 +207,7 @@ and run the same command again. It finds what already exists and creates only wh
 |---|---|---|
 | Release bundle | `deploy/.bundle/<version>/` | The verified Worker release that setup deploys |
 | D1 database | `pylota-mail` | In the chosen jurisdiction. Migrations applied. Holds the control plane: tenants, identities, the address directory, domains, hashed API keys, webhooks, suppressions, jobs, audit log |
-| R2 bucket | `pylota-mail-blobs` | Same jurisdiction. Lifecycle rule deletes `inbound-staging/` after one day |
+| R2 bucket | `pylota-mail-blobs` | Same jurisdiction. Lifecycle rules delete `inbound-staging/` after 15 days and abort incomplete multipart uploads after one day |
 | Queues | `pm-inbound`, `pm-outbound`, `pm-delivery-events`, `pm-webhooks`, `pm-index` | Each with a dead-letter queue (`pm-inbound-dlq` and so on) |
 | Vectorize index | `pm-mail-chunks` | 1,024 dimensions, cosine, eight metadata indexes. Holds no message text |
 | Email Routing | On the platform domain | Enabled, with a catch-all rule that sends every address to the Worker |
@@ -224,7 +249,8 @@ setup, it finds nothing to change and exits without deploying.
 
 ```bash
 pmail keys create --level platform --name first-key --permissions \
-tenants:manage,partners:manage,platform:ops,keys:manage,identities:read,identities:write,domains:read,\
+tenants:manage,tenants:erase,partners:manage,platform:ops,keys:manage,identities:read,identities:write,\
+domains:read,\
 domains:write,messages:read,messages:send,messages:write,attachments:read,search:read,search:agentic,\
 quarantine:review,webhooks:read,webhooks:manage,erasure:manage,suppressions:manage,usage:read,\
 audit:read,members:read,members:manage
@@ -233,7 +259,8 @@ audit:read,members:read,members:manage
 A platform key must list its permissions; there is no implicit full set. This one holds every permission
 a platform key may hold, so it can create every other key and run `pmail doctor --mail-test`. Setup's
 summary prints this command for you. (`identities:sign` is not in it: platform keys cannot sign as an
-identity.)
+identity. A platform key can still grant `identities:sign` to the tenant and identity keys it creates,
+so agents can sign on a deployment without the console.)
 
 This call authenticates with the short-lived **bootstrap key** that `pmail setup` stored in your CLI
 profile. Setup is the only moment the CLI knows `PM_KEY_PEPPER` (it generated it), so it mints that one
@@ -292,9 +319,10 @@ fails with `422 cf_token_required`. You can still add a zone **apex** yourself w
 local `CLOUDFLARE_API_TOKEN` (its zone permissions must cover that zone, [step 2](#2-create-a-cloudflare-api-token)).
 A zone subdomain, `nameservers` and `delegated_subdomain` need the token on the Worker, because the Worker
 keeps calling Cloudflare over the domain's life (a routing rule per address, onboarding once a new zone is
-active). To let tenants add these domains through the API, create a second token with the permissions
-marked for the Worker token in [step 2](#2-create-a-cloudflare-api-token) and store it as a Worker
-secret:
+active). To let tenants add these domains through the API, create a separate token with the permissions
+and zones marked for the Worker token in [step 2](#2-create-a-cloudflare-api-token) (specific zones: the
+mail domain's zone and every zone you will list in a tenant's `domains.cloudflare_zones`) and store it as
+a Worker secret:
 
 ```bash
 npx --yes wrangler@4.139.0 secret put PM_CF_API_TOKEN --name pylota-mail
@@ -316,24 +344,31 @@ Before you run it:
 
 | You need | Why |
 |---|---|
-| An AWS account | The resources below are created in it. Amazon Web Services then processes the mail of SES domains, so list it as a sub-processor ([Privacy](guides/privacy.md)) |
+| An AWS account, used by this deployment only in the chosen region | The resources below are created in it. Amazon Web Services then processes the mail of SES domains, so list it as a sub-processor ([Privacy](guides/privacy.md)). One region of one account can hold only one receiving deployment: give staging its own AWS account ([A staging environment](#a-staging-environment)) |
 | SES production access in the chosen region | The SES sandbox sends only to verified addresses, at most 200 messages a day ([SES quotas](https://docs.aws.amazon.com/ses/latest/dg/quotas.html), read 2026-10-09). Without production access, the command prints the AWS console steps to request it and stops before creating anything |
 | The SES à la carte plan, not Essentials | Sending costs $0.10 per 1,000 messages à la carte against $0.16 on Essentials ([SES pricing](https://aws.amazon.com/ses/pricing/), read 2026-10-09). The command warns on Essentials |
 | A region that receives mail | Not every SES region receives mail; the command refuses one that does not. With `PM_JURISDICTION` `eu`, the region must also be in the EU or the UK (`eu-central-1`, `eu-west-1`, `eu-west-2` (London), `eu-south-1`, `eu-west-3` or `eu-north-1`) unless you pass `--allow-non-eu`. For the SES region, `eu` means "EU or UK": the UK has an EU adequacy decision under the GDPR (European Commission [adequacy decisions](https://commission.europa.eu/law/law-topic/data-protection/international-dimension-data-protection/adequacy-decisions_en), renewed 19 December 2025, read 2026-10-09). Cloudflare's own `eu` jurisdiction for D1, R2 and Durable Objects means the EU only |
 | AWS credentials on your machine that can create the resources below (SES, S3, SNS, SQS and IAM) | Read from `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_SESSION_TOKEN`, else from the profile named by `AWS_PROFILE` (else `default`) in `~/.aws/credentials` and `~/.aws/config`. They are never stored, uploaded or printed |
 | `CLOUDFLARE_API_TOKEN`, as in [step 2](#2-create-a-cloudflare-api-token) | To store the Worker's own SES key as Worker secrets, redeploy, and publish the platform domain's SES DKIM records in its zone |
 
-What it creates in the region:
+What it creates in the region. `{dep}` is the deployment label, 8 hex characters derived from your API
+host, which the command prints. Every resource that accepts tags is tagged
+`pylota-mail:api-host = {your API host}`:
 
 | Resource | Name | Notes |
 |---|---|---|
-| S3 bucket | `{prefix}-inbound` (default prefix `pylota-mail-{aws-account-id}`, or `--prefix`) | Raw inbound mail waits here until the Worker has stored it, normally seconds and never more than 14 days. No public access, encrypted at rest. Only SES may write to it, and only for the rule below |
+| S3 bucket | `{prefix}-inbound` (default prefix `pylota-mail-{aws-account-id}-{dep}`, or `--prefix`) | Raw inbound mail waits here until the Worker has stored it, normally seconds and never more than 14 days. No public access, encrypted at rest. Only SES may write to it, and only for the rule below |
 | SNS topic | `pylota-mail-inbound` | Signature version 2. Pushes each inbound notification to `https://{api host}/hooks/ses/inbound` |
 | SQS queue | `pylota-mail-inbound` | Subscribed to the same topic. Keeps every notification for 14 days, so mail is not lost if a push fails |
 | Receipt rule set and rule | `pylota-mail` (or your account's existing active rule set), rule `pm-deliver` | Stores mail for every verified domain in the bucket and notifies the topic, with spam and virus scanning on. An existing active rule set is kept; the rule is added to it |
 | Configuration set and delivery-events topic | `pylota-mail` | Delivery, bounce and complaint events go to `https://{api host}/hooks/ses` |
 | Platform identity | The platform domain | Verified in SES through its Cloudflare zone, so that SES can bounce mail to retired addresses from `mailer-daemon@` the platform domain |
-| IAM user | `pylota-mail-worker` | One policy, with only the SES, S3 and SQS actions the Worker needs. **The policy JSON is printed for you to review before it is applied**; interactive runs ask, and `--yes` accepts it without asking. The user's access key goes straight into the Worker secrets `PM_SES_ACCESS_KEY_ID` and `PM_SES_SECRET_ACCESS_KEY`, and is never written to disk or printed |
+| IAM user | `pylota-mail-worker-{dep}` | One policy, with only the SES (including the receipt-rule actions for retired addresses), S3 and SQS actions the Worker needs. **The policy JSON is printed for you to review before it is applied**; interactive runs ask, and `--yes` accepts it without asking. The user's access key goes straight into the Worker secrets `PM_SES_ACCESS_KEY_ID` and `PM_SES_SECRET_ACCESS_KEY`, and is never written to disk or printed |
+
+Before it creates anything, it checks that the account and region hold no other deployment's resources:
+an active receipt rule set whose `pm-deliver` rule writes to another deployment's bucket, or a resource of
+one of these names tagged for another API host (or not tagged), stops the command with exit 14 and names
+it. It never reuses or changes another deployment's resources.
 
 It then writes the `PM_SES_*` variables into `deploy/wrangler.toml`, runs `pmail deploy` so the Worker
 reads them, subscribes the Worker's two SNS endpoints and waits up to 5 minutes for them to be
@@ -459,9 +494,12 @@ Run staging as a completely separate deployment: its own platform mail domain, A
 Vectorize index and queues. Nothing is shared
 ([Architecture §7](project/architecture.md#7-deployment-topology)).
 
-The simplest way is a **separate Cloudflare account**, because setup uses fixed resource names
-(`pylota-mail`, `pylota-mail-blobs`, `pm-*`). Give staging its own deployment directory and its own CLI
-profile, so it never touches production's `deploy/wrangler.toml` or production's key:
+Use a **separate Cloudflare account**, because setup uses fixed resource names (`pylota-mail`,
+`pylota-mail-blobs`, `pm-*`) and production's tokens should list only production's zones. If you connect
+Amazon SES, use a **separate AWS account** for staging too: `pm-deliver` receives mail for every verified
+domain in its region, so `pmail setup ses` refuses a second deployment in the same account and region.
+Give staging its own deployment directory and its own CLI profile, so it never touches production's
+`deploy/wrangler.toml` or production's key:
 
 ```bash
 export CLOUDFLARE_API_TOKEN=…        # a token for the staging account (step 2)
@@ -543,18 +581,30 @@ rolling back one release is safe; do not jump back across several releases.
 
 | Store | What protects it | Notes |
 |---|---|---|
-| D1 (control plane) | D1 Time Travel: restore to any point in the last 30 days | Restoring D1 alone can leave it out of step with the mailboxes. Restore both to the same point in time |
-| Durable Object SQLite (mailboxes) | Point-in-time recovery for the last 30 days, per object | Exposed by Cloudflare as an API inside the object. Pylota Mail's restore drill tooling is planned (P1) |
+| D1 (control plane) | D1 Time Travel: restore to any point in the last 30 days | One restore rewinds the whole database. `pmail ops restore d1` exports it first and re-applies every later change you do not exclude |
+| Durable Object SQLite (mailboxes) | Point-in-time recovery for the last 30 days, per object | Exposed by Cloudflare as an API inside the object; `pmail ops restore mailbox` calls it, and `pmail ops restore reconcile` re-queues later mail and re-applies erasures |
 | R2 (raw mail, attachments, exports) | Raw `.eml` is the source of truth. Any message can be re-parsed from it ([J3](project/edge-cases.md)) | If you copy the bucket elsewhere, erasure must reach the copy too ([I6](project/edge-cases.md)) |
 | Vectorize | Rebuilt from the mailboxes by a re-embed job | Holds no text |
 
 The recovery objectives are RPO ≤ 1 minute for indexes and ≤ 15 minutes for blobs, and RTO ≤ 4 hours
 ([NFR-OPS-2](project/prd.md#7-non-functional-requirements)).
 
+Before any restore, freeze the deployment (`pmail ops freeze`), and follow the restore runbook
+step by step ([Observability › Restore from PITR](project/design/observability.md#restore-from-pitr)).
+
 Point-in-time recovery is also **residual retention**: for 30 days after an erasure, a restore could
-bring the erased data back. Keep the `erasure.completed` events (or the erasure receipts) outside the
-deployment, and re-run any erasure that completed after the restore point. See
-[Privacy](guides/privacy.md#backups-and-residual-retention).
+bring the erased data back. The runbook re-applies every erasure that completed after the restore point
+from its stored record; keep the `erasure.completed` events (or the receipts) outside the deployment as
+your own evidence. See [Privacy](guides/privacy.md#backups-and-residual-retention).
+
+### Alerts when you run it alone
+
+Set `PM_ALERT_EMAIL` to your address: page alerts are emailed at once, and ticket alerts once a day
+([Observability › Alert email](project/design/observability.md#55-alert-email-and-the-external-heartbeat)).
+Then add the heartbeat workflow, which runs `pmail doctor` from GitHub Actions every 15 minutes and
+fails, so GitHub emails you, when the deployment stops answering or a page alert fires; set
+`PM_HEARTBEAT_KEY_ID` so the Worker alerts you in turn if the heartbeat stops. `pmail doctor` fails its
+`alerts` check while no alert address is set.
 
 ## What it costs
 
@@ -620,6 +670,8 @@ leftover mail DNS records, and delete the Cloudflare API tokens if you no longer
 | Setup says the mail domain is not a zone apex | You gave a subdomain, or the zone is in another account | Use the zone's apex, in the account named by `--account-id` |
 | Setup refuses the mail domain because it has MX records | The domain already receives mail elsewhere | Use a dedicated domain. Replacing the MX records would stop that mail |
 | Setup stops with a Cloudflare permission error | The token lacks a permission, or a zone, from step 2 | Add it and re-run setup. It continues where it stopped |
+| The first setup cannot create the Worker or its Custom Domain | You used the deploy token, whose per-Worker role cannot cover a Worker that does not exist yet | Run that first setup with the first-run token of step 2 (Workers Admin at product scope, Workers Routes Edit on the hosts' zones), then delete it |
+| `pmail setup ses` stops with exit 14 naming a rule or resource of another deployment | The AWS account and region already serve another deployment, for example production | Use a separate AWS account for this deployment |
 | `pmail doctor` warns on `quota` that it cannot read the quota errors | The token lacks Account Analytics · Read | Add it ([step 2](#2-create-a-cloudflare-api-token)) |
 | `pmail setup` or `pmail deploy` fails before uploading | Node.js older than 22, or no network access to GitHub Releases | Install Node.js 22+. Behind a proxy, set `HTTPS_PROXY`, which `pmail` honours. `--from-source --source-dir <checkout>` avoids the GitHub Releases download only: it still needs crates.io (or vendored crates) and npm for Wrangler |
 | `pmail setup` or `pmail deploy` refuses the bundle | The checksum did not match | Do not override it. Download again, or report it ([SECURITY.md](https://github.com/PILOTAAI/pylota-mail/blob/main/SECURITY.md)) |
@@ -644,10 +696,16 @@ serves the landing page and these docs at `/docs/`.
 cargo install mdbook --version 0.5.4 --locked
 mdbook build docs                         # writes the docs into site/public/docs
 cd site
-npx --yes wrangler@4.139.0 deploy         # deploys the Worker pylota-mail-site
+npm ci --ignore-scripts                   # Wrangler 4.139.0 from package-lock.json, hash-checked
+./node_modules/.bin/wrangler deploy       # deploys the Worker pylota-mail-site
 ```
 
-From the repository root, `npx --yes wrangler@4.139.0 deploy --config site/wrangler.jsonc` does the
-same. To serve the site on your own hostname, uncomment the `routes` entry in `site/wrangler.jsonc`
-and set the hostname (its zone must be on Cloudflare). Security headers, including the content
-security policy, are in `site/public/_headers`.
+`site/package-lock.json` pins Wrangler and every package it pulls in, each with its integrity hash, so
+a deploy never fetches a tool by name. Deploy it with a token of its own, as in
+[step 2](#2-create-a-cloudflare-api-token): *Workers · Editor* on the Worker `pylota-mail-site` only, never
+account-wide *Workers Scripts · Edit*. The first deploy creates the Worker, which needs *Workers · Admin*
+at the Workers product scope once, and attaching a hostname needs *Workers Routes · Edit* on its zone.
+
+To serve the site on your own hostname, uncomment the `routes` entry in `site/wrangler.jsonc` and set the
+hostname (its zone must be on Cloudflare). Security headers, including the content security policy, are
+in `site/public/_headers`.

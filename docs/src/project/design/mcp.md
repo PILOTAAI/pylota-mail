@@ -297,6 +297,8 @@ therefore never a tool error.
 | `mail_update_labels` | `messages:write` | – |
 | `mail_sign_assertion` | `identities:sign` | tenant and identity keys only: a platform or partner key can never hold `identities:sign` ([Agent signing keys](agent-keys.md#6-permissions-limits-and-plans)), so it never sees the tool; an identity key signs only as its own identity |
 | `mail_sign_http_request` | `identities:sign` | as `mail_sign_assertion`; `PM_WEB_BOT_AUTH` and the tenant's `policy.web_bot_auth.allowed` are checked per call (tool errors `web_bot_auth_disabled` and `policy_denied`) |
+| `mail_request_account` | `accounts:request` | – |
+| `mail_list_accounts` | `accounts:request` | – (`accounts:approve` includes it) |
 
 **Identity argument.** Identity-scoped tools take an optional `identity` argument: an identity ID
 (`idn_…`) or one of its active or retiring addresses.
@@ -336,6 +338,8 @@ checks, rate limits, idempotency and error codes. The table maps every tool:
 | `mail_update_labels` | `PATCH …/messages/{message_id}` or `PATCH …/threads/{thread_id}` | – (`RL_API` only) |
 | `mail_sign_assertion` | `POST /v1/identities/{id}/assertions` (no `Idempotency-Key`: each call mints a new token) | `RL_SIGN` (per identity, shared with `mail_sign_http_request` and both REST endpoints) |
 | `mail_sign_http_request` | `POST /v1/identities/{id}/http-signatures` (no `Idempotency-Key`) | `RL_SIGN` |
+| `mail_request_account` | `POST /v1/identities/{id}/accounts` (no `Idempotency-Key`; a repeat gets `account_exists` with the entry's ID) | – (`RL_API` only) |
+| `mail_list_accounts` | `GET /v1/identities/{id}/accounts` (`status`, `service_domain`, `limit`, `cursor`) | – (`RL_API` only) |
 
 `RL_API` is charged **once per MCP request**, at the transport ([§2.1](#21-request-handling), step 6). The
 tool then calls the REST handler's service function with that check already done, so `RL_API` is never
@@ -354,6 +358,8 @@ Annotation defaults in `schema.ts` are `readOnlyHint: false`, `destructiveHint: 
 | `mail_send`, `mail_reply`, `mail_forward` | `false` | `false` (adds a message, deletes nothing) | `true` (the same `idempotency_key` has no further effect) | `true` (emails outside parties) |
 | `mail_update_labels` | `false` | `true` (`labels_remove` removes state) | `true` | `false` |
 | `mail_sign_assertion`, `mail_sign_http_request` | `false` (no mail state changes, but each call issues a new credential, is counted in `usage_daily` and may create the identity's first key) | `false` (changes or deletes no existing state) | `false` (every call returns a new token or signature, with a new `jti` or `nonce`) | `false` (the Worker contacts no one; the agent presents the result) |
+| `mail_request_account` | `false` (creates a ledger entry) | `false` | `true` (a repeat creates nothing more: `account_exists`) | `false` (the operator decides; no one outside is contacted) |
+| `mail_list_accounts` | `true` | `false` | `true` | `false` |
 
 ### 4.2 Output and size budgets
 
@@ -381,6 +387,7 @@ a model's context:
 | `mail_search_contacts` | `limit` default 10, max 50 |
 | `mail_get_usage` | none; the whole `GET /v1/usage` response, including the plan catalog |
 | `mail_sign_assertion`, `mail_sign_http_request` | none; the results are a few KB and are never cut, because a cut token or header would not verify |
+| `mail_list_accounts` | `limit` default 20, max 50 |
 | any tool | the compact JSON of `structuredContent` is at most 96 KB |
 
 A cut text field ends with `…`, and the object that holds it gains `"<field>_truncated": true` (for
@@ -713,13 +720,21 @@ Title "Label or mark mail". Description:
     "thread_id": { "type": "string", "pattern": "^thr_[0-9A-HJKMNP-TV-Z]{26}$" },
     "labels_add": { "type": "array", "maxItems": 64, "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_:-]{0,63}$" } },
     "labels_remove": { "type": "array", "maxItems": 64, "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_:-]{0,63}$" } },
-    "read": { "type": "boolean" } },
-  "oneOf": [ { "required": ["message_id"] }, { "required": ["thread_id"] } ] }
+    "read": { "type": "boolean" } } }
 ```
 
-Output: `{ id, labels, read }` for the message or thread. A call with none of `labels_add`,
-`labels_remove` and `read` changes nothing and returns `invalid_request` (path `labels_add`), as the REST
-`PATCH` does through `minProperties: 1`.
+Output: `{ id, labels, read }` for the message or thread. Exactly one of `message_id` and `thread_id` is
+required, and the handler checks it: both, or neither, returns `invalid_request` with
+`details.errors[0].path` = `thread_id` (both) or `message_id` (neither), and changes nothing. The schema
+does not say it with a top-level `oneOf`, because the Anthropic API is reported to reject a tool whose
+`input_schema` has `oneOf`, `allOf` or `anyOf` at its top level, and to fail the whole request for one
+such tool (anthropics/claude-code issue 27337 and its duplicates, seen 2026-10-10; Anthropic's "Define
+tools" page, read the same day, requires `input_schema` to be a JSON Schema object and does not state
+the restriction). Every tool's `inputSchema` is therefore a plain `"type": "object"` at the top level;
+combinators may appear only inside a property, as in `mail_send`'s recipients
+(`it::mcp::input_schemas_plain_objects`). A call with none of `labels_add`, `labels_remove` and `read`
+changes nothing and returns `invalid_request` (path `labels_add`), as the REST `PATCH` does through
+`minProperties: 1`.
 
 #### `mail_sign_assertion`
 
@@ -789,6 +804,39 @@ whose value is not ASCII is refused (`invalid_request`, [O10](../edge-cases.md))
 Both signing tools arrive with milestone M25 of the [build plan](../build-plan.md). Signed HTTP requests
 also need spike S13 to pass; until `PM_WEB_BOT_AUTH=on`, `mail_sign_http_request` is listed but every
 call gets `web_bot_auth_disabled`.
+
+#### `mail_request_account`
+
+Title "Ask to create a service account". Description:
+`Ask the operator to approve an account you want to create at a third-party service with this mailbox's address. Do this before you sign up: while the request is pending, codes from that service are held for review and mail_wait with kind "verification" fails with policy_denied. Give the service's domain, the username or account email you will use, and a short honest purpose; the operator reads it. Check the decision with mail_list_accounts. When it is approved, sign up with the returned address, then call mail_wait with kind "verification" and from "@" plus the service domain.`
+
+```json
+{ "type": "object", "additionalProperties": false, "required": ["service_domain", "account_identifier", "purpose"], "properties": {
+    "identity": { "type": "string", "maxLength": 254, "description": "Identity id (idn_…) or address. Required for tenant keys." },
+    "service_domain": { "type": "string", "minLength": 1, "maxLength": 253 },
+    "account_identifier": { "type": "string", "minLength": 1, "maxLength": 254 },
+    "purpose": { "type": "string", "minLength": 1, "maxLength": 500 },
+    "sender_domains": { "type": "array", "maxItems": 5, "items": { "type": "string", "maxLength": 253 } },
+    "address": { "type": "string", "maxLength": 254 } } }
+```
+
+Output: the `201` body, a [service account](../../reference/api.md#service-account-object).
+
+#### `mail_list_accounts`
+
+Title "List service account requests". Description:
+`List this mailbox's requests to create third-party accounts and the operator's decisions: pending_approval, approved, rejected (by the operator, or expired after 7 days) or closed.`
+
+```json
+{ "type": "object", "additionalProperties": false, "properties": {
+    "identity": { "type": "string", "maxLength": 254 },
+    "status": { "type": "string", "enum": ["pending_approval", "approved", "rejected", "closed"] },
+    "service_domain": { "type": "string", "maxLength": 253 },
+    "limit": { "type": "integer", "minimum": 1, "maximum": 50, "default": 20 },
+    "cursor": { "type": "string" } } }
+```
+
+Output: `{ data, next_cursor }` as `GET /v1/identities/{identity_id}/accounts`.
 
 ## 5. Tool errors
 
@@ -948,7 +996,9 @@ v1.1 needs an ADR and updates to [Configuration](../../reference/configuration.m
 | `it::mcp::sse_deep_search_progress` | Progress notifications per step, keep-alive, final response; closing the stream stops the loop | §2.6 |
 | `it::mcp::size_budgets` | Truncation flags and the 96 KB cap; attachment text is cut per page; every cut result still validates against its tool's `outputSchema` and has `truncated: true` | §4.2 |
 | `it::mcp::get_usage` | `mail_get_usage` is listed for tenant and identity keys that do not hold `usage:read` explicitly and never for platform or partner keys; it returns the same body as `GET /v1/usage` for the key's own workspace; any argument gives `invalid_request` | §3, §4.3, FR-BILL-11 |
+| `it::mcp::input_schemas_plain_objects` | Every tool in `tools/list` has an `inputSchema` whose top level is `"type": "object"` with no `oneOf`, `anyOf`, `allOf` or `not`; `mail_update_labels` with both `message_id` and `thread_id`, or with neither, gets `invalid_request` with the path named above and changes nothing | §4.3, FR-MCP-1, M15 |
 | `it::mcp::sign_tools` | `mail_sign_assertion` and `mail_sign_http_request` are listed only for tenant and identity keys holding `identities:sign`; an identity key naming another identity gets `identity_not_found`; the results have the REST shapes and verify (the token against the identity's JWKS); two identical calls return different tokens; an identity of a suspended tenant gets `tenant_suspended` (checked first) and a paused identity `identity_paused`, and `PM_WEB_BOT_AUTH=off` and a tenant not opted in give `web_bot_auth_disabled` and `policy_denied` as `isError` results | §3, §4.3, §5, FR-IDN-7, FR-IDN-8 |
+| `it::mcp::accounts_tools` ([Service sign-up ledger §10](service-accounts.md#10-tests)) | `mail_request_account` and `mail_list_accounts` are listed only for keys with `accounts:request`, map to their REST routes and return the same errors (`account_exists`, `account_limit_reached`, `identity_paused`) | FR-IDN-10, M27 |
 | `it::mcp::rmcp_roundtrip` (native) | Every local protocol type round-trips through `rmcp::model` 3.4.1 | S5 fallback |
 | `it::mcp::inspector_replay` | A recorded MCP Inspector session replays green | M15 |
 | `it::auth::f2_permission` | A key without `search:read` cannot see or call search tools | [F2] |

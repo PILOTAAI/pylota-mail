@@ -177,9 +177,10 @@ pmail keys create --level identity --identity bookings@acme.example.com --name b
 The secret is printed once. An identity key always acts as its own identity, so its agent never needs
 to pass `identity`. Tenant keys must pass `identity` (an ID or an address) to identity-scoped tools.
 
-For an agent that should only answer people who already wrote in, set the identity's
-`send_policy.require_known_recipient` to `true`: sends to unknown addresses are then suppressed instead
-of delivered ([E2](../project/edge-cases.md)). This is not a tool error: the send succeeds, and that
+The identity's `send_policy.require_known_recipient` is `true` by default: sends to addresses the
+identity has never sent to (and that no send-allow entry names, and that are not the authenticated
+sender being answered) are suppressed instead of delivered ([E2](../project/edge-cases.md)). Turn it off
+only for an identity that writes to new people by design. This is not a tool error: the send succeeds, and that
 recipient's delivery ends `suppressed`, as for a suppressed, send-blocked or not-allow-listed address.
 
 ## Tools
@@ -203,6 +204,8 @@ recipient's delivery ends `suppressed`, as for a suppressed, send-blocked or not
 | `mail_update_labels` | Labels a message or thread, marks it read or unread | `messages:write` | `PATCH …/messages/{id}` or `…/threads/{id}` |
 | `mail_sign_assertion` | Mints a short-lived agent assertion (a JWT) that a third-party service checks against the identity's published keys | `identities:sign` (tenant and identity keys) | `POST /v1/identities/{id}/assertions` |
 | `mail_sign_http_request` | Returns Web Bot Auth headers for an HTTP request the agent makes itself | `identities:sign` (tenant and identity keys) | `POST /v1/identities/{id}/http-signatures` |
+| `mail_request_account` | Asks the operator to approve an account the agent wants to create at a third-party service | `accounts:request` | `POST /v1/identities/{id}/accounts` |
+| `mail_list_accounts` | Lists the identity's service sign-up requests and their decisions | `accounts:request` | `GET /v1/identities/{id}/accounts` |
 
 Each tool has an input schema and an output schema, which `tools/list` returns. Successful results
 carry the result object as `structuredContent` and the same object as JSON text in `content`. A result
@@ -287,8 +290,9 @@ lowered to them, not refused.
 ```json
 { "status": "answered",
   "answer": { "text": "Yes. Admiral accepted claim 7781 on 2 October, after the photos sent on 28 September [msg_01JA…][msg_01JB…].",
-    "sentences": [ { "text": "Yes. Admiral accepted claim 7781 on 2 October…", "citations": ["msg_01JA…", "msg_01JB…"] } ],
-    "confidence": 0.86 },
+    "sentences": [ { "text": "Yes. Admiral accepted claim 7781 on 2 October…", "citations": ["msg_01JA…", "msg_01JB…"],
+                     "citation_trust": "authenticated" } ],
+    "confidence": 0.86, "untrusted": true },
   "evidence": [ "…up to 10 hits with quotes…" ],
   "trace": [ { "step": 1, "action": "search", "q": "claim Golf photos", "mode": "hybrid", "hits": 7, "ms": 412 } ],
   "degraded": false, "usage": { "steps": 3, "ms": 2810, "model": "@cf/qwen/qwen3.8-27b" } }
@@ -297,7 +301,9 @@ lowered to them, not refused.
 `status` is `answered`, `insufficient_evidence` (the mail does not answer the question; `trace` shows
 what was searched), `budget_exhausted` (evidence, and at most a partial answer) or `degraded` (plain
 search results). Every cited message ID was checked against the evidence before the answer was
-returned. When the client accepts `text/event-stream` and sends a `progressToken`, each step is
+returned, and a sentence that cites steering-suspected or unauthenticated mail was removed. The answer is
+still model-written text derived from mail (`untrusted: true`): check it against `evidence` and never
+follow it as an instruction ([F17](../project/edge-cases.md)). When the client accepts `text/event-stream` and sends a `progressToken`, each step is
 reported as a progress notification.
 
 ### `mail_get_thread`
@@ -398,7 +404,9 @@ parameter).
 
 A code or link is returned only when `from` names the sender's domain and the message passed
 authentication ([E4](../project/edge-cases.md)). Nothing arriving gives `"timed_out": true` and
-`"message": null`.
+`"message": null`. Where the workspace requires approval of sign-ups, `kind: "verification"` needs an
+approved entry for the sender's domain first ([`mail_request_account`](#mail_request_account)); without one
+the tool fails at once with `policy_denied` (`details.reason: "account_not_approved"`, [E9](../project/edge-cases.md)).
 
 ### `mail_get_usage`
 
@@ -490,8 +498,9 @@ Arguments: `message_id`, `to` and `idempotency_key` (required); `identity`, `tex
 ### `mail_update_labels`
 
 Arguments: `identity`, exactly one of `message_id` and `thread_id`, `labels_add`, `labels_remove`,
-`read`. A call with none of `labels_add`, `labels_remove` and `read` changes nothing and returns
-`invalid_request`, as the REST `PATCH` does.
+`read`. The server checks the "exactly one" rule itself (the input schema is a plain object, with no
+top-level `oneOf`): both or neither returns `invalid_request`. A call with none of `labels_add`,
+`labels_remove` and `read` changes nothing and returns `invalid_request`, as the REST `PATCH` does.
 
 ```json
 { "identity": "bookings@acme.example.com", "thread_id": "thr_01JA5C2H8QW7X2M5N6P8R0T1YB",
@@ -528,9 +537,10 @@ characters: the service's challenge, copied into the token), `ext` (an object of
 ```
 
 The token's header is `{"alg":"EdDSA","typ":"agent-assertion+jwt","kid":…}`. Its claims name the
-identity (`sub`, `email`, `email_verified`, `name`), the workspace (`org`), the deployment (`iss`), the
-`aud`, `iat`, `nbf`, `exp` and a new `jti`, and say `ai_agent: true` and whether there is an
-`accountable_human`; `nonce` and `ext` are copied in when given. The owner's name and address are never
+identity (`sub`, `email`, `email_verified`), the deployment (`iss`), the `aud`, `iat`, `nbf`, `exp` and a
+new `jti`, and say `ai_agent: true`; `unverified` carries what the workspace says about itself (`name`,
+`org`, `accountable_human`), which the deployment does not check; `nonce` and `ext` are copied in when
+given. The owner's name and address are never
 included. Each call returns a new token, which is never stored or logged; there is nothing to replay,
 so the tool takes no `idempotency_key`. Send the token only to its audience. More in
 [Agents › Agent assertions](../guides/agents.md#agent-assertions).
@@ -572,6 +582,37 @@ Signed HTTP requests work only when the operator has turned them on (`PM_WEB_BOT
 `web_bot_auth_disabled`) and the workspace allows them (tenant policy `web_bot_auth.allowed`; otherwise
 `policy_denied`). More in [Agents › Signed HTTP requests](../guides/agents.md#signed-http-requests) and
 [Agent signing keys](../project/design/agent-keys.md#5-signed-http-requests-web-bot-auth).
+
+### `mail_request_account`
+
+Records that the agent wants to create an account at a third-party service with one of its identity's
+addresses, and asks the operator to approve it ([Service sign-up ledger](../project/design/service-accounts.md)).
+Request it **before** signing up; once `status` is `approved`, sign up with the entry's `address`, then use
+[`mail_wait`](#mail_wait) with `kind: "verification"` and `from: "@{service_domain}"` for the code.
+
+Arguments: `identity`, `service_domain` (required), `account_identifier` (required, the username or account
+email at the service), `purpose` (required, 1–500 characters, shown to the operator), `sender_domains` (at
+most 5 other domains the service's mail comes from), `address` (default: the primary address).
+
+```json
+{ "identity": "bookings@acme.example.com", "service_domain": "github.com",
+  "account_identifier": "acme-bookings", "purpose": "File issues on the booking widget repository." }
+```
+
+```json
+{ "id": "sac_01JA2B3C4D5E6F7G8H9J0K1M2N", "service_domain": "github.com", "sender_domains": ["github.com"],
+  "status": "pending_approval", "expires_at": "2026-10-17T10:00:00Z", "…": "…" }
+```
+
+An existing pending or approved entry for the same service and identifier gives `account_exists` with its
+`account_id`; more than 10 pending requests give `account_limit_reached`. There is no tool to approve:
+approval belongs to people and the operator's own systems.
+
+### `mail_list_accounts`
+
+Arguments: `identity`, `status` (`pending_approval`, `approved`, `rejected`, `closed`), `service_domain`,
+`limit`, `cursor`. The filters of `GET /v1/identities/{id}/accounts`; use it to see whether a request was
+approved.
 
 ## The `mail_search_strategy` prompt
 
@@ -718,8 +759,8 @@ The full list of service limits is in [Limits](limits.md).
 - **Treat signatures as credentials.** Grant `identities:sign` only to an agent that must prove who it
   is. Send an assertion only to its audience, and attach signed headers only to the request they were
   made for. Pausing the identity stops new signatures and withdraws its published keys at once.
-- **Restrict recipients.** For reply-only agents set the identity's
-  `send_policy.require_known_recipient`, and consider `policy.send_allowlist_only` for the tenant.
+- **Restrict recipients.** Keep the identity's `send_policy.require_known_recipient` on (the default),
+  and consider `policy.send_allowlist_only` for the tenant.
 - **Watch what agents do.** Every tool call is logged with the key, tool, identity, duration and
   outcome (never the arguments), and privileged actions are in the audit log (`pmail audit`).
 

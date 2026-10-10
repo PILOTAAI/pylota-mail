@@ -22,15 +22,34 @@ List endpoints take `limit` (default 25, max 100) and `cursor`. They return:
 { "data": [ ... ], "next_cursor": "c_01J9..." }
 ```
 
-`next_cursor` is `null` on the last page. Cursors are opaque and expire after 24 hours.
+`next_cursor` is `null` on the last page. Cursors are opaque to clients and expire after 24 hours. Every
+list uses one format (search keeps its own, [Search › Cursors](../project/design/search.md#58-cursors-and-as_of-pinning)):
+
+- **Order.** Each list returns rows newest first by its keyset: `created_at DESC`, then the row's ID
+  `DESC` (`kid` for the identity-key list). The cursor holds the keyset values of the last row returned,
+  and the next page takes rows strictly below them, so a row inserted or deleted between two pages never
+  shifts the others.
+- **Encoding.** `next_cursor = "c_" ‖ kid ‖ base64url_nopad(payload ‖ tag)`, where `kid` is the kid of
+  the current `signing_keys` key of purpose `cursor` (the key search cursors use), `payload` is the
+  compact JSON `{"v":1,"r":"<operationId>","f":"<filter hash>","k":["<created_at>","<id>"],"t":<issued_at ms>}`
+  and `tag = HMAC-SHA256(cursor key {kid}, "pm-list-cursor-v1\0" ‖ payload)[..16]`. `f` is the first
+  16 bytes, hex, of SHA-256 over the operation's path parameters, its filter query parameters in name
+  order and the calling key's ID, so a cursor works only for the list, filters and key that produced it.
+  The domain-separation prefix keeps list and search cursors apart although they share a key.
+- **Errors.** Bad base64, an unknown kid (neither the current cursor key nor one inside its 24-hour
+  verify window after a rotation), a bad tag, another operation or another filter hash:
+  `400 invalid_request` with `details.errors[0].path = "cursor"`. Older than 24 hours:
+  `410 cursor_expired`.
 
 ### Idempotency
 
 - **Required** on `POST …/messages`, `…/reply`, `…/reply-all` and `…/forward`. A missing key returns
   `400 idempotency_key_required`. The one exception is a dry run (`?dry_run=true`), where the key is
   optional and never recorded ([Sending](#sending)).
-- **Optional** on every other `POST`, except four that ignore the header and never record it
-  (`x-idempotency: none` in [`openapi.yaml`](openapi.yaml)): the two signing endpoints
+- **Optional** on every other `POST`, except six that ignore the header and never record it
+  (`x-idempotency: none` in [`openapi.yaml`](openapi.yaml)): the two search endpoints
+  (`POST /v1/identities/{identity_id}/search` and `POST /v1/tenants/{tenant_id}/search`), which return
+  mail and change nothing, so their results are never stored; the two signing endpoints
   ([`…/assertions`](#post-v1identitiesidentity_idassertions--tenant-or-identity-key-identitiessign) and
   [`…/http-signatures`](#post-v1identitiesidentity_idhttp-signatures--tenant-or-identity-key-identitiessign)),
   because each call signs anew and a replay record would have to store what was signed; and the two
@@ -47,6 +66,11 @@ List endpoints take `limit` (default 25, max 100) and `cursor`. They return:
   `POST /v1/webhooks/{webhook_id}/rotate-secret`) is stored without it: a replay returns the same body
   without `secret` and with `"secret_replayed": false`. A secret is shown once, in the first response;
   if it was lost, rotate or revoke ([J19](../project/edge-cases.md)).
+- No stored response holds mail content. A response that carries a message or a thread
+  (`…/release`, `…/cancel`, `…/resolve`, `…/threads/{thread_id}/hold`) is stored as a reference, and a
+  replay reads the resource again with the calling key's visibility (a resource erased since replays its
+  `404`). Records belong to the identity they name, so identity and tenant erasure delete them
+  ([Data model](../project/design/data-model.md#1-d1-control-plane)).
 - The same key with a different request returns `409 idempotency_conflict`.
 - The same key while the first request is still running returns `409 request_in_progress` with
   `retryable: true`.
@@ -58,13 +82,17 @@ See [Sending and safe retries](../guides/sending.md#safe-retries).
 | Bucket | Default | Scope |
 |---|---|---|
 | All requests | 600 per minute | per API key |
+| All requests of a tenant's keys together (binding `RL_TENANT`) | 1,800 per minute | per tenant, across all its tenant and identity keys |
+| All requests of a partner's partner keys together (binding `RL_PARTNER_API`) | 1,800 per minute | per partner, across all its partner keys |
 | Search (`keyword`, `semantic`, `hybrid`, related messages, contacts) | 120 per minute | per API key |
 | Agentic search | 20 per minute | per API key, plus a daily tenant cap |
 | Send (accepted into queue) | 120 per minute | per identity, plus daily caps from policy |
 | Signing (agent assertions and HTTP signatures together, binding `RL_SIGN`) | 600 per minute | per identity |
 | Tenant creation and invitations by partner keys (binding `RL_PARTNER`) | 10 per minute, together | per partner, across all its keys |
 
-Every authenticated response includes `RateLimit-Limit`, the limit of the bucket that applied, per period.
+Every authenticated response includes `RateLimit-Limit`: on a `429`, the limit of the bucket that refused
+(`details.bucket` names it: `key`, `tenant`, `partner`, `search`, `agentic`, `send`, `sign` or
+`partner_create`); otherwise the limit of the route's per-key bucket.
 A `429 rate_limited` also includes `Retry-After` and `RateLimit-Reset`, both the seconds to the end of the
 bucket's current period (other `429` codes, such as `daily_cap_reached`, set `Retry-After` to their own
 wait). There is no `RateLimit-Remaining`: Cloudflare's rate-limiting
@@ -78,7 +106,7 @@ A key holds a list of permissions. Every endpoint below names the one it needs.
 |---|---|
 | `tenants:manage` | Create, update and suspend tenants, and their billing accounts. Platform keys, for every tenant; partner keys, for the tenants their partner's keys created, without changing billing ([Partners](#partners)) |
 | `identities:read`, `identities:write` | Read, and create, update, pause or delete identities and addresses, and test forwarding; read, and create, rotate or revoke [identity signing keys](#identity-keys-and-signatures). Deleting an identity also needs `erasure:manage`, because it starts an identity-scope erasure |
-| `identities:sign` | Mint agent assertions and Web Bot Auth HTTP signatures as an identity. Tenant and identity keys (an identity key only for its own identity); platform and partner keys cannot hold it |
+| `identities:sign` | Mint agent assertions and Web Bot Auth HTTP signatures as an identity. Tenant and identity keys (an identity key only for its own identity); platform and partner keys cannot hold it, but can grant it to the tenant and identity keys they mint |
 | `domains:read`, `domains:write` | Read, and add, update, verify, probe or remove domains |
 | `messages:read` | Threads, messages, raw MIME, deliveries |
 | `messages:send` | Send, reply, reply-all, forward, cancel |
@@ -90,14 +118,18 @@ A key holds a list of permissions. Every endpoint below names the one it needs.
 | `webhooks:read` | Read webhook endpoints and their deliveries |
 | `webhooks:manage` | Create, change, test, rotate and delete webhook endpoints, and replay. Includes `webhooks:read` |
 | `keys:manage` | API keys within the caller's scope. A partner key manages only tenant and identity keys of its own tenants |
-| `erasure:manage` | Erasure requests, legal holds, exports |
+| `erasure:manage` | Erasure requests, legal holds, exports. A `tenant`-scope erasure request also needs `tenants:erase` |
+| `tenants:erase` | Delete the workspace: a `tenant`-scope erasure request, together with `erasure:manage`. Platform keys, partner keys for their own tenants, and tenant keys that the workspace owner minted in the console (or that descend from one); never admins or their keys ([Security › Who minted a key](../project/design/security.md#who-minted-a-key)) |
 | `suppressions:manage` | Suppressions and allow or block lists |
 | `usage:read` | Plan, allowances and usage figures. Every tenant and identity key holds it implicitly for its own workspace, without listing it. Platform and partner keys must hold it explicitly and pass `tenant_id` |
 | `audit:read` | Audit log |
+| `policy:write` | Read the per-field limits of, and change, the tenant's policy through `GET` and `PATCH /v1/tenants/{tenant_id}/policy`, within the key level's rules: a tenant key may set free fields and lower lower-only fields under its ceilings ([Configuration › Who may change a field](configuration.md#who-may-change-a-field)). Platform, partner and tenant keys; never identity keys |
+| `accounts:request` | Request, list, read and close entries of the [service sign-up ledger](#service-accounts). Every key level |
+| `accounts:approve` | Approve, reject and delete service-ledger entries. Includes `accounts:request`. Platform, partner and tenant keys; never identity keys, so an agent cannot approve its own request. Approval by an API key is also a decision reserved for people ([Approve](#post-v1identitiesidentity_idaccountsaccount_idapprove--accountsapprove)) |
 | `members:read` | List console members and pending invitations (tenant, partner and platform keys; every console role holds it) |
 | `members:manage` | Invite, revoke, change roles and remove console members (tenant, partner and platform keys). Includes `members:read` |
 | `partners:manage` | Create, list, read, update and delete partners, the integrators whose partner keys create tenants ([Partners](#partners)). Platform keys only |
-| `platform:ops` | Platform operations: signing-key rotation, the dead-letter queue, maintenance jobs, waitlist invitations (platform keys only) |
+| `platform:ops` | Platform operations: signing-key rotation, the dead-letter queue, maintenance jobs, waitlist invitations, switches, mailbox restores and re-applied erasures (platform keys only) |
 
 Key levels limit which resources a key can reach, whatever its permissions. From widest to narrowest:
 
@@ -122,13 +154,15 @@ lists one its level cannot hold with `400 invalid_request` and
 |---|---|
 | `platform:ops`, `partners:manage` | platform |
 | `tenants:manage` | platform, partner |
-| `members:read`, `members:manage`, `suppressions:manage`, `audit:read`, `usage:read` | platform, partner, tenant (an identity key holds `usage:read` implicitly for its own workspace, but cannot list it) |
-| `identities:sign` | tenant, identity |
+| `members:read`, `members:manage`, `suppressions:manage`, `audit:read`, `usage:read`, `policy:write`, `accounts:approve` | platform, partner, tenant (an identity key holds `usage:read` implicitly for its own workspace, but cannot list it) |
+| `tenants:erase` | platform, partner, and a tenant key minted by the workspace owner's console session or by a key descended from one (otherwise `details.reason = "permission_owner_only"`) |
+| `identities:sign` | tenant, identity (platform and partner keys may grant it without holding it) |
 | Every other permission | platform, partner, tenant, identity |
 
 There are no wildcard permissions and no implicit full set: every key, platform and partner keys included,
 holds the permissions listed when it was created, plus the implicit `usage:read` of tenant and identity keys. A
-`POST /v1/keys` without `permissions`, or with an empty list, returns `400 invalid_request`.
+`POST /v1/keys` without `permissions`, or with an empty list, returns `400 invalid_request`. A key can never
+create, read, rotate or revoke a key wider than itself ([API keys](#api-keys--keysmanage)).
 
 ### The console and billing routes
 
@@ -154,7 +188,8 @@ answer only on `PM_CONSOLE_HOST`, and the API host `PM_API_HOST` serves exactly:
 - signed links, `/v1/links/*`;
 - the provider hooks, `/hooks/*`, and `/billing/stripe/webhook`.
 
-Anything else returns `404`. No cookie is set or read on the API host
+Anything else returns `404 route_not_found`, as does a path that is no route at all; a route called with a
+method it does not have returns `405 method_not_allowed` with an `Allow` header. No cookie is set or read on the API host
 ([Cloud sign-up › Hostnames](../project/design/cloud-signup.md#2-hostnames)).
 
 ### Errors
@@ -182,8 +217,20 @@ The code catalogue is in [Errors](errors.md).
 
 ### `GET /health`
 
-No auth. Returns `{ "status": "ok", "version": "1.0.0", "commit": "abc1234", "env": "production" }`.
-`env` is `PM_ENV`. With an invalid configuration it returns `503 unavailable`.
+No auth. Returns `200` with `{ "status": "ok", "version": "1.0.0", "commit": "abc1234", "env": "production" }`.
+`env` is `PM_ENV`; `version` and `commit` are compiled into the release bundle. When SES is configured,
+the body also has `ses_region` (the value of `PM_SES_REGION`). While the deployment is frozen for a restore
+it has `"frozen": true` ([Observability § 7.1](../project/design/observability.md#71-get-health)).
+
+- **Degraded.** When the Worker serves with a feature turned off by its configuration, `status` is
+  `degraded`, still with `200`, and one field per feature names why: `ses` (`sns_topic_missing`: SES
+  credentials without `PM_SES_SNS_TOPIC_ARN`, so the SES transport is off), `billing`
+  (`stripe_secrets_missing`: `PM_BILLING=stripe` without its secrets, so billing has not started) and
+  `cf_api_token` (`missing`: a Cloudflare REST fallback is in use without `PM_CF_API_TOKEN`). Absent
+  fields are healthy.
+- **Invalid configuration.** A missing required variable or secret, or a malformed optional one, returns
+  `503 unavailable` with `details.config_invalid` naming the variable, as every other route does
+  ([Rust workspace › Startup rules](../project/design/rust-workspace.md#61-errors-and-configuration)).
 
 ### `GET /openapi.json`
 
@@ -209,7 +256,9 @@ partner, and `tenant_id` and `identity_id` are `null`.
 
 Keys with `tenants:manage`: a platform key reaches every tenant, and a partner key the tenants its
 partner's keys created ([Partners](#partners)). A tenant key can `GET /v1/tenants/{tenant_id}` for its
-own tenant; it cannot list tenants or change them.
+own tenant; it cannot list tenants or change them, except its policy through
+[`PATCH /v1/tenants/{tenant_id}/policy`](#get-v1tenantstenant_idpolicy--patch-v1tenantstenant_idpolicy--policywrite)
+with `policy:write`.
 
 ### `POST /v1/tenants`
 
@@ -227,11 +276,21 @@ own tenant; it cannot list tenants or change them.
 ```
 
 - `address_suffix` defaults to `"." + slug`. Only one tenant (the default tenant made by `pmail setup`)
-  can have an empty suffix.
+  can have an empty suffix. Every tenant shares the platform domain, so a suffix must not pass for
+  someone else ([D12](../project/edge-cases.md)). Its fold (the confusable fold of
+  [Identities › Username validation](../project/design/identity-domains.md#username-validation), without the
+  dot) is refused with `400 address_reserved` (`details.field = "address_suffix"`) when it equals the fold
+  of a reserved username, or of a name in the compiled list `core::address::RESERVED_SUFFIXES`: `pylota`,
+  `pylotamail`, `stripe`, `paypal`, `google`, `gmail`, `microsoft`, `outlook`, `apple`, `icloud`, `amazon`,
+  `aws`, `cloudflare`, `github`, `hmrc`, `gov`, `govuk`, `dvla`, `police`, `bank`, `visa`, `mastercard`,
+  `amex`, `billing`, `payments` and `admin`. A suffix whose fold equals another tenant's (`.acrne` beside
+  `.acme`) gets `409 suffix_taken`, enforced by the unique `tenants.suffix_fold`.
 - `policy` is merged over the defaults. See [Configuration › Tenant policy](configuration.md#tenant-policy).
 - `owner` (optional) creates the workspace's console owner and emails them a sign-in link. Without it, a
   platform or partner key can add an owner later with an invitation and an ownership transfer in the
-  console.
+  console. An address this deployment hosts (on the platform domain, or an identity's address) cannot
+  be an owner: `400 invalid_request` with `details.errors[0].path = "owner.email"`, because any key that
+  reads that mailbox could read the sign-in codes.
 - `billing.mode` defaults to `metered` on a deployment with billing on (plan `free`) and to `disabled`
   otherwise.
 - **With a partner key**, the new tenant's `partner_id` is the key's partner, for good, and its billing
@@ -266,11 +325,68 @@ key cannot call this route (`403 permission_denied`: it can never hold `tenants:
   one partner cannot spend the shared sending reputation or AI budget.
 - **Operator enforcement stays.** `suspended_by` records who suspended the tenant; a partner key that sets
   `status: "active"` on a tenant a platform key suspended gets `403 scope_denied`
-  (`details.field: "status"`). A value a platform key sets on a lower-only field becomes that field's
-  ceiling for partner keys ([J17](../project/edge-cases.md)).
+  (`details.field: "status"`). `status: "suspended"` on a tenant that is already suspended changes
+  nothing (`suspended_by` and `suspended_at` stay), so a partner cannot take over a platform suspension and
+  then lift it; a platform key's suspension replaces a partner's. A value a platform key sets on a
+  lower-only field becomes that field's ceiling for partner keys ([J17](../project/edge-cases.md)).
 - **Erasing and erased tenants.** Once a tenant is `erasing` or `erased`, only the erasure job changes its
   status: a platform key gets `409 tenant_erased`, and any other key gets `404 tenant_not_found` here and
   on every other write to the tenant ([I8](../project/edge-cases.md)).
+- **Listed zones.** Dropping a zone from `policy.domains.cloudflare_zones` while the tenant still has
+  domains in it returns `409 domain_in_use` with `details.reason: "zone_has_domains"` and
+  `details.domain_ids`; remove those domains first ([H13](../project/edge-cases.md)).
+- **Every policy write** goes through the same checks as `PATCH …/policy` below: it is a compare-and-set
+  (`503 unavailable` after three lost attempts), writes the audit row `tenant.policy_update` and emits
+  `tenant.policy_updated`. A lower-only value a partner key sets also becomes that field's partner ceiling
+  for the tenant's own keys and people ([J26](../project/edge-cases.md)).
+
+### `GET /v1/tenants/{tenant_id}/policy` · `PATCH /v1/tenants/{tenant_id}/policy` — `policy:write`
+
+The workspace's own policy route ([Workspace policy](../project/design/workspace-policy.md)). Platform,
+partner (its own tenants) and tenant (its own tenant) keys holding `policy:write`; identity keys can never
+hold it. `PATCH` takes a partial policy (the `policy` object of `PATCH /v1/tenants/{tenant_id}`: deep
+merge, `null` resets a field, arrays replace) and checks each field sent by the caller's level
+([Configuration › Who may change a field](configuration.md#who-may-change-a-field)). For a tenant key:
+
+- free fields take any valid value;
+- a lower-only field may be set at most to its workspace ceiling, the strictest of the deployment default,
+  the platform ceiling and the partner ceiling; above it, `403 scope_denied` with `details.field`,
+  `details.reason = "above_ceiling"`, `details.ceiling` and `details.ceiling_source`
+  ([J23](../project/edge-cases.md), [J26](../project/edge-cases.md));
+- a guard field (`send_allowlist_only`, `quarantine.on_auth_fail`, `quarantine.spam_threshold`,
+  `quarantine.unsolicited_otp`) may only be tightened, unless API keys may take decisions reserved for
+  people on this tenant (`PM_QUARANTINE_KEY_RELEASE=on`, or the tenant's `quarantine.key_release: true`);
+  otherwise `403 permission_denied` with `details.field` and `details.reason = "person_required"`
+  ([J25](../project/edge-cases.md));
+- platform-only fields and `quarantine.key_release` get `403 scope_denied` with `details.field` and
+  `details.reason = "not_writable"` ([J24](../project/edge-cases.md), [J14](../project/edge-cases.md)).
+
+One refused field refuses the whole write. Concurrent writes never lose one another: a write that keeps
+losing the compare-and-set gets `503 unavailable` (retryable) after three attempts
+([J27](../project/edge-cases.md)). Both methods return the policy view; `GET` changes nothing:
+
+```json
+{ "tenant_id": "ten_01J9…", "policy_version": 7,
+  "policy": { "...": "full effective policy" },
+  "fields": [
+    { "field": "tenant_daily_send_cap", "class": "lower_only", "writable": true, "ceiling": 1000,
+      "ceiling_source": "partner", "person_required_to_loosen": false },
+    { "field": "quarantine.on_auth_fail", "class": "guard", "writable": true, "ceiling": null,
+      "ceiling_source": null, "person_required_to_loosen": true },
+    { "field": "quarantine.key_release", "class": "partner_or_platform", "writable": false, "ceiling": null,
+      "ceiling_source": null, "person_required_to_loosen": false } ] }
+```
+
+`fields` describes what **the caller** may do: for a platform key every field is `writable` with no
+ceiling. Each write writes the audit row `tenant.policy_update` and emits `tenant.policy_updated`.
+Errors: `400 invalid_request`, `403 permission_denied`, `403 scope_denied`, `404 tenant_not_found`
+(out of scope, or a write to an `erasing` or `erased` tenant), `503 unavailable`.
+- **Automatic sending pause.** `sending_paused_at` is set when the tenant's complaint or bounce rate
+  reaches the provider's review level over 7 days ([G12](../project/edge-cases.md)), or when one of its
+  domains has a burst far above it within an hour or a day ([J33](../project/edge-cases.md)); the
+  `409 sending_paused` a send gets names which in `details.reason`. `"sending_paused": false` lifts
+  it, audit-logged; only a platform key may send it (`403 scope_denied`, `details.field:
+  "sending_paused"`), and no key can set a pause by hand.
 
 #### Tenant object
 
@@ -278,7 +394,7 @@ key cannot call this route (`403 permission_denied`: it can never hold `tenants:
 {
   "id": "ten_01J9…", "slug": "acme", "name": "Acme Car Hire", "mode": "live", "status": "active",
   "suspended_by": null, "partner_id": null, "address_suffix": ".acme", "timezone": "Europe/London",
-  "policy": { "...": "full effective policy" },
+  "policy": { "...": "full effective policy" }, "sending_paused_at": null,
   "created_at": "2026-10-09T10:00:00Z", "updated_at": "2026-10-09T10:00:00Z"
 }
 ```
@@ -354,9 +470,11 @@ the `partner_id`; only a platform key rotates or revokes one:
 
 ```json
 { "name": "pylota-backend", "level": "partner", "partner_id": "ptn_01JA…",
-  "permissions": ["tenants:manage", "keys:manage", "webhooks:manage", "quarantine:review", "usage:read",
-                  "identities:read", "identities:write", "domains:read", "domains:write", "messages:read",
-                  "messages:send", "messages:write", "attachments:read", "search:read", "members:manage"] }
+  "permissions": ["tenants:manage", "tenants:erase", "keys:manage", "webhooks:manage", "quarantine:review",
+                  "usage:read", "audit:read", "identities:read", "identities:write", "domains:read",
+                  "domains:write", "messages:read", "messages:send", "messages:write", "attachments:read",
+                  "search:read", "search:agentic", "erasure:manage", "suppressions:manage",
+                  "members:manage"] }
 ```
 
 A partner key acts only on the tenants its partner's keys created, with `tenant_id` or a resource ID,
@@ -365,11 +483,17 @@ exactly as a platform key does:
 | Permission | What a partner key can do with it |
 |---|---|
 | `tenants:manage` | Create tenants (each gets the partner's `partner_id` and `default_billing_mode`; at most `max_tenants`), list, read, update and suspend its own, and read their billing accounts. It never changes a billing account or sends `billing` (`403 scope_denied`), raises a lower-only policy field above its ceiling, sets a platform-only one, or lifts a platform suspension |
-| `keys:manage` | Mint, list, rotate and revoke tenant and identity keys of its own tenants. Never a partner or platform key (`403 key_scope_exceeded`) |
+| `keys:manage` | Mint, list, rotate and revoke tenant and identity keys of its own tenants, granting them `identities:sign` when their agents sign (it cannot hold it itself). Never a partner or platform key (`404 key_not_found` for an existing one, `403 key_scope_exceeded` to mint one), and never a key wider than itself |
+| `tenants:erase`, `erasure:manage` | Delete one of its tenants (`POST /v1/erasure-requests` with `scope: "tenant"`), which [`DELETE /v1/partners/{partner_id}`](#delete-v1partnerspartner_id) needs first, and the other erasure scopes |
 | `webhooks:manage`, `webhooks:read` | Partner endpoints (`POST /v1/webhooks` makes one, with `scope: "partner"`), which receive only its own tenants' events, and its tenants' endpoints ([Webhooks](#webhooks)) |
 | `quarantine:review` | See and release its tenants' quarantined mail; release by key follows the tenant's `quarantine.key_release` ([Release](#post-v1identitiesidentity_idmessagesmessage_idrelease--quarantinereview)) |
 | `usage:read` | Read one of its tenants' usage, with `tenant_id` |
-| Every other tenant-level permission | The same as a platform key, on its own tenants: identities and their addresses and signing keys (not `identities:sign`), domains, mail, search, erasure (a `tenant` scope included), suppressions and lists, audit, members |
+| Every other tenant-level permission | The same as a platform key, on its own tenants: identities and their addresses and signing keys (not `identities:sign`), domains, mail, search, suppressions and lists, audit, members |
+
+The example lists what Pylota's backend uses: tenant creation and deletion, keys for its operators'
+agents, webhooks, quarantine release, usage and the audit log of its tenants (`audit:read`, which
+[`GET /v1/audit-events`](#get-v1audit-events--auditread) needs), identities and domains, mail and search
+(agentic included), erasure requests for its operators' data subjects, suppressions and lists, and members.
 
 A partner key can never hold `platform:ops`, `partners:manage` or `identities:sign`, and never reaches
 `/v1/platform/*`, `/v1/partners/*`, the platform's webhook endpoints, or any partner or platform key, its
@@ -400,9 +524,14 @@ tenant's caps: with the default `tenant_daily_send_cap` of 5,000, at most 125,00
   "signature": { "text": "Acme Car Hire · 0113 496 0000" },
   "domain_id": "dom_01J9…",
   "client_id": "acme:bookings",
+  "send_policy": { "daily_cap": 300 },
   "metadata": { "operator_id": "op_123" }
 }
 ```
+
+- `send_policy` (optional) sets the identity's own send policy at creation, as `PATCH` does later. For any
+  key but a platform key, a `daily_cap` above the tenant's effective `identity_daily_send_cap` gets
+  `403 scope_denied` with `details.field: "send_policy.daily_cap"`, and nothing is created.
 
 - `username`: stored lower case as `^[a-z0-9][a-z0-9._-]{0,23}$`. The request value is checked by the
   username rules, not by a schema pattern, so each failure has its own code: a reserved or confusable name
@@ -441,7 +570,15 @@ retired or out-of-scope addresses.
 
 ### `GET /v1/identities/{identity_id}` — `identities:read`
 
+Returns the identity in any status, `deleting` and `deleted` included; once erased, a `deleted` identity
+has its personal fields scrubbed (`display_name` empty, `owner` and `signature` `null`, `metadata` `{}`,
+[Privacy § 6.5](../project/design/privacy.md#65-identity-scope-fr-idn-4)).
+
 ### `PATCH /v1/identities/{identity_id}` — `identities:write`
+
+On a `deleting` or `deleted` identity this returns `404 identity_not_found` and changes nothing, like every
+other write by identity ID except the legal-hold routes, which stay usable on a `deleting` identity
+([Privacy § 6.5](../project/design/privacy.md#65-identity-scope-fr-idn-4)).
 
 Updatable: `display_name`, `purpose`, `owner`, `signature`, `metadata`, `send_policy`, and `status`
 (`active` | `paused`). Setting `status: "active"` on an identity paused for `abuse_threshold` needs a
@@ -452,7 +589,9 @@ tenant's effective `identity_daily_send_cap` needs a platform key (`403 scope_de
 
 ### `DELETE /v1/identities/{identity_id}` — `identities:write` and `erasure:manage`
 
-Returns `202` with an [Erasure request](#erasure-request-object) of scope `identity`. The identity's
+Returns `202` with an [Erasure request](#erasure-request-object) of scope `identity`. A second `DELETE` of
+a `deleting` or `deleted` identity starts nothing and returns `200` with the identity's existing
+identity-scope erasure request (the same `era_` ID). The identity's
 addresses are tombstoned and can never be assigned to another identity. Its
 [signing keys](#identity-keys-and-signatures) are deleted and their key IDs tombstoned, so a deleted key ID
 is never published again ([O7](../project/edge-cases.md)). While the identity is `deleting` or `deleted`,
@@ -469,7 +608,7 @@ signing and its JWK Set return `404 identity_not_found`.
   "addresses": [ { "...": "Address objects" } ],
   "owner": { "name": "Sam Patel", "email": "sam@acmecarhire.example" },
   "signature": { "text": "…", "html": null },
-  "send_policy": { "daily_cap": 500, "auto_reply": "allowed", "require_known_recipient": false },
+  "send_policy": { "daily_cap": 500, "auto_reply": "allowed", "require_known_recipient": true },
   "metadata": { "operator_id": "op_123" },
   "client_id": "acme:bookings",
   "created_at": "…", "updated_at": "…"
@@ -575,7 +714,8 @@ design is in [Agent signing keys](../project/design/agent-keys.md); the integrat
 - Creating, rotating and revoking keys is audit-logged (`identity_key.create`, `identity_key.rotate`,
   `identity_key.revoke`) and emits `identity.key_created`, `identity.key_rotated` or
   `identity.key_revoked` ([Webhook events](events.md#identities-and-addresses)).
-- Signing needs `identities:sign`, which platform and partner keys cannot hold. Both signing endpoints count against
+- Signing needs `identities:sign`, which platform and partner keys cannot hold (they can grant it to the
+  tenant and identity keys they mint). Both signing endpoints count against
   the signing rate limit (600 a minute per identity, `429 rate_limited` over it), ignore
   `Idempotency-Key`, and store nothing but a daily count (`assertions` and `http_signatures` in
   [`GET /v1/usage/daily`](#get-v1usagedaily--usageread-platform-partner-or-tenant-key)). Signing is not metered
@@ -617,8 +757,10 @@ nothing. A thumbprint found among the key tombstones is never reused: a new seed
 No body. Makes a new key `active` at once and moves the previous active key to `retiring`, with
 `verify_until` set to now plus `PM_IDENTITY_KEY_OVERLAP_DAYS` (default 7 days). The retiring key stays
 in the JWK Set and no longer signs, so an assertion signed just before the rotation still verifies until
-then ([O2](../project/edge-cases.md)). With no active key, it creates the first one and `previous` is
-`null`. Emits `identity.key_rotated`. Returns `200`:
+then ([O2](../project/edge-cases.md)). With no active key (none yet, or the active key was revoked), it
+creates one, `previous` is `null` and it emits `identity.key_created`; otherwise it emits
+`identity.key_rotated`. Two concurrent creations end with one active key
+([O28](../project/edge-cases.md)). Returns `200`:
 
 ```json
 {
@@ -678,7 +820,7 @@ Mints an agent assertion: a JWT signed with the identity's active key. Each call
 | `audience` | Required. 1–256 characters of printable ASCII: a URL or an identifier the verifier expects. Becomes `aud` ([O4](../project/edge-cases.md)) |
 | `expires_in` | 60–600 seconds, default 300 ([O5](../project/edge-cases.md)) |
 | `nonce` | Optional, 1–128 characters of printable ASCII, copied into the token for the verifier's own challenge |
-| `ext` | Optional object, at most 2 KB as JSON, placed under the `ext` claim. Its members cannot use a registered or Pylota claim name (`iss`, `sub`, `aud`, `iat`, `nbf`, `exp`, `jti`, `email`, `email_verified`, `name`, `org`, `accountable_human`, `ai_agent`, `nonce`, `ext`) ([O6](../project/edge-cases.md)) |
+| `ext` | Optional object, at most 2 KB as JSON, placed under the `ext` claim. Its members cannot use a registered or Pylota claim name (`iss`, `sub`, `aud`, `iat`, `nbf`, `exp`, `jti`, `email`, `email_verified`, `unverified`, `ai_agent`, `nonce`, `ext`) ([O6](../project/edge-cases.md)) |
 
 Returns `201`:
 
@@ -695,17 +837,21 @@ The token's header is `{"alg":"EdDSA","typ":"agent-assertion+jwt","kid":"<thumbp
 { "iss": "https://mail.example.com", "sub": "idn_01J9Z3K8V4QW7X2M5N6P8R0T1Y",
   "aud": "https://portal.supplier.example", "iat": 1791547200, "nbf": 1791547200, "exp": 1791547500,
   "jti": "01M4G8HMG0Z6G25EVAN36PQG0H", "email": "bookings.acme@agents.example", "email_verified": true,
-  "name": "Acme Car Hire", "org": "Acme Car Hire", "accountable_human": true, "ai_agent": true,
-  "nonce": "b3f1c2d47a9e", "ext": { "booking_ref": "BK-2291" } }
+  "unverified": { "name": "Acme Car Hire", "org": "Acme Car Hire", "accountable_human": true },
+  "ai_agent": true, "nonce": "b3f1c2d47a9e", "ext": { "booking_ref": "BK-2291" } }
 ```
 
-- `iss` is `https://{PM_API_HOST}`, `sub` the identity ID, `jti` a new ULID, `email` the identity's
-  primary address, `name` its display name and `org` the workspace name.
-- `accountable_human` is `true` when the identity has an accountable owner. The owner's name and address
+- `iss` is `https://{PM_API_HOST}`, `sub` the identity ID, `jti` a new ULID and `email` the identity's
+  primary address. These are what the deployment vouches for.
+- `unverified` holds what the workspace says about itself, which the deployment does not check: `name`
+  (the identity's display name), `org` (the workspace name) and `accountable_human` (`true` when the
+  identity has owner fields set). A verifier must not grant access on them. The owner's name and address
   are never in the token.
 - The token is never stored or logged. A verifier checks it as in
   [Agents › Verifying an assertion](../guides/agents.md#verifying-an-assertion): `alg` and `typ`, an
-  issuer it trusts, the key from `{iss}/.well-known/jwks/{sub}.json` (cached for at most 5 minutes), the
+  issuer it trusts, `sub` matching `^idn_[0-9A-HJKMNP-TV-Z]{26}$` before any fetch, the key from
+  `{iss}/.well-known/jwks/{sub}.json` (no redirects, `application/jwk-set+json` only, cached for at most
+  5 minutes), the
   signature, `aud`, `nbf` and `exp` with 60 seconds of skew, and `jti` against replays
   ([Agent signing keys § 4.3](../project/design/agent-keys.md#43-how-a-verifier-checks-it)).
 
@@ -761,6 +907,91 @@ operator side is in [Self-hosting › Signed HTTP requests](../self-hosting.md#s
 
 ---
 
+## Service accounts
+
+The service sign-up ledger: an agent records each third-party account it wants to create with its
+identity's address, and an operator approves or rejects it. Where the tenant's `accounts.require_approval`
+is `true` (the default on Pylota Mail Cloud), verification mail from a service reaches the agent only when
+an approved entry matches it; other such mail is quarantined with `account_unapproved`
+([Service sign-up ledger](../project/design/service-accounts.md)). Every change emits an `account.*`
+[event](events.md#service-accounts) and writes an audit row (`account.request`, `account.approve`,
+`account.reject`, `account.close`, `account.delete`).
+
+### `POST /v1/identities/{identity_id}/accounts` — `accounts:request`
+
+```json
+{ "service_domain": "github.com", "account_identifier": "brightwell-bookings",
+  "purpose": "Open issues on the booking widget's repository.",
+  "sender_domains": ["github.com"], "address": "bookings.brightwell@pylotamail.com" }
+```
+
+- `service_domain` is reduced to its organisational domain (A-label, lower case). `sender_domains`
+  (optional, at most 5) adds other organisational domains the service's mail comes from; the service domain
+  is always included. A public suffix, an IP literal or a non-DNS name is `400 invalid_request`; this
+  deployment's own platform, API or console domain is `400 invalid_request` with
+  `details.reason = "own_deployment"` ([E14](../project/edge-cases.md)).
+- `account_identifier` (1–254 characters) and `purpose` (1–500) are shown to the operator. `address`
+  (optional) must be an `active` or `retiring` address of the identity; it defaults to its primary address.
+- Returns `201` with the [entry](#service-account-object) in `pending_approval`, which expires after 7 days.
+- `409 account_exists` (`details.account_id`, `details.status`) when a pending or approved entry exists for
+  the same service and account identifier; `422 account_limit_reached` beyond 10 pending or 200 entries
+  for the identity ([E12](../project/edge-cases.md)); `403 tenant_suspended`; `409 identity_paused`.
+
+### `GET /v1/identities/{identity_id}/accounts` · `GET /v1/identities/{identity_id}/accounts/{account_id}` — `accounts:request`
+
+The identity's entries, newest first (filters `status`, `service_domain`), and one entry. An entry outside
+the key's scope is `404 account_not_found`.
+
+### `GET /v1/tenants/{tenant_id}/accounts` — `accounts:request`, tenant, partner or platform key
+
+The tenant's entries (filters `status`, `identity_id`, `service_domain`). An identity key gets
+`403 scope_denied`.
+
+### `POST /v1/identities/{identity_id}/accounts/{account_id}/approve` — `accounts:approve`
+
+`{ "note": "Approved for the widget repository only." }` (optional, at most 500 characters). Platform,
+partner and tenant keys. Approving lets codes reach an agent, so it is a decision reserved for people: an
+API key may approve only when `PM_QUARANTINE_KEY_RELEASE` is `on` or the tenant's policy has
+`quarantine.key_release: true`; otherwise `403 permission_denied` with
+`details.reason = "person_required"`, and a person approves in the console
+([E11](../project/edge-cases.md)). Returns `200` with the entry, now `approved`. Approving an approved
+entry again returns it unchanged; an entry that is rejected, closed or past its 7 days gets
+`409 account_not_pending` with `details.status`. Mail already held as `account_unapproved` stays
+quarantined until someone releases it.
+
+### `POST /v1/identities/{identity_id}/accounts/{account_id}/reject` — `accounts:approve`
+
+As approve, with an optional `note`, but always allowed for a key that holds `accounts:approve`. The entry
+becomes `rejected` with `rejected_reason: "operator"`.
+
+### `POST /v1/identities/{identity_id}/accounts/{account_id}/close` — `accounts:request`
+
+An optional `note`. A pending or approved entry becomes `closed`; no mail matches it afterwards
+([E13](../project/edge-cases.md)). Closing a closed or rejected entry returns it unchanged. It does not
+close the account at the service.
+
+### `DELETE /v1/identities/{identity_id}/accounts/{account_id}` — `accounts:approve`
+
+Removes the entry, closing it first (with `account.closed`) when it was pending or approved. Returns `204`.
+
+#### Service account object
+
+```json
+{ "id": "sac_01JA…", "tenant_id": "ten_01J9…", "identity_id": "idn_01J9…",
+  "service_domain": "github.com", "sender_domains": ["github.com"],
+  "account_identifier": "brightwell-bookings", "address": "bookings.brightwell@pylotamail.com",
+  "purpose": "Open issues on the booking widget's repository.", "status": "approved",
+  "rejected_reason": null, "note": "Approved for the widget repository only.",
+  "requested_by_key_id": "key_01J9…", "decided_by_key_id": null, "decided_by_user_id": "usr_01JA…",
+  "decided_at": "…", "closed_by_key_id": null, "closed_by_user_id": null, "closed_at": null,
+  "expires_at": null, "created_at": "…", "updated_at": "…" }
+```
+
+`status` is `pending_approval`, `approved`, `rejected` or `closed`. `purpose` was written by an agent: show
+it as untrusted text.
+
+---
+
 ## Domains
 
 ### `POST /v1/tenants/{tenant_id}/domains` — `domains:write`
@@ -789,6 +1020,7 @@ The **connection method** says what the customer changes at their DNS host. It f
 | `receiving`, `sending` | all | Default `true` |
 | `replace_mx` | `cloudflare_zone` (apex), `dns_records` | Default `false`. A name that already has MX records, none of them the expected host, is refused with `409 existing_mx` unless this is `true` ([H5](../project/edge-cases.md)). On a zone apex, enabling routing replaces the existing mail provider. On `dns_records` it means "I will replace these": health reports `mx_unexpected` until the old records are gone |
 | `confirm_dedicated` | `nameservers` | Default `false`. Confirms that a website or mail on the name may stop (below) |
+| `claim` | all | Default `false`. Claims a name that another tenant holds but never verified, after you published the TXT record from `details.claim` of an earlier `409 domain_exists` (below) |
 | `inbound` | `smtp_relay` (required) | `forward` (the customer's mailbox forwards) or `ses` (they also publish the SES MX and DKIM records) |
 | `smtp` | `smtp_relay` (required) | `host` (a DNS name, not an IP literal), `port` (`465` or `587`), `username`, `password` and `probe_from` (an address the relay accepts as sender; default `postmaster@{name}`). The credentials are sealed under `PM_MASTER_KEY` and never returned, logged or exported |
 
@@ -806,9 +1038,12 @@ What each method checks before the domain is created:
   refused, for `nameservers` and `delegated_subdomain` too: `403 scope_denied` with
   `details.reason: "zone_not_allowed"`, before anything is changed ([H8](../project/edge-cases.md)).
   Platform keys may use any zone.
-- **`nameservers`** creates the zone in this account. Platform keys may always use it; tenant and partner
-  keys only when the tenant's policy has `domains.allow_create_zone: true` (otherwise `422 transport_unavailable`,
-  `details.reason: "zone_creation_not_allowed"`). Moving the nameservers hands the whole domain to this
+- **`nameservers`** creates the zone in this account, and never uses a zone that already exists there
+  (`409 domain_exists`, [H10](../project/edge-cases.md)). Platform keys may use it when the Worker's
+  Cloudflare token can create zones; tenant and partner keys only when the tenant's policy also has
+  `domains.allow_create_zone: true` (otherwise `422 transport_unavailable`,
+  `details.reason: "zone_creation_not_allowed"`). Pylota Mail Cloud does not offer it. Moving the
+  nameservers hands the whole domain to this
   deployment, so when the name has A, AAAA or MX records, or `www` has a CNAME, A or AAAA record, the request
   needs `"confirm_dedicated": true`; otherwise it fails with `409 domain_not_dedicated` and
   `details.records` lists what was found ([N21](../project/edge-cases.md)). The response's `records` are
@@ -838,7 +1073,19 @@ What each method checks before the domain is created:
 
 Also:
 
-- A name already registered in this deployment returns `409 domain_exists`.
+- A name your own tenant already has returns `409 domain_exists` with `details.domain_id`. A name held by
+  another tenant (in any state), or one for which the deployment's Cloudflare or AWS account already holds a
+  zone, sending domain, routing setup or SES identity it did not create for you, returns `409 domain_exists`
+  with one body for all of these cases, so the answer reveals nothing about others. Its `details.claim` is a
+  TXT record, `_pylota-mail.{name}` = `pm-claim=…`. If you control the name's DNS, publish it and repeat
+  the request with `"claim": true`: a holder that never verified the domain is evicted, the answer is
+  `409 domain_claim_pending` with `Retry-After` until its removal finishes, and then the same request
+  succeeds. A verified holder is never evicted ([H14](../project/edge-cases.md)).
+- A tenant may hold 5 domains that were never verified: the 6th returns `422 unverified_domain_limit`
+  (platform keys are not limited). A domain still unverified 14 days after it was added is removed, with
+  `domain.removed` and `reason: "unverified_expired"`.
+- A Cloudflare zone holds at most 30 mail domains, routing and sending together: the 31st returns
+  `422 zone_domain_limit` ([H15](../project/edge-cases.md)).
 - When the plan's `custom_domains` allowance is spent, the request fails with `402 billing_limit`
   (`details.feature: "custom_domains"`).
 - An apex whose merged SPF record would need more than 10 DNS lookups (or more than 2 void lookups) is
@@ -877,7 +1124,13 @@ Re-reads the expected records from the provider APIs and checks each against DNS
 
 ### `PATCH /v1/domains/{domain_id}` — `domains:write`
 
-The body has `transport`, `smtp` or both. Returns `200` with the domain. Audit-logged.
+The body has `transport`, `smtp`, `sending_paused`, or several. Returns `200` with the domain.
+Audit-logged.
+
+**`sending_paused`**, platform keys only (`403 scope_denied` with `details.field: "sending_paused"` for
+others): `false` lifts an automatic sending pause of a tenant domain (`sending_paused_at`,
+[G12](../project/edge-cases.md)). A paused domain's sends get `409 sending_paused` and never fall back to
+the platform domain.
 
 **`transport`**, platform keys only (`403 scope_denied` for others):
 
@@ -890,7 +1143,10 @@ Sending failover of [J5](../project/edge-cases.md). `ses` needs the SES transpor
 (`422 transport_unavailable`, `details.reason: "ses_not_configured"`) and an SES identity for the domain
 (`ses_region` set). A `cloudflare_zone`, `nameservers` or `delegated_subdomain` domain gets one, with its
 three DKIM records, during onboarding when the SES transport is configured; without one the switch gets
-`422 transport_unavailable`. A transport the domain's method cannot use returns
+`422 transport_unavailable`. The switch also needs SES to report the identity as verified for sending with
+DKIM `SUCCESS` at that moment; otherwise `422 transport_unavailable` with
+`details.reason: "ses_identity_not_verified"` and `details.dkim_status`. A transport the domain's method
+cannot use returns
 `422 transport_unavailable` with `details.reason: "method_not_supported"`: `dns_records` and `send_only`
 domains send only through `ses`, `smtp_relay` domains only through `smtp`, and the platform domain only
 through `cloudflare`. The change applies to sends that reach the transport after it and starts a health
@@ -954,10 +1210,14 @@ Issues a new ownership TXT value for a `suspended` domain. Returns the domain wi
 
 ### `DELETE /v1/domains/{domain_id}` — `domains:write`
 
-Fails with `409 domain_in_use` while any address on it is `active` or `retiring`. Otherwise it starts
-removal: routing rules, sending onboarding and the event subscription are deleted, and for a domain with
-an SES identity, the SES identity and the domain's addresses in the retired-address receipt rules
-(`pm-retired-{n}`). Returns `202`. `domain.removed` follows with `reason: "requested"`. A removal that
+Fails with `409 domain_in_use` while any address on it is `active` or `retiring`, and with
+`403 scope_denied` on the platform domain. Otherwise it starts removal of what onboarding created for
+this domain, and nothing else: its routing rules, its own routing records (Email Routing stays on for the
+zone's other mail domains), sending onboarding and the event subscription, and for a domain with an SES
+identity, the SES identity and the domain's addresses in the retired-address receipt rules
+(`pm-retired-{n}`). Returns `202`. `domain.removed` follows with `reason: "requested"`. If the removal
+fails after 10 attempts on one step, the domain stays `removing` and the removal restarts once a day;
+calling `DELETE` again restarts it at once ([H12](../project/edge-cases.md)). A removal that
 must call SES first waits up to 5 seconds for the deployment's SES control-plane budget, then fails with
 `429 upstream_rate_limited` and `Retry-After`, as `PATCH` does.
 
@@ -988,8 +1248,8 @@ must call SES first waits up to 5 seconds for the deployment's SES control-plane
 | `mail_from_domain` | `pm-bounce.{name}` on a `dns_records` or `send_only` domain, whose mail SES sends; the local part `pm-bounce` is reserved on such domains. Otherwise `null`, including a Cloudflare-method domain sending through its J5 failover identity after a `PATCH` to `ses`: that identity has no custom MAIL FROM |
 | `smtp` | `smtp_relay` only, otherwise `null`: `{ "host", "port", "username", "probe_from" }`. Never the password |
 | `probe` | `smtp` transport only, otherwise `null`: `{ "last_at", "result" }`. `result` is `pass` or the issue code of the failure (`smtp_unaligned`, `smtp_from_rewritten`, `smtp_probe_timeout`, `smtp_auth_failed`, `smtp_tls_required`); both are `null` before the first probe |
-| `state_reason` | The first issue code, or `zone_expired` on a `nameservers` domain whose zone Cloudflare deleted |
-| `delivery_events` | `active` (provider delivery events reach the service), `manual` (a Cloudflare-transport domain created without an event subscription: run `pmail domains subscribe <domain>`; until then statuses stop at `submitted`), or `none` (`sending: false`). See [Identities and domains › Kind `zone`](../project/design/identity-domains.md#kind-zone) |
+| `state_reason` | The first issue code; `zone_expired` on a `nameservers` domain whose zone Cloudflare deleted; `evicted` or `unverified_expired` on a never-verified domain being or already removed |
+| `delivery_events` | `active` (provider delivery events reach the service), `manual` (a Cloudflare-transport domain created without an event subscription: run `pmail domains subscribe <domain>`; until then its sends go out from each identity's platform address, marked `sent_via_fallback`), or `none` (`sending: false`). See [Identities and domains › Kind `zone`](../project/design/identity-domains.md#kind-zone) |
 | `details` | `null`, or `{ "action": "run pmail domains subscribe <domain>" }` while `delivery_events` is `manual`: the operator step that remains |
 
 ---
@@ -1042,7 +1302,9 @@ carries `extracted_text` (quotes stripped) rather than the full `text`.
 ```
 
 `DELETE /v1/identities/{identity_id}/threads/{thread_id}/hold` (`erasure:manage`) removes it. Both are
-audit-logged.
+audit-logged. On a tenant that is `erasing` with held threads, these two routes are the one write that
+a partner key (and a platform key) can still make, so a hold can be extended or released
+([Privacy design § 8](../project/design/privacy.md#8-legal-holds)).
 
 ### `GET /v1/identities/{identity_id}/messages` — `messages:read`
 
@@ -1091,7 +1353,7 @@ need `quarantine:review` for a quarantined message and never accept a hidden or 
   "triage": {
     "status": "done", "category": "billing", "needs_reply": 0.15, "urgency": 1,
     "summary": "Brightwell invoice 88213 for AB12 CDE brake work, £412.80 inc VAT.",
-    "language": "en", "risk_flags": [], "model": "@cf/openai/gpt-oss-20b", "version": 3
+    "language": "en", "risk_flags": [], "model": "@cf/openai/gpt-oss-20b", "version": 3, "run": 1
   },
   "refs": [ { "kind": "uk_plate", "value": "AB12CDE" }, { "kind": "invoice", "value": "88213" } ],
   "rfc_message_id": "CAF8a…@mail.brightwell.example",
@@ -1104,22 +1366,32 @@ need `quarantine:review` for a quarantined message and never accept a hidden or 
 
 - `text` is the full plain text. It is included with `include=quoted`.
 - `html` is sanitised HTML. It is included with `include=html` and is never rendered by the service.
-- `trust.flags` can hold `hidden_text`, `display_name_spoof`, `lookalike_domain`, `reply_to_mismatch`
-  and `thread_join_unverified`.
-- `triage.status` is `pending`, `done`, `skipped` or `failed`. `triage.reason` is present only for
-  `skipped` (`allowance`, `policy_disabled`, `not_eligible`) and `failed` (`invalid_output`,
+- `trust.flags` can hold `hidden_text`, `display_name_spoof`, `lookalike_domain`, `reply_to_mismatch`,
+  `thread_join_unverified` (a thread join without a valid token: a failed token, or `In-Reply-To` or
+  `References` from a sender who is not a participant, [C9](../project/edge-cases.md)) and
+  `shared_domain_sender` (the sender is another workspace's address on the shared platform domain,
+  [D12](../project/edge-cases.md)).
+- `triage.status` is `pending`, `done`, `skipped` or `failed`. `triage.version` is the triage logic
+  version that produced the record (it does not change on a re-run); `triage.run` counts completed runs
+  (`0` for a record written at ingest). `triage.reason` is present only for
+  `skipped` (`allowance`, `policy_disabled`, `not_eligible`, `ai_unavailable`) and `failed` (`invalid_output`,
   `model_unavailable`, `input_unavailable`) ([Triage design](../project/design/triage.md)). For example,
   mail that arrives after the workspace's `triage` allowance is spent is still stored, and its triage is
   skipped with reason `allowance`; the built-in rules' risk flags are kept and the model does not run
   ([W7](../project/edge-cases.md)):
-  `{ "status": "skipped", "reason": "allowance", "category": null, "needs_reply": null, "urgency": null, "summary": null, "language": null, "risk_flags": ["unknown_sender"], "model": null, "version": 3 }`.
+  `{ "status": "skipped", "reason": "allowance", "category": null, "needs_reply": null, "urgency": null, "summary": null, "language": null, "risk_flags": ["unknown_sender"], "model": null, "version": 3, "run": 0 }`.
 - `deliveries` is set on outbound messages:
   `[{ "address", "field", "status", "smtp_code", "enhanced_code", "bounce_type", "updated_at" }]`
   (`enhanced_code` is the RFC 3463 code, for example `5.1.1`, when the provider or relay gave one).
 - Message-level `flags` include `sent_via_fallback`, `parse_degraded`, `encrypted`,
   `message_id_conflict`, `reprocessed`, `reconciled`, `bcc`, `loopback` (delivered inside the deployment
-  for a test tenant, [L3](../project/edge-cases.md)) and `body_truncated` (a stored body was cut at its
-  storage cap; the full message is in the raw MIME).
+  for a test tenant, [L3](../project/edge-cases.md)), `body_truncated` (a stored body was cut at its
+  storage cap; the full message is in the raw MIME), `sender_suppressed` (the sender is on the tenant's
+  suppression list; the message is stored as usual, [D7](../project/edge-cases.md)), `body_redacted`
+  (links and codes replaced in a system-identity message, [A15](../project/edge-cases.md)) and
+  `dsn_untrusted` (a delivery report that changed no delivery, [D11](../project/edge-cases.md)).
+- `headers` (with `include=headers`) is `null` once the raw MIME it is read from is gone (past
+  `retention.raw_days`).
 - `is_primary_recipient` is `true` on exactly one copy when one message reached several identities of
   the tenant ([A9](../project/edge-cases.md)).
 
@@ -1154,7 +1426,11 @@ Query: `pages=1-3` (default: all, capped at 200 KB of text).
 
 ### `POST /v1/identities/{identity_id}/messages/{message_id}/triage` — `messages:write`
 
-Re-runs triage. Returns `202`. A `message.triaged` event follows.
+Re-runs triage (FR-TRI-5). Returns `202` with no body. A `message.triaged` event follows, and the record
+then has the same `version` and a `run` one higher. A message that ingest never triages (quarantined,
+hidden, throttled, a delivery report or read receipt, or a system-identity message) gets
+`409 triage_not_eligible` with `details.reason` (`quarantined` or `not_eligible`): release a quarantined
+message instead, which triages it. Outbound messages get `400 invalid_request`.
 
 ### `POST /v1/identities/{identity_id}/messages/{message_id}/release` — `quarantine:review`
 
@@ -1232,9 +1508,24 @@ which only a dry run returns. A `200` always has `would_send: true`; each recipi
 - `kind`:
   - `transactional` (the default);
   - `marketing`, which needs an `unsubscribe` object (`{ "url": "https://…", "mailto": "…" }`) and the
-    tenant's consent attestation (`"consent": { "basis": "opt_in", "recorded_at": "…" }`);
+    tenant's consent attestation (`"consent": { "basis": "opt_in", "recorded_at": "…" }`), else
+    `400 marketing_requirements_missing`. It also needs a sending domain whose transport is `ses` or
+    `smtp` (FR-OUT-15): Cloudflare Email Service is for transactional mail only, so a marketing send from
+    the platform domain or from a `cloudflare`-transport domain gets `422 transport_unavailable` with
+    `details.reason: "marketing_needs_ses"`. The check runs again before transport; a message whose domain
+    has changed transport or fallen back to the platform domain by then ends `rejected` with reason
+    `marketing_needs_ses`;
   - `auto_reply`, which sets `Auto-Submitted: auto-replied`. It is only allowed in reply to a
     non-automated message.
+- **Known recipients** (FR-OUT-13, [E2](../project/edge-cases.md)). By default
+  (`send_policy.require_known_recipient: true`) a recipient the identity has never sent to, that no
+  send-allow entry names, and that is not the authenticated sender being answered, is not an error: its
+  delivery is `suppressed` with `policy: unknown_recipient`. Mail received from an address does not make
+  it known. Set `require_known_recipient: false` on an identity that sends to new people by design.
+- **Loops and pauses.** Any send whose hop count would reach 10 gets `409 loop_detected`
+  (`details.hop`), whatever its `kind` ([N13](../project/edge-cases.md)). A tenant or sending domain whose
+  sending was paused automatically gets `409 sending_paused` (`details.scope`: `tenant` or `domain`,
+  [G12](../project/edge-cases.md)).
 - `thread_id` continues an existing thread without quoting. References are set from the thread.
 - `from_address` must be an `active` address of the identity, or a `retiring` one on a thread that
   already uses it (G7; with `thread_id`). Otherwise `400 invalid_request` with
@@ -1372,10 +1663,13 @@ request sets `facets: false`.
   "status": "answered",
   "answer": {
     "text": "Yes. Admiral accepted claim 7781 on 2 October, after the photos sent on 28 September [msg_01JA…][msg_01JB…].",
-    "sentences": [ { "text": "Yes. Admiral accepted claim 7781 on 2 October…", "citations": ["msg_01JA…", "msg_01JB…"] } ],
-    "confidence": 0.86
+    "sentences": [ { "text": "Yes. Admiral accepted claim 7781 on 2 October…", "citations": ["msg_01JA…", "msg_01JB…"],
+                     "citation_trust": "authenticated" } ],
+    "confidence": 0.86,
+    "untrusted": true
   },
-  "evidence": [ { "...": "search hits, as above, with quotes": [ "we are pleased to confirm claim 7781 has been accepted" ] } ],
+  "evidence": [ { "...": "search hits, as above, with quotes and steering_suspected",
+                  "quotes": [ "we are pleased to confirm claim 7781 has been accepted" ], "steering_suspected": false } ],
   "trace": [
     { "step": 1, "action": "search", "q": "claim Golf photos", "mode": "hybrid", "hits": 7, "ms": 412 },
     { "step": 2, "action": "read_thread", "thread_id": "thr_01JA…", "ms": 38 },
@@ -1388,6 +1682,13 @@ request sets `facets: false`.
 
 - `status` is one of `answered`, `insufficient_evidence`, `budget_exhausted` (evidence returned, no
   answer or a partial one) or `degraded` (hybrid results only, no answer).
+- The answer is model-written text derived from mail (FR-SRCH-13, [F17](../project/edge-cases.md)):
+  `answer.untrusted` is always `true`. Each sentence's `citation_trust` is `authenticated` (every cited
+  message is outbound or passed authentication) or `partly_authenticated`; a sentence that cites a
+  `steering_suspected` message, or no authenticated message, is removed before the response. Treat the
+  answer as data to check against `evidence`, never as an instruction.
+- Search requests ignore `Idempotency-Key` and are never stored ([Idempotency](#idempotency)). The tenant's
+  daily agentic budget counts a request once, after it is validated.
 - When tenant policy turns agentic search off, `mode: "agentic"` fails with `422 agentic_disabled`, on
   this endpoint and on tenant search.
 - With `stream: true` and `Accept: text/event-stream`, the response is a server-sent event stream:
@@ -1397,7 +1698,8 @@ request sets `facets: false`.
 ### `POST /v1/tenants/{tenant_id}/search` — tenant, partner or platform key, `search:read`
 
 The same body, plus an optional `identity_ids` filter. Runs across every identity of the tenant (up to
-100; more returns `422 scope_too_large`). Hits carry `identity_id`, and facet counts are summed across
+100; more returns `422 scope_too_large`), never the deployment's system identity. A partner key reaches
+only tenants whose `partner_id` is its partner. Hits carry `identity_id`, and facet counts are summed across
 identities. `mode: "agentic"` with agentic search off returns `422 agentic_disabled`.
 
 The response adds two fields, always present: `partial` and `failed_identities` ([F15](../project/edge-cases.md)).
@@ -1445,7 +1747,11 @@ Query parameters:
 ```
 
 A verification code or link is released only when `from` names the expected sender domain and the
-message passed authentication (`verdict: pass`). See [E4](../project/edge-cases.md). The handler polls
+message passed authentication (`verdict: pass`). See [E4](../project/edge-cases.md). When the tenant's
+`accounts.require_approval` is `true`, `kind=verification` also needs an approved
+[service-ledger entry](#service-accounts) for the sender domain: without one the request gets
+`403 policy_denied` with `details.reason = "account_not_approved"` at once ([E9](../project/edge-cases.md)),
+and a code is released only while its entry is still approved. The handler polls
 the mailbox every second and keeps the sender domain registered for unsolicited-OTP detection while it
 waits; the full behaviour is in [Inbound › The `wait` handler](../project/design/inbound.md#the-wait-handler-e4).
 
@@ -1490,7 +1796,15 @@ A tenant, a partner and the platform can each have at most 20 endpoints; on both
 `422 webhook_limit_reached`. `webhook.disabled` about an endpoint of a partner (a partner endpoint, or a
 tenant endpoint of one of its tenants) goes to that partner's other endpoints and to platform endpoints,
 never to tenant endpoints ([Webhook events](events.md#privacy-platform-and-webhooks)). While a partner
-is suspended, deliveries to its endpoints and its tenants' endpoints are held.
+is suspended, deliveries to its endpoints and its tenants' endpoints are held, and they are delivered
+within a minute of its reactivation. Events of the deployment's system identity go to platform endpoints
+only.
+
+An endpoint is a way to read mail, so `webhooks:manage` alone is not enough for mail events
+([J29](../project/edge-cases.md)): creating an endpoint, changing its `url` or `events`, or replaying to it
+needs `messages:read` as well when its `events` include `"*"`, any `message.*` type or
+`verification.received`, and `quarantine:review` as well when they include `"*"` or
+`message.quarantined`. Otherwise `403 permission_denied` with `details.required`.
 
 ### `GET /v1/webhooks` · `GET /v1/tenants/{tenant_id}/webhooks` · `GET|PATCH|DELETE /v1/webhooks/{webhook_id}`
 
@@ -1499,7 +1813,9 @@ platform endpoints for a platform key, the partner's endpoints for a partner key
 endpoints for a tenant or identity key. A partner key reaches its partner's endpoints and its tenants'
 endpoints by ID; any other endpoint is `404 webhook_not_found` to it.
 
-`PATCH` accepts `url`, `events`, `identity_ids`, `description` and `enabled`.
+`PATCH` accepts `url`, `events`, `identity_ids`, `description` and `enabled`. A changed `url` disables the
+endpoint with `disabled_reason: "url_changed"` until a test delivery to the new URL succeeds
+(`POST …/test`), which re-enables it; `enabled: true` on such an endpoint gets `400 invalid_request`.
 
 ### `POST /v1/webhooks/{webhook_id}/rotate-secret`
 
@@ -1508,7 +1824,8 @@ both signatures.
 
 ### `POST /v1/webhooks/{webhook_id}/test`
 
-Sends a `webhook.test` event straight away and returns the delivery attempt.
+Sends a `webhook.test` event straight away and returns the delivery attempt. A `2xx` re-enables an
+endpoint disabled with `url_changed`.
 
 ### `GET /v1/webhooks/{webhook_id}/deliveries` — `webhooks:read`
 
@@ -1546,7 +1863,7 @@ and `expires_at`.
 ### `DELETE /v1/tenants/{tenant_id}/suppressions/{address}`
 
 Removes a `manual`, `unsubscribe`, `hard_bounce` or `provider` suppression. Removing a `complaint`
-suppression needs `"confirm_complaint_removal": true` in the body and is audit-logged.
+suppression needs `"confirm_complaint_removal": true` in the body and is audit-logged (`suppression.remove`).
 
 ### `GET|PUT|DELETE /v1/tenants/{tenant_id}/lists/{direction}/{kind}/{entry}`
 
@@ -1573,9 +1890,18 @@ suppression needs `"confirm_complaint_removal": true` in the body and is audit-l
 ```
 
 The new key's level, tenant, identity and permissions must all lie within the caller's own, otherwise
-`403 key_scope_exceeded`. A tenant key's `mode` follows its tenant; platform and partner keys are `live`.
-Returns `201` with `"secret": "pmk_live_…"`, shown only once: an idempotent replay returns the body with
-`"secret_replayed": false` instead ([Idempotency](#idempotency)).
+`403 key_scope_exceeded`. The one exception: a platform or partner key may grant `identities:sign`, which
+it cannot hold, to a tenant or identity key it mints; the `key.create` audit row records it in
+`details.granted_without_holding`. A tenant key's `mode` follows its tenant; platform and partner keys are
+`live`. Returns `201` with `"secret": "pmk_live_…"`, shown only once: an idempotent replay returns the
+body with `"secret_replayed": false` instead ([Idempotency](#idempotency)).
+
+- **Who minted it.** `created_by_user_id` in the key object is the console user behind the key: the person
+  whose console session minted it, copied to every key minted with that key. It is `null` for keys minted
+  by a platform or partner key with no person behind it. Removing that person from the workspace, or
+  lowering their role, revokes their keys ([Members](#members)).
+- **Limits.** A tenant has at most 100 active (neither revoked nor expired) tenant and identity keys, and a
+  partner at most 10 partner keys: the next mint gets `422 key_limit_reached` with `details.limit`.
 
 - **Partner keys.** `level: "partner"` needs `partner_id` and no `tenant_id` or `identity_id`, and only
   a platform key may ask for it ([Partner keys](#partner-keys)); an unknown partner is
@@ -1589,18 +1915,34 @@ Returns `201` with `"secret": "pmk_live_…"`, shown only once: an idempotent re
   caller is, otherwise `400 invalid_request` with `details.reason = "permission_not_allowed_for_level"`: `platform:ops` and
   `partners:manage` only on platform keys; `tenants:manage` only on platform and partner keys;
   `members:read`, `members:manage`, `suppressions:manage`, `audit:read` and `usage:read` never on
-  identity keys; `identities:sign` never on platform or partner keys.
-- Both checks come before the scope check, so a refused permission is `400`, not `403`.
+  identity keys; `identities:sign` never on platform or partner keys; `tenants:erase` never on identity
+  keys.
+- `tenants:erase` on a tenant key needs a caller whose `created_by_role` is `owner` (the workspace owner's
+  console session, or a key it minted): otherwise `400 invalid_request` with
+  `details.reason = "permission_owner_only"`. Admins and the keys they mint can never delete the workspace.
+- These checks come before the scope check, so a refused permission is `400`, not `403`.
 
 ### `GET /v1/keys` · `GET /v1/keys/{key_id}` · `DELETE /v1/keys/{key_id}`
 
-`DELETE` revokes the key immediately. A partner key lists and reaches only tenant and identity keys of
-its own tenants; a partner or platform key ID, its own included, is `404 key_not_found` to it. Minting
-and revoking are audit-logged (`key.create`, `key.revoke`).
+`DELETE` revokes the key immediately. Minting and revoking are audit-logged (`key.create`, `key.revoke`).
+
+Reading, revoking and rotating a key follow two rules ([J20](../project/edge-cases.md)):
+
+- **Reach.** A platform key reaches every key; a partner key, the tenant and identity keys of its own
+  tenants (a partner or platform key ID, its own included, is `404 key_not_found` to it); a tenant key, the
+  keys of its tenant; an identity key, only the identity keys of its own identity. A key out of reach is
+  `404 key_not_found`, like a missing one.
+- **Not wider.** The target's level must be at most the caller's, and each of its permissions one the
+  caller holds (or, for a platform or partner caller, `identities:sign`). Otherwise
+  `403 key_scope_exceeded`, and nothing is changed or returned. A key always passes for itself.
+
+`GET /v1/keys` lists only the keys that pass both rules.
 
 ### `POST /v1/keys/{key_id}/rotate`
 
 `{ "overlap_hours": 24 }` (0–168). Returns a new secret. The old one keeps working until the overlap ends.
+The caller must reach the key and not be narrower than it, as above, so no key can obtain a wider key's
+secret.
 
 ---
 
@@ -1619,21 +1961,31 @@ and revoking are audit-logged (`key.create`, `key.revoke`).
 | `thread` | `identity_id`, `thread_id` | Every message in the thread |
 | `counterparty` | `counterparty_address` | Every message to or from that address, in every identity of the tenant |
 | `identity` | `identity_id` | The whole mailbox and the identity's signing keys. Its addresses and key IDs are tombstoned |
-| `tenant` | none | Everything in the tenant, every identity's signing keys included (their key IDs are tombstoned). Then the tenant is marked `erased` |
+| `tenant` | none | Everything in the tenant, every identity's signing keys included (their key IDs are tombstoned). Then the tenant is marked `erased`, once no held thread remains. Needs `tenants:erase` as well as `erasure:manage` (`403 permission_denied` with `details.required: ["tenants:erase"]` otherwise) |
 
 Held threads are skipped and listed in the receipt (FR-PRV-4): an erasure request is never refused
 because of a hold (it never returns `423 legal_hold`). The request's `status` is `queued`, `running`,
 `completed`, `completed_with_holds` (finished, but at least one held thread was skipped), `failed`, or
-`canceled` (a tenant erasure superseded it). Returns `202` with the object below. A `tenant` request for
-a tenant already `erasing` returns the existing request with `200` (same `era_` ID); for an `erased`
-tenant it returns `409 tenant_erased` ([I8](../project/edge-cases.md)):
+`canceled` (a tenant erasure superseded it). Returns `202` with the object below. An erasure that keeps
+failing is retried automatically until 20 hours after the request (`deadline_at` − 4 hours), then ends
+`failed`; a new request for the same scope and target then resumes it at its failed step, for every scope
+(`202`, `resumes_id` names it, `deadline_at` is copied; a counterparty request carries the address again).
+At most one request resumes a given request; a second one racing it gets `200` with the first. A `tenant` request for a tenant already `erasing` depends on the
+tenant's latest tenant-scope request ([I8](../project/edge-cases.md)): `queued` or `running` returns it
+with `200` (same `era_` ID); `failed` returns `202` with a new request that resumes the failed one at its
+failed step (`resumes_id` names it; `deadline_at` is copied); `completed_with_holds` returns `202` with a
+continuation request (`resumes_id` names it) that finishes the erasure once no hold remains. For an
+`erased` tenant it returns `409 tenant_erased`. A tenant erasure never deletes a held thread: while one
+remains the request ends `completed_with_holds` and the tenant stays `erasing`
+([Privacy design § 6.6](../project/design/privacy.md#66-tenant-scope)):
 
 #### Erasure request object
 
 ```json
 {
   "id": "era_01J9…", "tenant_id": "ten_01J9…", "scope": "counterparty", "status": "completed",
-  "created_at": "…", "completed_at": "…", "created_by_key_id": "key_01J9…",
+  "identity_id": null, "target_id": null, "resumes_id": null,
+  "created_at": "…", "deadline_at": "…", "completed_at": "…", "created_by_key_id": "key_01J9…",
   "receipt": {
     "messages_deleted": 14, "attachments_deleted": 9, "r2_objects_deleted": 38,
     "fts_rows_deleted": 14, "refs_deleted": 51, "vectors_deleted": 63,
@@ -1644,11 +1996,15 @@ tenant it returns `409 tenant_erased` ([I8](../project/edge-cases.md)):
 }
 ```
 
+`identity_id` is set for message, thread and identity scope, and `target_id` (the `msg_` or `thr_` ID) for
+message and thread scope; the counterparty address is never stored or returned. `deadline_at` is when
+the 24 hours of NFR-PRV-1 end, counted from the first request.
+
 `GET /v1/erasure-requests/{erasure_id}` and `GET /v1/erasure-requests` (filters: `tenant_id`, `status`). An
 `erasure.completed` event is emitted. The partner key of an erased tenant's partner can still read the
 tenant's erasure requests and their receipts.
 
-### `POST /v1/exports` · `GET /v1/exports/{export_id}`
+### `POST /v1/exports` · `GET|DELETE /v1/exports/{export_id}`
 
 ```json
 { "tenant_id": "ten_01J9…", "scope": "counterparty", "counterparty_address": "jo@example.net" }
@@ -1659,16 +2015,22 @@ identities) or `identity` (with `identity_id`: the whole mailbox). Returns `202`
 (`status: "queued"`).
 
 ```json
-{ "id": "exp_01JA4…", "tenant_id": "ten_01J9…", "scope": "counterparty", "status": "completed",
-  "size": 1843321, "created_at": "…", "expires_at": "…",
+{ "id": "exp_01JA4…", "tenant_id": "ten_01J9…", "scope": "counterparty", "identity_id": null,
+  "status": "completed", "size": 1843321, "created_at": "…", "expires_at": "…",
   "download_url": "https://mail.example.com/v1/links/bDE6Mz…" }
 ```
 
 `status` is `queued`, `running`, `completed`, `failed`, `canceled` (a tenant erasure superseded it) or
-`expired`. The finished export has
-`download_url`: a [signed link](#get-v1linkstoken) valid until `expires_at` (7 days) to a ZIP holding
-one `.eml` per message plus `messages.json`. The link is minted again on each `GET`. An
-`export.completed` event is emitted.
+`expired` (7 days after creation, or earlier when an erasure of the tenant expired it, because the ZIP
+could hold erased mail). The finished export has
+`download_url`: a [signed link](#get-v1linkstoken) to a ZIP holding one `.eml` per message plus
+`messages.json`, minted again on each `GET` and valid for one hour from it (or until `expires_at`, 7 days
+after completion, if that is sooner). An `export.completed` event is emitted.
+
+`DELETE /v1/exports/{export_id}` (`erasure:manage`) revokes every link at once: a `completed` export's
+ZIP is deleted and it becomes `expired`, a `queued` or `running` one is stopped and becomes `canceled`,
+and any other is left as it is. It returns `204`, and a link of a deleted export answers
+`404 export_not_found`. Audit-logged (`export.delete`).
 
 ---
 
@@ -1753,11 +2115,29 @@ key reads the rows of its own tenants only; rows about a partner itself (`partne
   "details": {}, "request_id": "req_01JA…", "created_at": "…" } ], "next_cursor": null }
 ```
 
-Audit rows cover administrative actions: keys (`key.create`, `key.rotate`, `key.revoke`), partners
-(`partner.create`, `partner.update`, `partner.delete`), tenants (`tenant.create`, with the `partner_id`
-when a partner key created it), identity status, identity signing keys
-(`identity_key.create`, `identity_key.rotate`, `identity_key.revoke`), quarantine releases, holds,
-suppression removals, erasure, resolve, members, billing, and platform operations. **Sends are not
+Audit rows cover administrative actions. These are every `action` value:
+
+- keys: `key.create`, `key.rotate`, `key.revoke`; identity signing keys `identity_key.create`, `identity_key.rotate`, `identity_key.revoke`; deployment signing keys `signing_key.rotate`;
+- partners: `partner.create`, `partner.update`, `partner.delete`;
+- tenants: `tenant.create` (with the `partner_id` when a partner key created it), `tenant.policy_update` (every policy write), `tenant.ramp_held`, `tenant.ramp_lifted`;
+- identities: `identity.create`, `identity.update` (a status change by a key or a person, with `details.from` and `details.to`), `identity.delete`, `identity.auto_pause`;
+- domains: `domain.create` (with any MX records `replace_mx` deleted), `domain.transport`, `domain.evict`;
+- service accounts: `account.request`, `account.approve`, `account.reject`, `account.close`, `account.delete`;
+- mail: `quarantine.release`, `message.cancel`, `message.resolve`, `suppression.remove` (only for a `complaint` suppression);
+- privacy: `erasure.create`, `hold.set`, `hold.removed`, `hold.expired`, `export.delete`;
+- people: `member.invite`, `member.invite_resend`, `member.invite_revoke`, `member.join`, `member.role_change`, `member.leave`, `member.remove`, `member.ownership_transfer`, `user.delete`, `user.notifications_resume`, `user.oauth_unlink`, `waitlist.invite`;
+- billing: `billing.checkout_started`, `billing.portal_opened`, `billing.mode_change`, `billing.plan_set`, `billing.plan_changed`, `billing.duplicate_cancelled`, `billing.dispute_opened`, `billing.dispute_closed`, `billing.refund_recorded`;
+- platform operations: `ops.switch`, `mailbox.restore`, `master_key.activated`, `master_key.resealed`;
+- automatic containment: `partner.auto_suspend`, `tenant.auto_pause`, `domain.auto_pause`;
+- reads of mail content by platform and partner keys: `mail.read`.
+
+Every request by a platform or partner key to a route that returns mail content (`GET …/threads/{thread_id}`,
+`GET …/messages`, `GET …/messages/{message_id}`, its `raw`, `attachments/{attachment_id}`,
+`attachments/{attachment_id}/text` and `related`, `GET …/quarantine`, `GET …/wait`,
+`POST …/identities/{identity_id}/search`, `POST /v1/tenants/{tenant_id}/search`, and the MCP tools that
+read the same) writes one `mail.read` row before the response, with `target_type` `message`, `thread` or `identity`,
+`target_id` and `details.route`; if the row cannot be written the request fails with
+`503 unavailable`. **Sends are not
 audit rows**: each send is recorded by its message, its events (`message.sent` and the delivery events)
 and its per-recipient delivery log. To review what a key sent, list the outbound messages of the
 identities it reaches for the period; request logs also carry the key ID for 7 days.
@@ -1786,18 +2166,26 @@ Not paginated: a workspace's members and pending invitations are bounded by its 
 system identity (`PM_SYSTEM_FROM`), also when the console is off (`PM_CONSOLE=off`). A pending invitation uses a seat; with no seat left the request fails with
 `402 billing_limit` (`details.feature: "seats"`). Roles: `admin`, `member`, `viewer`. The owner is set at
 workspace creation (`owner` in `POST /v1/tenants`) or by an ownership transfer in the console. Returns
-`201` with the invitation (`id`, `email`, `role`, `expires_at`).
+`201` with the invitation (`id`, `email`, `role`, `expires_at`). A tenant sends at most 50 invitation
+emails (new and re-sent) per UTC day; past that the request gets `429 daily_cap_reached` with
+`details.cap: "invitations"` and `details.resets_at`, before anything is written. An address this
+deployment hosts cannot be invited (`400 invalid_request`, path `email`). The person accepts in the
+console with an explicit click; when they are enrolled in two-step verification, the membership is
+created only after their second factor.
 
 ### `DELETE /v1/tenants/{tenant_id}/invitations/{invitation_id}` · `DELETE /v1/tenants/{tenant_id}/members/{user_id}` — `members:manage`
 
 Revokes an invitation, or removes a member and ends their sessions. Returns `204`. The owner cannot be
-removed (`409 owner_required`).
+removed (`409 owner_required`). Removing a member also revokes, in the same step, every key of the
+workspace whose `created_by_user_id` is that person, each with a `key.revoke` audit row
+(`details.reason: "creator_removed"`); a role change in the console revokes those holding a permission
+the new role lacks ([W36](../project/edge-cases.md)).
 
 ---
 
 ## Platform operations
 
-Platform keys with `platform:ops`. Every call is audit-logged.
+Platform keys with `platform:ops` (`GET /v1/platform/status`: `audit:read`). Every call that changes something is audit-logged.
 
 ### `POST /v1/platform/keys/{purpose}/rotate`
 
@@ -1866,6 +2254,7 @@ Starts a maintenance job ([J3](../project/edge-cases.md)):
 | `reparse` | Re-parses messages from raw MIME with the deployed parser and re-emits their events with `reprocessed: true`. Messages past `raw_days` are skipped and counted |
 | `reembed` | Re-chunks and re-embeds messages into Vectorize, for example after a model change |
 | `reindex` | Rebuilds the keyword index (FTS5 and references) of each mailbox |
+| `restore_reconcile` | After a mailbox point-in-time restore: re-queues inbound mail received after `after` whose raw MIME is still in R2, and re-inserts sends made after it as `uncertain` with their idempotency records ([Restore from PITR](../project/design/observability.md#restore-from-pitr)). Needs `after` and `identity_ids`; runs even while the deployment is frozen |
 
 `tenant_id` is required; `identity_ids` (default: every identity of the tenant), `after` and `before`
 narrow it. Returns `202` with the job:
@@ -1876,8 +2265,78 @@ narrow it. Returns `202` with the job:
 ```
 
 `status` is `queued`, `running`, `completed`, `failed` or `canceled`; `result` holds counts once it
-ends. `Idempotency-Key` is optional. `GET /v1/platform/jobs/{job_id}` returns jobs started through this
-endpoint; erasure and export jobs are read through their own requests.
+ends, and for a failed job the failed step and error code. `Idempotency-Key` is optional.
+`GET /v1/platform/jobs/{job_id}` returns any job except erasure and export jobs, which are read through
+their own requests: the jobs started here, and the `retention`, `backup` and `domain_remove` jobs that a
+`job_failed:{kind}` alert names.
+
+### `GET /v1/platform/status`
+
+Platform keys with `audit:read` (the external heartbeat's key holds only that). The deployment's
+operational state, read by `pmail doctor`, `pmail ops status` and the heartbeat
+([Observability § 5.5](../project/design/observability.md#55-alert-email-and-the-external-heartbeat)):
+
+```json
+{
+  "frozen": false, "frozen_since": null,
+  "switches": { "read_only": "off", "free_sending": "on", "emergency_prune": "off" },
+  "alert_email": "configured",
+  "firing": [ { "alert": "dlq:pm-inbound", "severity": "page", "fired_at": "2026-10-10T03:12:00Z" } ],
+  "master_key": { "active_slot": "a", "remaining": 0, "activated_at": "2026-07-01T09:00:00Z",
+                  "resealed_at": "2026-07-01T09:40:00Z",
+                  "slots": [ { "slot": "a", "present": true, "kid": "3f9a0c1d2e4b5a67" },
+                             { "slot": "b", "present": true, "kid": "88c1d0e2f3a4b596" } ] },
+  "capacity": { "d1_bytes": 1840000000, "d1_pct": 18.4, "vectors": 2100000, "vectors_pct": 10.5,
+                "tenants": 1204, "namespaces_pct": 2.4, "measured_at": "2026-10-10T03:00:00Z" }
+}
+```
+
+`alert_email` is `configured` or `missing` (neither `PM_ALERT_EMAIL` nor a `mailto:` `PM_SECURITY_CONTACT`).
+`firing` lists every state alert that is firing. `master_key.remaining` counts sealed values not yet
+re-sealed with the active slot's key; `activated_at` is when the Worker first saw that key, and
+`resealed_at` when `remaining` first reached 0 under it (`null` until then)
+([Security § 6.2](../project/design/security.md#62-rotation-procedures)). Key IDs are not secret: every
+ciphertext carries one. Key material is never returned.
+
+### `PUT /v1/platform/switches`
+
+`platform:ops`. `name` is `read_only`, `free_sending` or `emergency_prune`
+([Observability § 5.6](../project/design/observability.md#56-automatic-containment)):
+
+```json
+{ "name": "read_only", "state": "off", "reason": "rpc_owner_mismatch fixed in 1.0.3" }
+```
+
+Returns `200` with `{ "name", "state", "set_by": "platform", "reason", "set_at" }`. Readers cache a
+switch for 60 seconds. The audit action is `ops.switch`. `Idempotency-Key` is optional.
+
+### `POST /v1/platform/identities/{identity_id}/restore`
+
+`platform:ops`. Restores one identity's mailbox to a point in time, or undoes such a restore
+([Restore from PITR](../project/design/observability.md#restore-from-pitr)). Only while the deployment is
+frozen (`PM_FREEZE = "on"`); otherwise `409 not_frozen`.
+
+```json
+{ "at": "2026-10-09T09:00:00Z" }
+```
+
+or `{ "bookmark": "<undo bookmark>" }`. `at` must be within the last 30 days. Returns `200` with
+`{ "identity_id", "restored_to", "undo_bookmark" }`; the audit action `mailbox.restore` records the undo
+bookmark too.
+
+### `POST /v1/platform/erasure-requests/{erasure_id}/reapply`
+
+`platform:ops` and `erasure:manage`. Creates a new erasure request that repeats a stored one after a
+restore brought erased data back. No body. The new request has the same tenant, scope, `identity_id`
+and `target_id`, reason `reapply_after_restore:{erasure_id}` and its own `deadline_at`; a counterparty
+erasure matches by the stored keyed hash of the address, which is never needed in clear
+([Privacy design § 11](../project/design/privacy.md#11-what-remains-after-deletion)). Returns `202` with
+the new erasure request. It runs even while the deployment is frozen. `Idempotency-Key` is optional.
+Only a request that ended `completed` or `completed_with_holds` can be re-applied; any other gets
+`409 erasure_not_completed` (a `queued` or `running` request erases the restored data itself, and a
+`failed` one is resumed with a new request). A tenant-scope request is re-applied although the tenant
+is `erased`: the new job erases the mailboxes of the identities in the source receipt's
+`identities_affected` and sweeps the tenant's objects and vectors, and the tenant stays `erased`.
 
 ### `POST /v1/platform/waitlist/invite`
 

@@ -160,7 +160,8 @@ Its `message.quarantined` event carries no `extracted_text`.
 | `auth_unverified` | The sender's DMARC policy is `quarantine` or `reject`, DKIM did not align, and SPF could not be checked because the deployment has not yet learned Cloudflare's `Authentication-Results` authserv-id (`PM_TRUSTED_AUTHSERV_ID`; `pmail setup` sets it) | `quarantine.on_auth_fail` (default `true`) |
 | `spam` | `spam_score` above the threshold | `quarantine.spam_threshold` (default 0.8) |
 | `risky_attachment` | An attachment has a `risk` | Always |
-| `blocked_sender` | The sender is suppressed or matched a receive-block rule (see [Blocked senders and throttling](#blocked-senders-and-throttling)). These messages get status `hidden`, not `quarantined`: they are never evented, never shown in the quarantine and cannot be released | Tenant lists |
+| `blocked_sender` | The sender matched a receive-block rule (see [Blocked senders and throttling](#blocked-senders-and-throttling)). These messages get status `hidden`, not `quarantined`: they are never evented, never shown in the quarantine and cannot be released | Tenant lists |
+| `account_unapproved` | A verification code or link from a service for which the identity has no approved service sign-up entry ([E9](../project/edge-cases.md), [Service sign-up ledger](../project/design/service-accounts.md)). Senders on your receive-allow list are exempt | `accounts.require_approval` (default `false`; `true` on Pylota Mail Cloud) |
 | `otp_unsolicited` | A password-reset or one-time-code message that no `wait` asked for in the previous 30 minutes ([E5](../project/edge-cases.md)) | `quarantine.unsolicited_otp` (default `true`) |
 
 Review and release with a key that holds `quarantine:review`:
@@ -200,8 +201,9 @@ curl -X PUT https://mail.example.com/v1/tenants/ten_01J9…/lists/receive/block/
 |---|---|
 | Receive-block | Mail is stored `hidden` for audit, never shown to agents, never answered ([D7](../project/edge-cases.md)) |
 | Receive-allow | Mail skips spam quarantine. It does **not** skip authentication quarantine |
-| Suppressed sender | Treated like receive-block: stored `hidden` |
-| Per-sender throttle | More than `inbound.per_sender_per_hour` messages (default 60) from one sender to one identity in an hour: the excess is stored `throttled`, hidden from agents, counted and alerted ([D5](../project/edge-cases.md)) |
+| Suppressed sender | Stored and evented as usual, with the flag `sender_suppressed`: a suppression stops sending to the address, not receiving from it ([D7](../project/edge-cases.md)) |
+| Per-sender throttle | More than `inbound.per_sender_per_hour` messages (default 60) from one sender to one identity in an hour: the excess is stored `throttled`, hidden from agents, counted and alerted ([D5](../project/edge-cases.md)). Mail that fails authentication counts under its own bucket, so a forged `From` cannot use up a real sender's allowance |
+| Unsolicited-mail caps | From senders who are not known correspondents (the identity has never written to them) and are not receive-allowed: at most `inbound.unauthenticated_per_hour` (default 120) unauthenticated messages per identity, and `inbound.per_tenant_per_hour` (default 2,000) per tenant, an hour. The excess is stored `throttled`, is never triaged or evented, and does not count towards storage ([D13](../project/edge-cases.md)) |
 
 `hidden` and `throttled` mail follows the same rule as quarantined mail: lists leave it out unless the
 request filters on that `status` and the key holds `quarantine:review`.

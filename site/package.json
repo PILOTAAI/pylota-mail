@@ -1,0 +1,12 @@
+{
+  "name": "pylota-mail-site",
+  "private": true,
+  "description": "Pins the Wrangler release that deploys the site (site/wrangler.jsonc). Install with npm ci.",
+  "license": "UNLICENSED",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "devDependencies": {
+    "wrangler": "4.139.0"
+  }
+}

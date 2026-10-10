@@ -3,7 +3,7 @@
 Binding design for `pmail`, the command-line client: configuration, output and exit codes, `setup`,
 `setup ses`, `deploy`, `upgrade`, `doctor`, `destroy`, secret and signing-key rotation, dead-letter
 handling and the client-side behaviour of the mail and admin commands. It implements FR-CLI-1, FR-OPS-1
-to FR-OPS-3, FR-CON-7 and FR-BILL-12, build plan milestone M16, the CLI half of M17 (`dlq`, and `secrets rotate-master` in M17 Foundation), the
+to FR-OPS-3, FR-CON-7 and FR-BILL-12, build plan milestone M16, the CLI half of M17 (`dlq`, and `secrets rotate-master` in M17 Foundation; `ops` and `erasure retry|reapply` in M17 Completion), the
 `deploy --version` acceptance of M19, the CLI parts of FR-DOM-7 to FR-DOM-12 (M23: `domains add
 --method`, `domains update`, `domains probe`, `addresses test-forwarding`, `setup ses`), of FR-CON-8
 (M24: `waitlist invite`), of FR-KEY-4 (M5: `partners`, `keys create --level partner`) and of FR-IDN-6 to FR-IDN-8 (M25: `identity-keys`, `assertions`, `http-sign`,
@@ -76,6 +76,7 @@ pub enum CliError {
     DoctorFailed(u32),                                 // exit 12
     Timeout(String),                                   // exit 13
     Aws { step: &'static str, status: Option<u16>, code: Option<String> }, // exit 14
+    Precondition(String),                              // exit 15
     Interrupted,                                       // exit 130
     Internal(String),                                  // exit 1
 }
@@ -201,6 +202,10 @@ They need:
 The CLI passes both to Wrangler through the child's environment, never as arguments. The permissions of
 this token, and of the Worker's own `PM_CF_API_TOKEN`, are in one table:
 [Deploy to Cloudflare › Create a Cloudflare API token](../../self-hosting.md#2-create-a-cloudflare-api-token).
+That table scopes Workers access per Worker: the first `setup` (which creates the Worker and its Custom
+Domains) runs with a first-run token holding Workers Admin at product scope, and every later command
+with a deploy token holding Workers Editor on `pylota-mail` only. When step 13 or 14 of setup fails with
+a Workers authorization error, the CLI's fix names the first-run token.
 
 The deployment directory is `./deploy` unless `--dir <path>` is given. It holds `wrangler.toml` and
 `.bundle/<version>/` (extracted releases). `deploy/wrangler.toml` doubles as setup's record of the
@@ -304,8 +309,9 @@ JSON mode prints strings exactly as the API returned them (JSON escaping makes t
 | 10 | `cloudflare` | A Cloudflare API call or Wrangler run failed, or a prerequisite is missing (Node.js 22+, Wrangler) or not met (foreign MX records at the mail domain, `existing_mx`), during `setup`, `setup ses`, `deploy`, `upgrade`, `destroy`, `secrets`, `domains add --local-token` or `domains subscribe`. `doctor` never exits 10: a failed Cloudflare call is a failing check (exit 12) |
 | 11 | `verification` | A release signature or checksum did not verify; `webhooks verify` found no valid signature; `assertions verify` found the assertion invalid |
 | 12 | `doctor_failed` | `doctor` reported at least one `fail` |
-| 13 | `timeout` | `wait` returned `timed_out: true`; a polling step (health, re-seal, erasure, SNS subscription confirmation) passed its deadline |
-| 14 | `aws` | During `setup ses` or `destroy --include-ses`: an AWS API call failed (including access denied), or the AWS account is not ready (SES production access missing; the console steps are printed) |
+| 13 | `timeout` | `wait` returned `timed_out: true`; a polling step (health, erasure, SNS subscription confirmation) passed its deadline |
+| 14 | `aws` | During `setup ses` or `destroy --include-ses`: an AWS API call failed (including access denied), the AWS account is not ready (SES production access missing; the console steps are printed), or it holds another deployment's receipt rule or resources ([N31](../edge-cases.md)) |
+| 15 | `precondition` | A deployment state the command needs is not there: `secrets rotate-master` with an unfinished rotation and no `--resume`, or within 30 days of the previous re-seal without `--discard-previous`; `ops restore d1` while the deployment is not frozen |
 | 130 | `interrupted` | SIGINT or Ctrl-C |
 
 Exit codes are part of the CLI contract ([AGENTS.md](https://github.com/PILOTAAI/pylota-mail/blob/main/AGENTS.md):
@@ -423,7 +429,7 @@ Each step prints `created`, `exists`, `updated` or `skipped` with the resource a
 | 1 | Download and verify the release bundle | GitHub release lookup and downloads ([§8.1](#81-bundle-download), [§8.2](#82-signature-and-checksums)) | An extracted, verified `.bundle/<version>/` is reused |
 | 2 | D1 database `pylota-mail` | `GET /accounts/{a}/d1/database?name=pylota-mail` (filter parameter: verify at build time; otherwise list and match `name`); if absent `POST /accounts/{a}/d1/database` `{"name":"pylota-mail","jurisdiction":"eu"}` (no `jurisdiction` for `default`) | Found by name. If the existing database reports a different jurisdiction, stop: it cannot be moved ([Privacy](privacy.md#3-jurisdiction-and-residency)) |
 | 3 | R2 bucket `pylota-mail-blobs`, and the backup bucket with `--backup-bucket` | `GET /accounts/{a}/r2/buckets/pylota-mail-blobs` with header `cf-r2-jurisdiction: eu`; if `404`, `POST /accounts/{a}/r2/buckets` `{"name":"pylota-mail-blobs"}` with the same header (jurisdiction is a header, not a body field). The same two calls for `{PM_BACKUP_BUCKET}` when it is set, in the same jurisdiction | Found by name in the jurisdiction. A bucket of the same name in another jurisdiction is reported, not reused |
-| 4 | R2 lifecycle rule | `GET …/buckets/pylota-mail-blobs/lifecycle`, then `PUT …/lifecycle` with the existing rules plus `{"id":"pm-inbound-staging","enabled":true,"conditions":{"prefix":"inbound-staging/"},"deleteObjectsTransition":{"condition":{"type":"Age","maxAge":86400}}}` | `PUT` replaces the whole rule set, so the CLI merges: other rules are kept, a rule with id `pm-inbound-staging` is replaced. No `PUT` when it is already identical |
+| 4 | R2 lifecycle rules | `GET …/buckets/pylota-mail-blobs/lifecycle`, then `PUT …/lifecycle` with the existing rules plus `{"id":"pm-inbound-staging","enabled":true,"conditions":{"prefix":"inbound-staging/"},"deleteObjectsTransition":{"condition":{"type":"Age","maxAge":1296000}}}` (15 days, longer than the 14-day dead-letter retention, [J7](../edge-cases.md)) and `{"id":"pm-abort-multipart","enabled":true,"conditions":{"prefix":""},"abortMultipartUploadsTransition":{"condition":{"type":"Age","maxAge":86400}}}` (incomplete multipart uploads aborted after 1 day, [Privacy §9.1](privacy.md#91-job-steps)). Field names from the R2 lifecycle API reference (read 2026-10-10) | `PUT` replaces the whole rule set, so the CLI merges: other rules are kept, rules with these two ids are replaced. No `PUT` when they are already identical |
 | 5 | Queues | `GET /accounts/{a}/queues` (all pages); for each missing name `POST /accounts/{a}/queues` `{"queue_name": …}`. Dead-letter queues first: `pm-inbound-dlq`, `pm-outbound-dlq`, `pm-delivery-events-dlq`, `pm-webhooks-dlq`, `pm-index-dlq`, then `pm-inbound`, `pm-outbound`, `pm-delivery-events`, `pm-webhooks`, `pm-index` | Found by name |
 | 6 | Vectorize index `pm-mail-chunks` | `GET /accounts/{a}/vectorize/v2/indexes/pm-mail-chunks`; if absent `POST /accounts/{a}/vectorize/v2/indexes` `{"name":"pm-mail-chunks","description":"pylota-mail generation=1 embed_model=@cf/baai/bge-m3","config":{"dimensions":1024,"metric":"cosine"}}`. Then `GET …/metadata_index/list` and, for each missing, `POST …/metadata_index/create` `{"propertyName": …, "indexType": …}` for `identity_id` string, `thread_id` string, `sent_at` number, `sender_domain` string, `direction` string, `has_attachment` boolean, `verdict` string, `kind` string ([Data model](data-model.md)) | Found by name. An existing index with other dimensions or metric stops setup. Metadata indexes are created before any vector is written, because vectors written earlier are not filterable ([Search §7.3](search.md#73-re-embed-job-embedding-model-change)) |
 | 7 | Email Routing on the mail domain | `GET /zones/{z}/email/routing`; if not enabled, delete foreign MX records when `--replace-mx` was accepted, then `POST /zones/{z}/email/routing/dns` `{"name": "{mail_domain}"}` (adds and locks the MX and SPF records); then `PATCH /zones/{z}/email/routing` `{"support_subaddress": true}` if it is not already `true` | Read first; each call only when the setting differs |
@@ -549,17 +555,22 @@ the Cloudflare API and leaves the monitor ID empty; the Worker completes the row
 ```sql
 INSERT INTO domains (id, tenant_id, name, kind, method, inbound, zone_id, is_apex, routing_mode,
                      transport, reply_token, receiving, sending, state, state_changed_at,
-                     ownership_token, event_subscription_id, records_json, monitor_do_id,
-                     created_at, updated_at)
+                     ownership_token, event_subscription_id, records_json, expected_ns_json,
+                     provider_objects_json, monitor_do_id, created_at, updated_at)
 VALUES (?1, NULL, ?2, 'platform', 'platform', 'routing', ?3, 1, 'catch_all',
         'cloudflare', 'subaddress', 1, 1, 'pending', ?4,
-        ?5, ?6, ?7, '',
+        ?5, ?6, ?7, ?8, ?9, '',
         ?4, ?4)
-ON CONFLICT(name) DO UPDATE SET
+ON CONFLICT(name) WHERE state <> 'removed' DO UPDATE SET
   zone_id = excluded.zone_id, ownership_token = excluded.ownership_token,
   event_subscription_id = excluded.event_subscription_id,
-  records_json = excluded.records_json, updated_at = excluded.updated_at;
+  records_json = excluded.records_json, expected_ns_json = excluded.expected_ns_json,
+  provider_objects_json = excluded.provider_objects_json, updated_at = excluded.updated_at;
 ```
+
+`?8` is the zone's `name_servers` from `GET /zones/{zone_id}` (the baseline of the weekly NS check), and
+`?9` lists the routing, catch-all, sending and ownership-record objects setup created, with
+`created: true` (the platform domain is never removed through the API, but `destroy` uses the record).
 
 **Requirement on the Worker** (owned by [Identities, addresses and domains](identity-domains.md#the-platform-domain)):
 the `* * * * *` cron selects `SELECT id, kind FROM domains WHERE monitor_do_id = '' LIMIT 20`, mints a
@@ -613,7 +624,7 @@ this section decides the CLI's part. It runs after `setup`, against the deployme
 |---|---|---|
 | `--region` | – (required) | The SES region, `PM_SES_REGION` |
 | `--allow-non-eu` | off | Accept a region outside the EU and the UK when `PM_JURISDICTION = "eu"` ([N30](../edge-cases.md)) |
-| `--prefix` | `pylota-mail-{aws-account-id}` | Prefix of the inbound S3 bucket, `{prefix}-inbound`. The default holds the AWS account ID, so two accounts never choose the same bucket name |
+| `--prefix` | `pylota-mail-{aws-account-id}-{dep}` | Prefix of the inbound S3 bucket, `{prefix}-inbound`. The default holds the AWS account ID and the deployment label `{dep}` (the first 8 hex characters of `SHA-256(PM_API_HOST)`), so two accounts, or two deployments, never choose the same bucket name |
 | `--dir` | `./deploy` | Deployment directory; its `wrangler.toml` must exist (setup ran) |
 | `--yes` | off | Accept the IAM policy without the interactive review |
 
@@ -623,7 +634,9 @@ identity's DNS records. Like `setup`, it is idempotent and reads before it write
 resource up first, and creates or updates it only when it is missing or differs. Each step prints
 `created`, `exists`, `updated` or `skipped`.
 
-**Checks before anything is created** (each stops the command):
+**Checks before anything is created** (each stops the command). Every resource the command creates
+carries the tag `pylota-mail:api-host = {PM_API_HOST}` where the service accepts tags
+([Domains on any DNS host §4.2](domain-connections.md#42-deployment-set-up-for-ses)):
 
 1. `deploy/wrangler.toml` exists, and `GET https://{PM_API_HOST}/health` answers with the CLI's version
    (the Worker must confirm the SNS subscriptions later, and step 10 deploys). A different version stops
@@ -642,6 +655,15 @@ resource up first, and creates or updates it only when it is missing or differs.
    ($0.16 per 1,000 against $0.10 à la carte, SES pricing read 2026-10-09) it prints a warning and
    continues. How the plan is read from the account: verify at build time; if it cannot be read, the
    warning names both prices.
+4. **Another deployment ([N31](../edge-cases.md)).** `DescribeActiveReceiptRuleSet`: a rule `pm-deliver`
+   whose S3 action writes to a bucket other than `{prefix}-inbound`, or to a bucket whose
+   `pylota-mail:api-host` tag is not `PM_API_HOST`, stops the command with exit 14 ("another deployment
+   receives mail in this AWS account and region; use a separate AWS account"). Then each resource of the
+   steps below that already exists under its name (bucket, both topics, queue, configuration set, IAM user,
+   platform identity) is read with its tags: a missing tag or another host's tag stops the command with
+   exit 14, naming the resource. Nothing has been created or changed at that point. The tag-reading calls
+   per service (for example `GetBucketTagging`, `ListTagsForResource`, `ListQueueTags`, `ListUserTags`):
+   verify at build time.
 
 **Steps**, in order. The numbers in brackets are the rows of Domains on any DNS host §4.2.
 
@@ -653,7 +675,7 @@ resource up first, and creates or updates it only when it is missing or differs.
 | 4 | Receipt rule set and rule `pm-deliver` [7, 8] | An account that already has an active rule set keeps it: the rule is added to that set, and its name becomes `PM_SES_RULE_SET`. Otherwise the set `pylota-mail` is created and made active |
 | 5 | Configuration set, event destination and the delivery-events topic [10] | As in [Outbound › Amazon SES](outbound.md#amazon-ses). This topic, `PM_SES_SNS_TOPIC_ARN`, also gets `SignatureVersion = 2` |
 | 6 | Platform identity [9] | `CreateEmailIdentity` for the platform domain; its DKIM CNAMEs are written into the platform zone through the Cloudflare API (find, then create) |
-| 7 | IAM user `pylota-mail-worker` and its policy [11] | The policy JSON is printed for review first. Interactive runs ask before applying it; non-interactive runs need `--yes`, else exit 2. An existing policy that differs is shown as a diff |
+| 7 | IAM user `pylota-mail-worker-{dep}` and its policy [11] | The policy JSON is printed for review first. Interactive runs ask before applying it; non-interactive runs need `--yes`, else exit 2. An existing policy that differs is shown as a diff |
 | 8 | The Worker's access key | Only when `PM_SES_ACCESS_KEY_ID` is not among the Worker's secret names (Worker secrets are write-only, so an existing key is never read or replaced). `CreateAccessKey`, then `PM_SES_ACCESS_KEY_ID` and `PM_SES_SECRET_ACCESS_KEY` are piped to `wrangler secret put` on stdin and dropped from memory. They are never written to disk or printed; `--print-secrets` does not exist here |
 | 9 | Variables | Renders `deploy/wrangler.toml` ([§7](#7-rendering-wranglertoml)) with `PM_SES_REGION`, `PM_SES_INBOUND_BUCKET`, `PM_SES_INBOUND_TOPIC_ARN`, `PM_SES_INBOUND_QUEUE_URL`, `PM_SES_RULE_SET` and `PM_SES_SNS_TOPIC_ARN` under `[vars]`. These six are owned by `setup ses`: a re-run writes the values it found |
 | 10 | Deploy | `pmail deploy` ([§8](#8-deploy)), so the Worker reads the new variables. A re-run that changed nothing is a no-op ([§8.9](#89-no-op-redeploys)) |
@@ -673,7 +695,7 @@ receipt-rule-set calls, `CreateAccessKey` and the subscription status): verify a
 | 9 | The Worker's `/health` does not answer |
 | 10 | Wrangler (`secret put`, deploy) or a Cloudflare API call failed |
 | 13 | The SNS subscriptions were not confirmed within 5 minutes |
-| 14 | An AWS API call failed, or the account has no SES production access |
+| 14 | An AWS API call failed, the account has no SES production access, or the account and region hold another deployment's rule or resources (check 4) |
 | 130 | Interrupted |
 
 JSON mode prints `{ "region", "rule_set", "steps": [ { "step", "status", "resource", "id" } ],
@@ -742,7 +764,7 @@ repository's template with `--from-source`). The output is the file in
 
 **Choice: minisign** (Ed25519 signatures in the minisign format), verified with the `minisign-verify`
 crate (pin at build time; "a small Rust library with no external dependencies", crates.io, read
-2026-10-09). The `SHA256SUMS.sig` file produced by `cargo xtask release`
+2026-10-09). The `SHA256SUMS.sig` file produced offline by the owner with `cargo xtask release sign`
 ([Rust workspace §9](rust-workspace.md#9-xtask)) is a minisign signature of `SHA256SUMS`.
 
 Why minisign rather than cosign:
@@ -970,13 +992,15 @@ Data sources:
 | `sending.domains` | D1 `SELECT name, zone_id FROM domains WHERE sending = 1 AND transport = 'cloudflare' AND state <> 'removed'`, then `GET /zones/{z}/email/sending/subdomains` per zone (`preview_enabled`) |
 | `sending.event_subscriptions` | `GET /accounts/{a}/event_subscriptions/subscriptions` compared with the same domains and each row's `event_subscription_id` |
 | `bindings` | D1, R2 (with the jurisdiction header), queues and their consumers (`GET /accounts/{a}/queues/{queue_id}/consumers`), the Vectorize index and its metadata indexes, as declared in the rendered file; plus the index generation state of [§8.7](#87-index-generation-changes). A bound index's dimensions are compared with those of the model named in its description (1,024 for `@cf/baai/bge-m3`, otherwise a probe embedding as in §8.7), never with a fixed number, because a re-embed may create an index of another dimension |
-| `secrets` | `GET /accounts/{a}/workers/scripts/pylota-mail/secrets` (names only). `warn` only while `PM_MASTER_KEY_NEXT` is present (an unfinished master-key rotation, [§12.1](#121-secrets-rotate-master)) |
+| `secrets` | `GET /accounts/{a}/workers/scripts/pylota-mail/secrets` (names only): `fail` when a required secret is missing, or when the slot named by `PM_MASTER_KEY_ACTIVE` (default `a`) has no secret; `warn` only while `master_key.remaining` in `GET /v1/platform/status` is above 0 (an unfinished master-key rotation, [§12.1](#121-secrets-rotate-master); `skip` for that part without a key holding `audit:read`) |
 | `observability` | The rendered file's `[observability]` table |
 | `worker.version`, `health` | `GET https://{api_host}/health` |
-| `alerts` | `GET /v1/audit-events?action=alert.fired` and `?action=alert.resolved` with the profile's key (needs `audit:read`; `skip` without it) |
+| `alerts` | `GET /v1/platform/status` with the profile's key (a platform key with `audit:read`; `skip` without one): `fail` on a firing page alert, on `alert_email: missing`, or when `frozen_since` is more than 4 hours ago; `warn` on a firing ticket alert |
 | `dlq` | D1 `SELECT queue, COUNT(*) AS n, MIN(first_seen_at) AS oldest FROM dlq_items WHERE redriven_at IS NULL GROUP BY queue` |
 | `quota` | Workers Analytics Engine SQL API (`POST /accounts/{a}/analytics_engine/sql`; verify at build time) over the `provider_quota_errors_total` points of the last 24 hours ([Observability §3](observability.md#3-metrics)). `warn` when `PM_DAILY_SEND_QUOTA` is unset in the rendered file, with the fix `pmail setup --daily-send-quota <n>` (or set it under `[vars]` and `pmail deploy`). The SQL API needs Account Analytics · Read on the token (Cloudflare's SQL API page, read 2026-10-09); when the call is refused for a missing permission, the check is `warn`, not `fail`, with the fix naming that permission ([Deploy to Cloudflare › step 2](../../self-hosting.md#2-create-a-cloudflare-api-token)) |
-| `ses` | Only when `PM_SES_REGION` is set in the rendered file (otherwise `skip`); needs local AWS credentials ([§2.6](#26-aws-credentials); `skip` without them). `fail` when: SES `GetAccount` shows no production access, or sending paused; `PM_SES_INBOUND_TOPIC_ARN` is set and the active receipt rule set is not `PM_SES_RULE_SET` or does not contain `pm-deliver`; `PM_SES_REGION` is not a receiving region. `warn` when the region is outside the EU and the UK under `PM_JURISDICTION = "eu"` (only possible through `setup ses --allow-non-eu` or a hand edit, [N30](../edge-cases.md)). Identity count from D1, the same count the Worker uses: `SELECT COUNT(*) FROM domains WHERE ses_region IS NOT NULL AND state <> 'removed'`, plus 1 for the platform identity. At 9,000 or more, `warn` `ses_identities_90pct` ([N26](../edge-cases.md)); at 10,000, `fail` (new SES domains are refused with `transport_unavailable`, `ses_identity_limit`). SES allows 10,000 identities per region (SES quotas, read 2026-10-09). Field and call names beyond `GetAccount`: verify at build time |
+| `ses` | Only when `PM_SES_REGION` is set in the rendered file (otherwise `skip`); needs local AWS credentials ([§2.6](#26-aws-credentials); `skip` without them). `fail` when: SES `GetAccount` shows no production access, or sending paused; `PM_SES_INBOUND_TOPIC_ARN` is set and the active receipt rule set is not `PM_SES_RULE_SET` or does not contain `pm-deliver`; `PM_SES_REGION` is not a receiving region. `warn` when the region is outside the EU and the UK under `PM_JURISDICTION = "eu"` (only possible through `setup ses --allow-non-eu` or a hand edit, [N30](../edge-cases.md)). Identity count: the same count the Worker uses ([Domains on any DNS host §4.3](domain-connections.md#43-dns_records)), from D1 (`SELECT COUNT(*) FROM domains WHERE ses_region IS NOT NULL AND state <> 'removed'`, plus the `domain_onboarding` rows whose journal holds an SES identity, plus 1 for the platform identity) and from `ListEmailIdentities` with the local credentials, whichever is larger. `fail` also when a resource that `setup ses` created no longer carries this deployment's `pylota-mail:api-host` tag, or `pm-deliver` writes to another bucket ([N31](../edge-cases.md)). At 9,000 or more, `warn` `ses_identities_90pct` ([N26](../edge-cases.md)); at 10,000, `fail` (new SES domains are refused with `transport_unavailable`, `ses_identity_limit`). SES allows 10,000 identities per region (SES quotas, read 2026-10-09). Field and call names beyond `GetAccount`: verify at build time |
+| `domains.orphans` | D1 `zone_claims` rows still `pending` an hour after `created_at` and `domain_onboarding` rows older than two hours (the hourly cleanup should have removed both); for each pending claim, `GET /zones?name={zone_name}&account.id={a}`. `warn` per leftover, with the zone ID when a zone of that name was created after the claim, and the fix: delete that zone in the dashboard if no domain uses it ([Identities and domains › Cleanup after a failed add](identity-domains.md#cleanup-after-a-failed-add)) |
+| `routing.leftover_subdomains` | Only if spike S9 showed that a subdomain's routing cannot be removed on its own: each zone's routing subdomains (`GET /zones/{z}/email/routing/dns`, or the dashboard step S9 records) that no non-`removed` domain row names. `warn`, with the dashboard step (Email Routing › Settings › Subdomains) ([Identities and domains › Domain removal](identity-domains.md#domain-removal)) |
 | `cloudflare.zones` | `GET /zones?account.id={a}`: the number of zones in the account, always printed in the detail. Never `fail`; `warn` above 1,000, with the fix "ask Cloudflare to confirm the account's zone limit": the limit for a non-Enterprise account is not documented ([Domains on any DNS host §3.2](domain-connections.md#32-nameservers)) |
 | `security_txt` | `GET https://{api_host}/.well-known/security.txt` (`Expires`) and `PM_SECURITY_CONTACT` in the rendered file |
 | `web_bot_auth` | Only when `PM_WEB_BOT_AUTH = "on"` in the rendered file (otherwise `skip`). `GET https://{api_host}/.well-known/http-message-signatures-directory`, no key. `fail` unless it answers `200` with `Content-Type: application/http-message-signatures-directory+json`, lists one to three keys, and carries one `Signature-Input` and `Signature` member per listed key, with tag `http-message-signatures-directory`, that verifies with that key (`core::httpsig`; [Agent signing keys §3.2](agent-keys.md#32-web-bot-auth-key-directory)). The fix names the deploy step or the key rotation |
@@ -1037,19 +1061,23 @@ database or bucket.
    `--skip-erasure` is for a Worker that no longer answers.
 3. **Tear down remaining domains.** For each row left in `domains` (always the platform domain), the
    removal steps of [Identities, addresses and domains › Domain removal](identity-domains.md#domain-removal)
-   with the local token: literal rules, catch-all disabled, `DELETE /zones/{z}/email/routing/dns`
-   (unless `--keep-dns`), `DELETE /zones/{z}/email/sending/subdomains/{tag}`, the event subscription,
-   and the ownership TXT. SES identities are left to step 4.
+   with the local token, on the recorded provider objects only: literal rules, catch-all disabled, the
+   routing step (one name's records, or `DELETE /zones/{z}/email/routing/dns` only for the zone's last
+   routing domain at its apex; skipped with `--keep-dns`), `DELETE /zones/{z}/email/sending/subdomains/{tag}`,
+   the event subscription, and the ownership TXT. Rows are processed subdomains first, so each zone's apex
+   comes last. SES identities are left to step 4.
 4. **Amazon SES resources** (only with `--include-ses`; otherwise listed as above). With the local AWS
    credentials, in the reverse order of [§6.9](#69-setup-ses): the two HTTPS subscriptions; the Worker's
-   access key, then the IAM user `pylota-mail-worker` and its policy; the SES identities of every domain
+   access key, then the IAM user `pylota-mail-worker-{dep}` and its policy; the SES identities of every domain
    row that still has `ses_identity` (left by `--skip-erasure`) and the platform identity, with the
    platform identity's DKIM CNAMEs removed from its zone through the Cloudflare API; the configuration
    set, its event destination and the delivery-events topic; the receipt rule `pm-deliver`, and the rule
    set `pylota-mail` only when setup created it (an operator's own active rule set is kept, without the
    rule); the SQS queue and its subscription; the inbound SNS topic; the inbound S3 bucket, emptied
    first (it holds raw mail for at most 14 days). Each step reads first and treats AWS's not-found error
-   as done; any other AWS error is exit 14, and a re-run continues. Operation names beyond those cited in
+   as done; any other AWS error is exit 14, and a re-run continues. A resource whose
+   `pylota-mail:api-host` tag names another deployment, or an SES identity whose tags do not name this
+   one, is never deleted: it is listed and skipped. Operation names beyond those cited in
    [Domains on any DNS host §4.2](domain-connections.md#42-deployment-set-up-for-ses): verify at build
    time.
 5. **Delete the Worker:** `npx --yes wrangler@4.139.0 delete --name pylota-mail`. Wrangler describes
@@ -1059,8 +1087,9 @@ database or bucket.
    (`DELETE /accounts/{a}/vectorize/v2/indexes/{name}`); the ten queues
    (`DELETE /accounts/{a}/queues/{queue_id}`); the R2 bucket (`DELETE /accounts/{a}/r2/buckets/pylota-mail-blobs`
    with the jurisdiction header), and the `BACKUP` bucket when `PM_BACKUP_BUCKET` is set. R2 refuses to
-   delete a bucket that still holds objects; staging objects expire within a day by the lifecycle rule,
-   so the CLI reports the bucket as pending and a re-run the next day finishes. The tenant erasures of
+   delete a bucket that still holds objects; staging objects expire within 15 days by the lifecycle rule
+   (normally none is left: a staged object is deleted once it is routed), so the CLI reports the bucket
+   as pending and a re-run after they expire finishes. The tenant erasures of
    step 2 sweep the backup bucket too ([Privacy §5.4](privacy.md#54-optional-r2-backup-copy)); an object
    left in it is reported the same way. Last, the D1 database (`DELETE /accounts/{a}/d1/database/{id}`).
 7. Remove the profile's key (it no longer works) and rename `<dir>/wrangler.toml` to
@@ -1073,45 +1102,34 @@ Each step is idempotent; a `404` carrying Cloudflare's own "not found" code coun
 
 ### 12.1 `secrets rotate-master`
 
-The procedure is [Security §6.2](security.md#62-rotation-procedures). The CLI's part:
+`pmail secrets rotate-master [--resume] [--discard-previous] [--yes]`
 
-1. Refuse if `PM_MASTER_KEY_NEXT` already exists (a rotation is in progress) unless `--resume`.
-2. Generate `K2` (32 bytes, OS CSPRNG) and compute `kid(K2)` = first 8 bytes of `SHA-256(K2)`, lower-case
-   hex ([Security §7.2](security.md#72-encryption-envelope)). Upload it with
-   `wrangler secret put PM_MASTER_KEY_NEXT` (value on stdin).
-3. Poll every 60 s through the D1 query API until the count is 0. The query is built from the
-   sealed-column registry (`core::sealed`, [Security §7.2](security.md#72-encryption-envelope)), one term per
-   column; for v1.0 it reads:
+The procedure, with its two key slots, is [Security §6.2](security.md#62-rotation-procedures). The
+CLI's part needs the Cloudflare token (Workers Scripts · Edit, to write secrets) and a platform key with
+`audit:read` (to read `GET /v1/platform/status`); it makes no D1 query.
 
-   ```sql
-   SELECT
-     (SELECT COUNT(*) FROM webhook_endpoints WHERE secret_enc NOT LIKE 'pm1.' || ?1 || '.%')
-   + (SELECT COUNT(*) FROM webhook_endpoints WHERE prev_secret_enc IS NOT NULL
-                                               AND prev_secret_enc NOT LIKE 'pm1.' || ?1 || '.%')
-   + (SELECT COUNT(*) FROM identity_keys WHERE private_enc NOT LIKE 'pm1.' || ?1 || '.%')
-   + (SELECT COUNT(*) FROM signing_keys WHERE ciphertext NOT LIKE 'pm1.' || ?1 || '.%')
-   + (SELECT COUNT(*) FROM domains WHERE smtp_sealed IS NOT NULL
-                                     AND smtp_sealed NOT LIKE 'pm1.' || ?1 || '.%')
-   + (SELECT COUNT(*) FROM domains WHERE smtp_pending_sealed IS NOT NULL
-                                     AND smtp_pending_sealed NOT LIKE 'pm1.' || ?1 || '.%')
-   + (SELECT COUNT(*) FROM users WHERE totp_sealed IS NOT NULL
-                                   AND totp_sealed NOT LIKE 'pm1.' || ?1 || '.%')
-   + (SELECT COUNT(*) FROM users WHERE recovery_codes_sealed IS NOT NULL
-                                   AND recovery_codes_sealed NOT LIKE 'pm1.' || ?1 || '.%')
-   + (SELECT COUNT(*) FROM oauth_states WHERE pkce_sealed NOT LIKE 'pm1.' || ?1 || '.%') AS remaining;
-   ```
+1. Read `master_key` from `GET /v1/platform/status`: `active_slot`, the two slots with `present` and
+   `kid`, `remaining`, `activated_at` and `resealed_at`.
+2. `remaining > 0`: a rotation is unfinished. Without `--resume`, exit 15 with the fix
+   `pmail secrets rotate-master --resume`. With `--resume`, go to step 5.
+3. The inactive slot holds a key and `resealed_at` is less than 30 days ago: exit 15, naming the date
+   from which a rotation is allowed, unless `--discard-previous`, which prints that a D1 restore to before `resealed_at` may no longer
+   open sealed values and asks for confirmation (`--yes` in scripts).
+4. Generate `K2` (32 bytes, OS CSPRNG) and compute `kid(K2)` = first 8 bytes of `SHA-256(K2)`,
+   lower-case hex ([Security §7.2](security.md#72-encryption-envelope)). Write it to the inactive slot
+   (`wrangler secret put PM_MASTER_KEY_B --name pylota-mail`, or `PM_MASTER_KEY` when `b` is active;
+   value on stdin), drop it from memory, then `wrangler secret put PM_MASTER_KEY_ACTIVE` with the slot's
+   letter. A failure between the two writes leaves the old slot active and the new key unused: a re-run
+   without `--resume` writes a fresh key into the same inactive slot.
+5. Poll `GET /v1/platform/status` every 60 s, printing `remaining` and the estimate `remaining / 500`
+   minutes (the every-minute re-seal sweep handles 500 values per run), until `remaining` is 0. Ctrl-C
+   stops the polling only; the sweep continues in the Worker, and `--resume` polls again. There is no
+   deadline.
+6. Print the new active slot and `kid`, and the first date a next rotation is allowed without
+   `--discard-previous` (30 days after `resealed_at`).
 
-   The columns are every value sealed under `PM_MASTER_KEY`, the same registry the Worker's re-seal sweep
-   reads.
-
-   printing the count each time. With `--resume`, `K2` is not known; the CLI reads the target `kid`
-   from the most common `kid` among rows already re-sealed and asks for confirmation.
-4. Upload `PM_MASTER_KEY = K2`, then delete `PM_MASTER_KEY_NEXT` (`wrangler secret delete
-   PM_MASTER_KEY_NEXT --name pylota-mail`), then drop `K2` from memory.
-5. Deadline 24 hours (exit 13; `--resume` continues).
-
-`PM_MASTER_KEY_NEXT` is defined by Security §6.2 and listed in
-[Configuration › Secrets](../../reference/configuration.md#secrets). While it is set, `doctor` warns
+`PM_MASTER_KEY_B` and `PM_MASTER_KEY_ACTIVE` are defined by Security §6.2 and listed in
+[Configuration › Secrets](../../reference/configuration.md#secrets). While `remaining > 0`, `doctor` warns
 (`secrets`).
 
 ### 12.2 Signing keys: `keys rotate thread|link|cursor|web_bot_auth`
@@ -1391,12 +1409,17 @@ The CLI never falls back to the local token on its own.
    than `422 cf_token_required` is handled as usual.
 3. On `cf_token_required`: run steps 1–8 of
    [Identities, addresses and domains › Kind `zone`](identity-domains.md#kind-zone) with the local token
-   (including the existing-MX and SPF preflights, with `--replace-mx` as the explicit opt-in).
+   (including the existing-MX and SPF preflights, with `--replace-mx` as the explicit opt-in), recording
+   each object it creates, and each existing one it uses as `created: false`, in the shape of
+   `provider_objects_json` ([No adoption](identity-domains.md#no-adoption-of-provider-objects): this is a
+   platform operation, so an existing sending domain or routing setup is used, never deleted later).
 4. Insert the row through the D1 query API (`POST /accounts/{a}/d1/database/{id}/query`), with the
    account ID of step 1: the database is the one named `pylota-mail` in that account, found by name as
    in setup step 2, or the `database_id` of `<dir>/wrangler.toml` when that file exists. The statement
    is the one of [§6.6](#66-the-platform-domain-row) with `tenant_id`, `kind = 'zone'`,
-   `method = 'cloudflare_zone'`, `inbound = 'routing'` and `state = 'pending'`. The Worker's cron hook
+   `method = 'cloudflare_zone'`, `inbound = 'routing'`, `state = 'pending'`, `expected_ns_json` (the
+   zone's `name_servers`) and `provider_objects_json`, after checking that no non-`removed` row has the
+   name. The Worker's cron hook
    mints the monitor, starts verification and emits `domain.created`. An apex uses the catch-all, so no
    literal rules are needed.
 5. Steps the Cloudflare API cannot do (spike S9) are printed as dashboard steps, and `doctor` checks
@@ -1417,6 +1440,7 @@ A Cloudflare API or D1 failure in steps 3 and 4 is exit 10; every step reads fir
 | `--no-receiving`, `--no-sending` | `receiving: false`, `sending: false` | always |
 | `--replace-mx` | `replace_mx: true` | `cloudflare_zone` (apex), `dns_records` |
 | `--confirm-dedicated` | `confirm_dedicated: true` | `nameservers` |
+| `--claim` | `claim: true` | always |
 | `--inbound forward\|ses` | `inbound` | `smtp_relay` (required) |
 | `--smtp-host`, `--smtp-port 465\|587`, `--smtp-username` | `smtp.host`, `smtp.port`, `smtp.username` | `smtp_relay` (required) |
 | `--smtp-password-stdin` | `smtp.password` | `smtp_relay` (required) |
@@ -1436,7 +1460,9 @@ A Cloudflare API or D1 failure in steps 3 and 4 is exit 10; every step reads fir
   `nameservers` and `delegated_subdomain` the records are the `NS` values to set at the registrar or
   DNS host. `--json` prints the response unchanged.
 - Errors keep their API meaning: `409 domain_not_dedicated` (exit 6) prints `details.records` and the
-  fix `--confirm-dedicated`; `429 upstream_rate_limited` (exit 8) prints the retry time.
+  fix `--confirm-dedicated`; `409 domain_exists` (exit 6) with `details.claim` prints the TXT record to
+  publish and the fix `--claim`; `409 domain_claim_pending` (exit 6) prints the retry time;
+  `429 upstream_rate_limited` (exit 8) prints the retry time.
   `422 transport_unavailable` and `422 cf_token_required` are the two exceptions to the API's exit code:
   exit 3, with the fixes listed in [§18.1](#181-domains-add-without-pm_cf_api_token).
 
@@ -1543,13 +1569,16 @@ Checks an assertion offline, the way a verifier should, by calling the SDK's `ve
    except for `localhost`, `127.0.0.1` and `[::1]` (exit 2 otherwise).
 3. The header must have `alg: EdDSA` and `typ: agent-assertion+jwt`; `iss` must equal the issuer.
    Only then is `{iss}/.well-known/jwks/{sub}.json` fetched, without an `Authorization` header and
-   after checking that `sub` is a well-formed identity ID. A key URL inside the token is never used.
+   after checking that `sub` matches `^idn_[0-9A-HJKMNP-TV-Z]{26}$` (`malformed` otherwise, with no
+   request); the fetch follows no redirect and accepts only `application/jwk-set+json`
+   ([O27](../edge-cases.md)). A key URL inside the token is never used.
 4. The key whose `kid` matches verifies the Ed25519 signature; `aud` must equal `--audience`; `nbf` and
    `exp` are checked against `--now` or the clock, allowing 60 seconds of skew.
-5. Replay (step 6 of §4.3) needs state across calls, so the CLI does not check it; it prints `jti` and
+5. Replay (step 7 of §4.3) needs state across calls, so the CLI does not check it; it prints `jti` and
    `exp` for a caller that keeps a replay cache.
 
-Output: `valid` and the claims (`sub`, `email`, `name`, `org`, `aud`, `exp`, `jti`, `kid`), exit 0; or
+Output: `valid` and the claims (`sub`, `email`, `aud`, `exp`, `jti`, `kid`, and `unverified.name` and
+`unverified.org` labelled as unverified), exit 0; or
 `invalid: <reason>`, exit 11 (`verification`, [§3.4](#34-exit-codes)), where reason is `malformed`,
 `unsupported_algorithm`, `issuer_mismatch`, `identity_not_found` (the JWKS answered `404`: the identity is
 unknown, paused, suspended or deleted), `unknown_kid`, `bad_signature`, `audience_mismatch`, `expired` or
@@ -1589,6 +1618,8 @@ have no command: they are set only in the console ([Notifications §2](notificat
 | `tenants create\|list\|get\|update` | `POST /v1/tenants`; `GET /v1/tenants` (`--partner` sends `partner_id`); `GET /v1/tenants/{id}`; `PATCH /v1/tenants/{id}` (platform or partner key, `tenants:manage`) |
 | `partners create\|list\|get\|update\|delete` | `POST /v1/partners`; `GET /v1/partners`; `GET /v1/partners/{id}`; `PATCH /v1/partners/{id}`; `DELETE /v1/partners/{id}` (platform key, `partners:manage`) |
 | `tenants suspend\|resume` | `PATCH /v1/tenants/{id}` `{"status":"suspended"\|"active"}` |
+| `tenants policy` | Without `--set`/`--set-file`: `GET /v1/tenants/{id}/policy`; with them: `PATCH /v1/tenants/{id}/policy` (`policy:write`, platform, partner or tenant key; [Workspace policy](workspace-policy.md)) |
+| `accounts request\|list\|get\|approve\|reject\|close\|delete` | `POST /v1/identities/{id}/accounts`; `GET /v1/identities/{id}/accounts` or, with `--tenant`, `GET /v1/tenants/{t}/accounts`; `GET …/accounts/{sac}`; `POST …/{sac}/approve`; `POST …/{sac}/reject`; `POST …/{sac}/close`; `DELETE …/{sac}` (`accounts:request`; approve, reject and delete `accounts:approve`; [Service sign-up ledger](service-accounts.md)) |
 | `identities create\|list\|get\|update` | `POST /v1/tenants/{t}/identities`; `GET /v1/tenants/{t}/identities` or `GET /v1/identities`; `GET /v1/identities/{id}`; `PATCH /v1/identities/{id}` |
 | `identities pause\|resume` | `PATCH /v1/identities/{id}` `{"status":"paused"\|"active"}` |
 | `identities delete` | `DELETE /v1/identities/{id}` (typed confirmation of the address) |
@@ -1624,6 +1655,8 @@ have no command: they are set only in the console ([Notifications §2](notificat
 | `suppressions list\|add\|remove` | `GET\|POST /v1/tenants/{t}/suppressions`; `DELETE /v1/tenants/{t}/suppressions/{address}` |
 | `lists list\|add\|remove` | `GET /v1/tenants/{t}/lists/{direction}/{kind}`; `PUT …/{entry}`; `DELETE …/{entry}` |
 | `erasure create\|get\|list` | `POST /v1/erasure-requests`; `GET /v1/erasure-requests/{id}`; `GET /v1/erasure-requests` |
+| `erasure retry` | `GET /v1/erasure-requests/{id}`, then `POST /v1/erasure-requests` with the same `tenant_id`, `scope`, `identity_id` and target (`--address` for counterparty scope) and reason `retry:{era_id}`; the API makes it a resumption of the failed request ([Privacy §6.1](privacy.md#61-request)) |
+| `erasure reapply` | `POST /v1/platform/erasure-requests/{id}/reapply` (platform key, `platform:ops`) |
 | `export create\|get` | `POST /v1/exports`; `GET /v1/exports/{id}` |
 | `members list\|invite\|remove` | `GET /v1/tenants/{t}/members` (`members:read`); `POST /v1/tenants/{t}/invitations`; `DELETE /v1/tenants/{t}/members/{user_id}` (`members:manage`, tenant, partner or platform key) |
 | `invitations revoke` | `DELETE /v1/tenants/{t}/invitations/{invitation_id}` (`members:manage`) |
@@ -1635,10 +1668,50 @@ have no command: they are set only in the console ([Notifications §2](notificat
 | `dlq list\|redrive` | `GET /v1/platform/dlq`; `POST /v1/platform/dlq/{dlq_id}/redrive` (platform key, `platform:ops`; [§13](#13-dlq)) |
 | `jobs start\|get` | `POST /v1/platform/jobs`; `GET /v1/platform/jobs/{job_id}` (platform key, `platform:ops`) |
 | `waitlist invite` | `POST /v1/platform/waitlist/invite` (platform key, `platform:ops`) |
+| `ops status\|switch\|freeze\|unfreeze\|restore` | [§20](#20-ops) |
 | `mcp config` | `GET /v1/me` |
 | `login`, `config show\|set` | `GET /v1/me` (`config set`: none) |
-| `setup`, `deploy`, `upgrade`, `doctor`, `destroy`, `secrets rotate-master` | Cloudflare API, Wrangler, GitHub, and the API as described above (`doctor` also reads `/.well-known/*`; `destroy --include-ses` also the AWS APIs) |
+| `setup`, `deploy`, `upgrade`, `doctor`, `destroy`, `secrets rotate-master` | Cloudflare API, Wrangler, GitHub, and the API as described above (`secrets rotate-master` also `GET /v1/platform/status`) (`doctor` also reads `/.well-known/*`; `destroy --include-ses` also the AWS APIs) |
 | `setup ses` | AWS APIs, Wrangler, the Cloudflare API and `/health` ([§6.9](#69-setup-ses)) |
+
+## 20. `ops`
+
+Operator commands for one person running the deployment ([Observability §5.5–5.7 and the restore
+runbook](observability.md#55-alert-email-and-the-external-heartbeat)). Built by M17 Completion.
+
+| Command | Calls | Credentials |
+|---|---|---|
+| `ops status` | `GET /v1/platform/status`; human output groups the freeze flag, switches, `alert_email`, firing alerts, `master_key` and capacity | platform key with `audit:read` |
+| `ops switch <name> on\|off [--reason <text>]` | `PUT /v1/platform/switches` with `{"name", "state", "reason"}` | platform key with `platform:ops` |
+| `ops freeze` / `ops unfreeze` | Sets `PM_FREEZE` to `on` / `off` under `[vars]` in `<dir>/wrangler.toml` (`freeze` also writes `PM_FREEZE_SINCE` with the current time; `unfreeze` removes it), then the code-deploy step of `deploy` with the deployed version's bundle (§8.6; a variable change only, no migration). Then polls `GET /health` until `frozen` matches, at most 120 s | Cloudflare token |
+| `ops restore d1 --at <T> …` | The steps of the restore runbook's step 3, with Wrangler `d1 export`, `d1 time-travel info`, `d1 time-travel restore` and `d1 execute --file` (all through the pinned Wrangler, §5) | Cloudflare token (D1 · Edit) |
+| `ops restore mailbox <identity> (--at <T> \| --bookmark <b>)` | `POST /v1/platform/identities/{identity_id}/restore` | platform key with `platform:ops` |
+| `ops restore reconcile --tenant <t> --identity <i>… --after <T>` | `POST /v1/platform/jobs` (`kind: restore_reconcile`), then `GET /v1/erasure-requests?tenant_id=…` (every page) and, for each request with `completed_at` after `T` whose identity is restored or whose scope is counterparty or tenant, `POST /v1/platform/erasure-requests/{erasure_id}/reapply`; then polls the job and the new requests until they end | platform key with `platform:ops` and `erasure:manage` |
+| `ops restore cleanup` | Deletes `<dir>/restore-*/` | none |
+
+Rules for `ops restore d1`:
+
+- It refuses (exit 15) unless `GET /health` reports `frozen: true`.
+- Working files go to `<dir>/restore-<UTC timestamp>/`, created `0700`, files `0600`: `before.sql`,
+  `after.sql`, `undo-bookmark`, `replay.sql`, `summary.json`. The undo bookmark is printed as soon as the
+  restore returns, before anything else can fail.
+- The comparison is pure Rust: `core::sqldump` parses the `INSERT INTO "<table>" VALUES(…)` statements
+  of each export (SQL literals: integers, reals, `'…'` strings with doubled quotes, `X'…'` blobs, `NULL`)
+  into rows, and keys them by the primary keys in `core::schema`, a table generated at build time from
+  `migrations/d1/`. Every table except `schema_migrations` is compared. `--exclude` and `--exclude-row`
+  names are checked against `core::schema`, and an unknown name is exit 2 before anything is restored.
+  The export format is checked against a recorded export from the pinned Wrangler
+  (`cli::ops::sqldump_parses_export`).
+- Statements are ordered by the foreign keys of `migrations/d1/` (inserts and updates parents first,
+  deletes children first). Values are written as SQL literals with blobs in `X'…'` form; the file is
+  applied with `wrangler d1 execute pylota-mail --remote --file`, which accepts files up to 5 GiB
+  (Import and export data, read 2026-10-10).
+- `--yes` skips the confirmation of the summary. Without it, a non-interactive run is exit 2.
+- `--replay-only <dir>` recomputes and applies the replay from an existing `before.sql` against a fresh
+  export of the current database, for the case where a migration had to be re-applied first.
+
+Exit codes are those of §3.4; a Cloudflare or Wrangler failure in the middle is exit 10 with the step
+reached, and every step can be re-run.
 
 ## Tests
 
@@ -1657,7 +1730,7 @@ have no command: they are set only in the console ([Notifications §2](notificat
 | `cli::setup::order` | The recorded call order matches §6.3; the catch-all `PUT` comes after the first deploy, the secrets and a `200` health | FR-OPS-1 |
 | `cli::setup::h5_existing_mx` | Foreign MX records stop setup without `--replace-mx`; with it they are deleted before routing is enabled | [H5] |
 | `cli::setup::not_apex` | A subdomain or a zone in another account is refused with the zone's name | FR-OPS-1 |
-| `cli::setup::lifecycle_merge` | Existing R2 lifecycle rules are kept; the staging rule is added or replaced | FR-OPS-1 |
+| `cli::setup::lifecycle_merge` | Existing R2 lifecycle rules are kept; the 15-day staging rule and the 1-day multipart-abort rule are added or replaced | FR-OPS-1, [J7](../edge-cases.md), [I13](../edge-cases.md) |
 | `cli::setup::bootstrap_key` | The inserted key authenticates against the workerd harness and holds every permission except `identities:sign`; the decision table of §6.5 holds, including refusal when keys exist, and every pepper upload happens in step 14 | FR-OPS-1, FR-KEY-2 |
 | `cli::setup::owner_email` | The default tenant is created with the owner; `--no-console` writes `PM_CONSOLE = "off"` | FR-CON-7 |
 | `cli::setup::billing_off` | Setup writes no `PM_BILLING`; the default tenant reports `billing: disabled` | FR-BILL-12 |
@@ -1676,13 +1749,17 @@ have no command: they are set only in the console ([Notifications §2](notificat
 | `cli::deploy::noop_redeploy` | `deploy` straight after `setup` calls no Wrangler command and exits 0 | FR-OPS-2 |
 | `cli::deploy::version_flag` | `pmail deploy --version <v>` downloads and deploys that release | M19 |
 | `cli::doctor::every_check_has_fix` | Each failing check prints a fix; exit 12 with a fail, 0 with warnings only | FR-OPS-3 (M16) |
-| `cli::doctor::warn_rules` | `secrets` warns only while `PM_MASTER_KEY_NEXT` exists; `quota` warns when `PM_DAILY_SEND_QUOTA` is unset, and when the token lacks Account Analytics · Read (never `fail` for that); `cloudflare.zones` prints the count and warns above 1,000; a Cloudflare error in any other check is `fail` and exit 12, never 10 | FR-OPS-3 |
+| `cli::doctor::warn_rules` | `secrets` warns only while `master_key.remaining` is above 0 and fails when the active slot is empty; `quota` warns when `PM_DAILY_SEND_QUOTA` is unset, and when the token lacks Account Analytics · Read (never `fail` for that); `cloudflare.zones` prints the count and warns above 1,000; a Cloudflare error in any other check is `fail` and exit 12, never 10 | FR-OPS-3 |
 | `cli::doctor::web_bot_auth` | `skip` with `PM_WEB_BOT_AUTH = "off"`; with `on`, `pass` for a directory signed once per listed key, `fail` for a missing signature, a wrong tag or content type, or more than three keys | FR-OPS-3, FR-IDN-8, [O12] |
 | `cli::doctor::ses_check` | `skip` without `PM_SES_REGION` or AWS credentials; `fail` on no production access, paused sending, an inactive rule set or a missing `pm-deliver`; `warn` `ses_identities_90pct` at 9,000 identities and `fail` at 10,000 | FR-OPS-3, FR-DOM-9, [N26] |
 | `cli::destroy::confirmation` | Without the typed platform domain nothing is deleted; `--dry-run` changes nothing; an erasure ending `completed_with_holds` lists the held threads and exits 6 before any domain, Worker or storage is deleted | FR-OPS-1, FR-PRV-4 |
 | `cli::destroy::include_ses` | Without `--include-ses`, the plan and the final output list the `setup ses` resources as left in place and no AWS call is made; with it and no AWS credentials, exit 3 before anything is deleted; with credentials, every resource of §6.9 is deleted in reverse order against the recorded AWS fake, an operator's own active rule set is kept without `pm-deliver`, and a re-run after a failure continues | FR-OPS-1, FR-DOM-8 |
-| `cli::secrets::rotate_master` | The flow of §12.1 against the harness ends with no ciphertext under the old `kid` and no `PM_MASTER_KEY_NEXT` | [Security §6.2](security.md#62-rotation-procedures) |
+| `cli::secrets::rotate_master` | The flow of §12.1 against the harness writes the new key to the inactive slot, then switches `PM_MASTER_KEY_ACTIVE`, and ends with no ciphertext under the old `kid` while the old key stays in its slot; a second rotation within 30 days of the previous re-seal's end is exit 15 without `--discard-previous`; an interrupted run is finished by `--resume` with no key generated; a failure between the two writes leaves the old slot active | [Security §6.2](security.md#62-rotation-procedures) |
 | `cli::secrets::rotate_signing_key` | `keys rotate thread\|link\|cursor\|web_bot_auth` calls the platform endpoint, `--revoke-previous` adds `revoke_previous=true`, and the output shows the new kid (a 43-character thumbprint for `web_bot_auth`) and the previous kid with `verify_until` or `revoked`, never key material; `422 web_bot_auth_disabled` is exit 7; `keys rotate key_…` still rotates an API key; mixed flags are exit 2 | [Security §6.2](security.md#62-rotation-procedures), FR-IDN-8 |
+| `cli::ops::sqldump_parses_export` | A recorded `wrangler d1 export` file parses into the expected rows (strings with quotes, blobs, nulls, reals) | §20 |
+| `cli::ops::restore_replay_diff` | From two parsed exports, the replay inserts rows created after `T`, deletes rows deleted after `T`, updates changed rows, skips `--exclude` tables, columns and rows, orders statements by foreign key, and refuses an unknown exclude name with exit 2; `ops restore d1` refuses with exit 13 unless `/health` reports `frozen: true` | §20, [I6](../edge-cases.md) |
+| `cli::ops::freeze_unfreeze` | `ops freeze` writes `PM_FREEZE = "on"`, redeploys the deployed bundle with no migration and waits for `/health` to report `frozen`; `ops unfreeze` reverses it; a re-run is a no-op | §20 |
+| `cli::erasure::retry` | `erasure retry` resubmits the stored scope and target with reason `retry:{era_id}`; a counterparty retry without `--address` is exit 2 | §19 |
 | `cli::dlq::j8_list_redrive` | `list` passes `queue`, `status` and `tenant_id` to `GET /v1/platform/dlq`; `redrive` posts once per item and reports partial failures; no Cloudflare, D1 or Queues call is made | FR-OPS-4, [J8] |
 | `cli::jobs::start_get` | `jobs start` builds the job body (repeated `--identity` resolved to `identity_ids`; `--tenant` required) and `jobs get` reads it back | [J3] |
 | `cli::waitlist::invite` | `--count` outside 1–500 is exit 2 before any request; the result prints `invited` and `waiting` | FR-CON-8 |
