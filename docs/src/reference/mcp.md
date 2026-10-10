@@ -203,6 +203,8 @@ recipient's delivery ends `suppressed`, as for a suppressed, send-blocked or not
 | `mail_update_labels` | Labels a message or thread, marks it read or unread | `messages:write` | `PATCH …/messages/{id}` or `…/threads/{id}` |
 | `mail_sign_assertion` | Mints a short-lived agent assertion (a JWT) that a third-party service checks against the identity's published keys | `identities:sign` (tenant and identity keys) | `POST /v1/identities/{id}/assertions` |
 | `mail_sign_http_request` | Returns Web Bot Auth headers for an HTTP request the agent makes itself | `identities:sign` (tenant and identity keys) | `POST /v1/identities/{id}/http-signatures` |
+| `mail_request_account` | Asks the operator to approve an account the agent wants to create at a third-party service | `accounts:request` | `POST /v1/identities/{id}/accounts` |
+| `mail_list_accounts` | Lists the identity's service sign-up requests and their decisions | `accounts:request` | `GET /v1/identities/{id}/accounts` |
 
 Each tool has an input schema and an output schema, which `tools/list` returns. Successful results
 carry the result object as `structuredContent` and the same object as JSON text in `content`. A result
@@ -398,7 +400,9 @@ parameter).
 
 A code or link is returned only when `from` names the sender's domain and the message passed
 authentication ([E4](../project/edge-cases.md)). Nothing arriving gives `"timed_out": true` and
-`"message": null`.
+`"message": null`. Where the workspace requires approval of sign-ups, `kind: "verification"` needs an
+approved entry for the sender's domain first ([`mail_request_account`](#mail_request_account)); without one
+the tool fails at once with `policy_denied` (`details.reason: "account_not_approved"`, [E9](../project/edge-cases.md)).
 
 ### `mail_get_usage`
 
@@ -573,6 +577,37 @@ Signed HTTP requests work only when the operator has turned them on (`PM_WEB_BOT
 `web_bot_auth_disabled`) and the workspace allows them (tenant policy `web_bot_auth.allowed`; otherwise
 `policy_denied`). More in [Agents › Signed HTTP requests](../guides/agents.md#signed-http-requests) and
 [Agent signing keys](../project/design/agent-keys.md#5-signed-http-requests-web-bot-auth).
+
+### `mail_request_account`
+
+Records that the agent wants to create an account at a third-party service with one of its identity's
+addresses, and asks the operator to approve it ([Service sign-up ledger](../project/design/service-accounts.md)).
+Request it **before** signing up; once `status` is `approved`, sign up with the entry's `address`, then use
+[`mail_wait`](#mail_wait) with `kind: "verification"` and `from: "@{service_domain}"` for the code.
+
+Arguments: `identity`, `service_domain` (required), `account_identifier` (required, the username or account
+email at the service), `purpose` (required, 1–500 characters, shown to the operator), `sender_domains` (at
+most 5 other domains the service's mail comes from), `address` (default: the primary address).
+
+```json
+{ "identity": "bookings@acme.example.com", "service_domain": "github.com",
+  "account_identifier": "acme-bookings", "purpose": "File issues on the booking widget repository." }
+```
+
+```json
+{ "id": "sac_01JA2B3C4D5E6F7G8H9J0K1M2N", "service_domain": "github.com", "sender_domains": ["github.com"],
+  "status": "pending_approval", "expires_at": "2026-10-17T10:00:00Z", "…": "…" }
+```
+
+An existing pending or approved entry for the same service and identifier gives `account_exists` with its
+`account_id`; more than 10 pending requests give `account_limit_reached`. There is no tool to approve:
+approval belongs to people and the operator's own systems.
+
+### `mail_list_accounts`
+
+Arguments: `identity`, `status` (`pending_approval`, `approved`, `rejected`, `closed`), `service_domain`,
+`limit`, `cursor`. The filters of `GET /v1/identities/{id}/accounts`; use it to see whether a request was
+approved.
 
 ## The `mail_search_strategy` prompt
 

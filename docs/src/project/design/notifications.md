@@ -18,7 +18,7 @@ and the API; this page is about the humans behind them.
 |---|---|---|---|
 | `usage` | An allowance reached 80% or 100% of its limit (FR-BILL-13) | Owner and admins | Yes, per person |
 | `new_mail` | New mail arrived in inboxes the person follows (FR-CON-14) | Nobody (opt-in) | Yes |
-| `needs_person` | Daily list of quarantined mail, uncertain sends, failing domains and failing webhooks (FR-CON-15) | Owner and admins, daily | Yes |
+| `needs_person` | Daily list of quarantined mail, uncertain sends, failing domains and failing webhooks (FR-CON-15), and service sign-ups waiting for approval ([Service sign-up ledger §8](service-accounts.md#8-console)) | Owner and admins, daily | Yes |
 | `account` | Security and billing events, one value of `AccountEvent` each: `two_factor_disabled` (two-step verification turned off), `sign_in_method_linked` (a Google or GitHub identity linked), `ownership_transferred` (sent to the previous and the new owner) and `payment_failed` (sent to the owner) | The person concerned, or the owner for billing | No (transactional) |
 | `digest` | The items held back that day by a daily cap ([Caps and the daily digest](#caps-and-the-daily-digest)) | A person whose items were held back | Yes: its unsubscribe turns off `usage`, `new_mail` and `needs_person` |
 

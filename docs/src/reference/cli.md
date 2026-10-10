@@ -719,6 +719,28 @@ pmail tenants update acme --policy '{"search":{"agentic_daily_cap":200}}'
 pmail tenants update acme --policy '{"quarantine":{"key_release":true}}'
 ```
 
+### `tenants policy`
+
+Shows the tenant's policy with what your key may change, or changes it, through
+`GET`/`PATCH /v1/tenants/{tenant_id}/policy`. Needs `policy:write` (platform, partner or tenant keys;
+never identity keys). Without `--set` or `--set-file` it prints each field with its class, its ceiling for
+your key and where the ceiling comes from.
+
+```text
+pmail tenants policy <tenant> [--set <json> | --set-file <file>]
+```
+
+With a tenant key, a lower-only field above its ceiling is refused with `403 scope_denied` (exit 4, the
+field, ceiling and source printed), loosening a guard field where only people may is refused with
+`403 permission_denied` (`person_required`, exit 4), and platform-only fields and
+`quarantine.key_release` are refused with `403 scope_denied` (`not_writable`, exit 4)
+([Configuration › Who may change a field](configuration.md#who-may-change-a-field)).
+
+```bash
+pmail tenants policy acme
+pmail tenants policy acme --set '{"retention":{"message_days":365},"search":{"refs_packs":["core","uk_vehicle"]}}'
+```
+
 ### `tenants suspend` and `tenants resume`
 
 Suspends a tenant (sends are refused with `tenant_suspended`; inbound mail is deferred) or resumes it. A
@@ -1676,6 +1698,38 @@ The first argument decides what is rotated: a `key_…` ID rotates that API key,
 `cursor` or `web_bot_auth` rotates a signing key
 ([`keys rotate thread|link|cursor|web_bot_auth`](#keys-rotate-threadlinkcursorweb_bot_auth)).
 `--overlap-hours` with a signing key, or `--revoke-previous` with an API key, is refused (exit 2).
+
+---
+
+## Service accounts
+
+The service sign-up ledger ([API › Service accounts](api.md#service-accounts)): an agent asks before it
+creates an account at a third-party service, and an operator approves or rejects. `request`, `list`, `get`
+and `close` need `accounts:request`; `approve`, `reject` and `delete` need `accounts:approve`, which identity
+keys cannot hold.
+
+```text
+pmail accounts request --identity <identity> --service <domain> --account <identifier> --purpose <text>
+                       [--sender-domain <domain>]… [--address <address>]
+pmail accounts list (--identity <identity> | --tenant <tenant>) [--status pending_approval|approved|rejected|closed]
+                    [--service <domain>] [--limit <n>] [--all]
+pmail accounts get <account_id> --identity <identity>
+pmail accounts approve|reject|close <account_id> --identity <identity> [--note <text>]
+pmail accounts delete <account_id> --identity <identity> [--yes]
+```
+
+`approve` with an API key works only where keys may take decisions reserved for people
+(`PM_QUARANTINE_KEY_RELEASE = "on"`, or the tenant's `quarantine.key_release: true`); otherwise the API
+answers `403 permission_denied` (`person_required`, exit 4) and a person approves in the console.
+`approve` or `reject` on an entry that is no longer pending exits 6 (`409 account_not_pending`); a
+request beyond the limits exits 7 (`422 account_limit_reached`).
+
+```bash
+pmail accounts request --identity bookings@acme.example.com --service github.com \
+  --account acme-bookings --purpose "File issues on the booking widget repository"
+pmail accounts list --tenant acme --status pending_approval
+pmail accounts approve sac_01JA2B3C4D5E6F7G8H9J0K1M2N --identity bookings@acme.example.com
+```
 
 ---
 

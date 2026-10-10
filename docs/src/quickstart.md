@@ -311,13 +311,13 @@ the space) and has an attachment. Each hit has a `snippet`, a `why` list explain
 example `ref:AB12CDE (attachment p.1)`) and the sender's `trust`.
 
 Vehicle plates and PCNs come from the optional `uk_vehicle` reference pack. The tenant policy is
-changed with a platform key that holds `tenants:manage`, so ask your deployment's operator, or run
-this yourself if you deployed it:
+changed by the workspace itself: on the console's policy page (owners and admins), or with a tenant key
+that holds `policy:write`:
 
 ```bash
-curl -X PATCH https://mail.example.com/v1/tenants/ten_01J9… \
-  -H "Authorization: Bearer $PLATFORM_KEY" -H "Content-Type: application/json" \
-  -d '{"policy":{"search":{"refs_packs":["core","uk_vehicle"]}}}'
+curl -X PATCH https://mail.example.com/v1/tenants/ten_01J9…/policy \
+  -H "Authorization: Bearer $TENANT_KEY" -H "Content-Type: application/json" \
+  -d '{"search":{"refs_packs":["core","uk_vehicle"]}}'
 ```
 
 References are extracted when mail arrives, so turn the pack on before the mail you want to find

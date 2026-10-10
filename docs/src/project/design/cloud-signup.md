@@ -237,7 +237,8 @@ After any successful sign-in (and two-step verification), the first matching row
 
 **Frame.** A header with the workspace switcher, a "Test" badge for test tenants, the plan name and the
 user menu (settings, security, sign out). A left navigation, in this order: Overview, Inboxes, Search,
-Quarantine, Domains, Webhooks, API keys, Connect, Members, Plan and usage, Audit log, Settings.
+Quarantine, Service accounts, Domains, Webhooks, API keys, Connect, Members, Plan and usage, Audit log,
+Settings (with the workspace policy).
 
 **Body, top to bottom:**
 
@@ -260,7 +261,9 @@ Quarantine, Domains, Webhooks, API keys, Connect, Members, Plan and usage, Audit
    - sends whose outcome is `uncertain` and must be resolved;
    - domains with issues to fix;
    - webhook endpoints that are failing or disabled;
-   - invitations about to expire.
+   - invitations about to expire;
+   - service sign-ups waiting for approval (count, plus the five oldest with inbox and service;
+     [Service sign-up ledger §8](service-accounts.md#8-console)).
 
    The daily "needs a person" email reads the same counts ([Notifications](notifications.md#3-how-notifications-are-produced)).
 4. **Usage.** A meter per allowance (inboxes, sends, triage analyses, custom domains, storage, seats) from

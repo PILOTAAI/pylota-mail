@@ -23,6 +23,7 @@ of truth for both.
   | `usr_` | console user | `inv_` | invitation |
   | `dlq_` | dead-letter item | `hld_` | quota hold |
   | `prb_` | alignment probe | `ptn_` | partner |
+  | `sac_` | service-ledger entry | | |
 
 - **Times** are stored as Unix milliseconds (`INTEGER`) and exposed in the API as RFC 3339 UTC strings.
 - **Email addresses** are stored lower-cased, with the domain as an IDNA A-label (punycode). Local parts
@@ -82,8 +83,13 @@ CREATE TABLE tenants (
   timezone         TEXT NOT NULL DEFAULT 'UTC',            -- IANA name
   policy_json      TEXT NOT NULL,                          -- TenantPolicy (see configuration.md)
   policy_ceilings_json TEXT NOT NULL DEFAULT '{}',         -- lower-only policy fields a platform key set, with
-                                                           -- the value it set: a ceiling for partner keys
-                                                           -- (Configuration › Who may change a field)
+                                                           -- the value it set: a ceiling for partner keys and
+                                                           -- workspace writers (Configuration › Who may change a field)
+  partner_ceilings_json TEXT NOT NULL DEFAULT '{}',        -- lower-only policy fields the tenant's partner key set,
+                                                           -- with the value: a ceiling for workspace writers only
+                                                           -- (Workspace policy § 2)
+  policy_version   INTEGER NOT NULL DEFAULT 0,             -- compare-and-set counter of policy writes (Workspace
+                                                           -- policy § 4); +1 with every write of policy_json
   quota_do_id      TEXT NOT NULL,                          -- TenantQuota Durable Object id; minted with the row,
                                                            -- then QuotaRequest::Init { tenant_id }
   notify_do_id     TEXT NOT NULL,                          -- Notifier Durable Object id; minted with the row,
@@ -493,6 +499,39 @@ CREATE TABLE identity_keys (
 );
 CREATE UNIQUE INDEX identity_keys_one_active ON identity_keys (identity_id) WHERE status = 'active';
 
+-- The service sign-up ledger (Service sign-up ledger § 2): one row per third-party account an agent asked
+-- to create. Written by the …/accounts routes, the console's accounts page, the global retention job
+-- (expiry, purge) and erasure; read by those routes, the inbound consumer (step 12, approved rows) and
+-- the wait handler.
+CREATE TABLE service_accounts (
+  id                  TEXT PRIMARY KEY,                     -- sac_
+  tenant_id           TEXT NOT NULL REFERENCES tenants(id),
+  identity_id         TEXT NOT NULL REFERENCES identities(id),
+  service_domain      TEXT NOT NULL,                        -- organisational domain, A-label, lower case
+  sender_domains_json TEXT NOT NULL,                        -- JSON array of organisational domains, 1–6,
+                                                            -- always including service_domain
+  account_identifier  TEXT NOT NULL,                        -- username or account email at the service, ≤ 254
+  address             TEXT NOT NULL,                        -- the identity's address the service mails
+  purpose             TEXT NOT NULL,                        -- ≤ 500 chars, written by the agent (untrusted)
+  status              TEXT NOT NULL CHECK (status IN ('pending_approval','approved','rejected','closed')),
+  rejected_reason     TEXT CHECK (rejected_reason IN ('operator','expired')),
+  note                TEXT,                                 -- decision or closing note, ≤ 500 chars
+  requested_by_key_id TEXT,
+  decided_by_key_id   TEXT,
+  decided_by_user_id  TEXT,
+  decided_at          INTEGER,
+  closed_by_key_id    TEXT,
+  closed_by_user_id   TEXT,
+  closed_at           INTEGER,
+  expires_at          INTEGER,                              -- pending only: created_at + 7 days
+  created_at          INTEGER NOT NULL,
+  updated_at          INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX service_accounts_live ON service_accounts(identity_id, service_domain, account_identifier)
+  WHERE status IN ('pending_approval','approved');
+CREATE INDEX service_accounts_identity ON service_accounts(identity_id, status, created_at);
+CREATE INDEX service_accounts_tenant ON service_accounts(tenant_id, status, created_at);
+
 -- Thumbprints of deleted identity keys, never published again (O7). Written by identity- and tenant-scope
 -- erasure in the step that deletes identity_keys; read by key generation, which draws a new seed when the
 -- thumbprint of a new key is found here. Key IDs are not personal data and are never deleted.
@@ -881,8 +920,12 @@ CREATE TABLE platform_objects (
   outbox dispatch, which copies it to `event_index.partner_id` (read by replay). `tenants.suspended_by` is
   written with `status` by `PATCH /v1/tenants/{tenant_id}` and read by the next status change (a partner
   key cannot lift `platform`). `tenants.policy_ceilings_json` is written when a platform key sets a
-  lower-only policy field and read when a partner key writes one
-  ([Configuration › Who may change a field](../../reference/configuration.md#who-may-change-a-field)).
+  lower-only policy field and read when a partner key or a workspace writer writes one;
+  `tenants.partner_ceilings_json` is written when the tenant's partner key sets one and read when a
+  workspace writer writes one; `tenants.policy_version` is written by every policy write and read by the
+  next one's compare-and-set, and by the console's policy page
+  ([Configuration › Who may change a field](../../reference/configuration.md#who-may-change-a-field),
+  [Workspace policy](workspace-policy.md)).
   `api_keys.partner_id` is written by `POST /v1/keys` for `level: "partner"` and read by authentication
   (step 9). `webhook_endpoints.partner_id` is written by `POST /v1/webhooks` with a partner key and read
   by the fan-out, the replay selection and the owner check. `zone_claims` rows are written by the
@@ -1030,7 +1073,7 @@ CREATE TABLE IF NOT EXISTS messages (
   known_sender        INTEGER,
   quarantine_reason   TEXT                                 -- NULL unless status is quarantined or hidden
                       CHECK (quarantine_reason IN ('auth_failed','auth_unverified','spam','risky_attachment',
-                                                   'blocked_sender','otp_unsolicited')),
+                                                   'blocked_sender','otp_unsolicited','account_unapproved')),
   flags_json          TEXT NOT NULL DEFAULT '[]',          -- parse_degraded, message_id_conflict, encrypted,
                                                            -- hidden_text, sent_via_fallback, reprocessed, bcc,
                                                            -- thread_join_unverified, reconciled, loopback,
@@ -1173,7 +1216,10 @@ CREATE TABLE IF NOT EXISTS verifications (                 -- codes and links fo
   value         TEXT NOT NULL,
   sender_domain TEXT NOT NULL,
   expires_at    INTEGER NOT NULL,                          -- received + 24 h; purged after
-  consumed_at   INTEGER                                    -- first released by wait; purged 1 h later
+  consumed_at   INTEGER,                                   -- first released by wait; purged 1 h later
+  account_id    TEXT                                       -- sac_ of the approved service-ledger entry that
+                                                           -- matched (rule 4a); NULL when the tenant does not
+                                                           -- require approval. Read by wait before a release
 );
 
 CREATE TABLE IF NOT EXISTS rate_windows (                  -- inbound per-sender throttle (D5)

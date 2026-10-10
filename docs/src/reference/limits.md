@@ -111,6 +111,21 @@ range gets `400 invalid_request`.
 | HTTP signature components | Always `@authority`, `signature-agent` and `from`; optionally `@method`, `@path` and `@query`. ASCII values only |
 | Web Bot Auth key directory | At most 3 keys (one active, two retiring); a rotated deployment key stays listed for 7 days. `Cache-Control: max-age=86400` |
 
+## Service sign-up ledger
+
+From [Service sign-up ledger](../project/design/service-accounts.md).
+
+| Limit | Value |
+|---|---|
+| Pending entries per identity | 10; the next request gets `422 account_limit_reached` |
+| Entries per identity, any status | 200; the next request gets `422 account_limit_reached` |
+| Pending entry lifetime | 7 days, then `rejected` with reason `expired` |
+| Rejected and closed entries | Deleted 90 days after the decision or closure |
+| `sender_domains` | The service domain plus at most 5 more organisational domains |
+| `account_identifier` | 1–254 characters |
+| `purpose` | 1–500 characters |
+| `note` (approve, reject, close) | At most 500 characters |
+
 ## Notifications
 
 From [Notifications and usage alerts](../project/design/notifications.md).
@@ -162,6 +177,7 @@ resets) are in [Plans and billing](../guides/plans.md). Read your workspace's li
 | New workspace on Free (Pylota Mail Cloud) | At most 50 messages a day (the effective `tenant_daily_send_cap` is the policy value or 50, whichever is lower) for the first 7 days. A daily evaluation lifts the ramp from day 7 if bounce and complaint rates are under the auto-pause thresholds; otherwise it stays and is evaluated again each day. A paid plan lifts it at once. Above it: `429 daily_cap_reached` |
 | Session lifetime | 7 days rolling, 30 days absolute |
 | Re-authentication for sensitive actions | signed in within the last 10 minutes |
+| Workspace policy saves | Owner and admin only; each save needs a sign-in within the last 10 minutes, and a change that deletes mail needs a second, confirmed `POST` ([Workspace policy §6](../project/design/workspace-policy.md#6-the-console-page)) |
 | Invitation lifetime | 7 days |
 
 ## Webhooks

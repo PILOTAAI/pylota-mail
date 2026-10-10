@@ -142,8 +142,8 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
 
 | Area | P0 | P1 | P2 |
 |---|---|---|---|
-| Tenancy and keys | Tenants (live and test), API keys at four levels, partner keys for integrators on a shared deployment (FR-KEY-4) | – | – |
-| Identities | CRUD, idempotent create, pause, accountable human; agent signing keys and assertions (JWKS) | Signed HTTP requests (Web Bot Auth, spike S13) | – |
+| Tenancy and keys | Tenants (live and test), API keys at four levels, partner keys for integrators on a shared deployment (FR-KEY-4), workspace policy self-service within ceilings (FR-TEN-4) | – | – |
+| Identities | CRUD, idempotent create, pause, accountable human; agent signing keys and assertions (JWKS); the service sign-up ledger (FR-IDN-10) | Signed HTTP requests (Web Bot Auth, spike S13) | – |
 | Addresses | Platform domain, aliases, promote, retire, rollback | – | – |
 | Domains | Platform domain; `cloudflare_zone`; `nameservers` | `dns_records` (spike S11); `send_only` (S8); `smtp_relay` (S12); `delegated_subdomain` behind `PM_CF_SUBDOMAIN_SETUP` (S10) | Mailgun and SendGrid inbound sources |
 | Inbound | Parse, verdicts, quarantine, loops, attachments, extracted text | Malware scanner hook | – |
@@ -201,6 +201,14 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
   one tenant or one partner mints, its request rate **must** stay bounded by a shared per-tenant or
   per-partner limit, and the number of its active keys by a cap
   ([Security › Who minted a key](design/security.md#who-minted-a-key), [Security § 10](design/security.md#10-rate-limiting-and-abuse)).
+- **FR-TEN-4** A workspace **must** be able to change its own tenant policy: a tenant key holding
+  `policy:write`, and a console owner or admin, **may** set the free fields and lower the lower-only fields,
+  never above the strictest of the deployment default, the platform operator's value and, for a partner's
+  tenant, the partner's value. Platform-only fields and `quarantine.key_release` **must** stay out of its
+  reach, identity keys **must not** hold `policy:write`, and a key **must not** loosen a guard field
+  (allow-list only, quarantine on authentication failure, the spam threshold, unsolicited-code quarantine)
+  where only people may release quarantined mail (FR-CON-6). Every policy write **must** be audited and
+  evented, and concurrent writes **must not** lose one another ([Workspace policy](design/workspace-policy.md)).
 
 ### 6.2 Identities and addresses
 
@@ -257,6 +265,16 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
   - homoglyph look-alikes of the names reserved on that domain.
 - **FR-ADR-7** Internationalised (SMTPUTF8) local parts **must** be refused with a clear error, because
   Cloudflare Email Routing cannot route them. Unicode display names are allowed.
+- **FR-IDN-10** An agent **must** create a third-party account with its identity's address only through
+  the **service sign-up ledger**: it records the service, the account identifier, the address and the
+  purpose, and an operator approves or rejects each entry, in the console or with a key holding
+  `accounts:approve`, which identity keys **must not** hold; approval by an API key follows the rule of
+  FR-CON-6. Where the tenant's `accounts.require_approval` is on (the default on Pylota Mail Cloud, which no
+  workspace or partner can turn off), a verification code or link **must** reach an agent only when an
+  approved entry matches the mail (the authenticated sender's organisational domain and the receiving
+  address); other such mail **must** be held for review, never dropped. Entries **must** emit
+  `account.requested`, `account.approved`, `account.rejected` and `account.closed`, expire when undecided,
+  and be deleted with the identity or tenant ([Service sign-up ledger](design/service-accounts.md)).
 
 ### 6.3 Domains
 
@@ -509,6 +527,10 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
 - **FR-OPS-3** `pmail doctor` **must** check DNS, routing, sending, event subscriptions, bindings, secrets
   and quota, and print a fix for each failure.
 - **FR-OPS-4** Every queue **must** have a dead-letter queue with a consumer that records and alerts.
+- **FR-OPS-5** Pylota Mail Cloud production **must** be commissioned from the written
+  [Cloud commissioning](cloud-commissioning.md) page: its full configuration, scoped and short-lived
+  credentials, the partner bootstrap, the checks, and three gated phases (partner-only, waitlist, open),
+  so that Pylota's integration runs on Cloud before public sign-up opens.
 
 ### 6.14 Console and workspaces
 

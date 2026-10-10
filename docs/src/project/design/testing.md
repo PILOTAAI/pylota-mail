@@ -368,7 +368,8 @@ a tenant key holds every permission except `tenants:manage`, `partners:manage`, 
 `tenants:erase` (which only the workspace owner's keys hold; the fixture mints keys through the API), so it
 holds `identities:sign`, granted by the platform key that mints it; an identity key holds the same set
 without the tenant-only permissions (`members:read`, `members:manage`, `suppressions:manage`,
-`audit:read`, `usage:read`), plus `usage:read` implicitly for its own workspace. A partner key holds every
+`audit:read`, `usage:read`, `policy:write`,
+`accounts:approve`), plus `usage:read` implicitly for its own workspace. A partner key holds every
 permission except `platform:ops`, `partners:manage` and `identities:sign`, so it holds `tenants:erase`.
 
 **Attacker key classes** (each with full permissions for its level):

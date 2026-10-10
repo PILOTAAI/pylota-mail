@@ -31,7 +31,8 @@ person who minted them and are revoked when that person leaves the workspace.
 
 Some permissions belong to particular levels. `platform:ops` and `partners:manage` are for platform keys
 only, and `tenants:manage` for platform and partner keys. `members:read`, `members:manage`,
-`suppressions:manage`, `audit:read` and `usage:read` cannot be listed on identity keys (an identity key
+`suppressions:manage`, `audit:read`, `usage:read`, `policy:write` and `accounts:approve` cannot be listed on
+identity keys (an identity key
 still reads its own workspace's `GET /v1/usage`, as every tenant and identity key does).
 `identities:sign` cannot be held by platform or partner keys, but they can grant it to the tenant and
 identity keys they create (the audit log records the grant). `tenants:erase`, which deleting a workspace
@@ -55,11 +56,14 @@ non-empty `permissions` list (`400 invalid_request` without one): there is no im
 | A privacy tool for data requests | `tenant` | `erasure:manage` |
 | Suppression and list management | `tenant` | `suppressions:manage` |
 | Dashboards | `tenant` or `platform` | `usage:read`, `audit:read` |
+| An agent that signs up for third-party services | `identity` | What it otherwise needs, plus `accounts:request` and `search:read` (for `wait`) ([Service sign-up ledger](../project/design/service-accounts.md)) |
+| Your approval screen for service sign-ups | `tenant` | `accounts:approve` (approval by a key also needs the workspace to allow keys to take people's decisions) |
+| Policy automation for your own workspace | `tenant` | `policy:write` |
 | An integrator provisioning its customers on a shared deployment (for example Pylota on Pylota Mail Cloud) | `partner` | `tenants:manage`, `keys:manage`, `webhooks:manage` and what its back end needs; `quarantine:review` only for its human review screen |
 | Deployment administration | `platform` | `tenants:manage`, `keys:manage` and what the task needs |
 
-Never give `quarantine:review`, `erasure:manage`, `keys:manage`, `suppressions:manage` or
-`tenants:manage` to an agent. Never give any mailbox permission to a public or customer-facing agent
+Never give `quarantine:review`, `erasure:manage`, `keys:manage`, `suppressions:manage`, `policy:write`,
+`accounts:approve` or `tenants:manage` to an agent. Never give any mailbox permission to a public or customer-facing agent
 ([F2](../project/edge-cases.md)).
 
 ### What a partner key cannot change
@@ -72,6 +76,9 @@ A partner key manages its own tenants, but the deployment's operator keeps the l
   `domains.allow_create_zone` or `domains.cloudflare_zones`
   ([Configuration › Who may change a field](../reference/configuration.md#who-may-change-a-field));
 - it cannot lift a suspension the operator made, or resume an identity paused for abuse;
+- the values it sets on lower-only fields bind its tenants in turn: a tenant's own keys and people may
+  lower them, never raise them above the partner's value
+  ([Workspace policy](../project/design/workspace-policy.md#8-a-partners-tenants));
 - it has at most `max_tenants` tenants (25 by default), creates tenants and invitations at most 10 a
   minute, and its new tenants follow the send ramp unless the operator exempts the partner;
 - when the operator suspends the partner, its keys and every key of its tenants stop at once, and webhook

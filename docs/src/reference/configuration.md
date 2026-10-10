@@ -99,7 +99,7 @@ Cron triggers:
 | `PM_LOG_LEVEL` | `info` | `error`, `warn`, `info` or `debug`. Content is never logged at any level |
 | `PM_DEFAULT_POLICY` | `{}` | JSON merged over the built-in tenant policy defaults |
 | `PM_CONSOLE` | `on` | `on` serves the console at `/console`; `off` removes its routes |
-| `PM_QUARANTINE_KEY_RELEASE` | `on` | `on`: API keys with `quarantine:review` may release quarantined mail (`POST …/release`). `off`: only a signed-in person can, in the console, and API keys get `403 permission_denied` (FR-CON-6), except on a tenant whose policy has `quarantine.key_release: true` ([Tenant policy](#tenant-policy)). Pylota Mail Cloud sets `off`. With `PM_CONSOLE=off` it is always treated as `on` |
+| `PM_QUARANTINE_KEY_RELEASE` | `on` | `on`: API keys with `quarantine:review` may release quarantined mail (`POST …/release`). `off`: only a signed-in person can, in the console, and API keys get `403 permission_denied` (FR-CON-6), except on a tenant whose policy has `quarantine.key_release: true` ([Tenant policy](#tenant-policy)). The same rule decides whether API keys may take the other decisions reserved for people: loosening a guard field of the policy and approving a service account ([Workspace policy §3](../project/design/workspace-policy.md#3-decisions-reserved-for-people)). Pylota Mail Cloud sets `off`. With `PM_CONSOLE=off` it is always treated as `on` |
 | `PM_CONSOLE_HOST` | the value of `PM_API_HOST` | The host that serves the console. When it differs from `PM_API_HOST`, console paths answer only on this host and API paths only on `PM_API_HOST`; anything else gets `404`, and no cookie is set or read on the API host. Every console POST must carry `Origin: https://{PM_CONSOLE_HOST}` (CSRF defence in depth), and console links in mail use that origin. It is read even with `PM_CONSOLE=off`, because invitation links use it |
 | `PM_SIGNUP` | `closed` | Self-serve sign-up: `closed` (people join by invitation or `pmail setup --owner-email`), `waitlist` (double opt-in, invited in batches with `pmail waitlist invite`) or `open` ([Cloud sign-up](../project/design/cloud-signup.md#6-sign-up)) |
 | `PM_SYSTEM_FROM` | `Pylota Mail <no-reply@{PM_PLATFORM_DOMAIN}>` | The display name and address of the **system identity**, which `pmail setup` creates on the default tenant and which sends sign-in, invitation and notification mail through the platform domain. Its local part may be a reserved name; it is never listed to tenants ([Identities and domains › The system identity](../project/design/identity-domains.md#the-system-identity)). Read even with `PM_CONSOLE=off` |
@@ -162,12 +162,15 @@ OAuth flows and cursors fail). Then rotate `PM_MASTER_KEY`.
 
 ## Tenant policy
 
-Stored per tenant. `PATCH /v1/tenants/{tenant_id}` with `{ "policy": { … } }` deep-merges it; it needs
-`tenants:manage`, so a platform key changes any tenant's policy and a partner key the policy of the
-tenants its partner's keys created ([REST API › Partners](api.md#partners)). Tenant keys and the console
-cannot change it. A partner key may change only some fields, and some only downwards
-([Who may change a field](#who-may-change-a-field)), so one partner cannot spend the shared sending
-reputation or the AI budget of a Cloud deployment. This is the full document with defaults:
+Stored per tenant. Two routes deep-merge a policy write: `PATCH /v1/tenants/{tenant_id}` with
+`{ "policy": { … } }`, which needs `tenants:manage`, so a platform key changes any tenant's policy and a
+partner key the policy of the tenants its partner's keys created ([REST API › Partners](api.md#partners));
+and `PATCH /v1/tenants/{tenant_id}/policy`, which needs `policy:write`, a permission tenant keys can hold
+too, so a workspace changes its own policy ([REST API › Tenants](api.md#tenants)). Console owners and
+admins change it on the policy page ([Workspace policy](../project/design/workspace-policy.md)). Partner
+keys and workspaces may change only some fields, and some only downwards
+([Who may change a field](#who-may-change-a-field)), so no partner or workspace can spend the shared
+sending reputation or the AI budget of a Cloud deployment. This is the full document with defaults:
 
 ```json
 {
@@ -224,6 +227,9 @@ reputation or the AI budget of a Cloud deployment. This is the full document wit
   "web_bot_auth": {
     "allowed": false
   },
+  "accounts": {
+    "require_approval": false
+  },
   "domain_fallback": true
 }
 ```
@@ -237,7 +243,7 @@ reputation or the AI budget of a Cloud deployment. This is the full document wit
 | `auto_reply.max_automatic_exchanges` | Automatic replies allowed per thread before a human must act ([D6](../project/edge-cases.md)) |
 | `inbound.ses_bounce_retired` | `true` bounces mail to retired addresses on SES-receiving domains with `550 5.1.6`, through SES receipt rules; `false` drops it without a bounce ([Domains on any DNS host › Retired and unknown recipients](../project/design/domain-connections.md#46-retired-and-unknown-recipients)) |
 | `quarantine.unsolicited_otp` | Quarantine password-reset and OTP mail that no `wait` asked for ([E5](../project/edge-cases.md)) |
-| `quarantine.key_release` | `true` lets keys with `quarantine:review` that reach this tenant, its partner key included, release its quarantined mail even when `PM_QUARANTINE_KEY_RELEASE` is `off`. `false` by default. Only a platform key, or the partner key of the tenant's own partner, can set it (a tenant key cannot call `PATCH /v1/tenants/{tenant_id}`: `403 permission_denied`). With `PM_QUARANTINE_KEY_RELEASE=on` it changes nothing. On Pylota Mail Cloud, Pylota's partner key sets it to `true` on each operator's tenant ([J14](../project/edge-cases.md), [J16](../project/edge-cases.md)) |
+| `quarantine.key_release` | `true` lets keys with `quarantine:review` that reach this tenant, its partner key included, release its quarantined mail even when `PM_QUARANTINE_KEY_RELEASE` is `off`, and take the other decisions reserved for people (loosening a guard field, approving a service account; [Workspace policy §3](../project/design/workspace-policy.md#3-decisions-reserved-for-people)). `false` by default. Only a platform key, or the partner key of the tenant's own partner, can set it (a tenant key cannot call `PATCH /v1/tenants/{tenant_id}`: `403 permission_denied`; with `policy:write` it gets `403 scope_denied` on `PATCH …/policy`). With `PM_QUARANTINE_KEY_RELEASE=on` it changes nothing. On Pylota Mail Cloud, Pylota's partner key sets it to `true` on each operator's tenant ([J14](../project/edge-cases.md), [J16](../project/edge-cases.md)) |
 | `retention.message_days` | `null` keeps parsed messages indefinitely. A number deletes messages, attachments, index rows and vectors after that age, except held threads |
 | `retention.events_days` | 1–365, default 30. Webhook delivery rows, the event index and the event payloads kept for replay are deleted after this many days. Webhook replay reaches back 30 days from an event's `occurred_at`, or this many days if fewer ([Privacy design › Retention](../project/design/privacy.md#52-steps-of-a-tenant-retention-job)) |
 | `triage.categories` | `null` uses the built-in list. Otherwise an array of up to 20 `{ "name": "pcn", "description": "Penalty charge notices from councils" }`, which replaces it |
@@ -248,46 +254,60 @@ reputation or the AI budget of a Cloud deployment. This is the full document wit
 | `domains.cloudflare_zones` | Zones of the deployment's Cloudflare account, by name (A-label apex, lower case, up to 50), that the tenant's own keys and its partner key may use with the `cloudflare_zone` method and with `replace_mx`, besides the zones this deployment created for the tenant (`nameservers`, `delegated_subdomain`). A listed zone grants names strictly under it; its apex and `replace_mx` there stay platform-only. `[]` by default. A zone created for another tenant, or one under the zones of `PM_PLATFORM_DOMAIN`, `PM_API_HOST` or `PM_CONSOLE_HOST`, is refused even when listed (`403 scope_denied`, `details.reason = "zone_not_allowed"`). Platform keys may use any zone. Each listed zone must also be in the zone list of the Worker's `PM_CF_API_TOKEN`. Dropping a zone while the tenant still has domains in it is refused with `409 domain_in_use` (`details.reason = "zone_has_domains"`) ([H13](../project/edge-cases.md)). Only a platform key can set it ([Identities and domains › Zone permission](../project/design/identity-domains.md#zone-permission)) |
 | `web_bot_auth.allowed` | Lets the tenant's identities obtain signed HTTP requests (Web Bot Auth). `false` by default, and until it is `true` those requests get `403 policy_denied`. Only a platform key can set it: a tenant or partner key cannot turn it on. It has no effect while `PM_WEB_BOT_AUTH` is `off` ([Agent signing keys](../project/design/agent-keys.md#5-signed-http-requests-web-bot-auth)) |
 | `domain_fallback` | `false` fails sends on a failing domain instead of using the platform address |
+| `accounts.require_approval` | `true` turns on the [service sign-up ledger](../project/design/service-accounts.md) gate: a verification code or link from a service reaches the tenant's agents only when an approved ledger entry matches the mail, otherwise the message is quarantined `account_unapproved`, and `wait` with `kind=verification` needs an approved entry (`403 policy_denied`, `details.reason = "account_not_approved"`). `false` by default; Pylota Mail Cloud sets it to `true` in `PM_DEFAULT_POLICY`. Lower-only, with `false` as the looser value, so a partner or workspace cannot turn it off where the deployment default or a ceiling has it on |
 
 ### Who may change a field
 
-Every policy write is checked against this table: the `policy` of `POST /v1/tenants` and of
-`PATCH /v1/tenants/{tenant_id}`. Only the fields present in the write are compared; one refused field
-refuses the whole write and nothing is stored. Platform keys may set every field. Tenant keys, identity
-keys and the console cannot write the policy at all (`PATCH /v1/tenants/{tenant_id}` needs
-`tenants:manage`).
+Every policy write is checked against this table: the `policy` of `POST /v1/tenants`, of
+`PATCH /v1/tenants/{tenant_id}`, of `PATCH /v1/tenants/{tenant_id}/policy` and of the console's policy page.
+Only the fields present in the write are compared; one refused field refuses the whole write and nothing
+is stored. Platform keys may set every field. A **workspace writer** is a tenant key holding
+`policy:write` or a console owner or admin of the workspace ([Workspace policy](../project/design/workspace-policy.md)).
+Identity keys cannot write the policy at all: they can hold neither `tenants:manage` nor `policy:write`.
 
-| Class | Fields | A partner key |
-|---|---|---|
-| Platform-only | `web_bot_auth.allowed`, `domains.allow_create_zone`, `domains.cloudflare_zones` | `403 scope_denied` with `details.field` |
-| Platform or own partner | `quarantine.key_release` | May set it on the tenants of its own partner, at creation and later |
-| Lower-only | `identity_daily_send_cap`, `tenant_daily_send_cap`, `max_recipients`, `auto_reply.allowed`, `auto_reply.max_automatic_exchanges`, `inbound.per_sender_per_hour`, `inbound.extract_image_text`, `retention.raw_days`, `retention.events_days`, `triage.enabled`, `search.agentic_enabled`, `search.agentic_daily_cap`, `search.agentic_max_steps`, `search.agentic_max_seconds`, `abuse.complaint_rate_pause`, `abuse.bounce_rate_pause` | May set a value at or below the field's ceiling; above it, `403 scope_denied` with `details.field` |
-| Free | Every other field: `send_allowlist_only`, `large_attachments`, `link_ttl_hours`, `ai_disclosure`, `quarantine.on_auth_fail`, `quarantine.spam_threshold`, `quarantine.unsolicited_otp`, `inbound.extract_attachment_text`, `inbound.ses_bounce_retired`, `retention.message_days`, `triage.categories`, `triage.rules`, `search.refs_packs`, `search.custom_refs`, `webhook_text_bytes`, `domain_fallback` | May set any valid value |
+| Class | Fields | A partner key | A workspace writer |
+|---|---|---|---|
+| Platform-only | `web_bot_auth.allowed`, `domains.allow_create_zone`, `domains.cloudflare_zones` | `403 scope_denied` with `details.field` | `403 scope_denied` with `details.field` and `details.reason = "not_writable"` |
+| Platform or own partner | `quarantine.key_release` | May set it on the tenants of its own partner, at creation and later | `403 scope_denied` with `details.field` and `details.reason = "not_writable"` ([J14](../project/edge-cases.md)) |
+| Lower-only | `identity_daily_send_cap`, `tenant_daily_send_cap`, `max_recipients`, `auto_reply.allowed`, `auto_reply.max_automatic_exchanges`, `inbound.per_sender_per_hour`, `inbound.extract_image_text`, `retention.raw_days`, `retention.events_days`, `triage.enabled`, `search.agentic_enabled`, `search.agentic_daily_cap`, `search.agentic_max_steps`, `search.agentic_max_seconds`, `abuse.complaint_rate_pause`, `abuse.bounce_rate_pause`, `accounts.require_approval` | May set a value at or below the field's ceiling; above it, `403 scope_denied` with `details.field` | May set a value at or below its workspace ceiling; above it, `403 scope_denied` with `details.field`, `details.reason = "above_ceiling"`, `details.ceiling` and `details.ceiling_source` ([J23](../project/edge-cases.md)) |
+| Guard | `send_allowlist_only`, `quarantine.on_auth_fail`, `quarantine.spam_threshold`, `quarantine.unsolicited_otp` | May set any valid value | A person may set any valid value. A tenant key may only tighten them (a value at least as strict as the current one), unless API keys may take decisions reserved for people on this tenant; otherwise `403 permission_denied` with `details.field` and `details.reason = "person_required"` ([J25](../project/edge-cases.md)) |
+| Free | Every other field: `large_attachments`, `link_ttl_hours`, `ai_disclosure`, `inbound.extract_attachment_text`, `inbound.ses_bounce_retired`, `retention.message_days`, `triage.categories`, `triage.rules`, `search.refs_packs`, `search.custom_refs`, `webhook_text_bytes`, `domain_fallback` | May set any valid value | May set any valid value |
 
-- **Ceiling.** A lower-only field's ceiling is the more restrictive of the deployment default (the
-  built-in defaults above merged with `PM_DEFAULT_POLICY`) and the tenant's platform ceiling, the value a
-  platform key last set on that field, at creation or by `PATCH` (kept in `tenants.policy_ceilings_json`):
-  min(deployment default, platform ceiling). A platform key's `null` for the field removes its platform
-  ceiling. A higher number is always the looser value, the `abuse` thresholds included (a higher rate
-  makes auto-pause more lenient), and so are longer retention, more steps or seconds, and more automatic
-  exchanges.
+- **Ceiling.** A lower-only field's ceiling for a partner key is the more restrictive of the deployment
+  default (the built-in defaults above merged with `PM_DEFAULT_POLICY`) and the tenant's platform ceiling,
+  the value a platform key last set on that field, at creation or by `PATCH` (kept in
+  `tenants.policy_ceilings_json`): min(deployment default, platform ceiling). A platform key's `null` for
+  the field removes its platform ceiling. A higher number is always the looser value, the `abuse`
+  thresholds included (a higher rate makes auto-pause more lenient), and so are longer retention, more
+  steps or seconds, and more automatic exchanges.
+- **Workspace ceiling.** For a workspace writer the ceiling is also bounded by the **partner ceiling**: for a
+  tenant a partner's key created, the value that partner's key last set on the field, at creation or later
+  (kept in `tenants.partner_ceilings_json`; the partner key's `null` removes it). So a partner's tenant can
+  lower what its partner set, and raise it back to that value, never above it ([J26](../project/edge-cases.md)).
+  `details.ceiling_source` says which bound decided: `deployment`, `platform` or `partner`.
 - **Switches.** For `auto_reply.allowed`, `inbound.extract_image_text`, `triage.enabled` and
-  `search.agentic_enabled`, `true` is the looser value (it sends more mail or spends Workers AI). A
-  partner key may always set `false`, and `true` only when the deployment default and the platform
-  ceiling (if any) are both `true`.
-- **`null` from a partner key** on a lower-only field resets it to the deployment default, so it is
-  compared as that value: refused when a platform ceiling is lower.
+  `search.agentic_enabled`, `true` is the looser value (it sends more mail or spends Workers AI). For
+  `accounts.require_approval`, `false` is the looser value (it lets codes from unapproved services reach
+  agents). A partner key or workspace writer may always set the stricter value, and the looser one only when
+  every bound that applies to it (the deployment default, the platform ceiling, and for a workspace writer
+  the partner ceiling) allows it.
+- **`null` from a partner key or workspace writer** on a lower-only field resets it to the deployment
+  default, so it is compared as that value: refused when a stricter ceiling applies.
+- **Guard fields** have no ceilings. Tightening means `true` for the three switches and a value at or below
+  the current `quarantine.spam_threshold`. API keys may take decisions reserved for people when
+  `PM_QUARANTINE_KEY_RELEASE` is `on`, `PM_CONSOLE` is `off`, or the tenant's `quarantine.key_release` is
+  `true` ([Workspace policy §3](../project/design/workspace-policy.md#3-decisions-reserved-for-people)).
 - Ceilings are checked when a value is written. Changing `PM_DEFAULT_POLICY` later does not rewrite
-  stored values; a platform key that wants a tenant lower sets the field.
+  stored values; a platform or partner key that wants a tenant lower sets the field.
 - **An identity's `send_policy.daily_cap`** (`POST …/identities`, `PATCH /v1/identities/{identity_id}`)
   may not exceed the tenant's effective `identity_daily_send_cap` for any key but a platform key
   (`403 scope_denied`, `details.field = "send_policy.daily_cap"`), so a lower-only cap cannot be raised
   one identity at a time.
-- **`quarantine.on_auth_fail: false`** is free, but it removes a guarantee: mail whose authentication
+- **`quarantine.on_auth_fail: false`** is a guard value, and it removes a guarantee: mail whose authentication
   verdict is `fail` or `unverified` is then stored as `received` and evented to agents with that verdict,
   instead of being quarantined (rules 3 and 3a of
-  [Inbound › Quarantine decision](../project/design/inbound.md#quarantine-decision)). A partner that turns
-  it off accepts that its agents must check `verdict` themselves.
+  [Inbound › Quarantine decision](../project/design/inbound.md#quarantine-decision)). A partner or workspace
+  that turns it off accepts that its agents must check `verdict` themselves.
 
 ## CLI configuration
 

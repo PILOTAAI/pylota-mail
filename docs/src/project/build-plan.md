@@ -39,9 +39,10 @@ wire behaviour and the design page wins for internal behaviour
 | Phase | What | Elapsed time with AI coding agents |
 |---|---|---|
 | A. Foundation and spikes | M0–M1 | 0.5–1 day. Spikes need a real Cloudflare account and DNS |
-| B. Build | M2–M19, M21–M26, run as parallel tracks after M5 | 3–5 days of agent time, depending on parallelism and review speed |
+| B. Build | M2–M19, M21–M27, run as parallel tracks after M5 | 3–5 days of agent time, depending on parallelism and review speed |
 | C. Live proof | M20: staging deploy, live end-to-end suite, deliverability checks | 2–5 days. DNS propagation, Email Sending onboarding and real-mailbox tests are wall-clock bound |
 | D. Hardening before production traffic | DMARC ramp (`p=none` → `quarantine` → `reject`), Postmaster Tools enrolment, external review | 4–6 weeks of calendar time, mostly waiting, run in parallel with early use |
+| E. Cloud production | M28: commission `pylotamail.com` and open it in three gated phases, partner-only, waitlist, then open ([Cloud commissioning](cloud-commissioning.md)) | Phase A within a day of M20; phase B at least 14 days later; phase C at least 30 days after B, alongside phase D |
 
 Writing the code is the fast part. The time that cannot be compressed is the live proof:
 
@@ -104,6 +105,9 @@ M22 billing ─▶ M15 MCP (mail_get_usage calls M22's GET /v1/usage)
 M9, M10, M21, M22, M24 (and M6's system identity) ─▶ M26 notifications and usage alerts
 M5 ─▶ M17 Foundation (metrics writer, alert evaluator, alert table, re-seal sweep) ─▶ M7, M8, M9
    (M17 Completion, the checks that measure later milestones, is accepted at M20)
+M7, M8, M14, M15, M16, M21 ─▶ M27 service sign-up ledger ─▶ M20
+   (M27 also adds two tools to M15's table and its commands to M16's CLI)
+M20 staging + live proof ─▶ M28 Cloud production commissioning (phases A, B, C)
 ```
 
 After M5, these tracks can run in parallel, each in its own branch and worktree:
@@ -122,7 +126,10 @@ webhooks, erasure, identity keys) call their services; M22 starts after M9, M12 
 M22, and M26 after M9, M10, M21, M22 and M24 (it sends through M6's system identity, is fed by M8's
 webhook dispatcher and M12's triage, which come before M21, and adds hooks to M24's sign-in files).
 M15 also waits for M22, whose `GET /v1/usage` its `mail_get_usage` tool calls, and for M25, whose two
-signing tools it registers. M17 is accepted in two halves, without renumbering: **M17 Foundation** (the
+signing tools it registers. M27 comes after M7, M8, M14, M15, M16 and M21, because its gate changes M7's
+ingest and `wait`, its events need M8's fan-out, its rows join M14's erasure and retention jobs, it adds two
+tools to M15 and commands to M16, and its page joins M21's console. M28 runs against production after M20.
+M17 is accepted in two halves, without renumbering: **M17 Foundation** (the
 metrics writer, the alert evaluator, the alert table and the master-key re-seal sweep) is Track 3's first
 pull request and merges before M7, M8 and M9, because M7 and M8 emit their SLI metrics through its writer
 and M9's G3 (`it::ops::provider_quota_80`) and M23's N26 (`ses_identities_90pct`) fire through its
@@ -149,10 +156,11 @@ rule of their own:
   when a workspace moves to a paid plan, and M26 the `Account { event: payment_failed }` hook.
 - `jobs/erasure.rs`, tenant and person erasure. M14 creates it with every step and the named stubs of its
   table (below); M21 (console rows), M22 (`cancel_billing` and the billing rows), M23 (the
-  `pm-retired-{n}` entries), M24 (person deletion) and M26 (the Notifier rows) each fill in their own stub.
+  `pm-retired-{n}` entries), M24 (person deletion), M26 (the Notifier rows) and M27 (the
+  `service_accounts` rows) each fill in their own stub.
 - `jobs/retention.rs`, the global retention job. M14 creates it with the job framework and the steps whose
   tables have writers by then; M21 (`console`), M22 (`billing_events`), M23 (`ses_ingest`), M24
-  (`signup`) and M25 (`identity_keys`) each add their own step and its test. If M23 or M25 lands before
+  (`signup`), M25 (`identity_keys`) and M27 (`service_accounts`) each add their own step and its test. If M23 or M25 lands before
   M14, M14 writes that step, and the milestone's test runs once M14 has landed.
 - `deploy/wrangler.toml.tmpl` and the `export_worker!` call in `crates/worker/src/lib.rs`. M5 writes
   both whole: every binding of [Configuration › Bindings](../reference/configuration.md#bindings) (the
@@ -363,6 +371,17 @@ keyed by the calling key, with one-time secrets stripped; and the `foreign_partn
 cross-tenant suite. Partner endpoints (`POST /v1/webhooks` with a partner key, and their scoped delivery)
 land with the webhook routes in M8, and `quarantine.key_release` with the release route in M7.
 
+**Workspace policy** (FR-TEN-4, [Workspace policy](design/workspace-policy.md)) lands here with the
+policy classes: the `policy:write` permission (tenant-only, refused on identity keys),
+`GET` and `PATCH /v1/tenants/{tenant_id}/policy`, the one `policy::write` service that every policy write
+goes through (`POST /v1/tenants`, `PATCH /v1/tenants/{tenant_id}` and the new route) with
+`core::policy::check_write` and the `FIELDS` table, the guard class, the partner ceilings
+(`tenants.partner_ceilings_json`), the compare-and-set on `tenants.policy_version`, the `tenant.policy_update`
+audit row and the `tenant.policy_updated` platform event row, and `auth::people::key_may_decide`, the rule
+for decisions reserved for people that M7's release and M27's approval also call. The policy field
+`accounts.require_approval` is stored and classed here; it takes effect with M27. The console's policy page
+comes with M21.
+
 **The cross-tenant matrix grows with each route family.** J10's matrix (`it::security::cross_tenant_matrix`
 with its `foreign_partner` class, and `it::partners::j10_foreign_partner_not_found`) starts here with the
 tenant, partner and key routes. Each milestone that adds a route family extends both in the same pull
@@ -459,6 +478,12 @@ well-formed answer. Later milestones replace behaviour, never a signature:
 - NFR-SEC-1: the cross-tenant suite (`it::security::cross_tenant_matrix`), with its `foreign_partner`
   class, finds 0 cross-tenant reads or writes. Every later milestone extends it with its routes, and it
   must stay at 0.
+- Workspace policy (FR-TEN-4): `core::policy::workspace_write_table`; J23 (`it::policy::j23_workspace_ceilings`),
+  J24 (`it::policy::j24_workspace_field_classes`), J25 (`it::policy::j25_guard_fields_need_person`), J26
+  (`it::policy::j26_partner_ceiling`), J27 (`it::policy::j27_concurrent_writes`) and
+  `it::policy::policy_updated_event_and_audit` (the `event_index` row here; its delivery to the tenant's,
+  partner's and platform endpoints is asserted once M8 lands); the two `/policy` routes join the
+  cross-tenant matrix.
 
 **One migration until v1.0.** `0001_init.sql` holds every table until v1.0 is released. No later
 milestone adds a D1 migration: M6–M26 change code only. A milestone that finds a missing column or table
@@ -528,7 +553,7 @@ this stage), `crates/api-types/src/internal/index_job.rs` (the whole `IndexJob` 
 fill in their arms).
 
 **Implements:** FR-IN-1–9, FR-THR-1/2, NFR-REL-1/2, read APIs, quarantine and release (with the
-`quarantine.key_release` override of FR-CON-6 for API keys), and `wait`
+`quarantine.key_release` override of FR-CON-6 for API keys, through M5's `auth::people::key_may_decide`), and `wait`
 ([Inbound › The `wait` handler](design/inbound.md#the-wait-handler-e4)), which is P0 because quarantine
 rule 5 (E5) depends on its registrations.
 
@@ -835,6 +860,7 @@ test it names:
 | SES: the domain's addresses in the `pm-retired-{n}` receipt rules (`prune_retired_rules`, run by `remove_domains`) | M23 | `it::erasure::tenant_ses_rows` (lands in M23) |
 | Person rows: deleting every person left with no workspace ([Privacy §6.9](design/privacy.md#69-people-console-accounts)) | M24 | `it::erasure::person_scope`; assertions on people left with no workspace in `it::erasure::tenant_console_rows` |
 | Notifier: `notification_prefs` in `delete_d1_rows`, and `Notifier` `delete_all` | M26 | Notifier assertions in `it::erasure::tenant_console_rows` and `it::erasure::person_scope` |
+| Service accounts: `service_accounts` in `delete_d1_rows` (tenant scope) and in `scrub_control_plane` (identity scope) | M27 | `it::accounts::erasure_and_retention` |
 
 ---
 
@@ -843,7 +869,8 @@ test it names:
 **Files:** `mcp/{mod.rs, transport.rs, tools.rs, schemas.rs, prompts.rs}`.
 
 **Implements:** FR-MCP-1 and the tool list in [MCP reference](../reference/mcp.md), including the two
-signing tools of M25 (`mail_sign_assertion`, `mail_sign_http_request`).
+signing tools of M25 (`mail_sign_assertion`, `mail_sign_http_request`). M27 later adds
+`mail_request_account` and `mail_list_accounts` to the same table and its table test.
 
 **Acceptance:**
 
@@ -985,6 +1012,9 @@ including identity-key management on the identity page ([Agent signing keys §6]
   assertions to it (M23's SES rows have their own test, `it::erasure::tenant_ses_rows`).
 - The global retention job's `console` step (`login_tokens`, `sessions`, and invitations expired or
   revoked more than 30 days ago) is added here: `it::retention::global_console_rows`.
+- The workspace policy page `/console/settings/policy` ([Workspace policy §6](design/workspace-policy.md#6-the-console-page)),
+  on M5's `policy::write` and `policy::view`: `it::console::policy_page`; owners and admins hold
+  `policy:write` in their session's permission set.
 
 ---
 
@@ -1196,6 +1226,46 @@ column are in `0001_init.sql`). Hooks in other milestones' files, each reviewed 
 
 ---
 
+## M27 · Service sign-up ledger (after M7, M8, M14, M15, M16 and M21)
+
+**Files:** `crates/core/src/accounts.rs` (request normalisation, the match rule and the gate, pure),
+`crates/worker/src/accounts/{mod.rs, service.rs}`, `handlers/accounts.rs` (the eight `…/accounts`
+routes), `console/pages/accounts.rs`; no migration (`service_accounts`, `tenants.partner_ceilings_json`,
+the mailbox's `verifications.account_id` and the `account_unapproved` quarantine reason are in
+`0001_init.sql` and mailbox schema v1). Hooks in other milestones' files, each reviewed by that file's
+owner:
+
+| File | Hook |
+|---|---|
+| `consumers/inbound.rs` (M7) | Step 12: the approved-entries query when `accounts.require_approval` is on and the message has a verification match; `IngestInput.approved_accounts` |
+| `mailbox/ingest.rs` (M7) | Quarantine rule 4a (`account_unapproved`), and `verifications.account_id` |
+| `handlers/wait.rs` (M7) | The `403 policy_denied` (`account_not_approved`) check for `kind=verification`, and the entry re-check before a release |
+| `jobs/erasure.rs`, `jobs/retention.rs` (M14) | The `service_accounts` rows of identity and tenant erasure; the global retention job's `service_accounts` step |
+| `mcp/tools.rs` (M15) | `mail_request_account` and `mail_list_accounts`, with their rows in M15's table test |
+| `crates/cli/src/commands/accounts.rs` (M16) | `pmail accounts request\|list\|get\|approve\|reject\|close\|delete` |
+| `console/pages/overview.rs` (M24) and the Notifier's needs-a-person counts (M26) | The pending sign-ups item of "Needs a person" |
+
+**Implements:** FR-IDN-10 and edge rows E9–E14, with E5's ledger part
+([Service sign-up ledger](design/service-accounts.md)), and the cross-tenant suite's new routes (NFR-SEC-1).
+
+**Acceptance:**
+
+- Edge rows E9–E14, with the tests named in the register: `it::accounts::e9_unapproved_code_held` (E9, and
+  E5's ledger part), `core::accounts::e10_match_rules` and `it::accounts::e10_matched_code_released` (E10),
+  `it::accounts::e11_key_approval_rule` (E11), `it::accounts::e12_limits_and_expiry` (E12),
+  `it::accounts::e13_closed_entry_holds_codes` (E13) and `it::accounts::e14_own_deployment_refused` (E14).
+- `core::accounts::normalise_request`, `it::accounts::lifecycle_events_and_audit` (the four `account.*`
+  events delivered through M8's fan-out to tenant, partner and platform endpoints) and
+  `it::accounts::scope_matrix`; the eight routes join `it::security::cross_tenant_matrix`.
+- Erasure and retention: `it::accounts::erasure_and_retention` fills the M14 stub row and adds the
+  `service_accounts` step of the global retention job.
+- `it::console::accounts_page`; the page joins `browser::console::no_js` and `browser::console::axe_scan`.
+- `it::mcp::accounts_tools`; `sdk::coverage::every_operation` still passes with the eight new operations.
+- With `accounts.require_approval` off, the M7 suites (`it::wait::e4_*`, `it::inbound::e5_unsolicited_otp`)
+  pass unchanged.
+
+---
+
 ## M20 · Staging deploy and live proof
 
 **Implements:** NFR-OPS-1 (the timed rehearsal, step 12) and the live measurements of NFR-REL-3,
@@ -1252,3 +1322,27 @@ the ones marked manual there need a person in a browser and run with `cargo xtas
     unsubscribe turns that kind off (`live::notify::gmail_one_click_unsubscribe`, manual).
 
 **v1.0 release criteria:** [PRD §9](prd.md#9-release-criteria-v10).
+
+---
+
+## M28 · Cloud production commissioning (after M20)
+
+**Files:** none in the repository. The owner keeps the rendered production `deploy/wrangler.toml`, the
+check results and the gate notes in a private operations repository ([Cloud commissioning](cloud-commissioning.md)).
+
+**Implements:** FR-OPS-5: the production configuration of [Cloud commissioning §4](cloud-commissioning.md#4-production-configuration)
+and its default policy (§5), the scoped Cloudflare tokens (§3), Stripe live mode (§6), the OAuth
+applications (§8), SES in `eu-west-2`, the Pylota partner and Pylota's two tenants (§7), and the three
+phases of §2.
+
+**Acceptance:**
+
+- Gate A ([Cloud commissioning §10](cloud-commissioning.md#10-go-live-gates)): checks CC1–CC14, CC18 and CC19
+  pass on production; the fresh-agent dry run finds no difference between the docs and the deployed
+  configuration; the independent adversarial agent review finds nothing rated high; `PM_SIGNUP=waitlist`
+  with no invitation sent. Pylota's backend creates operator workspaces with its partner key.
+- Gate B: 14 days of Pylota on Cloud with no service-owned edge row failing in production; checks CC15–CC17;
+  DMARC at `p=quarantine`. Waitlist invitations start.
+- Gate C: the [pre-release checklist](design/security.md#16-pre-release-checklist) complete; 30 days of
+  phase B within the auto-pause thresholds; DMARC at `p=reject`; a second dry run and review on the
+  phase-C configuration. `PM_SIGNUP=open`: Pylota Mail Cloud is public.
