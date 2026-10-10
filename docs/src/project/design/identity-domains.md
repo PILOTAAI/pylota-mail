@@ -51,7 +51,8 @@ normal outbound pipeline.
   address of `PM_SYSTEM_FROM` (default `Pylota Mail <no-reply@{PM_PLATFORM_DOMAIN}>`): an `identities`
   row with `is_system = 1`, `username` = the address's local part, `display_name` = its display name,
   `owner_name = 'Operator'` and `owner_email` = setup's `--owner-email` (else
-  `postmaster@{PM_PLATFORM_DOMAIN}`), and `send_policy.daily_cap` = 50,000; plus one `active` primary
+  `postmaster@{PM_PLATFORM_DOMAIN}`), `send_policy.daily_cap` = 50,000 and
+  `send_policy.require_known_recipient` = `false` (it writes to people who have never been written to); plus one `active` primary
   address on the platform domain. Setup writes both rows with `mailbox_do_id = ''`, and the every-minute
   cron mints the mailbox and sends `MailboxRequest::Init`, as the [monitor hook](#create) does for
   domains. At most one row has `is_system = 1` (a partial unique index).
@@ -65,7 +66,9 @@ normal outbound pipeline.
   `404 identity_not_found`. Only a platform key reads or changes it, by ID. It is not counted against
   `inboxes`.
 - **Mail sent to it** is stored in its mailbox like any identity's (bounces and replies to sign-in mail),
-  readable only with a platform key.
+  readable only with a platform key. Its mailbox stores bodies with links and codes redacted, is never
+  indexed or triaged, and is outside every tenant fan-out, export and tenant webhook
+  ([Inbound › The system identity's mailbox](inbound.md#the-system-identitys-mailbox), [A15](../edge-cases.md)).
 - **Exempt from the tenant daily cap and from abuse auto-pause.** Its sends are not counted against the
   default tenant's `tenant_daily_send_cap`; its own `send_policy.daily_cap` (50,000) still applies
   ([Outbound › Policy pipeline](outbound.md#policy-pipeline), step 18). The delivery consumer records its
@@ -230,13 +233,15 @@ tenant domains (`POST …/addresses`), are checked against the tenant set.
 
 **Role mail on a tenant domain.** Mail to `postmaster@` or `abuse@` a tenant domain that reaches the
 Worker (a catch-all apex) goes to the tenant's owner contact: the email of the member with role
-`owner`. `forward()` only reaches verified Email Routing destinations, so the `email()` handler instead
-sends the owner a new message from `postmaster@{PM_PLATFORM_DOMAIN}` through Email Sending, with the
-original attached as `message/rfc822` (its headers only when it is over 4 MiB), and accepts the original.
-Nothing is stored in a mailbox. A tenant without an owner falls back to `PM_SECURITY_CONTACT`, else
-`550 5.1.1` ([Inbound › Steps](inbound.md#steps)). Mail for `PM_SECURITY_CONTACT` (an email address,
-bare or `mailto:`) is sent the same way, as a new message, and never with `forward()`: `forward()`
-reaches only verified Email Routing destination addresses
+`owner`. `forward()` only reaches verified Email Routing destinations, so the message is instead relayed
+as a new send of the system identity, through the normal submit path with its suppressions, caps and
+idempotency, rate-limited per domain and per sender, with a hop header that refuses loops; the original
+is attached only when it passed authentication and has no risky attachment, otherwise its headers alone
+([Inbound › Role mail relay](inbound.md#role-mail-relay), [D14](../edge-cases.md)). Nothing is stored in a
+tenant mailbox. A tenant without an owner falls back to `PM_SECURITY_CONTACT`, else `550 5.1.1`
+([Inbound › Steps](inbound.md#steps)). Mail for `PM_SECURITY_CONTACT` (an email address, bare or
+`mailto:`) is relayed the same way, and never with `forward()`: `forward()` reaches only verified Email
+Routing destination addresses
 ([email handler](https://developers.cloudflare.com/email-service/api/route-emails/email-handler/),
 read 2026-10-09), and setup registers none.
 
@@ -1003,15 +1008,17 @@ per resolver, and `fallback_active`.
 
 ### Fallback behaviour
 
-- `fallback_active = (state ∈ {failing, suspended} OR (transport = ses AND SES sending is paused for the
-  account) OR (transport = cloudflare AND sending AND delivery_events = manual)) AND policy.domain_fallback`,
-  never for the platform domain. The service never sends as a domain whose authentication records
-  are broken (`failing`) or whose ownership signals changed (`suspended`) (FR-DOM-5). SES sending is
-  paused when the platform check reports `ses_sending_paused`
-  ([Health checks per method](domain-connections.md#6-health-checks-per-method)). A Cloudflare-transport
-  domain without an event subscription would send with no bounce, complaint or suppression handling, so it
-  uses the platform address until its subscription exists ([Kind `zone`](#kind-zone) step 7,
-  [H17](../edge-cases.md)).
+- `fallback_active = (state ∈ {failing, suspended} OR (transport = cloudflare AND sending AND
+  delivery_events = manual)) AND policy.domain_fallback`, never for the platform domain. The service never
+  sends as a domain whose authentication records are broken (`failing`) or whose ownership signals changed
+  (`suspended`) (FR-DOM-5). A Cloudflare-transport domain without an event subscription would send with no
+  bounce, complaint or suppression handling, so it uses the platform address until its subscription exists
+  ([Kind `zone`](#kind-zone) step 7, [H17](../edge-cases.md)). A pause is not a fallback case: while the
+  platform check reports `ses_sending_paused`
+  ([Health checks per method](domain-connections.md#6-health-checks-per-method)), and while the domain or
+  its tenant is sending-paused ([G12](../edge-cases.md)), queued sends are held, never moved to the shared
+  platform domain, whose reputation every tenant shares
+  ([Outbound › From address and fallback](outbound.md#from-address-and-fallback), [N10](../edge-cases.md)).
 - Fallback works the same for every connection method. An `smtp_relay` domain whose alignment probe
   fails twice becomes `failing` like any other
   ([§5.3](domain-connections.md#53-proving-alignment-the-probe)). The platform address always sends

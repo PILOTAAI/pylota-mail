@@ -75,16 +75,22 @@ events); `identity.deleted` is the one job event that sets it. `tenant_id` is `n
 Payloads are **thin**. They carry IDs, a summary, verdicts and up to `policy.webhook_text_bytes` of
 `extracted_text` (default 16 KB, maximum 64 KB). Fetch anything else through the API.
 
+Because the `message.*` and `verification.received` payloads carry mail, an endpoint that receives them
+can only be created, re-pointed or replayed by a key that also holds `messages:read` (and
+`quarantine:review` for `message.quarantined`) ([REST API › Webhooks](api.md#webhooks),
+[J29](../project/edge-cases.md)). Events of the deployment's system identity go to platform endpoints
+only.
+
 ## Event types
 
 ### Messages
 
 | Type | When | `data` |
 |---|---|---|
-| `message.received` | An inbound message is stored and visible | `message` (summary, see below), `thread_id`, `trust`, `extracted_text`, `extracted_text_truncated`, `attachments[]` (id, filename, content type, size) |
-| `message.quarantined` | An inbound message is stored but quarantined | as `message.received`, plus `quarantine_reason`. No `extracted_text` |
+| `message.received` | An inbound message is stored and visible | `message` (summary, see below), `thread_id`, `trust`, `extracted_text`, `extracted_text_truncated`, `attachments[]` (id, filename, content type, size); plus `reprocessed: true` when a re-parse emits it again ([J3](../project/edge-cases.md)): it is not new mail |
+| `message.quarantined` | An inbound message is stored but quarantined | as `message.received`, plus `quarantine_reason`. No `extracted_text`. `reprocessed: true` as for `message.received` |
 | `message.released` | A quarantined message was released | `message`, `released_by_key_id` (API release) or `released_by_user_id` (console release; the other is `null`), `reason` |
-| `message.triaged` | Triage finished (or failed) | `message_id`, `thread_id`, `triage` |
+| `message.triaged` | Triage finished (or failed) | `message_id`, `thread_id`, `triage` (with `version`, the triage logic version, and `run`, which counts completed runs) |
 | `message.sent` | The transport accepted an outbound message, or a person resolved an uncertain send as `sent` | `message`, `provider`, `provider_message_id` (`null` after a resolve), `sent_via_fallback` |
 | `message.delivered` | A recipient's server accepted it | `message_id`, `recipient`, `smtp_code` |
 | `message.deferred` | A temporary failure; the provider is retrying | `message_id`, `recipient`, `smtp_code`, `smtp_response` |
@@ -92,7 +98,7 @@ Payloads are **thin**. They carry IDs, a summary, verdicts and up to `policy.web
 | `message.complained` | A recipient reported spam | `message_id`, `recipient`, `suppressed: true` |
 | `message.rejected` | The transport refused it, at submission or, for some recipients, when the recipient's server rejected it after submission | `message_id`, `reason`, `detail` |
 | `message.failed` | It could not be sent | `message_id`, `reason` |
-| `message.uncertain` | The outcome is unknown; never resent automatically | `message_id`, `reason`, `fix` |
+| `message.uncertain` | The outcome is unknown; never resent automatically | `message_id`, `reason` (`transport_timeout`, `transport_connection_lost` or `provider_outcome_unknown`), `fix` |
 | `message.reconciled` | An uncertain send was matched to a provider event | `message_id`, `status` |
 | `message.suppressed` | Every recipient is suppressed | `message_id`, `recipients[]` |
 | `message.canceled` | Cancelled while queued | `message_id` |

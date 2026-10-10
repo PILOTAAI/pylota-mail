@@ -82,10 +82,11 @@ the thread lock, then fails with `409 thread_busy` (retryable, after `details.re
 - Recipients on the tenant's **send-block** list are not sent to: the send is accepted and their
   deliveries end `suppressed`. With `policy.send_allowlist_only: true`, only recipients on the
   **send-allow** list are sent to; the others are `suppressed` the same way.
-- With the identity's `send_policy.require_known_recipient: true`, the identity only delivers to
-  addresses it has already exchanged mail with; other recipients are `suppressed`
-  (`policy: unknown_recipient`), not refused with an error. Use it for agents that could be talked into sending
-  data to a new address ([E2](../project/edge-cases.md)).
+- `send_policy.require_known_recipient` is `true` by default: the identity only delivers to addresses
+  it has sent to before, to addresses on the send-allow list, and, in a reply, to the authenticated sender
+  it is answering. Mail received from an address does not make it known. Other recipients are
+  `suppressed` (`policy: unknown_recipient`), not refused with an error. Set it to `false` for an identity
+  that writes to new people by design, such as booking confirmations ([E2](../project/edge-cases.md)).
 - Suppressed recipients are skipped and the rest are delivered. See
   [Bounces, complaints and suppressions](#bounces-complaints-and-suppressions).
 
@@ -445,7 +446,7 @@ If the tenant sets `domain_fallback: false`, sends from a failing domain fail in
 Test tenants send to a simulator instead of the internet. Mail to `*@simulator.invalid` produces a
 scripted outcome by local part: `delivered@`, `bounce@`, `softbounce@`, `complaint@`, `deferred@`,
 `reject@` and `timeout@`. `timeout@` produces an `uncertain` send, which is the best way to test your
-handling of [uncertain sends](#uncertain-sends) ([L2](../project/edge-cases.md)). Mail to identities on
-the same deployment is delivered internally; every other recipient is refused with
-`403 test_mode_recipient`. See
+handling of [uncertain sends](#uncertain-sends) ([L2](../project/edge-cases.md)). Mail to identities of the
+same tenant, or of a tenant with the same partner, is delivered internally; every other recipient,
+other workspaces on the same deployment included, is refused with `403 test_mode_recipient`. See
 [Quickstart › Try it without sending real mail](../quickstart.md#try-it-without-sending-real-mail).

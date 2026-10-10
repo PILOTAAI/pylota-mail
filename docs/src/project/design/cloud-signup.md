@@ -279,7 +279,9 @@ An unknown plan value means `free`.
    OAuth flow), shown when the person has no workspace and no pending invitation. The fields are the
    workspace name, the address suffix (pre-filled from the name, for example `.brightwell`, with the
    resulting example address shown under it) and the time zone, plus the plan in a hidden field. A taken
-   suffix returns the form with `suffix_taken` ([W33](../edge-cases.md)). The form returns with
+   suffix, or one whose confusable fold equals another workspace's, returns the form with `suffix_taken`
+   ([W33](../edge-cases.md)), and one that folds to a reserved name with `address_reserved`
+   ([D12](../edge-cases.md), [REST API › Tenants](../../reference/api.md#post-v1tenants)). The form returns with
    `workspace_limit` when this person, or another person whose address is the same mailbox with a
    different `+tag` (the local part compared with everything from the first `+` removed, through
    `users.email = ?base OR users.email LIKE ?pattern ESCAPE '\'`), already owns a workspace on the

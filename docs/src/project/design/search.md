@@ -1,8 +1,8 @@
 # Search
 
 Binding design for keyword, semantic, hybrid and agentic search, the indexing pipeline behind them,
-contacts and related-message lookup, and the quality gates. It implements FR-SRCH-1 to FR-SRCH-11,
-NFR-PERF-3 to NFR-PERF-6 and NFR-QUAL-1/2, and the edge-case rows F1–F15, B12 and E1 in the
+contacts and related-message lookup, and the quality gates. It implements FR-SRCH-1 to FR-SRCH-13,
+NFR-PERF-3 to NFR-PERF-6 and NFR-QUAL-1/2, and the edge-case rows F1–F17, A15, B12, E1 and I10 in the
 [edge-case register](../edge-cases.md). The `wait` long-poll (E4) is specified in
 [Inbound › The `wait` handler](inbound.md#the-wait-handler-e4).
 
@@ -57,14 +57,14 @@ These steps run in the front Worker (`handlers/search.rs`) for every mode, in th
    A missing permission returns `403 permission_denied` with `details.required`.
 2. **Scope.** The identity route requires a key that reaches that identity
    ([Architecture §3](../architecture.md#3-tenancy-and-isolation)). The tenant route requires a key of
-   level `tenant` (its own tenant) or `platform`. An identity key on the tenant route gets
+   level `tenant` (its own tenant), `partner` (a tenant whose `partner_id` is the key's partner; any
+   other tenant is `404 tenant_not_found`) or `platform`. An identity key on the tenant route gets
    `403 scope_denied` ([F3]). Scope is never read from the body (FR-KEY-3).
 3. **Rate limit.** `RL_SEARCH` (120 per minute, keyed by API key ID) for keyword, semantic and hybrid.
-   Agentic uses `RL_AGENTIC` (20 per minute) and the tenant's daily cap
-   (`policy.search.agentic_daily_cap`, counted by `QuotaRequest::CountAgentic` in `TenantQuota` metric
-   `agentic` for the day in the tenant's time zone); a spent cap returns
-   `429 agentic_budget_exhausted`. `policy.search.agentic_enabled = false` returns
-   `422 agentic_disabled`.
+   Agentic uses `RL_AGENTIC` (20 per minute). `policy.search.agentic_enabled = false` returns
+   `422 agentic_disabled`. The tenant's daily agentic cap is not touched here: it is counted once, at
+   agentic **Init** ([§11.2](#112-state-machine)), after the body, cursor and query are valid, so a
+   request refused with a `400` or `403` never uses it.
 4. **Validate the body** into `SearchRequest` (below). Out-of-range values return `400 invalid_request`
    with `details.errors[]`. `include_quarantined: true` from a key without `quarantine:review` is
    filtered silently: the request runs as if it were `false`, and quarantined mail stays out of the
@@ -80,7 +80,7 @@ These steps run in the front Worker (`handlers/search.rs`) for every mode, in th
 9. **Assemble** hits, snippets, `why`, facets, `semantic_coverage`, `degraded`, `as_of` and
    `next_cursor`, then apply the byte cap ([§5.9](#59-response-byte-cap)).
 10. **Account**: `QuotaRequest::RecordUsage { metric: Search, n: 1 }` for keyword, semantic and hybrid
-    searches (an agentic search was already counted by `CountAgentic` at step 3; the roll-up flushes both to
+    searches (an agentic search was already counted by `CountAgentic` at its Init; the roll-up flushes both to
     `usage_daily`, [Outbound › TenantQuota](outbound.md#tenantquota)). Log mode, latency, hit count
     and `query_hash = hex(HMAC-SHA256(PM_HASH_KEY, q))[..16]`. The query text is never logged
     (FR-PRV-6).
@@ -734,6 +734,7 @@ pub enum IndexJob {
     Triage         { tenant_id: String, identity_id: String, message_id: String,
                      #[serde(default)] reason: TriageReason, #[serde(default)] attempt: u32 }, // triage.md
     DeleteVectors  { tenant_id: String, vector_ids: Vec<String> /* ≤ 500 */, #[serde(default)] also_next: bool },
+    // Embed and Triage also carry `#[serde(default)] deferrals: u32` (Workers AI fair use, below)
     Reconcile      { tenant_id: String, identity_id: String, run_date: String /* YYYY-MM-DD, § 6.6 */ },
 }
 #[derive(Default)]
@@ -754,6 +755,44 @@ re-enqueue: it records its final outcome, as each job's table says. Only an
 unexpected error (a bug, a panic) is left to the queue's `retry()` and, after 10 deliveries, the
 dead-letter queue.
 
+**Job kinds before their milestone.** M7 defines the whole `IndexJob` enum but builds only the
+`AttachmentText` arm ([Build plan › M7](../build-plan.md#m7--inbound-track-1)). Until M10 and M12 fill
+in theirs, the consumer acks the other kinds without work and increments
+`index_job_unimplemented_total{kind}`: `Embed` writes no chunk rows (the message counts as not covered,
+so `semantic_coverage` stays below 1), `Reconcile` reports nothing, `DeleteVectors` has no vectors to
+delete, and `Triage` leaves `triage_status = 'pending'`. Nothing is retried or dead-lettered. M10's
+first nightly reconciliation embeds the messages that have no chunk rows ([§6.6](#66-nightly-reconciliation));
+triage is not backfilled. No deployment runs these stubs in production: the first staging deploy is
+M20, after every arm exists.
+
+**Workers AI fair use ([F16](../edge-cases.md)).** Workers AI rate limits are per account and per task
+type: 300 requests per minute for text generation (the triage model and the planner) and 3,000 for text
+embeddings ([Workers AI limits](https://developers.cloudflare.com/workers-ai/platform/limits/), read
+2026-10-10; neither `PM_TRIAGE_MODEL` nor `PM_AGENT_MODEL` is marked as needing the Workers Paid plan
+on its model page, read 2026-10-10, so the 20-per-minute limit of paid models does not apply). The page
+does not say whether two text-generation models share one limit, so the design assumes they do. On Pylota
+Mail Cloud every tenant shares the account, so each tenant gets a share:
+
+- `RL_AI` (60 per 60 s, keyed by tenant ID) is asked before every text-generation call: a triage model
+  call, an agentic planning call and an answer call. `RL_EMBED` (600 per 60 s, keyed by tenant ID) is
+  asked before every embedding request (one batch of up to 16 texts, or one query embedding). One tenant
+  therefore takes at most a fifth of either account limit. The rate-limiting bindings are approximate
+  and per location ([Security § 10](security.md#10-rate-limiting-and-abuse)), which is enough for a
+  share.
+- A refused **background** job (`Embed`, `Triage`) is **deferred**: re-enqueued with the same `attempt`
+  and `delay_seconds = 60 + jitter(0..30)`, with `deferrals + 1` in the job body, and
+  `ai_deferred_total{kind}` incremented. A deferral is not a failure; after 120 deferrals (about 2
+  hours) a `Triage` job records `skipped` with reason `ai_unavailable` and an `Embed` job acks and
+  leaves its rows `pending` for the nightly reconciliation.
+- A Workers AI rate-limit answer (the account limit, reached by all tenants together) is treated the
+  same way for background jobs, and also increments `ai_rate_limited_total{task}`.
+- **Interactive** calls are never queued: a refused query embedding makes semantic and hybrid search
+  fall back to keyword with `degraded: true` (as for any embedding failure, [§8](#8-semantic-query-path));
+  a refused planning or answer call is handled as a model error in the agentic state machine
+  ([§11.2](#112-state-machine) step 3).
+- The `ai_backlog` alert ([Observability](observability.md#53-alert-list)) fires when
+  `ai_deferred_total` exceeds 1,000 in 15 minutes, or `ai_rate_limited_total` exceeds 20 in 5 minutes.
+
 ### 6.1 When jobs are created
 
 | Event | Job |
@@ -763,6 +802,9 @@ dead-letter queue.
 | Quarantined message released | `Embed { reason: Release }` |
 | Attachment text written (`text_status = 'ready'`) | `Embed { reason: AttachmentText }`, queued by the mailbox after it rewrites the FTS row ([Inbound](inbound.md#attachment-text-extraction)) |
 | Outbound message canceled, or a message erased or purged | `DeleteVectors` with the message's vector IDs |
+
+The system identity's mailbox creates none of these jobs ([Inbound › The system identity's mailbox](inbound.md#the-system-identitys-mailbox),
+[A15](../edge-cases.md)).
 
 ### 6.2 Chunking
 
@@ -809,7 +851,8 @@ bytes, under the 64-byte limit.
 ### 6.3 Embed job
 
 1. The consumer calls the mailbox `index.source(message_id)`. The mailbox returns `Skip` if the
-   message no longer exists or its status is `hidden`, `throttled` or `quarantined`. Otherwise it
+   message no longer exists, its ID is in `erased_ids`, or its status is `hidden`, `throttled` or
+   `quarantined`. Otherwise it
    returns the subject, `extracted_text` (or `text`), `sender_domain`, direction, `verdict`, thread ID,
    message date, the attachment list with `text_r2_key`, and the existing chunk rows.
 2. The consumer reads attachment text from R2 and runs `chunk`.
@@ -849,7 +892,9 @@ bytes, under the 64-byte limit.
    An upsert replaces any existing vector with the same ID in full (Vectorize client API, read
    2026-10-09).
 6. `index.mark(vector_ids, 'embedded', model_tag)` for the upserted rows; `failed` for rows whose
-   embedding or upsert failed.
+   embedding or upsert failed. When the message was erased while the job ran (its row is gone or its ID
+   is in `erased_ids`), `mark` answers `Erased`: the consumer calls `deleteByIds` on every vector ID it
+   upserted (on both indexes during a re-embed) and acks ([I10](../edge-cases.md)).
 7. `deleteByIds` for the `deleting` IDs, then `index.drop_deleting(ids)`.
 8. If any row is `failed`, the consumer re-enqueues the job with `attempt + 1` and
    `delay_seconds = min(30 · 2^attempt, 3600)`, then acks. A retry re-runs the whole job; embedded rows
@@ -946,10 +991,24 @@ deletes message rows:
 3. In the mailbox transaction: `DELETE FROM fts WHERE rowid = ?`, `DELETE FROM fts_tri WHERE rowid = ?`,
    then the message row (cascading to `refs`, `chunks`, `labels`, `attachments`, `deliveries`,
    `verifications`).
+   The same transaction inserts each message ID into `erased_ids`, the tombstone that async writers
+   check ([Data model](data-model.md#mailbox-notes)).
 4. **Probes** for the receipt: a keyword probe (the erased message IDs and, for counterparty scope,
    the counterparty address as `participant:` filter) must return 0 hits; a semantic probe calls
-   `getByIds` on the deleted IDs, retried every 10 seconds for up to 2 minutes until it returns none.
-   The counts go into `receipt.probe.keyword_hits` and `receipt.probe.semantic_hits`.
+   `getByIds` on every vector ID a message can have, not only the listed ones (`{msg}:0` to `{msg}:63`
+   and `{msg}:a{k}:0` to `{msg}:a{k}:199` for each attachment position `k`, in batches of 20), retried every
+   10 seconds for up to 2 minutes until it returns none; an R2 probe lists the prefixes
+   `t/{ten}/i/{idn}/m/{msg}/` and `t/{ten}/i/{idn}/out/{msg}` and must find nothing (any object found is deleted and the probe repeated; this probe is not in the
+   receipt). The counts go into `receipt.probe.keyword_hits` and `receipt.probe.semantic_hits`.
+
+**Writers that race erasure ([I10](../edge-cases.md)).** An `Embed`, `AttachmentText` or post-commit
+attachment step can finish after the erasure transaction. Each re-checks after it writes: `index.mark`,
+`AttachmentTextReady` and `ConfirmStored` answer `Erased` for a message that is gone or in `erased_ids`,
+and the writer deletes what it wrote (vectors, `a/{att}.md` objects, attachment objects) before acking
+([Inbound › Post-commit](inbound.md#post-commit-attachments-and-index-jobs)). A writer that dies between
+its write and the re-check leaves an object the probe above finds, or the
+[orphan sweep](inbound.md#orphan-objects) deletes. `erased_ids` rows are kept for 7 days, longer than any
+job's retries.
 
 An identity-scope erasure lists every vector ID in the mailbox, deletes them, then calls `delete_all()`.
 
@@ -1118,9 +1177,12 @@ re-embed costs roughly that rate times the token volume of the indexed text.
 
 `POST /v1/tenants/{tenant_id}/search` (FR-SRCH-10, [F3], [F15]).
 
-1. **Identities**: `SELECT id, mailbox_do_id FROM identities WHERE tenant_id = ?1 AND status IN ('active','paused') ORDER BY id`
+1. **Identities**: `SELECT id, mailbox_do_id FROM identities WHERE tenant_id = ?1 AND status IN ('active','paused') AND is_system = 0 ORDER BY id`
    (cached per isolate for 30 seconds), narrowed by `identity_ids` if given. An ID in `identity_ids`
-   that is not in the tenant returns `404 identity_not_found`. More than 100 identities (or more than
+   that is not in this list (another tenant's, or the system identity) returns `404 identity_not_found`.
+   The system identity's mailbox is therefore never searched at tenant scope, and the Vectorize leg's
+   `identity_id` `$in` filter is built from this list, so its vectors (there are none) could not match
+   either ([A15](../edge-cases.md)). More than 100 identities (or more than
    100 IDs) returns `422 scope_too_large`.
 2. **Fan-out**: every keyword, read-back and facet call goes to the identity's mailbox, at most 20 in
    flight at once. Each identity has a deadline of **900 ms from the start of the fan-out**, raced
@@ -1192,16 +1254,18 @@ pub enum AgentStatus { Answered, InsufficientEvidence, BudgetExhausted, Degraded
 
 Transitions:
 
-1. **Init**: validate the budget; take the tenant's daily `agentic` count in `TenantQuota`
-   (`429 agentic_budget_exhausted` if spent); generate the fence nonce (16 Crockford base32
-   characters from the platform RNG).
+1. **Init**: validate the budget; then, once per search, `QuotaRequest::CountAgentic { tz, cap }` with
+   `cap = policy.search.agentic_daily_cap` counts the tenant's `agentic` metric for the day in the
+   tenant's time zone (`429 agentic_budget_exhausted` if it is spent; a request refused before Init is
+   never counted); generate the fence nonce (16 Crockford base32 characters from the platform RNG).
 2. **Seed** (step 0): run a hybrid search with the question text and the request filters, `limit` 8.
    Its hits are streamed at once as an `evidence` event (first evidence within 1.5 s, NFR-PERF-6) and
    given to the planner as the first tool result. It runs in parallel with the first planning call's
    request construction. If it fails, the loop continues without it.
-3. **Plan(k)**: call the model ([§11.4](#114-model-calls)). If it returns tool calls → **Act**. If it
-   returns no tool calls → **Answer**. An error or timeout on the first call → **Degraded**; on a later
-   call, retry once, then **Answer** if any evidence exists, else **Degraded**.
+3. **Plan(k)**: ask `RL_AI` for the tenant, then call the model ([§11.4](#114-model-calls)). If it
+   returns tool calls → **Act**. If it returns no tool calls → **Answer**. An error, a timeout or an
+   `RL_AI` refusal on the first call → **Degraded**; on a later call, retry once, then **Answer** if any
+   evidence exists, else **Degraded**. An `RL_AI` refusal is not retried.
 4. **Act**: validate each call against its JSON Schema; execute up to 4 in parallel
    ([§11.5](#115-planner-tools)). Invalid arguments, an unknown tool, a duplicate call or an ID not
    seen before become error results (they still count against the budget).
@@ -1436,6 +1500,15 @@ Execution rules:
   `DUPLICATE_CALL: already run at step <n>; refine the query`.
 - Quarantined messages are visible only when the request set `include_quarantined` with
   `quarantine:review`.
+- `contacts` runs the query of [§12.1](#121-contacts-search) with `limit` rows. At identity scope it
+  reads the one mailbox. At tenant scope it fans out to the identities of [§10](#10-tenant-scope-fan-out)
+  step 1 (never the system identity), with the same 20-in-flight limit and 900 ms deadline, and merges
+  the rows by `address`: `inbound_count` and `outbound_count` are summed, `first_seen_at` is the earliest,
+  `last_seen_at` the latest, `match_rank` the highest, and `name`, `last_thread_id` and `identity_id` come
+  from the row with the latest `last_seen_at`. Merged rows are ordered as in §12.1 and cut to `limit`. Each
+  `last_thread_id` joins the evidence set with that `identity_id`, so `read_thread` can open it. An
+  identity that misses the deadline is listed in the step's trace entry as `failed_identities`; the
+  response's `partial` covers it. Names and addresses are fenced like every other mail string.
 
 ### 11.6 Fencing mail content
 
@@ -1461,8 +1534,13 @@ Escaping, applied to every untrusted string before fencing (`core::injection::fe
 4. Facet values are domain names and category names; they are validated against
    `^[a-z0-9.-]{1,253}$` and `^[a-z0-9_]{1,32}$` and dropped if they fail, so they need no fence.
 
-The `why` line contains reference values (normalised to `[A-Z0-9:.+]`) and operator text; it is
-generated by the service.
+The `why` line is generated by the service from operator text and matched reference values. A
+reference value is written there only when `core::injection::fact_ref` accepts it (upper-cased, it
+matches `^[A-Z0-9][A-Z0-9:.+/-]{0,39}$`, and its kind is not `email` or `domain`;
+[Inbound › Reference extraction](inbound.md#reference-extraction)). Any other matched value (an address, a domain, a custom
+ref with `normalise: none`) is written as `ref:<kind>` alone, and the value itself reaches the model only
+inside the fence of the field it was found in, so up to 64 characters of attacker text never sit among
+the service's own lines ([E1](../edge-cases.md)).
 
 ### 11.7 Answer schema
 
@@ -1484,6 +1562,12 @@ generated by the service.
 }
 ```
 
+The answer the service returns is model-written text derived from mail, so it is marked as such: the
+response's `answer.untrusted` is always `true`, each kept sentence carries `citation_trust`, and each
+evidence item carries `steering_suspected` ([§11.8](#118-citation-verifier), FR-SRCH-13,
+[F17](../edge-cases.md)). Callers (and the MCP tool description) treat the answer as data to check,
+never as an instruction or as a statement by Pylota Mail.
+
 Extraction: take `choices[0].message.content`; strip a surrounding Markdown code fence if present;
 parse with `serde_json` into the typed struct with `deny_unknown_fields`. If parsing fails, use the
 **fallback path**: treat `content` as prose, split it into sentences ([§11.8](#118-citation-verifier)),
@@ -1502,9 +1586,12 @@ pub struct EvidenceItem {
     pub texts_seen: Vec<String>,   // every untrusted string the planner saw for this message:
                                    // subject, from, snippets, bodies, attachment pages (unfenced)
     pub refs: Vec<String>,         // normalised reference values of the message
+    pub authenticated: bool,       // outbound, or inbound with verdict `pass`
+    pub steering_suspected: bool,  // § 11.9
 }
 pub struct Removal { pub index: usize, pub reason: RemovalReason, pub excerpt: String /* ≤ 120 chars */ }
-pub enum RemovalReason { NoCitation, CitationNotInEvidence, QuoteNotFound, UnsupportedReference }
+pub enum RemovalReason { NoCitation, CitationNotInEvidence, QuoteNotFound, UnsupportedReference, UntrustedSource }
+pub enum CitationTrust { Authenticated, PartlyAuthenticated }
 ```
 
 Algorithm, per draft sentence in order:
@@ -1526,14 +1613,19 @@ Algorithm, per draft sentence in order:
    normalised value contains a digit and is at least 4 characters long (claim, invoice, plate and
    booking numbers, amounts; dates excluded) must appear in the `refs` of a cited message or, after
    normalisation, in its `texts_seen`. Otherwise remove (`UnsupportedReference`).
-7. Kept sentences are rendered `"<text> [msg_a][msg_b]"` and joined with single spaces into
-   `answer.text`. `answer.sentences` holds the kept items with their citations.
-8. If sentences were removed, `confidence = model_confidence × kept / total`.
-9. Each removal is recorded in the `answer` trace entry: `removed_sentences` (count) and `removed`
+7. **Source trust** ([F17](../edge-cases.md)). If any cited message is `steering_suspected`, or none of
+   the cited messages is `authenticated`, remove (`UntrustedSource`). Mail that tried to steer the model,
+   or whose sender cannot be shown, can still be read in `evidence`, but it cannot be restated as an
+   answer. A kept sentence gets `citation_trust = authenticated` when every cited message is
+   authenticated, else `partly_authenticated`.
+8. Kept sentences are rendered `"<text> [msg_a][msg_b]"` and joined with single spaces into
+   `answer.text`. `answer.sentences` holds the kept items with their citations and `citation_trust`.
+9. If sentences were removed, `confidence = model_confidence × kept / total`.
+10. Each removal is recorded in the `answer` trace entry: `removed_sentences` (count) and `removed`
    (list of `Removal`).
 
 `evidence[].quotes` lists, for each evidence message, the quoted fragments of kept sentences that were
-found in it.
+found in it, and `evidence[].steering_suspected` repeats the flag of [§11.9](#119-steering-detection).
 
 ### 11.9 Steering detection
 
@@ -1552,8 +1644,10 @@ the planner, and the executor watches the model's own calls. Signals:
 
 A message with at least one signal is marked `steering_suspected: true` in the evidence set and gets
 a trace entry `{ "step": k, "action": "steering_suspected", "message_id": "msg_…", "signals": [ … ] }`.
-The message stays usable as evidence (the facts in it may be real); the planner prompt already tells
-the model to treat it as data. Steering can never widen scope or filters, because the tools take no
+The message stays in the evidence set and is returned in `evidence` with `steering_suspected: true`
+(the facts in it may be real), but the verifier removes every answer sentence that cites it
+([§11.8](#118-citation-verifier) step 7); the planner prompt already tells the model to treat it as
+data. Steering can never widen scope or filters, because the tools take no
 scope arguments and the executor binds them.
 
 ### 11.10 Statuses and degradation
@@ -1591,7 +1685,7 @@ data: {"step":2,"action":"read_thread","thread_id":"thr_01JA…","ms":38}
 
 id: 4
 event: answer
-data: {"status":"answered","answer":{"text":"…","sentences":[…],"confidence":0.86},"degraded":false}
+data: {"status":"answered","answer":{"text":"…","sentences":[…],"confidence":0.86,"untrusted":true},"degraded":false}
 
 id: 5
 event: done
@@ -1735,12 +1829,15 @@ written there.
 | `it::auth::f2_permission` | A key without `search:read` gets `403 permission_denied` | [F2] |
 | `it::search::f3_tenant_scope_denied` | An identity key on the tenant route gets `403 scope_denied` | FR-SRCH-10, [F3] |
 | `it::search::f4_coverage` | Coverage formula with pending, failed, deleting and stale-model rows | FR-SRCH-7, [F4] |
-| `it::erasure::f6_probe_empty` | FTS rows, refs and vectors deleted; both probes return 0 | FR-SRCH-11, [F6] |
+| `it::erasure::f6_probe_empty` | FTS rows, refs and vectors deleted; the keyword, semantic and R2 probes return 0 | FR-SRCH-11, [F6] |
+| `it::erasure::race_with_index_jobs` | An `Embed` job paused between upsert and `mark`, an `AttachmentText` job paused before `AttachmentTextReady`, and a post-commit attachment put paused before `ConfirmStored` all resume after the message is erased: each gets `Erased` and deletes what it wrote, so the probe finds no vector for any `{msg}:*` ID and no object under the message's prefixes; a late `pm-inbound` retry of the erased message's pointer gets `identity_not_found` | FR-SRCH-11, [I10](../edge-cases.md) |
+| `it::index::f16_ai_fair_queue` | With `RL_EMBED` at 600 per minute, `Embed` jobs of one tenant over its share are deferred (`deferrals` increments, `attempt` does not) while another tenant's are embedded at once; an `Embed` job past 120 deferrals acks and leaves its rows `pending`; a Workers AI rate-limit answer defers background jobs and degrades an interactive hybrid search to keyword with `degraded: true`; `ai_backlog` fires past 1,000 deferrals in 15 minutes (the triage side is `it::triage::f16_rl_ai_deferral`) | [F16](../edge-cases.md) |
+| `it::index::job_kinds_before_milestone` | In an M7 build, `Embed`, `Triage`, `DeleteVectors` and `Reconcile` jobs ack without retry or dead letter, increment `index_job_unimplemented_total{kind}`, and leave `triage_status = 'pending'` (build plan M7) | §6 |
 | `it::search::f7_quarantine_hidden` | Quarantined mail is absent unless `include_quarantined` and `quarantine:review`; without `quarantine:review`, `include_quarantined: true` and `is:quarantined` are filtered silently (`200`, no quarantined hits, never `403`); semantic read-back also hides it | FR-IN-5, [F7] |
 | `it::search::f8_budget` | `limit` ≤ 50, `snippet_chars`, `group_by=thread`, 256 KB cap sets `truncated` and a continuing cursor | FR-SRCH-5, [F8] |
 | `it::index::f14_retry_and_reconcile` | Failed upserts retried; nightly reconciliation re-enqueues missing and failed rows; a retried `Reconcile` job does not count twice in `index_reconcile`; with the fake's `describe()` count offset by 2%, the drift alert fires on the second night and not the first, and an incomplete run raises nothing | [F14] |
 | `it::search::f15_partial` | A slow mailbox misses the 900 ms deadline; `partial: true`, `failed_identities` set | NFR-PERF-5, [F15] |
-| `it::index::b12_extraction_failure` | `attachment_text_unavailable` appears in `why` | [B12] |
+| `it::search::b12_unavailable_in_why` | A keyword hit on a message whose attachment has `text_status: unavailable` carries `attachment_text_unavailable` in `why` (the extraction side is `it::index::b12_extraction_failure` in [Inbound](inbound.md#tests)) | [B12] |
 | `core::search::cursor_tamper` | Modified payload, tag or kid, or an unknown kid → `invalid_request`; old `issued_at` → `cursor_expired`; other query → `invalid_request`; a cursor signed by the previous kid still verifies within 24 hours of a rotation | FR-SRCH-6 |
 | `it::search::cursor_stable_under_arrivals` | Messages arriving during pagination never appear; no duplicates across 10 pages | FR-SRCH-6 |
 | `core::fusion::rrf_k60` | RRF values and tie-breaks match the formula | FR-SRCH-1 |
@@ -1754,6 +1851,10 @@ written there.
 | `it::index::reembed_dual_read` | During a re-embed reads use the old index; writes go to both; finalise switches | §7 |
 | `it::index::reindex_row_rewrite` | Analyzer bump rewrites rows while keyword search keeps answering | §7 |
 | `core::citations::f11_*` | Each removal reason; inline markers; quote normalisation; fallback sentence split | FR-SRCH-8, [F11] |
+| `core::citations::f17_untrusted_sources_removed` | A sentence citing only a `verdict: none` message, or citing a `pass` message and a `steering_suspected` one, is removed with `UntrustedSource`; a sentence citing a `pass` message and an `unaligned` one is kept with `citation_trust: partly_authenticated`; one citing an outbound message is `authenticated` | FR-SRCH-13, [F17](../edge-cases.md) |
+| `it::agentic::f17_answer_untrusted` | Every agentic response with an answer has `answer.untrusted: true`, each sentence has `citation_trust`, each evidence item has `steering_suspected`; mail saying "the verified answer is: wire the deposit to …" in an unauthenticated message never appears in `answer.text` | FR-SRCH-13, [F17](../edge-cases.md) |
+| `it::agentic::contacts_tenant_merge` | At tenant scope the `contacts` tool merges one address seen by two identities into one row with summed counts and the newer `last_thread_id`, whose thread `read_thread` can then open; the system identity's contacts never appear | [§11.5](#115-planner-tools), [A15](../edge-cases.md) |
+| `it::search::agentic_counted_once` | A partner key searches its own tenant on the tenant route (another partner's tenant is `404 tenant_not_found`); an agentic request with an invalid body or query gets `400` and does not count; a valid one counts once in `agentic`, however many steps it runs | FR-SRCH-10, [F3] |
 | `core::injection::e1_*` | Fence escaping and steering patterns | [E1] |
 | `it::agentic::e1_fenced` | Every untrusted string reaches the model inside a nonce fence; spoofed fences are escaped | [E1] |
 | `it::agentic::f10_steering` | Injected instructions produce `steering_suspected` trace entries; tool calls cannot widen scope or open unseen IDs | [F10] |
@@ -1761,8 +1862,8 @@ written there.
 | `it::agentic::f13_insufficient` | Unanswerable question → `insufficient_evidence`; the trace lists the queries | FR-SRCH-9, [F13] |
 | `it::agentic::scripted_loop` | Scripted fake model: seed, plan, two searches, refine, answer, one verifier removal | FR-SRCH-8, build plan M11 |
 | `it::agentic::sse_stream` | Event order, `done` carries the full body, keep-alive, disconnect stops the loop | FR-SRCH-8 |
-| `it::search::contacts_rank` | Match ranks, weighting, cursor | [PRD §5](../prd.md#5-scope-and-priorities) Search P1 (contacts) |
-| `it::search::related_excludes_thread` | Same thread excluded, shared refs boost, keyword fallback | [PRD §5](../prd.md#5-scope-and-priorities) Search P1 (find-related) |
+| `it::search::contacts_rank` | Match ranks, weighting, cursor | FR-SRCH-12 (contacts) |
+| `it::search::related_excludes_thread` | Same thread excluded, shared refs boost, keyword fallback | FR-SRCH-12 (find-related) |
 | `xtask eval-search` (nightly) | recall@10 ≥ 0.90 hybrid, regression ≤ 0.01 | NFR-QUAL-1 |
 | `xtask eval-agentic` (nightly) | citation precision ≥ 0.98 | NFR-QUAL-2 |
 | `it::bench::keyword_p95` (benchmark, M10, nightly) | Keyword p95 ≤ 200 ms on 50,000 messages in workerd, seeded with the bulk-seed hook ([Testing § 6.9](testing.md#69-benchmarks)); reports the figure, warns above | NFR-PERF-3 |

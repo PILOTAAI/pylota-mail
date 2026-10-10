@@ -267,9 +267,9 @@ What you should do:
   ```
 
   Delimiting helps, but it is not a defence on its own. The defences are the next three points.
-- **Limit what the agent can do.** An agent that reads untrusted mail should hold a narrow key. Use
-  `send_policy.require_known_recipient` so it cannot write to an address it has never exchanged mail
-  with ([E2](../project/edge-cases.md)).
+- **Limit what the agent can do.** An agent that reads untrusted mail should hold a narrow key. Keep
+  `send_policy.require_known_recipient` on (the default), so it cannot write to an address it has never
+  written to, even one that sent it mail first ([E2](../project/edge-cases.md)).
 - **Keep approvals on risky actions.** Payments, changes to bank details, sharing documents with a
   new party and anything flagged by triage go to a person.
 - **Never act on links or attachments automatically.** Pylota Mail never fetches remote content in

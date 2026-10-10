@@ -6,9 +6,9 @@ mailbox.
 
 | | |
 |---|---|
-| Requirements | FR-IN-1 … FR-IN-9, FR-THR-1, FR-THR-2, FR-ADR-3, FR-ADR-5, FR-TEN-3, FR-DLV-5, FR-DOM-9, FR-DOM-10, FR-DOM-11, FR-SRCH-2, FR-SRCH-4, NFR-REL-1, NFR-REL-2, NFR-REL-3 |
-| Edge cases | [A2](../edge-cases.md), [A6](../edge-cases.md), [A9](../edge-cases.md), [A10](../edge-cases.md), [B1–B14](../edge-cases.md), [D1–D5](../edge-cases.md), [D7](../edge-cases.md), [D9](../edge-cases.md), [E4](../edge-cases.md), [E5](../edge-cases.md), [E9](../edge-cases.md), [E10](../edge-cases.md) and [E13](../edge-cases.md) (the ledger gate, [Service sign-up ledger](service-accounts.md)), [J1–J3](../edge-cases.md), [J7](../edge-cases.md), [L3](../edge-cases.md), [N1–N7](../edge-cases.md), [N12](../edge-cases.md), [N18](../edge-cases.md), [N19](../edge-cases.md), [N27](../edge-cases.md), [N28](../edge-cases.md) |
-| Code | `crates/worker/src/email.rs`, `handlers/wait.rs`, `handlers/hooks_ses.rs`, `crons/ses_backstop.rs`, `inbound/sources/{routing.rs, ses.rs}`, `consumers/inbound.rs`, `consumers/index.rs`, `mailbox/{ingest.rs, threads.rs, messages.rs, attachments.rs, outbox.rs}`; `crates/core/src/{mime/, sanitize.rs, text.rs, quote.rs, refs/, classify.rs, auth.rs, trust.rs, attach.rs, sns.rs}` |
+| Requirements | FR-IN-1 … FR-IN-12, FR-THR-1, FR-THR-2, FR-ADR-3, FR-ADR-5, FR-TEN-3, FR-DLV-5, FR-DOM-9, FR-DOM-10, FR-DOM-11, FR-SRCH-2, FR-SRCH-4, NFR-REL-1, NFR-REL-2, NFR-REL-3 |
+| Edge cases | [A2](../edge-cases.md), [A4](../edge-cases.md), [A6](../edge-cases.md), [A9](../edge-cases.md), [A10](../edge-cases.md), [A15](../edge-cases.md), [A16](../edge-cases.md), [B1–B14](../edge-cases.md), [C9](../edge-cases.md), [D1–D5](../edge-cases.md), [D7](../edge-cases.md), [D9](../edge-cases.md), [D11–D14](../edge-cases.md), [E4](../edge-cases.md), [E5](../edge-cases.md), [E9](../edge-cases.md), [E10](../edge-cases.md) and [E13](../edge-cases.md) (the ledger gate, [Service sign-up ledger](service-accounts.md)), [I9](../edge-cases.md), [I10](../edge-cases.md), [J1–J3](../edge-cases.md), [J7](../edge-cases.md), [L3](../edge-cases.md), [N1–N7](../edge-cases.md), [N12](../edge-cases.md), [N18](../edge-cases.md), [N19](../edge-cases.md), [N27](../edge-cases.md), [N28](../edge-cases.md) |
+| Code | `crates/worker/src/email.rs`, `handlers/{wait.rs, threads.rs, messages.rs, quarantine.rs}`, `handlers/hooks_ses.rs`, `crons/ses_backstop.rs`, `inbound/sources/{routing.rs, ses.rs}`, `inbound/role_mail.rs`, `consumers/inbound.rs`, `consumers/index.rs`, `mailbox/{ingest.rs, threads.rs, messages.rs, read.rs, attachments.rs, outbox.rs}`; `crates/core/src/{mime/, sanitize.rs, text.rs, quote.rs, refs/, classify.rs, auth.rs, trust.rs, attach.rs, sns.rs}` |
 | Related | [Threading](threading.md), [Outbound](outbound.md) (delivery events, loopback), [Search](search.md) (indexing), [Triage](triage.md), [Webhooks](webhooks.md), [Domains on any DNS host](domain-connections.md) (SES receiving, probes, forwarding checks) |
 
 ```text
@@ -83,7 +83,7 @@ pub trait InboundEmail {
 }
 
 // crates/worker/src/email.rs
-pub enum TempFail { Storage, Queue, TenantSuspended, Forward, Check }
+pub enum TempFail { Storage, Queue, TenantSuspended, RoleRate, Busy, Check }
 pub async fn handle_email<P: Platform>(p: &P, msg: &impl InboundEmail) -> Result<(), TempFail>;
 ```
 
@@ -119,7 +119,7 @@ setup registers no Email Routing destination address
    |---|---|
    | `journal`, with a detail | Outbound Message-ID learning (spike S7 strategy B). Handled entirely here, see [Outbound](outbound.md#message-id-of-outbound-mail-spike-s7). Nothing is stored; the handler returns `Ok` |
    | `pm-probe`, with a detail | The alignment probe of an `smtp_relay` domain ([Domains on any DNS host § 5.3](domain-connections.md#53-proving-alignment-the-probe), [N18](../edge-cases.md)); the detail is the probe token. The handler copies the (small) message into wasm memory, checks that the `From` header still names the domain's `probe_from`, and evaluates DMARC for that domain with steps 1–6 of [Authentication verdict](#authentication-verdict) (an aligned DKIM signature, or SPF on an aligned MAIL FROM). It sends `{ token, from_unchanged, dkim_d, dmarc }` to that domain's `DomainMonitor`, which records the probe result. Nothing is stored or counted, and the handler returns `Ok`, also for an unknown or expired token. If the monitor cannot be reached, `Err(TempFail::Check)`, so the relay retries |
-   | An RFC 2142 operational name (`postmaster`, `abuse`, `security`, `hostmaster`, `webmaster`, `noc`) | If `PM_SECURITY_CONTACT` is an email address (bare or `mailto:`), read the raw message and send that address a new message from `postmaster@{PM_PLATFORM_DOMAIN}` through the `EMAIL` binding, with the original attached as `message/rfc822` (only its headers above 4 MiB), as for tenant role mail below; `forward()` is not used, because it reaches only verified Email Routing destinations and setup registers none. A send error returns `Err(TempFail::Forward)`. If it is unset or not an email address, reject `550 5.1.1`. These names are reserved on the platform domain, so no identity can own them ([A4](../edge-cases.md)) |
+   | An RFC 2142 operational name (`postmaster`, `abuse`, `security`, `hostmaster`, `webmaster`, `noc`) | Relayed to `PM_SECURITY_CONTACT` through the system identity, as [Role mail relay](#role-mail-relay) specifies. If `PM_SECURITY_CONTACT` is unset, is not an email address (bare or `mailto:`), or routes back into this deployment, reject `550 5.1.1`. These names are reserved on the platform domain, so no identity can own them ([A4](../edge-cases.md)) |
    | Any other reserved role name (`info`, `sales`, `support`, `marketing` and the rest of the RFC 2142 list) | No special handling: no identity can own them, so the directory lookup (step 4) finds nothing and step 5 rejects `550 5.1.1` |
 
    **Forwarding check** ([Domains on any DNS host § 4.4](domain-connections.md#44-send_only), [N12](../edge-cases.md)).
@@ -128,7 +128,8 @@ setup registers no Email Routing destination address
    recipient is the platform address of the identity that owns the tested address, the monitor sets the
    address's `forwarding` to `ok` and `forwarding_checked_at`; the message is not stored and the handler
    returns `Ok`. An unknown or expired token changes nothing, and the message continues to step 4 like
-   any other mail.
+   any other mail. This token is the only proof that mail came through the customer's forwarder:
+   ordinary mail never changes `forwarding` ([Multiple identities in one tenant](#multiple-identities-in-one-tenant-a9)).
 
    **Check tokens.** Probe and forwarding-check tokens have the form
    `{domain ULID, lower case}.{16 random Crockford base32 characters}` (at most 52 characters with the
@@ -140,20 +141,69 @@ setup registers no Email Routing destination address
 
    **Tenant-domain role addresses** (any other domain, and `base_local` is `postmaster` or `abuse`; both
    are reserved on tenant domains, so no address row can exist): look up the domain's tenant and its owner
-   (`SELECT d.tenant_id, u.email FROM domains d LEFT JOIN members m ON m.tenant_id = d.tenant_id AND m.role = 'owner' LEFT JOIN users u ON u.id = m.user_id WHERE d.name = ?1 AND d.kind <> 'platform' AND d.state NOT IN ('removing', 'removed')`).
-   With an owner, read the raw message and send the owner a new message from
-   `postmaster@{PM_PLATFORM_DOMAIN}` through the `EMAIL` binding (subject
-   `"[{domain}] {base_local} mail: " + original subject`, the original attached as `message/rfc822`, or
-   only its headers when it is over 4 MiB), then return `Ok` without storing anything. `forward()` is not
-   used because it only reaches verified Email Routing destinations. A send error returns
-   `Err(TempFail::Forward)`. Without an owner, handle it as the platform-domain row above
+   (`SELECT d.id, d.tenant_id, d.monitor_do_id, u.email FROM domains d LEFT JOIN members m ON m.tenant_id = d.tenant_id AND m.role = 'owner' LEFT JOIN users u ON u.id = m.user_id WHERE d.name = ?1 AND d.kind <> 'platform' AND d.state NOT IN ('removing', 'removed')`).
+   With an owner whose address does not route back into this deployment, relay the message to the owner
+   as [Role mail relay](#role-mail-relay) specifies. Otherwise handle it as the platform-domain row above
    (`PM_SECURITY_CONTACT`, else `550 5.1.1`). The other role names (`support`, `sales`, `info` and the
    rest) are ordinary addresses on tenant domains and go through steps 4 and 5
    ([Identities and domains › Username validation](identity-domains.md#username-validation)).
 
+   #### Role mail relay
+
+   Role mail is attacker-reachable, so it is relayed as ordinary outbound mail of the
+   [system identity](identity-domains.md#the-system-identity), with every control a send has, and never
+   with `forward()` (which reaches only verified Email Routing destinations, and setup registers none) or a
+   direct `EMAIL` binding call ([A4](../edge-cases.md), [D14](../edge-cases.md)):
+
+   1. **Destination.** `PM_SECURITY_CONTACT` (platform domain, or a tenant without a usable owner) or the
+      tenant owner's address. A destination **routes back into this deployment** when its domain is
+      `PM_PLATFORM_DOMAIN` or the name of any `domains` row that is not `removed` (one D1 query, cached
+      for 60 seconds per isolate). Such a destination is never used: the owner falls back to
+      `PM_SECURITY_CONTACT`, and a `PM_SECURITY_CONTACT` that routes back counts as unset (`pmail doctor`
+      reports it as an error, and setup refuses it).
+   2. **Loop guard.** A message that already carries `X-Pylota-Mail-Role-Hop`, or whose envelope sender
+      is the system identity's address, is refused with `set_reject("550 5.4.6 Routing loop detected")`.
+   3. **Rate limits.** `DomainMonitorRequest::AdmitRoleMail { sender_hash, now }` on the destination
+      domain's `DomainMonitor` (the platform domain's for operational names) admits at most 30 role
+      messages an hour per domain and 5 an hour per envelope sender (`sender_hash` = hex
+      HMAC-SHA256(`PM_HASH_KEY`, lower-cased envelope sender, or `<>` for the null sender)), in hourly
+      windows kept in the monitor's storage for 48 hours. `Limited` → `Err(TempFail::RoleRate)`, so a real
+      sender retries later; an unreachable monitor → `Err(TempFail::Check)`.
+   4. **Accept.** Write the raw message to `inbound-staging/role/{yyyy}/{mm}/{dd}/{ulid}.eml` (step 6's
+      retries; the 1-day lifecycle rule on `inbound-staging/` is the backstop), queue
+      `InboundJob::RoleMail` with the destination, the domain and `base_local`, and return `Ok`. A failed
+      write or enqueue is `Err(TempFail::Storage)` or `Err(TempFail::Queue)` as in steps 6 and 7.
+   5. **Relay** (in the `pm-inbound` consumer). Authenticate the message with steps 1–7 of
+      [Authentication verdict](#authentication-verdict) and classify its attachments with
+      [Attachment safety](#attachment-safety). Then submit, through the system identity's internal submit
+      path (`MailboxRequest::Submit` on its mailbox, `kind: transactional`), a new message to the
+      destination: subject `"[{domain}] {base_local} mail: " + original subject` (control characters
+      removed, cut to 998 characters) and a short text body naming the original sender, date and verdict.
+      Its internal submit input carries `role_relay: true`, which makes the service add
+      `X-Pylota-Mail-Role-Hop: 1` and `Auto-Submitted: auto-generated` ([Outbound › Headers](outbound.md#headers));
+      like `list_unsubscribe`, the field exists only on the internal input. The original is
+      attached as `message/rfc822` (at most 4 MiB) only when its verdict is `pass`, none of its
+      attachments has a `risk` and none is `infected`; otherwise only its header block is attached as
+      `text/rfc822-headers` (at most 64 KiB), with no attachment of it. The submit's `Idempotency-Key` is
+      `role:{raw_sha256}:{hex HMAC-SHA256(PM_HASH_KEY, destination)[..16]}`, so a redelivered copy relays
+      once. The system identity's policy applies as to any send: suppressions, its daily cap, delivery
+      events and its sent copy. A submit error (for example a suppressed destination or a spent cap) is
+      final for that message: it is counted in `role_mail_failed_total{reason}` and the staging object is
+      deleted; the sender already had its `250`.
+   6. Delete the staging object and ack. Nothing is stored in a tenant mailbox.
+
+   For the SES source, the consumer runs steps 1–3 and 5–6 on the staged object directly (SES has already
+   accepted the message, so a refusal there is a drop, counted in `role_mail_failed_total{reason}`, never a
+   bounce).
+
 4. **Directory lookup.** The isolate keeps an LRU cache (`thread_local`, 10,000 entries) keyed by
-   `base`: hits are cached for 60 seconds, misses for 5 seconds. On a cache miss it runs, with a
-   2-second deadline:
+   `base`: hits and misses are both cached for 60 seconds (a negative entry only exists for an address
+   that received mail before it was created, so the delay it adds is rare). **Dictionary guard**
+   ([A16](../edge-cases.md)): the isolate also counts, per recipient domain, the lookups that ended in a
+   miss during the current second; once a domain has 20, further uncached addresses on that domain get
+   `Err(TempFail::Busy)` (a temporary failure, so a real sender retries) for the rest of that second,
+   without a D1 query, and `inbound_dictionary_guard_total` is incremented. Cached hits are unaffected.
+   On a cache miss it runs, with a 2-second deadline:
 
    ```sql
    SELECT a.status AS address_status, a.identity_id, a.tenant_id, i.mailbox_do_id,
@@ -202,7 +252,12 @@ setup registers no Email Routing destination address
 ### Staging when the directory is unavailable
 
 When the D1 lookup in step 4 fails transiently ([J7](../edge-cases.md)), the handler never rejects for
-our own outage:
+our own outage. It stages only mail that could be routable: the recipient domain must be in the isolate's
+list of deployment domains (the platform domain and every `domains` name that is not `removed`, refreshed
+every 5 minutes; an isolate that never loaded it stages any domain), and the local part must be a valid
+username form (`^[a-z0-9][a-z0-9._-]{0,63}$`). Anything else gets `550 5.1.1` without staging, so a
+dictionary attack during an outage is not answered with a `250` for every guess ([A16](../edge-cases.md)).
+The dictionary guard of step 4 applies here too.
 
 1. Key `inbound-staging/{yyyy}/{mm}/{dd}/{ulid}.eml` (UTC date, a bare ULID), custom metadata
    `envelope_to_hash` = hex `HMAC-SHA256(PM_HASH_KEY, base)`.
@@ -220,6 +275,7 @@ pub enum InboundJob {
     Message(InboundPointer),
     Staged(StagedPointer),
     Reparse(ReparsePointer),
+    RoleMail(RoleMailPointer),              // Role mail relay; never stored in a mailbox
 }
 
 #[derive(Serialize, Deserialize)]
@@ -267,7 +323,19 @@ pub struct ReparsePointer {
     pub v: u8, pub job_id: String, pub tenant_id: String, pub identity_id: String,
     pub message_id: String, pub parser_version: u32,
 }
+
+#[derive(Serialize, Deserialize)]
+pub struct RoleMailPointer {
+    pub v: u8, pub staging_key: String,     // inbound-staging/role/…, or inbound-staging/ses/{key} for SES
+    pub domain: String, pub base_local: String,         // postmaster, abuse, security, …
+    pub destination_kind: String,                       // "security_contact" | "tenant_owner"
+    pub tenant_id: Option<String>,                      // the domain's tenant, for "tenant_owner"
+    pub raw_size: u64, pub envelope_from: String, pub received_at: i64, pub request_id: String,
+}
 ```
+
+The destination address itself is never in the queue message: the consumer resolves it again
+(`PM_SECURITY_CONTACT`, or the owner query above).
 
 ## The SES source
 
@@ -299,9 +367,9 @@ the [consumer](#the-pm-inbound-consumer):
    ledger row is still `queued` means the lifecycle rule ran: the row becomes `lost` (with `done_at`),
    `ses_object_lost_total` is incremented, the `ses_object_lost` alert fires, and the pointer is acked
    ([N4](../edge-cases.md)).
-2. **Resolve** the recipient: normalise it as in `email()` step 2, handle tenant-domain `postmaster` and
-   `abuse` as in step 3 (the owner gets a copy; the platform domain never uses SES), and run the directory
-   lookup of step 4.
+2. **Resolve** the recipient: normalise it as in `email()` step 2, relay tenant-domain `postmaster` and
+   `abuse` mail as in [Role mail relay](#role-mail-relay) (the platform domain never uses SES), and run
+   the directory lookup of step 4.
 3. **Decide** (first match):
 
    | Directory result | Action |
@@ -333,8 +401,17 @@ Two recipients in one mailbox give one message (duplicate by hash, [B14](../edge
 
 ## The pm-inbound consumer
 
-`pm-inbound` has batch size 10 and 10 retries. The consumer processes messages one at a time (a batch
-could otherwise hold 250 MiB of raw mail in a 128 MB isolate) and acks each after its post-commit steps.
+`pm-inbound` has batch size 10, 10 retries and `retry_delay = 120` seconds (the consumer setting that
+delays every retried message, [Wrangler configuration](https://developers.cloudflare.com/workers/wrangler/configuration/),
+read 2026-10-10), so the ten retries of a message span about 20 minutes. The consumer processes messages
+one at a time (a batch could otherwise hold 250 MiB of raw mail in a 128 MB isolate) and acks each after
+its post-commit steps.
+
+**Poison messages.** A parser panic aborts the whole invocation, and every message of the batch that was
+not yet acked is retried. To keep one poison message from dragging fresh ones towards the dead-letter
+queue, the consumer first processes the pointers whose `received_at` is less than 120 seconds old (they
+have not failed before), acking each, and only then the older ones (they may have failed before), oldest
+last. A message is therefore retried with its batch-mates only when they are retries too.
 
 ### Steps
 
@@ -359,10 +436,16 @@ could otherwise hold 250 MiB of raw mail in a 128 MB isolate) and acks each afte
    a bug: ask the mailbox whether `message_id` exists; ack either way and count
    `inbound_raw_missing_total` when it does not.
 3. **Hash**: `raw_sha256 = hex(sha256(raw))`.
-4. **Parse** under caps (see [Parsing](#parsing)). **Degraded mode:** if the pointer is older than 15
-   minutes (`now - received_at > 900_000`), earlier attempts have failed (a parser panic aborts the
-   invocation, and `workers-rs` does not expose the attempt count), so the consumer parses headers
-   only, stores the message with `parse_degraded`, and never drops it (FR-IN-3).
+4. **Parse** under caps (see [Parsing](#parsing)). **Degraded mode:** `workers-rs` does not expose the
+   queue's attempt count, and a parser panic aborts the invocation before anything is recorded, so the
+   consumer counts attempts itself: just before parsing it calls
+   `MailboxRequest::NoteParseAttempt { message_id }`, which increments `meta['parse:{msg}']` and returns
+   the new value (ingest deletes the key; the daily maintenance alarm deletes keys older than a day). From
+   the third attempt (two have failed, about 4 minutes after the first because of `retry_delay`) the
+   consumer parses headers only, stores the message with `parse_degraded`, and never drops it (FR-IN-3).
+   A queue backlog does not trigger it, because the count, not the pointer's age, decides. The degraded
+   attempts skip the body, attachment and reference code paths that can panic; a message that still fails
+   goes to `pm-inbound-dlq` with its raw object kept for a redrive ([J8](../edge-cases.md)).
 5. **Effective policy** = built-in defaults ⊕ `PM_DEFAULT_POLICY` ⊕ `tenants.policy_json`
    ([tenant policy](../../reference/configuration.md#tenant-policy)).
 6. **Classify** automation ([Automated mail](#automated-mail-and-loops)). A DSN goes to
@@ -377,16 +460,23 @@ could otherwise hold 250 MiB of raw mail in a 128 MB isolate) and acks each afte
     ([Attachment safety](#attachment-safety)).
 11. **Verification codes and links** ([Verification codes](#verification-codes-and-unsolicited-otp-e5)).
 12. **D1 facts** (one `batch`, 5-second deadline):
-    - sender suppressed: `SELECT 1 FROM suppressions WHERE tenant_id = ?1 AND address_hash = ?2 AND (expires_at IS NULL OR expires_at > ?3)`;
+    - sender suppressed (only sets the flag `sender_suppressed`; it never hides the message, [D7](../edge-cases.md)): `SELECT 1 FROM suppressions WHERE tenant_id = ?1 AND address_hash = ?2 AND (expires_at IS NULL OR expires_at > ?3)`;
     - receive lists: `SELECT kind FROM sender_lists WHERE tenant_id = ?1 AND direction = 'receive' AND entry IN (?2, ?3)` with `?2` = sender address, `?3` = `@` + sender domain (block wins over allow);
-    - tenant domains (for look-alike checks): `SELECT name FROM domains WHERE (tenant_id = ?1 OR kind = 'platform') AND state <> 'removed'`;
+    - tenant domains: `SELECT name, kind FROM domains WHERE (tenant_id = ?1 OR kind = 'platform') AND state <> 'removed'`. Every row feeds the look-alike checks; only rows with `kind <> 'platform'` (the tenant's own domains) can make a sender `known_sender` ([Trust signals](#trust-signals));
     - co-recipient identities ([A9](#multiple-identities-in-one-tenant-a9));
     - only when the effective policy has `accounts.require_approval: true` and step 11 found a
       verification match: the identity's approved service-ledger entries,
       `SELECT id, sender_domains_json, address FROM service_accounts WHERE identity_id = ?1 AND status = 'approved' ORDER BY created_at`,
       passed as `IngestInput.approved_accounts` ([Service sign-up ledger §5](service-accounts.md#5-the-verification-gate)).
-13. **Call `MailboxRequest::Ingest`** with an `IngestInput` (30-second deadline).
-14. **Post-commit** ([Post-commit](#post-commit-attachments-and-index-jobs)), then ack.
+13. **Admit** against the inbound volume caps ([Inbound volume caps](#inbound-volume-caps-d5-d13)):
+    `QuotaRequest::AdmitInbound { identity_id, bucket, at, cap }` (`cap` =
+    `policy.inbound.per_tenant_per_hour`) to the tenant's `TenantQuota`. The answer
+    (`Admit` or `Throttle`) goes into `IngestInput.inbound_admit`; `ingest` ignores a `Throttle` for a
+    known correspondent or a receive-allowed sender. `TenantQuota` unavailable → `Admit` (mail is never
+    lost for our outage; the per-sender throttle inside `ingest` still applies). Loopback and re-parse
+    pointers skip this step.
+14. **Call `MailboxRequest::Ingest`** with an `IngestInput` (30-second deadline).
+15. **Post-commit** ([Post-commit](#post-commit-attachments-and-index-jobs)), then ack.
 
 ### Failure handling
 
@@ -401,7 +491,7 @@ could otherwise hold 250 MiB of raw mail in a 128 MB isolate) and acks each afte
 | Scanner (`PM_SCANNER_URL`) | 30 s per attachment, 60 s per message | `scan_status = 'error'`, continue, count `scanner_error_total` |
 | `Ingest` RPC | 30 s | `unavailable` or `timeout` → `retry(30 s)`; `ingest` is idempotent on `raw_sha256` ([J2](../edge-cases.md)) |
 | R2 `put` attachments, queue `send_batch` | 10 s | `retry(30 s)`; the repeat `Ingest` returns the stored message |
-| Unexpected error or panic | – | queue retry up to 10, then `pm-inbound-dlq` ([J8](../edge-cases.md)) |
+| Unexpected error or panic | – | queue retry after `retry_delay` (120 s) up to 10, degraded parsing from the third attempt, then `pm-inbound-dlq` ([J8](../edge-cases.md)) |
 
 ## Parsing
 
@@ -453,22 +543,45 @@ Rules:
 
 ### Storage caps
 
-Durable Object SQLite allows at most 2 MB per value or row
-([limits](https://developers.cloudflare.com/durable-objects/platform/limits/), read 2026-10-09). The full
-message always remains in R2, so the stored columns are capped, cutting at a UTF-8 character boundary:
+Durable Object SQLite allows at most 2 MB per string, BLOB or table row, 100 bound parameters per query,
+100 KB per SQL statement and 100 columns per table
+([limits](https://developers.cloudflare.com/durable-objects/platform/limits/), read 2026-10-10). The
+full message always remains in R2, so every stored column is capped, cutting at a UTF-8 character
+boundary, and the **whole row** has a budget of **1,900,000 bytes** (the sum of the UTF-8 lengths of
+every column, so a row never reaches 2 MB):
 
 | Column | Cap |
 |---|---|
 | `subject` | 998 characters |
-| `text` | 512 KiB |
-| `html_sanitized` | 1 MiB |
-| `extracted_text` | 256 KiB |
-| `snippet` | 240 characters of `extracted_text`, whitespace collapsed |
-| `to_json`, `cc_json` | 200 addresses each |
-| `references_json` | 200 msg-ids (the last 200) |
 | `from_name`, display names | 256 characters, control characters removed |
+| `to_json`, `cc_json` | 200 addresses each, and 64 KiB of JSON each (later addresses are dropped) |
+| `reply_to_json` | 10 addresses |
+| `references_json` | 200 msg-ids (the last 200), and 32 KiB of JSON (the oldest entries are dropped until it fits) |
+| `automated_json` | 64 KiB; `dsn.recipients` at most 100 entries, each `diagnostic_code` at most 512 characters; `calendar` strings 256 characters |
+| `auth_json` | 16 KiB; at most 10 `dkim` entries |
+| `metadata_json`, `flags_json` | 16 KiB each |
+| `extracted_text` | 256 KiB |
+| `text` | 512 KiB |
+| `html_sanitized` | 1 MiB, and whatever the row budget leaves (below) |
+| `snippet` | 240 characters of `extracted_text`, whitespace collapsed |
 
-When `text`, `html_sanitized` or `extracted_text` is cut, the message gets the flag `body_truncated`.
+**Row budget.** `fixed` is the size of every column except the three bodies, after the caps above (at
+most about 270 KiB). A reserve of 16 KiB is kept for later writes to the row (`triage_json`, added
+flags). The bodies are cut in this order until `fixed + reserve + bodies ≤ 1,900,000`: first
+`html_sanitized` (the sanitised copy is a convenience; the original HTML is in the raw MIME), then
+`text`, then `extracted_text`. With every cap at its maximum, `html_sanitized` keeps at least
+about 820 KiB. The same budget and order apply to outbound rows ([Outbound › Storage of an accepted
+send](outbound.md#storage-of-an-accepted-send)) and to a re-parse.
+
+When a body is cut, the message gets the flag `body_truncated`; when an address list or
+`references_json` is cut, `parse_degraded`. A DSN's recipients beyond the first 100 are not applied to
+delivery state.
+
+**Bound parameters.** No statement binds more than 100 parameters: every mailbox and D1 statement that
+takes a list of values (IDs, addresses, hashes) binds it as **one** JSON array parameter and expands it
+with `json_each(?n)` (as [Search](search.md) does), never as `IN (?, ?, …)` with one parameter per
+value. The longest fixed statement is the message insert (37 parameters). Statements are built only from
+fixed fragments, so none comes near 100 KB.
 
 ## Sanitising HTML
 
@@ -629,6 +742,13 @@ present), normalised by `normalise`: `upper`, `lower` or `none`, then trimmed.
 Refs are inserted into `refs` and their values (normalised plus, for plates, the spaced display form)
 into the FTS `refs` column ([Search](search.md)).
 
+Ref values are text from the mail: an `email` or `domain` value, or a custom ref with `normalise: none`
+or `lower`, can hold up to 64 characters an attacker chose. They are therefore untrusted wherever a model
+reads them. Only a value that `core::injection::fact_ref` accepts (after upper-casing, it matches
+`^[A-Z0-9][A-Z0-9:.+/-]{0,39}$`, and its kind is not `email` or `domain`) may appear outside a fence, in
+triage's `FACTS` block and the planner's `why=` line; every other value goes inside the nonce fence or is
+left out ([Triage § 6.2](triage.md#62-user-message), [Search § 11.6](search.md#116-fencing-mail-content)).
+
 ## Automated mail and loops
 
 `core::classify::classify(&ParsedMessage) -> Classification { kind, automated, evidence, dsn, mdn }`
@@ -640,19 +760,22 @@ from every row is collected into `automated_json.evidence`.
 | 1 | `Content-Type: multipart/report; report-type=delivery-status` (RFC 3464); or a heuristic bounce: `From` local part `mailer-daemon` or `postmaster`, a subject matching `undeliver|delivery status notification|mail delivery failed|returned mail|failure notice`, and a `message/rfc822` or `text/rfc822-headers` part | `dsn` |
 | 2 | `multipart/report; report-type=disposition-notification` (RFC 8098) | `mdn` |
 | 3 | `List-Id`, `List-Unsubscribe` or `List-Post` present, or `Precedence: list` or `bulk` | `list` |
-| 4 | `Auto-Submitted` present with a value other than `no` (RFC 3834 `auto-generated`, `auto-replied`; RFC 5436 `auto-notified`); `X-Autoreply`, `X-Autorespond`; `X-Auto-Response-Suppress` containing `All` or `OOF`; `Precedence: junk` or `auto_reply`; a subject starting `Out of Office`, `Automatic reply:`, `Auto:`, `Autosvar:`, `Abwesenheitsnotiz`, `Réponse automatique`; `From` local part `noreply`, `no-reply`, `donotreply`, `do-not-reply`; the null envelope sender; `X-Pylota-Mail-Hop` ≥ 20 | `automated` |
+| 4 | `Auto-Submitted` present with a value other than `no` (RFC 3834 `auto-generated`, `auto-replied`; RFC 5436 `auto-notified`); `X-Autoreply`, `X-Autorespond`; `X-Auto-Response-Suppress` containing `All` or `OOF`; `Precedence: junk` or `auto_reply`; a subject starting `Out of Office`, `Automatic reply:`, `Auto:`, `Autosvar:`, `Abwesenheitsnotiz`, `Réponse automatique`; `From` local part `noreply`, `no-reply`, `donotreply`, `do-not-reply`; the null envelope sender; `X-Pylota-Mail-Hop` ≥ `MAX_HOP` (10) | `automated` |
 | 5 | A `text/calendar` part (and none of the above) | `calendar` |
 | 6 | Otherwise | `normal` |
 
 - `trust.automated` is true for `dsn`, `mdn`, `list` and `automated`. Agents must not auto-reply to these;
   the send path refuses `kind: auto_reply` replies to them ([Outbound](outbound.md)).
 - `X-Pylota-Mail-Hop: n` is set by our own outbound mail ([Outbound](outbound.md#composition)). Any value
-  ≥ 1 adds evidence `pylota_agent`; ≥ 20 makes the message `automated` (a loop breaker).
+  ≥ 1 adds evidence `pylota_agent`; ≥ `MAX_HOP` (10, a constant in `core::policy`) makes the message
+  `automated` (a loop breaker). The value is stored as `automated_json.hop`, and the send path refuses
+  any send whose computed hop would reach `MAX_HOP`, whatever its `kind` (`409 loop_detected`,
+  [Outbound › Policy pipeline](outbound.md#policy-pipeline), [N13](../edge-cases.md)).
 - `Disposition-Notification-To` adds evidence `mdn_requested`. Read receipts are never sent ([B8](../edge-cases.md)).
 - For a DSN, `classify` also parses the `message/delivery-status` part into
-  `dsn = { reporting_mta, original_envelope_id, original_message_id, recipients: [{ final_recipient, action, status, diagnostic_code }] }`,
-  taking `original_message_id` from the `Message-ID` of the returned `message/rfc822` or
-  `text/rfc822-headers` part.
+  `dsn = { reporting_mta, original_envelope_id, original_message_id, original_from, recipients: [{ final_recipient, action, status, diagnostic_code }] }`
+  (at most 100 recipients), taking `original_message_id` and `original_from` from the `Message-ID` and
+  `From` of the returned `message/rfc822` or `text/rfc822-headers` part.
 
 ## Authentication verdict
 
@@ -755,16 +878,17 @@ Computed partly in the consumer and finished inside `ingest`, which can see the 
 
 | Signal | Rule |
 |---|---|
-| `known_sender` (FR-IN-4) | True when the sender address is in `contacts` with `outbound_count > 0` (we have written to them), or matches a receive-allow entry, or its domain is one of the tenant's domains and the verdict is `pass` |
+| `known_sender` (FR-IN-4) | True when the sender address is in `contacts` with `outbound_count > 0` (we have written to them), or matches a receive-allow entry, or its domain is one of the tenant's **own** domains (`kind <> 'platform'`) and the verdict is `pass`. The shared platform domain never gives domain-level trust: every tenant's agents send from it with a passing DMARC verdict, so a platform-domain sender is known only through `contacts` or an address-level receive-allow entry ([D12](../edge-cases.md)) |
+| `shared_domain_sender` ([D12](../edge-cases.md)) | The `From` domain is `PM_PLATFORM_DOMAIN` and the sender is not an address of this identity's own tenant: the mail comes from another workspace on the shared domain, whose name the receiving agent should not take at face value |
 | `display_name_spoof` ([D2](../edge-cases.md)) | The display name contains an address-like token different from the `From` address; or its confusable fold equals the fold of the name of a contact with `outbound_count > 0` whose address differs; or it equals the identity's display name or the tenant name while the sender is not this identity |
-| `lookalike_domain` ([D2](../edge-cases.md)) | The fold of the sender's registrable domain equals the fold of a tenant domain or of a contact domain with `outbound_count > 0`, while the domains differ. The fold is the UTS #39 skeleton plus the ASCII rules of [Identities › Confusables](identity-domains.md#confusable-detection) |
+| `lookalike_domain` ([D2](../edge-cases.md)) | The fold of the sender's registrable domain equals the fold of a tenant domain or of a contact domain with `outbound_count > 0`, while the domains differ. For a sender on the platform domain, the fold of its local part's tenant suffix (the part after the last `.`) is also compared with the folds of the receiving tenant's own suffix and domain labels. The fold is the UTS #39 skeleton plus the ASCII rules of [Identities › Confusables](identity-domains.md#confusable-detection) |
 | `reply_to_mismatch` ([D3](../edge-cases.md)) | `Reply-To` is present and its organisational domain differs from the `From` organisational domain. Who replies go to is decided at reply time ([Outbound](outbound.md#composition)) |
 | `thread_join_unverified` ([D10](../edge-cases.md)) | [Threading](threading.md#31-order-fr-thr-1) |
 | `hidden_text` ([B11](../edge-cases.md)) | [Hidden text](#hidden-text-b11) |
 
 These are stored in `flags_json`; the API returns `hidden_text`, `display_name_spoof`,
-`lookalike_domain`, `reply_to_mismatch` and `thread_join_unverified` as `trust.flags` and the rest as
-message `flags`.
+`lookalike_domain`, `reply_to_mismatch`, `thread_join_unverified` and `shared_domain_sender` as
+`trust.flags` and the rest as message `flags`.
 
 **Spam score** (`spam_score`, 0–1, FR-IN-4). The consumer computes a base from deterministic signals and
 `ingest` applies the sender adjustments, then clamps to [0, 1]:
@@ -773,6 +897,7 @@ message `flags`.
 |---|---|
 | verdict `softfail` / `none` / `unaligned` / `unverified` / `fail` | +0.20 / +0.10 / +0.10 / +0.20 / +0.50 |
 | `display_name_spoof`, `lookalike_domain` | +0.30 each |
+| `shared_domain_sender` | +0.05 |
 | `hidden_text` | +0.20 |
 | `reply_to_mismatch` | +0.10 |
 | a link whose visible text is a URL or domain different from its `href` domain | +0.20 (once) |
@@ -791,8 +916,8 @@ Decided inside `ingest` (first match wins, FR-IN-5):
 
 | Order | Condition | `status` | `quarantine_reason` |
 |---|---|---|---|
-| 1 | Sender suppressed, or matches a receive-block entry ([D7](../edge-cases.md)) | `hidden` | `blocked_sender` |
-| 2 | Per-sender throttle exceeded ([D5](../edge-cases.md)) | `throttled` | – |
+| 1 | Sender matches a receive-block entry ([D7](../edge-cases.md)) | `hidden` | `blocked_sender` |
+| 2 | An inbound volume cap exceeded: the per-sender throttle, or a `Throttle` admission for a sender that is neither a known correspondent nor receive-allowed ([D5](../edge-cases.md), [D13](../edge-cases.md)) | `throttled` | – |
 | 3 | `verdict = 'fail'` and `quarantine.on_auth_fail` | `quarantined` | `auth_failed` |
 | 3a | `verdict = 'unverified'` and `quarantine.on_auth_fail` (no trusted `Authentication-Results` yet, so SPF alignment could not be checked) | `quarantined` | `auth_unverified` |
 | 4 | Any attachment has a `risk` that quarantines ([Attachment safety](#attachment-safety)), or `scan_status = 'infected'`, or the SES source's `virusVerdict` is `FAIL` ([N27](../edge-cases.md)) | `quarantined` | `risky_attachment` |
@@ -808,21 +933,50 @@ explicit `status` filter from a key holding `quarantine:review`
 ([Security §5.3](security.md#53-cross-level-read-access)). A receive-allow entry skips rules 4a and 6 only,
 never rule 3.
 
-**Per-sender throttle ([D5](../edge-cases.md)).** Inside the transaction:
+**Suppressed senders are not hidden ([D7](../edge-cases.md)).** A suppression is an outbound decision (a
+bounce, a complaint, an unsubscribe, a provider entry): it says we must not write to the address, not
+that its mail is unwanted. Mail from a suppressed address is stored and evented like any other, with the
+message flag `sender_suppressed`, so an agent can see why a reply to it would not be delivered (the reply's
+delivery is `suppressed` at submit). Only a receive-block entry hides mail.
+
+#### Inbound volume caps (D5, D13)
+
+Unsolicited mail costs storage, indexing and model calls, and its `From` is forgeable, so the caps are
+keyed by what can be trusted (FR-IN-4, FR-IN-12, [D5](../edge-cases.md), [D13](../edge-cases.md)):
+
+| Cap | Key | Default (policy) | Exceeded |
+|---|---|---|---|
+| Per sender, per identity | The `From` address when the verdict is `pass`; otherwise `unauth:` + the `From` address (or `env:` + envelope sender when `From` is missing) | 60 an hour (`inbound.per_sender_per_hour`) | `throttled` |
+| Unauthenticated, per identity | One bucket for all mail whose verdict is not `pass`, from senders that are not known correspondents | 120 an hour (`inbound.unauthenticated_per_hour`) | `throttled` |
+| Per tenant | One bucket per tenant in `TenantQuota` (`AdmitInbound`), across its identities, for senders that are not known correspondents | 2,000 an hour (`inbound.per_tenant_per_hour`) | `throttled` |
+
+A **known correspondent** is a sender in the identity's `contacts` with `outbound_count > 0`; it and a
+receive-allowed sender are never throttled by the unauthenticated and tenant caps, so a flood from forged
+senders cannot crowd out the people an agent already writes to. The per-identity caps use the mailbox's
+`rate_windows` inside the transaction:
 
 ```sql
 INSERT INTO rate_windows (sender, window_start, count) VALUES (?1, ?2, 1)
 ON CONFLICT (sender, window_start) DO UPDATE SET count = count + 1
 RETURNING count;
--- ?1 lower-cased From address (or 'env:' || envelope sender when From is missing)
+-- ?1 the key from the table: the sender key, or 'unauth:*' for the unauthenticated bucket
 -- ?2 received_at - received_at % 3600000
 ```
 
-`count > inbound.per_sender_per_hour` (default 60) → `throttled`, `inbound_throttled_total` incremented;
-the observability design alerts on it. Rows older than 48 hours are deleted by the mailbox's daily
-maintenance alarm.
+`AdmitInbound { identity_id, bucket, at, cap }` increments the tenant's `counters` row with metric
+`inbound_hour` and window `YYYY-MM-DDTHH` (the UTC hour of `at`) and answers `Throttle` above `cap`;
+rows older than 48 hours are deleted by its daily alarm. `bucket` is the cap's key from the table, kept
+for the `inbound_throttled_total{cap}` label.
+
+A cap exceeded → `throttled`, `inbound_throttled_total{cap}` incremented; the observability design alerts
+on it. Throttled and hidden mail is never triaged, embedded or evented, its attachments are not
+extracted, and it does not count towards `storage_gb`, so a flood can neither spend a workspace's AI
+budget nor block its sends ([Plans, metering and billing › Storage](billing.md#storage)). Rows of
+`rate_windows` older than 48 hours are deleted by the mailbox's daily maintenance alarm.
 
 ## Verification codes and unsolicited OTP (E5)
+
+Extraction implements FR-IN-11 with the `wait` handler below.
 
 `core::classify::find_verification(subject, extracted_text, links) -> Option<Verification>`:
 
@@ -855,7 +1009,7 @@ Rules:
 
 ## The `wait` handler (E4)
 
-`GET /v1/identities/{identity_id}/wait` (`search:read`, any key level, bucket `RL_API`), in
+`GET /v1/identities/{identity_id}/wait` (FR-IN-11; `search:read`, any key level, bucket `RL_API`), in
 `handlers/wait.rs`. The request and response shapes are those of
 [REST API › wait](../../reference/api.md#get-v1identitiesidentity_idwait--searchread); MCP's `mail_wait`
 calls the same function (its `timeout_seconds` is the API's `timeout`). It is P0, because quarantine
@@ -886,7 +1040,9 @@ rule 5 (unsolicited OTP, [E5](../edge-cases.md)) depends on its registrations.
    - `subject_contains`: a case-insensitive substring of the subject;
    - `thread_id`: the message's thread;
    - `kind = reply`: the message joined an existing thread that holds an outbound message (by token or
-     headers, not a new thread);
+     headers, not a new thread), and it does not carry `thread_join_unverified`: a join that failed a
+     token check, or a header join by someone who is not a participant, never counts as the reply an agent
+     waits for ([C9](../edge-cases.md));
    - `kind = verification`: a `verifications` row exists for the message with `expires_at > now`.
 4. **Release.** With `kind = verification` (or `any` with a match that has a verification row), the
    `verification` object is filled only when the message's verdict is `pass` and the row's
@@ -909,7 +1065,7 @@ Tests (`it::wait::e4_*`):
 | `it::wait::e4_code_withheld_unauthenticated` | The same mail with `verdict: fail`, or from another domain, returns the message with `verification: null` |
 | `it::wait::e4_timeout` | No match: `200` with `timed_out: true` at the deadline (time-controlled harness) |
 | `it::wait::e4_registration_refresh` | `RegisterWait` is sent at the start and every 10 s with `ttl_ms = (timeout + 10) × 1000`; an OTP mail from that domain 20 minutes after the wait ended is not quarantined (E5) |
-| `it::wait::e4_filters_and_since` | `subject_contains`, `thread_id`, `kind=reply` and `since` each narrow the match; `kind=verification` without `from` is `400 invalid_request` |
+| `it::wait::e4_filters_and_since` | `subject_contains`, `thread_id`, `kind=reply` and `since` each narrow the match; a message flagged `thread_join_unverified` never satisfies `kind=reply`; `kind=verification` without `from` is `400 invalid_request` |
 | `it::wait::e4_retry_after_release` | A second wait within 1 hour of release returns the same value; after the maintenance purge it returns none |
 
 ## Multiple identities in one tenant (A9)
@@ -921,8 +1077,8 @@ each copy computes `is_primary_recipient` deterministically from the headers, wi
 
 1. Header recipients in order: every `To` address, then every `Cc` address.
 2. One D1 query:
-   `SELECT address, identity_id FROM addresses WHERE tenant_id = ?1 AND status IN ('active','retiring') AND address IN (?2, …)`
-   (at most 50 addresses; bound parameters stay under D1's 100).
+   `SELECT address, identity_id FROM addresses WHERE tenant_id = ?1 AND status IN ('active','retiring') AND address IN (SELECT value FROM json_each(?2))`
+   (at most 50 addresses, bound as one JSON array, so the statement has two parameters whatever the count).
 3. The first header recipient that resolves names the **primary identity**.
 4. `is_primary_recipient = 1` when no header recipient resolves (for example, a BCC-only delivery), or
    when the primary identity is this identity; else 0.
@@ -931,9 +1087,12 @@ each copy computes `is_primary_recipient` deterministically from the headers, wi
 `external` domain arrives forwarded to the identity's platform address, so when the envelope recipient
 is the platform address and a `To`/`Cc` address belongs to the same identity on an external domain,
 `delivered_to` is that external address ([Identities and domains](identity-domains.md#kind-external)).
-Such a message proves that forwarding works: after the commit, when that address's `forwarding` is
-`unverified` or `failed`, the consumer sets it to `ok` with `forwarding_checked_at`
-([Domains on any DNS host § 4.4](domain-connections.md#44-send_only)).
+Such a message does **not** prove that forwarding works: anyone can write to the platform address
+directly with the external address in `To`, and no header a forwarder adds (ARC, `X-Forwarded-To`, an SRS
+envelope sender) can tell that apart from mail the sender forwarded through any account of their own. So
+ordinary mail never changes an address's `forwarding`; only the forwarding-check token of `email()`
+step 3, which reaches the platform address only through the customer's own forwarding rule, sets it to
+`ok` ([Domains on any DNS host § 4.4](domain-connections.md#44-send_only), [N12](../edge-cases.md)).
 `is_bcc = 1` (flag `bcc`) when `delivered_to` matches none of `To`/`Cc` ([A10](../edge-cases.md)). The value is stored in
 `messages.is_primary_recipient` and returned as `is_primary_recipient` in the API.
 
@@ -951,15 +1110,18 @@ pub struct IngestInput {
     pub refs: Vec<Ref>, pub attachments: Vec<AttachmentMeta>, pub verification: Option<Verification>,
     pub approved_accounts: Option<Vec<ApprovedAccount>>,   // step 12; None when the gate does not apply
     pub sender_suppressed: bool, pub receive_list: Option<ListKind>,
-    pub tenant_domains: Vec<String>, pub is_primary_recipient: bool, pub is_bcc: bool,
+    pub tenant_domains: Vec<(String, DomainKind)>,  // own domains and the platform domain
+    pub inbound_admit: Admission,                  // Admit | Throttle, from AdmitInbound (D13)
+    pub is_primary_recipient: bool, pub is_bcc: bool,
     pub policy: InboundPolicy, pub parser_version: u32, pub loopback: Option<LoopbackSource>,
 }
 
 pub enum IngestOutcome {
     Stored { message_id: String, thread_id: String, status: String, duplicate: bool,
+             stored_raw_r2_key: String,            // the stored message's raw key (a duplicate's differs)
              attachments: Vec<AttachmentToStore>, suppress: Vec<SuppressionRequest> },
     Backscatter,                                   // an unmatched DSN: nothing written (D4)
-}
+}                                                  // an untrusted DSN (D11) is Stored, hidden, with no state change
 pub struct AttachmentToStore { pub attachment_id: String, pub part_index: u32, pub r2_key: String,
                                pub text_pending: bool }
 ```
@@ -993,8 +1155,10 @@ transaction that stores it):
 5. **Thread token.** If `detail` looks like a token, apply the brute-force limits and verify it
    ([Threading › Verification](threading.md#23-verification)).
 6. **Thread** with `resolve_inbound` ([Threading](threading.md#31-order-fr-thr-1)).
-7. **Trust and quarantine:** `known_sender`, look-alike and display-name checks against `contacts`, the
-   final spam score, the throttle upsert, the E5 check, then the [Quarantine decision](#quarantine-decision).
+7. **Trust and quarantine:** `known_sender` (own domains only), look-alike, display-name and
+   shared-domain checks against `contacts` and `tenant_domains`, the final spam score, the volume-cap
+   upserts and `inbound_admit` ([Inbound volume caps](#inbound-volume-caps-d5-d13)), the E5 check, then the
+   [Quarantine decision](#quarantine-decision).
 8. **Insert the thread** if new ([Threading](threading.md#34-effects-on-the-thread-row)).
 9. **Insert the message:**
 
@@ -1005,18 +1169,25 @@ transaction that stores it):
      reply_to_json, to_json, cc_json, delivered_to, is_bcc, is_primary_recipient, subject, text,
      html_sanitized, extracted_text, snippet, sent_at, received_at, kind, automated_json, auth_json,
      verdict, spam_score, known_sender, quarantine_reason, flags_json, read, triage_status,
-     parser_version, metadata_json)
+     triage_json, parser_version, metadata_json)
    VALUES (?1, ?2, 'inbound', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
-           ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, 0, ?35, ?36, '{}')
+           ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, 0, ?35, ?36,
+           ?37, '{}')
    RETURNING rowid;
    -- triage_status ?35: 'pending' for received (triage enabled), NULL for quarantined (triaged on
-   -- release), 'skipped' for hidden, throttled, dsn and mdn
+   -- release), 'skipped' for received with triage disabled, and for hidden, throttled, dsn and mdn;
+   -- the system identity's mailbox: always 'skipped' (not_eligible), it is never triaged
+   -- triage_json ?36: the skipped record for 'skipped' ({"status":"skipped","reason":"policy_disabled"
+   -- or "not_eligible","risk_flags":[],"model":null,"version":TRIAGE_VERSION,"run":0}, Triage § 2),
+   -- else NULL
+   -- every value is capped by Storage caps (row budget 1,900,000 bytes)
    ```
 
 10. **Attachments:** one row each, `id = att_…`, `r2_key = t/{ten}/i/{idn}/m/{msg}/a/{att}`,
     `text_status` = `pending` when eligible for extraction, else `skipped`
     ([Attachment text extraction](#attachment-text-extraction)), `risk`, `sniffed_type`, `scan_status`.
-11. **Keyword index:**
+11. **Keyword index** (skipped in the system identity's mailbox, which is never indexed,
+    [A15](../edge-cases.md)):
 
     ```sql
     INSERT INTO fts (rowid, subject, participants, body_new, body_full, attachments, refs)
@@ -1041,36 +1212,97 @@ transaction that stores it):
     ```
 
 14. **Verifications** row when applicable (see above).
-15. **Thread counters** ([Threading](threading.md#34-effects-on-the-thread-row)).
+15. **Thread counters**, from visible messages only: the thread's visible columns are recomputed when
+    the new message is visible (`received`); a quarantined, hidden or throttled message changes none of
+    them ([Threading § 3.4](threading.md#34-effects-on-the-thread-row)).
 16. **Outbox:** `message.received` (status `received`) or `message.quarantined` (status `quarantined`),
     plus `verification.received` when inserted. No event for `hidden`, `throttled` or DSN rows. Payloads
     are built by the builders in [Webhooks](webhooks.md); `extracted_text` is cut to
     `policy.webhook_text_bytes`, and `message.quarantined` carries none.
 17. Set `alarm:outbox`.
 
+`ingest` also deletes `meta['parse:{msg}']` ([consumer step 4](#the-pm-inbound-consumer)). A message
+ID listed in `erased_ids` (an erasure removed it while its pointer was still queued) gets
+`identity_not_found` at step 1 too, so a late retry never re-creates erased mail
+([I10](../edge-cases.md)).
+
 ## Post-commit: attachments and index jobs
 
 After `Stored`:
 
-1. **Attachments.** For each `AttachmentToStore`: on the first ingest, `put` the part's bytes to its
+1. **Duplicate raw copy** ([B14](../edge-cases.md), [I9](../edge-cases.md)). When `duplicate` is true
+   and `stored_raw_r2_key` differs from this pointer's `r2_key` (a sender's retry wrote a second copy
+   under a new `msg_` ID), delete this pointer's raw object; the stored message keeps its own. A failed
+   delete is left to the [orphan sweep](#orphan-objects).
+2. **Attachments.** For each `AttachmentToStore`: on the first ingest, `put` the part's bytes to its
    `r2_key` with custom metadata `tenant`, `identity`, `message`, `sha256`. On a duplicate, `head` the
-   key first and `put` only if missing. Attachment bytes therefore appear shortly after the
+   key first and `put` only if missing. Then `MailboxRequest::ConfirmStored { message_id }`: when the
+   answer is `Erased` (an erasure removed the message while these puts ran), delete every object just
+   put ([I10](../edge-cases.md)). Attachment bytes therefore appear shortly after the
    `message.received` event; the attachment endpoint answers `503 unavailable` (retryable) for an
    attachment row whose object is missing and whose message is less than 5 minutes old.
-2. **Suppressions** from a matched DSN: `INSERT OR IGNORE INTO suppressions …` (see
-   [Outbound › Suppressions](outbound.md#suppressions)).
-3. **Index jobs** in one `send_batch` to `pm-index`:
+3. **Suppressions** from a trusted DSN ([DSN routing](#dsn-routing-and-backscatter)): `INSERT OR IGNORE
+   INTO suppressions …` with an expiry (a DSN alone never creates a permanent suppression), and, when the
+   row was inserted, `suppression.created` through `MailboxRequest::EmitEvent` with the deterministic
+   event ID of [Outbound › Suppressions](outbound.md#suppressions).
+4. **Index jobs** in one `send_batch` to `pm-index` (none for the system identity's mailbox, which is
+   never indexed, embedded or triaged, [A15](../edge-cases.md)):
    - `AttachmentText { tenant_id, identity_id, message_id }` when any attachment has `text_pending`;
    - `Embed { tenant_id, identity_id, message_id }` for every stored inbound message
      ([Search](search.md));
    - `Triage { tenant_id, identity_id, message_id }` when the status is `received`, the kind is not
      `dsn` or `mdn`, and triage is enabled ([Triage](triage.md)).
-4. Count it: `QuotaRequest::RecordUsage { metric: Inbound, n: 1 }` to the tenant's `TenantQuota`, which
+5. Count it: `QuotaRequest::RecordUsage { metric: Inbound, n: 1 }` to the tenant's `TenantQuota`, which
    the hourly roll-up flushes to `usage_daily` ([Outbound › TenantQuota](outbound.md#tenantquota)); never
    a D1 write per message.
-5. **SES source:** set the `ses_ingest` row to `done`, and delete the S3 object when no row for its key
+6. **SES source:** set the `ses_ingest` row to `done`, and delete the S3 object when no row for its key
    is still `queued` ([The SES source](#the-ses-source)).
-6. Ack. On a duplicate the same steps run again; every step is idempotent.
+7. Ack. On a duplicate the same steps run again; every step is idempotent.
+
+### Orphan objects
+
+An R2 object that no row names is an orphan: a raw copy whose pointer never reached `ingest`, an
+attachment put after its message was erased, an outbound sent copy written for a send that was then
+refused, or a failed delete. Retention and erasure follow rows, so an orphan would otherwise live for
+ever ([I9](../edge-cases.md)). Three rules keep them short-lived:
+
+1. **Delete at the source.** The duplicate rule above; `email()` step 7 and the staging steps delete the
+   object when the enqueue fails; the outbound submit path deletes its sent copy on every refusal after
+   it was written ([Outbound › Composition](outbound.md#composition)).
+2. **Compose markers.** Before an outbound sent copy is written, the mailbox records `meta['compose:{msg}']`
+   in the transaction that takes the thread lock; the accept transaction deletes it. A marker older than
+   10 minutes with no `messages` row names an orphan.
+3. **Rolling sweep.** The mailbox's daily maintenance alarm deletes the objects of stale compose markers,
+   then lists the next 5,000 keys under `t/{tenant_id}/i/{identity_id}/` (continuing from
+   `meta.orphan_sweep_cursor`, wrapping at the end) and deletes every key older than 15 days that no row
+   names (`messages.raw_r2_key`, `attachments.r2_key`, `attachments.text_r2_key`, and the outbound
+   `out/{msg}.eml` of a `messages` row), in `BLOBS` and, when configured, `BACKUP`. Fifteen days is
+   longer than a queue or dead-letter queue keeps a message (14 days), so no pointer that could still be
+   processed or redriven names a swept key. Each deletion increments `r2_orphans_deleted_total`. A
+   mailbox of any size is covered within a bounded number of days, at a cost of five list calls a day.
+
+### The system identity's mailbox
+
+The [system identity](identity-domains.md#the-system-identity) sends sign-in links and codes, invitation
+tokens (valid 7 days) and notification mail, and receives bounces and replies that quote them. Its mailbox
+is the deployment's, not the default tenant's, so it is kept out of every tenant-facing path
+([A15](../edge-cases.md)). `MailboxRequest::Init` records `meta.is_system = '1'` for it, and the mailbox
+then:
+
+- **stores bodies redacted**: in `text`, `extracted_text`, `html_sanitized`, `snippet` and every
+  attachment text, each URL is replaced by `[link]` and each run of 6 or more digits (alone or split by
+  spaces or dashes) by `[code]`, before the row is written, for inbound and outbound messages alike (the
+  flag `body_redacted` is set). Its outbound sent copy `out/{msg}.eml`, which holds the real token, is
+  deleted as soon as the message leaves `queued`; its inbound raw MIME follows the identity's fixed 7-day
+  raw retention;
+- **is never indexed**: no FTS rows, no `refs`, no `Embed`, `AttachmentText` or `Triage` jobs (its
+  `triage_status` is `skipped`, reason `not_eligible`);
+- **never reaches tenant endpoints**: the `Fanout` consumer delivers its events to platform endpoints only
+  and never hands them to a Notifier ([Webhooks › Endpoint resolution](webhooks.md#endpoint-resolution-and-filters));
+- **is outside every tenant fan-out**: tenant search and its agentic tools skip it
+  ([Search § 10](search.md#10-tenant-scope-fan-out)), MCP reaches it only through those same handlers, and
+  a subject-access export never includes it. Only a platform key reads it, by ID; person deletion still
+  erases the mail sent to that person ([Privacy § 6.9](privacy.md#69-people-console-accounts)).
 
 ## Attachment safety
 
@@ -1082,6 +1314,24 @@ Risky attachments are never passed to agents or to text extraction, and download
 
 The type is sniffed from the first 8 KiB (and, for containers, from the structure). The sniffed type
 wins over the declared `Content-Type` and the filename extension.
+
+**Container parsers.** `core` runs on `wasm32`, and `flate2` is allowed for native code only, so the
+container checks use two pure-Rust crates (crates.io sparse index, read 2026-10-10):
+`miniz_oxide = { version = "=0.9.1", default-features = false, features = ["with-alloc"] }` (published
+2026-03-13; DEFLATE inflation only, with no `std`) and `cfb = "=0.15.0"` (published 2026-09-18, more than
+two weeks before; OLE compound-file directories; its dependencies `fnv`, `uuid` and `web-time` build for
+`wasm32`). What each check reads:
+
+- ZIP: the central directory and local headers are read without inflating anything (names, sizes, the
+  encryption bit). Only three kinds of entry are inflated, each capped at 1 MiB of output: an OOXML
+  `[Content_Types].xml`, an ODF `META-INF/manifest.xml`, and one level of nested ZIP for the
+  executable-name check. An entry that would inflate beyond its cap counts as `archive_bomb`.
+- OLE: `cfb` lists the stream and storage names (`VBA`, `_VBA_PROJECT`, `EncryptionInfo`,
+  `EncryptedPackage`); no stream content is read.
+- gzip: the trailer's `ISIZE` only; PDF: a byte scan for `/Encrypt` in the trailer and in cross-reference
+  stream dictionaries (which are not compressed).
+
+Spike S4 measures the bundle with both crates.
 
 | Magic | Sniffed type |
 |---|---|
@@ -1177,9 +1427,17 @@ INVOICE 88213 …
 Terms and conditions …
 ```
 
-For PDFs, a form feed (U+000C) in the converter output is a page boundary. If the output has none, the
-whole document is page 1. **Spike S6** records whether `toMarkdown` marks PDF pages; if it does by
-another convention, that convention is parsed here instead.
+For PDFs, the call passes `conversionOptions: { pdf: { metadata: false } }`, so the output has no
+metadata section ([Conversion options](https://developers.cloudflare.com/workers-ai/features/markdown-conversion/conversion-options/),
+read 2026-10-10). The **primary rule** is the converter's own page headings: Workers AI's published PDF
+output has a `## Contents` heading followed by one `### Page N` heading per page
+([Markdown conversion changelog, 20 March 2025](https://developers.cloudflare.com/changelog/post/2025-03-20-markdown-conversion/),
+read 2026-10-10). Each line that is exactly `### Page N` (N a positive integer, increasing) starts page N,
+the heading line itself is replaced by the `<!-- pm:page N -->` marker, and a leading `# {filename}` and
+`## Contents` are dropped. **Fallback**, when the output has no such heading: a form feed (U+000C) is a
+page boundary; with neither, the whole document is page 1. A `### Page N` line inside the text of a page
+whose N does not follow the previous page is ordinary text. **Spike S6** confirms the heading form from
+Rust; if it differs, the observed form replaces the primary rule here.
 
 **Limits** ([limits](../../reference/limits.md#mail)): input over 20 MB, more than 200 pages, or more
 than 2 MB of text → `text_status = 'unavailable'`. The hidden-character rules are applied to the text.
@@ -1189,7 +1447,9 @@ than 2 MB of text → `text_status = 'unavailable'`. The hidden-character rules 
 In one transaction the mailbox sets `text_status`, `text_r2_key` and `text_pages`, inserts the refs with
 `source = att:{id}:{page}`, and rebuilds the message's FTS row with `fts_text` (filenames plus attachment
 text, at most 1 MiB) in the `attachments` column, as specified in [Search](search.md). It then queues an
-`Embed` job for the attachment chunks.
+`Embed` job for the attachment chunks. When the message no longer exists, or its ID is in `erased_ids`
+(an erasure ran while the job converted), the mailbox answers `Erased` and writes nothing, and the job
+deletes the `.md` objects it wrote before acking ([I10](../edge-cases.md)).
 
 **Failure ([B12](../edge-cases.md)).** A `toMarkdown` error, an `error` result, or no answer within 60 s:
 re-enqueue the job with `attempt + 1` after 60 s, then 300 s; after the third attempt, `unavailable`.
@@ -1207,25 +1467,45 @@ path is the `From` address, so every bounce of such a send is an RFC 3464 DSN th
 identity through forwarding or SES ([Domains on any DNS host § 5.4](domain-connections.md#54-delivery-events-from-a-relay),
 [N19](../edge-cases.md)). The SMTP transport stores the composed `Message-ID` as `rfc_message_id`
 ([Outbound › SMTP relay](outbound.md#smtp-relay)), so step 1 below finds the original by the DSN's
-original `Message-ID`. The recipients' statuses move from `submitted` to `bounced` (`hard` for `5.x.x`,
-with a suppression; `soft` for `4.x.x`), and the DSN is stored as in step 4, never shown to agents as new
-mail.
+original `Message-ID`. For a trusted DSN (below) the recipients' statuses move from `submitted` to
+`bounced` (`hard` for `5.x.x`, with a 30-day suppression; `soft` for `4.x.x`), and the DSN is stored as in
+step 4, never shown to agents as new mail.
+
+**Anyone can write a DSN.** A message classified `dsn` that names one of our outbound `Message-ID`s is
+easy to forge: the ID is in every copy a recipient received. If it were trusted, a forger could mark
+every recipient of a send as hard-bounced, create suppressions in the tenant, and pause the identity
+(11 bounces in 200, [Outbound › Abuse auto-pause](outbound.md#abuse-auto-pause-fr-dlv-3)), which on a
+partner's tenant only a platform key can undo. So a DSN changes delivery state only when it is
+**trusted** ([D11](../edge-cases.md)):
+
+- the original was sent through a transport with no provider events, which today means `provider =
+  'smtp'` (an `smtp_relay` domain). For Cloudflare and SES sends the provider's own events are the only
+  source of delivery state, and a DSN about them is ignored;
+- the DSN's verdict is `pass`;
+- the organisational domain of the DSN's `From` equals the organisational domain of the
+  `final_recipient` it reports on (the recipient's own mail system), or the organisational domain of the
+  relay host (the host in the original's `provider_message_id`, `smtp:{host}:{Message-ID}`);
+- the returned header part's `From` (`dsn.original_from`) equals the original's `from_address`.
+
+A recipient entry that fails a condition is not applied. Even a trusted DSN never creates a permanent
+suppression on its own and never feeds abuse auto-pause.
 
 Inside `ingest`, before any write:
 
 1. Find the original:
 
    ```sql
-   SELECT rowid, id, thread_seq FROM messages
+   SELECT rowid, id, thread_seq, provider, provider_message_id, from_address FROM messages
    WHERE direction = 'outbound' AND (rfc_message_id = ?1 OR provider_message_id = ?1)
    ORDER BY rowid DESC LIMIT 1;           -- ?1 = dsn.original_message_id (normalised)
    ```
 
 2. **No match → backscatter.** Return `Backscatter`. The consumer deletes the raw object, increments
    `backscatter_total`, and acks. Nothing is stored.
-3. **Match.** For each `dsn.recipients[]` entry whose `final_recipient` is a recipient of the original,
-   apply a delivery event with `event_id = "dsn:{message_id}:{recipient}"` through the same function as
-   provider events ([Outbound › Applying an event](outbound.md#applying-an-event-to-a-message)):
+3. **Match.** Evaluate the trust conditions above. For each `dsn.recipients[]` entry (the first 100) whose
+   `final_recipient` is a recipient of the original and that passes them, apply a delivery event with
+   `event_id = "dsn:{message_id}:{recipient}"` and `source = Dsn` through the same function as provider
+   events ([Outbound › Applying an event](outbound.md#applying-an-event-to-a-message)):
 
    | `Action` | `Status` | Delivery status |
    |---|---|---|
@@ -1234,10 +1514,16 @@ Inside `ingest`, before any write:
    | `delayed` | any | `deferred` |
    | `delivered`, `relayed`, `expanded` | any | `delivered` |
 
+   Entries that fail are counted in `dsn_untrusted_total{reason}` (`provider_events`, `verdict`,
+   `domain`, `from`) and change nothing.
 4. Store the DSN itself as a message with `kind = 'dsn'`, `status = 'hidden'`, `triage_status = 'skipped'`,
    in the original's thread (no token or header threading), with the parsed report in
-   `automated_json.dsn`. No `message.received` event; the delivery update emits `message.bounced` (or
-   `deferred`, `delivered`). Hard bounces return a `SuppressionRequest`.
+   `automated_json.dsn` and, when no entry was applied, the flag `dsn_untrusted`. No `message.received`
+   event; an applied update emits `message.bounced` (or `deferred`, `delivered`). A trusted hard bounce
+   returns a `SuppressionRequest` with reason `hard_bounce` and `expires_at = now + 30 days`, never
+   permanent; the post-commit step writes it and emits `suppression.created`
+   ([Post-commit](#post-commit-attachments-and-index-jobs)). The delivery consumer's abuse windows never
+   see DSN-derived outcomes: `ApplyDeliveryEvent` returns no `outcome` for `source = Dsn`.
 
 ## Re-parsing (J3)
 
@@ -1267,12 +1553,156 @@ gets `message.received` or `message.quarantined` again with `data.reprocessed = 
 For a test tenant, the outbound loopback transport delivers mail to identities on the same deployment
 by writing the composed MIME to the recipient's raw key and queuing an `InboundPointer` with `loopback`
 set ([Outbound › Transports](outbound.md#transports), FR-OUT-12, [L3](../edge-cases.md)). Only the
-outbound consumer sets this field. For a loopback pointer the consumer:
+outbound consumer sets this field, and only for a recipient identity in the **same tenant**, or in a
+tenant with the same non-null `partner_id`: loopback skips authentication and spam scoring, so it must
+never reach another workspace's mailbox ([L3](../edge-cases.md), [G11](../edge-cases.md)). The consumer
+checks it again: a pointer whose `loopback.tenant_id` is neither the recipient's tenant nor a tenant of
+the same partner (re-read from D1 in step 1) is processed as ordinary mail, with full authentication and
+scoring, and `loopback_refused_total` is incremented. For an accepted loopback pointer the consumer:
 
 - skips the DNS prefetch and authentication; `verdict = 'pass'`, `auth_json = { "source": "loopback", … }`;
 - adds the flag `loopback`;
 - sets `spam_base = 0` and skips rule 6 of the quarantine decision (risky attachments still quarantine);
 - otherwise runs the normal pipeline, so threading, references, events and triage behave as for real mail.
+
+## Read path and release
+
+Every read, label change and release of mail is a `MailboxRequest` on the identity's mailbox, after the
+handler's scope check ([Security § 5.2](security.md#52-order-of-checks)). The handler passes `review`,
+which is true only when the key holds `quarantine:review`; the mailbox never sees the key otherwise.
+
+```rust
+// crates/worker/src/mailbox/read.rs
+pub enum ReadRequest {                      // variants of MailboxRequest
+    ListThreads   { filters: ThreadFilters, limit: u32, cursor: Option<ListBoundary> },
+    GetThread     { thread_id: String, messages_limit: u32, cursor: Option<ListBoundary>, include: Include, review: bool },
+    ListMessages  { filters: MessageFilters, limit: u32, cursor: Option<ListBoundary>, review: bool },
+    GetMessage    { message_id: String, include: Include, review: bool },
+    UpdateMessage { message_id: String, labels_add: Vec<String>, labels_remove: Vec<String>, read: Option<bool>, review: bool },
+    UpdateThread  { thread_id: String, labels_add: Vec<String>, labels_remove: Vec<String>, read: Option<bool>, archived: Option<bool> },
+    ListQuarantine { limit: u32, cursor: Option<ListBoundary> },
+    Release       { message_id: String, actor: Actor, reason: String, key_release: KeyRelease },
+    ConfirmStored { message_id: String },   // post-commit check (I10): Stored | Erased
+}
+pub struct ListBoundary { pub sort_ms: i64, pub key: i64 }   // the last row's sort time and seq or rowid
+pub struct Include { pub quoted: bool, pub html: bool, pub headers: bool }
+pub enum KeyRelease { NotAKey, Allowed }    // decided by the handler, below
+```
+
+**Visibility.** A message is **visible** when its status is not `quarantined`, `hidden` or `throttled`.
+Lists show visible messages only; `ListMessages` with an explicit `status` filter of `quarantined`,
+`hidden` or `throttled` returns those messages only with `review`, and otherwise returns none with `200`
+([Security § 5.3](security.md#53-cross-level-read-access)). `GetMessage` of a message that is not visible
+answers `message_not_found` without `review`, the same as a missing ID.
+
+**Threads** keep visible-only columns ([Threading § 3.4](threading.md#34-effects-on-the-thread-row)), so a
+thread list never counts, dates or names mail an agent cannot see. A thread with no visible message has
+`message_count = 0` and is never listed. `ListThreads`:
+
+```sql
+-- ?1 archived (0|1), ?2 limit + 1, ?3/?4 the boundary (last_at, seq) or NULL, then the filter parameters
+SELECT t.seq, t.id, t.subject, t.participants_json, t.message_count, t.unread_count, t.first_at,
+       t.last_at, t.last_inbound_at, t.category, t.needs_reply, t.urgency, t.archived, t.hold_json,
+       lm.direction AS last_direction, lm.snippet
+FROM threads t
+JOIN messages lm ON lm.rowid = (SELECT m.rowid FROM messages m
+                                WHERE m.thread_seq = t.seq
+                                  AND m.status NOT IN ('quarantined','hidden','throttled')
+                                ORDER BY m.received_at DESC, m.rowid DESC LIMIT 1)
+WHERE t.message_count > 0 AND t.archived = ?1
+  AND (?3 IS NULL OR (t.last_at, t.seq) < (?3, ?4))
+  AND (<filters>)
+ORDER BY t.last_at DESC, t.seq DESC
+LIMIT ?2;
+```
+
+The filters are fixed fragments: `category = ?`, `needs_reply >= ?`, `unread_count > 0` (`is_unread`),
+`lm.direction = ?`, `last_at >= ?` and `last_at < ?` (`after`, `before`, resolved to UTC in the handler),
+and for `label`, `EXISTS (SELECT 1 FROM labels l JOIN messages m ON m.rowid = l.message_rowid WHERE
+m.thread_seq = t.seq AND l.label = ? AND m.status NOT IN ('quarantined','hidden','throttled'))`. A thread's
+`labels` (the union over its visible messages) come from one more query per page:
+
+```sql
+SELECT m.thread_seq, l.label FROM labels l JOIN messages m ON m.rowid = l.message_rowid
+WHERE m.thread_seq IN (SELECT value FROM json_each(?1))
+  AND m.status NOT IN ('quarantined','hidden','throttled')
+GROUP BY m.thread_seq, l.label;
+```
+
+`snippet` and `last_direction` are therefore those of the latest visible message.
+
+**Messages.** `ListMessages` orders by `received_at DESC, rowid DESC` with the same boundary rule, and the
+fixed filters `thread_seq = (SELECT seq FROM threads WHERE id = ?)`, `direction = ?`, `status = ?`,
+`EXISTS (… labels …)`, `received_at >= ?`, `received_at < ?`. `GetThread` returns the thread summary
+plus its visible messages oldest first (`received_at ASC, rowid ASC`, `messages_limit` per page; with
+`review`, also its quarantined messages). Each message is built from its row, its `attachments`,
+`labels`, `refs` and, for outbound, `deliveries`. `extracted_text` is always included; `text` with
+`include=quoted`, `html` (from `html_sanitized`) with `include=html`.
+
+**`include=headers`.** Header fields are not stored in SQLite: they are read from the raw MIME in R2 and
+parsed with the core parser (the first 200 fields, at most 64 KiB, each value cut to 2,048 bytes). Once
+the raw MIME is past `raw_days` (`raw_r2_key` is `NULL`), `headers` is `null`, and so it is for outbound
+messages whose sent copy was deleted ([The system identity's mailbox](#the-system-identitys-mailbox)).
+
+**Cursors.** Every list cursor uses the HMAC envelope of [Search § 5.8](search.md#58-cursors-and-as_of-pinning)
+(keyring purpose `cursor`), with the payload
+`ListCursorV1 { v: 1, list: "threads" | "thread_messages" | "messages" | "quarantine", qh, issued_at,
+last: ListBoundary }` (the contacts list has its own boundary, [Search § 12.1](search.md#121-contacts-search)). `qh` is the first 16 bytes of SHA-256 over the list name, the canonical
+filters, the identity ID and the API key ID, so a cursor works only for the same list, filters and key.
+A cursor older than 24 hours gets `410 cursor_expired`; a bad tag, kid or `qh` gets `400 invalid_request`
+(`details.errors[0].path = "cursor"`). Lists are keyset-paginated newest first, so mail that arrives during
+pagination appears on the first page only and never shifts later pages.
+
+**Labels and read state** (FR-IN-10). `UpdateMessage` and `UpdateThread` run in one transaction each:
+
+- `labels_add`: `INSERT OR IGNORE INTO labels`, refused with `400 invalid_request` when a message would
+  pass 64 labels; `labels_remove`: `DELETE FROM labels WHERE message_rowid = ? AND label IN (SELECT value
+  FROM json_each(?))`. On a thread they apply to every visible message of the thread;
+- `read`: sets `messages.read` (on a thread: every visible inbound message), then recomputes
+  `threads.unread_count` (visible inbound messages with `read = 0`);
+- `archived` (threads only): sets `threads.archived`. A new visible inbound message in an archived
+  thread sets it back to 0.
+
+They emit no event. `UpdateMessage` on a message that is not visible needs `review` (else
+`message_not_found`). The search operator `is:unread` and the list filter `is_unread` read the same
+columns.
+
+**Quarantine list.** `ListQuarantine` (`quarantine:review` is checked by the handler):
+
+```sql
+SELECT … FROM messages
+WHERE direction = 'inbound' AND status = 'quarantined'
+  AND (?2 IS NULL OR (received_at, rowid) < (?2, ?3))
+ORDER BY received_at DESC, rowid DESC LIMIT ?1;
+```
+
+Each item is a Message object with `quarantine_reason`.
+
+**Release.** The handler first decides whether the caller may release ([J14](../edge-cases.md),
+[J16](../edge-cases.md)): a person in the console always may (`KeyRelease::NotAKey`); an API key needs
+`quarantine:review`, and, when `PM_QUARANTINE_KEY_RELEASE` is `off`, the tenant's
+`policy.quarantine.key_release` must be `true`. The policy is read from D1 for this request, never from a
+cache, immediately before the call; otherwise `403 permission_denied`, and the mailbox is not called. The
+mailbox refuses a key actor whose request does not carry `KeyRelease::Allowed`. Then, in one transaction:
+
+1. Load the row. Not found, or erased → `message_not_found`. Status not `quarantined` (including
+   `hidden` and `throttled`, which are never released) → `409 not_quarantined`.
+2. `UPDATE messages SET status = 'received', quarantine_reason = NULL, triage_status = ?, triage_json = ?`:
+   `pending` and `NULL` when triage is enabled for the tenant (the handler passes the flag) and the kind
+   is not `dsn` or `mdn`; otherwise `skipped` with the skipped record.
+3. Thread: recompute its visible columns (count, `unread_count`, `last_at`, `last_inbound_at`,
+   `participants_json`, and `subject` when it is still empty), and update `reply_from_address` by the
+   inbound rule of [Threading § 5](threading.md#5-which-address-a-reply-is-sent-from-c3-fr-out-5) as if
+   the message had just arrived. An archived thread is unarchived.
+4. Verification: when the message has a verification match and its verdict is `pass`, insert the
+   `verifications` row with `expires_at = received_at + 24 h` (none if that has passed). No
+   `verification.received` event is emitted for a release.
+5. Outbox: `message.released` with `released_by_key_id` or `released_by_user_id` and `reason`.
+
+After the commit the mailbox queues `Triage { reason: Release }` (when `pending`) and
+`Embed { reason: Release }`; the handler writes the `quarantine.release` audit row with the key or user.
+The `message.released` event reaches the Notifier through the webhook fan-out
+([Webhooks › Handing new mail to the Notifier](webhooks.md#handing-new-mail-to-the-notifier)).
 
 ## Open points
 
@@ -1285,7 +1715,19 @@ outbound consumer sets this field. For a loopback pointer the consumer:
 
 | Test | Covers |
 |---|---|
-| `it::inbound::a4_role_mail_routing` | `postmaster@` and `abuse@` the platform domain become a new message to `PM_SECURITY_CONTACT` (nothing stored); with the variable unset they get `550 5.1.1`; `info@` the platform domain gets `550 5.1.1`; `postmaster@` a tenant domain goes to the owner, and to `PM_SECURITY_CONTACT` when the tenant has no owner ([A4](../edge-cases.md)) |
+| `it::inbound::a4_role_mail_routing` | `postmaster@` and `abuse@` the platform domain become a new message from the system identity to `PM_SECURITY_CONTACT` (nothing stored in a tenant mailbox); with the variable unset they get `550 5.1.1`; `info@` the platform domain gets `550 5.1.1`; `postmaster@` a tenant domain goes to the owner, and to `PM_SECURITY_CONTACT` when the tenant has no owner or the owner's address is on a deployment domain ([A4](../edge-cases.md)) |
+| `it::inbound::d14_role_mail_relay_guarded` | The 31st role message in an hour to one domain, and the 6th from one sender, get a temporary failure; a message carrying `X-Pylota-Mail-Role-Hop`, or from the system identity, gets `550 5.4.6`; a relay of a message whose verdict is not `pass`, or that has a risky attachment, attaches only `text/rfc822-headers`; the same raw message delivered twice is relayed once (`role:` idempotency key); a suppressed `PM_SECURITY_CONTACT` ends in `role_mail_failed_total` with no retry; a `PM_SECURITY_CONTACT` on the platform domain counts as unset ([D14](../edge-cases.md)) |
+| `it::inbound::a16_dictionary_guard` | 50 messages in one second to random unknown addresses on one domain: the first 20 are looked up in D1 and get `550 5.1.1`, the rest get a temporary failure with no D1 query; a known address that is cached still gets through; with D1 down, an address on a domain that is not a deployment domain gets `550 5.1.1` instead of being staged ([A16](../edge-cases.md), [J7](../edge-cases.md)) |
+| `it::inbound::d11_forged_dsn_ignored` | A DSN naming a Cloudflare- or SES-sent message changes no delivery and creates no suppression; for an SMTP-relay send, a DSN with verdict `fail`, from a domain aligned with neither the recipient nor the relay, or whose returned `From` differs, is ignored (`dsn_untrusted`); a trusted one marks the recipient `bounced` (hard) with a suppression that expires after 30 days, emits `suppression.created` once, and adds nothing to the abuse window, so eleven of them never pause the identity ([D11](../edge-cases.md), [N19](../edge-cases.md)) |
+| `core::trust::d12_platform_domain_not_known` | A `pass` sender on the platform domain from another tenant is not `known_sender` and carries `shared_domain_sender`; the same sender with `outbound_count > 0` is known; a sender on the tenant's own domain with `pass` is known; a platform-domain local part whose suffix folds to the receiving tenant's suffix gets `lookalike_domain` ([D12](../edge-cases.md)) |
+| `it::tenants::d12_suffix_confusable_refused` | `POST /v1/tenants` with a suffix whose fold is on the reserved list (`.stripe`, `.str1pe`, `.p0stmaster`) gets `400 address_reserved` with `details.field = "address_suffix"`; one whose fold equals an existing tenant's suffix fold (`.acrne` beside `.acme`) gets `409 suffix_taken`; a distinct suffix is accepted; the console's workspace form shows the same errors ([D12](../edge-cases.md), [REST API › Tenants](../../reference/api.md#post-v1tenants)) |
+| `it::inbound::d13_unsolicited_flood_caps` | 200 unauthenticated messages in an hour from 200 forged senders: the 121st onwards is `throttled`, with no event, triage or embedding; mail from a known correspondent in the same hour is `received`; 2,001 messages across a tenant's identities throttle the rest; throttled mail is not counted in `storage_gb`; with `TenantQuota` unavailable mail is still stored ([D13](../edge-cases.md), [D5](../edge-cases.md)) |
+| `it::inbound::panic_to_degraded` | A message whose full parse panics (a fault hook) is retried after `retry_delay`; its third attempt parses headers only and stores it with `parse_degraded`; a fresh message in the same batch is stored on its first attempt; under a 10-minute queue backlog a healthy message is still parsed in full ([B2](../edge-cases.md), FR-IN-3) |
+| `it::erasure::orphan_objects_swept` | A sender's retry of the same raw message leaves one raw object (the duplicate's copy is deleted); a send refused after its sent copy was written (`402`, `429`, `thread_busy`) leaves no `out/` object; a compose marker left by a killed submit is cleaned by the next maintenance run; an orphan key older than 15 days is deleted by the rolling sweep, in `BACKUP` too; keys named by rows are never deleted ([I9](../edge-cases.md)) |
+| `it::security::a15_system_mailbox_unreachable` | With mail in the system identity's mailbox: a tenant search, keyword or agentic, by a tenant or partner key of the default tenant never returns it; it has no FTS rows and no vectors; its events reach platform endpoints only and never a tenant endpoint or a Notifier; a subject-access export of the default tenant leaves it out; its stored bodies show `[link]` and `[code]` instead of the sign-in link and code, and its sent copy is gone once the message is `submitted` ([A15](../edge-cases.md)) |
+| `it::messages::read_path_visible_threads` | A thread whose only message is quarantined is not listed; after release it is, with the released message's subject, `snippet`, `last_direction`, participants and `unread_count`; a hidden message never changes a thread's counts; list cursors expire after 24 hours (`410 cursor_expired`) and refuse other filters or keys (`400`); `include=headers` returns `null` once the raw MIME is past `raw_days` (FR-IN-10, FR-IN-7) |
+| `it::messages::labels_and_read_state` | `PATCH` of a message and of a thread adds and removes labels and sets read state; `is:unread` and `is_unread` follow; the 65th label is `400 invalid_request`; archiving a thread hides it from the default list until new visible mail arrives; a message that is not visible needs `quarantine:review` (FR-IN-10) |
+| `it::quarantine::release_transaction` | Release moves the message to `received`, clears `quarantine_reason`, recomputes the thread, sets `triage_status = 'pending'` and queues `Triage` and `Embed`, inserts a `verifications` row for a `pass` code mail, emits `message.released` once, and writes the audit row; a second release gets `409 not_quarantined`; a hidden message cannot be released (FR-IN-5) |
 | `it::inbound::a6_reject_codes` | Unknown and erased `550 5.1.1` (indistinguishable), retired `550 5.1.6`, suspended tenant temporary failure for 5 days then `550 5.2.1` ([A6](../edge-cases.md), FR-IN-2, FR-TEN-3) |
 | `it::inbound::a2_forged_token_ignored` | A forged `+t…` detail files by headers and never changes the identity ([A2](../edge-cases.md)) |
 | `it::inbound::a9_two_identities_two_copies` | Two copies, same `raw_sha256`, exactly one `is_primary_recipient = true` ([A9](../edge-cases.md)) |
@@ -1310,7 +1752,7 @@ outbound consumer sets this field. For a loopback pointer the consumer:
 | `it::inbound::d4_backscatter_dropped` | Unmatched DSN dropped and counted ([D4](../edge-cases.md), FR-DLV-5) |
 | `it::inbound::d5_sender_throttle` | The 61st message in an hour from one sender is `throttled` ([D5](../edge-cases.md)) |
 | `core::classify::d6_*` | RFC 3834, lists, out-of-office, hop counter ([D6](../edge-cases.md), FR-IN-6) |
-| `it::inbound::d7_blocked_hidden` | Suppressed and receive-blocked senders stored `hidden`, no event ([D7](../edge-cases.md)) |
+| `it::inbound::d7_blocked_hidden` | A receive-blocked sender's mail is stored `hidden` with no event; a suppressed sender's mail (hard bounce, complaint, unsubscribe, provider) is stored `received`, evented, with the flag `sender_suppressed` ([D7](../edge-cases.md)) |
 | `it::inbound::receive_allow_skips_spam` | A sender on the tenant's receive-allow list (address or `@domain`) is not quarantined for its spam score, and is still quarantined when authentication fails (build plan M9, with the lists API) |
 | `it::inbound::nfr_rel1_no_loss_canary` | Under the J1, J2 and J7 fault injections, every message `email()` accepted carries a canary token, and once the queues drain each canary is found exactly once through the read API; `inbound_raw_missing_total` stays 0 (NFR-REL-1, build plan M7) |
 | `core::auth::d9_forged_ar_ignored` | A lower header with the trusted authserv-id, and any other authserv-id, are ignored ([D9](../edge-cases.md)) |
@@ -1324,7 +1766,7 @@ outbound consumer sets this field. For a loopback pointer the consumer:
 | `it::inbound::j7_d1_transient` | D1 down in `email()` → staged, routed by the consumer, unroutable staged mail dropped ([J7](../edge-cases.md)) |
 | `it::ses::push_and_backstop_once`, `it::ses::unknown_recipient_dropped`, `it::ses::cross_tenant_recipients` | One message per object and recipient; unknown recipients dropped with no bounce; recipients of two tenants stay apart ([N3](../edge-cases.md), [N6](../edge-cases.md), [N28](../edge-cases.md)) |
 | `it::ses::verdict_mapping`, `it::ses::large_message_40mb` | SPF from SES, DKIM and DMARC recomputed, virus `FAIL` quarantined, spam `FAIL` scores 0.9; a 39 MB message is ingested ([N5](../edge-cases.md), [N27](../edge-cases.md)) |
-| `it::inbound::probe_and_forwarding_check` | `pm-probe+{token}` and a forwarding-check token are recorded on the domain's monitor and never stored as messages; an unknown forwarding token is ordinary mail ([N12](../edge-cases.md), [N18](../edge-cases.md)) |
+| `it::inbound::probe_and_forwarding_check` | `pm-probe+{token}` and a forwarding-check token are recorded on the domain's monitor and never stored as messages; an unknown forwarding token is ordinary mail; mail sent straight to the platform address with the external address in `To` leaves `forwarding` unchanged ([N12](../edge-cases.md), [N18](../edge-cases.md)) |
 | `it::smtp::dsn_to_bounce` | An RFC 3464 DSN for a relay send → `bounced` (hard), a suppression, the DSN stored `hidden` ([N19](../edge-cases.md)) |
-| `it::testmode::l3_loopback` | Test-tenant mail to a local identity arrives with `verdict: pass` and flag `loopback` ([L3](../edge-cases.md)) |
+| `it::testmode::l3_loopback` | Test-tenant mail to an identity of the same tenant, or of a tenant of the same partner, arrives with `verdict: pass` and flag `loopback`; a send to an identity of any other tenant gets `403 test_mode_recipient`; a forged loopback pointer for another tenant is processed with full authentication ([L3](../edge-cases.md)) |
 | `it::logs::i5_no_content_in_logs` | No body text, subject or clear address in captured logs ([I5](../edge-cases.md), FR-PRV-6) |

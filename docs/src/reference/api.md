@@ -46,8 +46,10 @@ list uses one format (search keeps its own, [Search › Cursors](../project/desi
 - **Required** on `POST …/messages`, `…/reply`, `…/reply-all` and `…/forward`. A missing key returns
   `400 idempotency_key_required`. The one exception is a dry run (`?dry_run=true`), where the key is
   optional and never recorded ([Sending](#sending)).
-- **Optional** on every other `POST`, except four that ignore the header and never record it
-  (`x-idempotency: none` in [`openapi.yaml`](openapi.yaml)): the two signing endpoints
+- **Optional** on every other `POST`, except six that ignore the header and never record it
+  (`x-idempotency: none` in [`openapi.yaml`](openapi.yaml)): the two search endpoints
+  (`POST /v1/identities/{identity_id}/search` and `POST /v1/tenants/{tenant_id}/search`), which return
+  mail and change nothing, so their results are never stored; the two signing endpoints
   ([`…/assertions`](#post-v1identitiesidentity_idassertions--tenant-or-identity-key-identitiessign) and
   [`…/http-signatures`](#post-v1identitiesidentity_idhttp-signatures--tenant-or-identity-key-identitiessign)),
   because each call signs anew and a replay record would have to store what was signed; and the two
@@ -64,6 +66,11 @@ list uses one format (search keeps its own, [Search › Cursors](../project/desi
   `POST /v1/webhooks/{webhook_id}/rotate-secret`) is stored without it: a replay returns the same body
   without `secret` and with `"secret_replayed": false`. A secret is shown once, in the first response;
   if it was lost, rotate or revoke ([J19](../project/edge-cases.md)).
+- No stored response holds mail content. A response that carries a message or a thread
+  (`…/release`, `…/cancel`, `…/resolve`, `…/threads/{thread_id}/hold`) is stored as a reference, and a
+  replay reads the resource again with the calling key's visibility (a resource erased since replays its
+  `404`). Records belong to the identity they name, so identity and tenant erasure delete them
+  ([Data model](../project/design/data-model.md#1-d1-control-plane)).
 - The same key with a different request returns `409 idempotency_conflict`.
 - The same key while the first request is still running returns `409 request_in_progress` with
   `retryable: true`.
@@ -268,7 +275,15 @@ with `policy:write`.
 ```
 
 - `address_suffix` defaults to `"." + slug`. Only one tenant (the default tenant made by `pmail setup`)
-  can have an empty suffix.
+  can have an empty suffix. Every tenant shares the platform domain, so a suffix must not pass for
+  someone else ([D12](../project/edge-cases.md)). Its fold (the confusable fold of
+  [Identities › Username validation](../project/design/identity-domains.md#username-validation), without the
+  dot) is refused with `400 address_reserved` (`details.field = "address_suffix"`) when it equals the fold
+  of a reserved username, or of a name in the compiled list `core::address::RESERVED_SUFFIXES`: `pylota`,
+  `pylotamail`, `stripe`, `paypal`, `google`, `gmail`, `microsoft`, `outlook`, `apple`, `icloud`, `amazon`,
+  `aws`, `cloudflare`, `github`, `hmrc`, `gov`, `govuk`, `dvla`, `police`, `bank`, `visa`, `mastercard`,
+  `amex`, `billing`, `payments` and `admin`. A suffix whose fold equals another tenant's (`.acrne` beside
+  `.acme`) gets `409 suffix_taken`, enforced by the unique `tenants.suffix_fold`.
 - `policy` is merged over the defaults. See [Configuration › Tenant policy](configuration.md#tenant-policy).
 - `owner` (optional) creates the workspace's console owner and emails them a sign-in link. Without it, a
   platform or partner key can add an owner later with an invitation and an ownership transfer in the
@@ -365,6 +380,10 @@ losing the compare-and-set gets `503 unavailable` (retryable) after three attemp
 ceiling. Each write writes the audit row `tenant.policy_update` and emits `tenant.policy_updated`.
 Errors: `400 invalid_request`, `403 permission_denied`, `403 scope_denied`, `404 tenant_not_found`
 (out of scope, or a write to an `erasing` or `erased` tenant), `503 unavailable`.
+- **Automatic sending pause.** `sending_paused_at` is set when the tenant's complaint or bounce rate
+  reaches the provider's review level ([G12](../project/edge-cases.md)). `"sending_paused": false` lifts
+  it, audit-logged; only a platform key may send it (`403 scope_denied`, `details.field:
+  "sending_paused"`), and no key can set a pause by hand.
 
 #### Tenant object
 
@@ -372,7 +391,7 @@ Errors: `400 invalid_request`, `403 permission_denied`, `403 scope_denied`, `404
 {
   "id": "ten_01J9…", "slug": "acme", "name": "Acme Car Hire", "mode": "live", "status": "active",
   "suspended_by": null, "partner_id": null, "address_suffix": ".acme", "timezone": "Europe/London",
-  "policy": { "...": "full effective policy" },
+  "policy": { "...": "full effective policy" }, "sending_paused_at": null,
   "created_at": "2026-10-09T10:00:00Z", "updated_at": "2026-10-09T10:00:00Z"
 }
 ```
@@ -586,7 +605,7 @@ signing and its JWK Set return `404 identity_not_found`.
   "addresses": [ { "...": "Address objects" } ],
   "owner": { "name": "Sam Patel", "email": "sam@acmecarhire.example" },
   "signature": { "text": "…", "html": null },
-  "send_policy": { "daily_cap": 500, "auto_reply": "allowed", "require_known_recipient": false },
+  "send_policy": { "daily_cap": 500, "auto_reply": "allowed", "require_known_recipient": true },
   "metadata": { "operator_id": "op_123" },
   "client_id": "acme:bookings",
   "created_at": "…", "updated_at": "…"
@@ -1102,7 +1121,13 @@ Re-reads the expected records from the provider APIs and checks each against DNS
 
 ### `PATCH /v1/domains/{domain_id}` — `domains:write`
 
-The body has `transport`, `smtp` or both. Returns `200` with the domain. Audit-logged.
+The body has `transport`, `smtp`, `sending_paused`, or several. Returns `200` with the domain.
+Audit-logged.
+
+**`sending_paused`**, platform keys only (`403 scope_denied` with `details.field: "sending_paused"` for
+others): `false` lifts an automatic sending pause of a tenant domain (`sending_paused_at`,
+[G12](../project/edge-cases.md)). A paused domain's sends get `409 sending_paused` and never fall back to
+the platform domain.
 
 **`transport`**, platform keys only (`403 scope_denied` for others):
 
@@ -1323,7 +1348,7 @@ need `quarantine:review` for a quarantined message and never accept a hidden or 
   "triage": {
     "status": "done", "category": "billing", "needs_reply": 0.15, "urgency": 1,
     "summary": "Brightwell invoice 88213 for AB12 CDE brake work, £412.80 inc VAT.",
-    "language": "en", "risk_flags": [], "model": "@cf/openai/gpt-oss-20b", "version": 3
+    "language": "en", "risk_flags": [], "model": "@cf/openai/gpt-oss-20b", "version": 3, "run": 1
   },
   "refs": [ { "kind": "uk_plate", "value": "AB12CDE" }, { "kind": "invoice", "value": "88213" } ],
   "rfc_message_id": "CAF8a…@mail.brightwell.example",
@@ -1336,22 +1361,32 @@ need `quarantine:review` for a quarantined message and never accept a hidden or 
 
 - `text` is the full plain text. It is included with `include=quoted`.
 - `html` is sanitised HTML. It is included with `include=html` and is never rendered by the service.
-- `trust.flags` can hold `hidden_text`, `display_name_spoof`, `lookalike_domain`, `reply_to_mismatch`
-  and `thread_join_unverified`.
-- `triage.status` is `pending`, `done`, `skipped` or `failed`. `triage.reason` is present only for
-  `skipped` (`allowance`, `policy_disabled`, `not_eligible`) and `failed` (`invalid_output`,
+- `trust.flags` can hold `hidden_text`, `display_name_spoof`, `lookalike_domain`, `reply_to_mismatch`,
+  `thread_join_unverified` (a thread join without a valid token: a failed token, or `In-Reply-To` or
+  `References` from a sender who is not a participant, [C9](../project/edge-cases.md)) and
+  `shared_domain_sender` (the sender is another workspace's address on the shared platform domain,
+  [D12](../project/edge-cases.md)).
+- `triage.status` is `pending`, `done`, `skipped` or `failed`. `triage.version` is the triage logic
+  version that produced the record (it does not change on a re-run); `triage.run` counts completed runs
+  (`0` for a record written at ingest). `triage.reason` is present only for
+  `skipped` (`allowance`, `policy_disabled`, `not_eligible`, `ai_unavailable`) and `failed` (`invalid_output`,
   `model_unavailable`, `input_unavailable`) ([Triage design](../project/design/triage.md)). For example,
   mail that arrives after the workspace's `triage` allowance is spent is still stored, and its triage is
   skipped with reason `allowance`; the built-in rules' risk flags are kept and the model does not run
   ([W7](../project/edge-cases.md)):
-  `{ "status": "skipped", "reason": "allowance", "category": null, "needs_reply": null, "urgency": null, "summary": null, "language": null, "risk_flags": ["unknown_sender"], "model": null, "version": 3 }`.
+  `{ "status": "skipped", "reason": "allowance", "category": null, "needs_reply": null, "urgency": null, "summary": null, "language": null, "risk_flags": ["unknown_sender"], "model": null, "version": 3, "run": 0 }`.
 - `deliveries` is set on outbound messages:
   `[{ "address", "field", "status", "smtp_code", "enhanced_code", "bounce_type", "updated_at" }]`
   (`enhanced_code` is the RFC 3463 code, for example `5.1.1`, when the provider or relay gave one).
 - Message-level `flags` include `sent_via_fallback`, `parse_degraded`, `encrypted`,
   `message_id_conflict`, `reprocessed`, `reconciled`, `bcc`, `loopback` (delivered inside the deployment
-  for a test tenant, [L3](../project/edge-cases.md)) and `body_truncated` (a stored body was cut at its
-  storage cap; the full message is in the raw MIME).
+  for a test tenant, [L3](../project/edge-cases.md)), `body_truncated` (a stored body was cut at its
+  storage cap; the full message is in the raw MIME), `sender_suppressed` (the sender is on the tenant's
+  suppression list; the message is stored as usual, [D7](../project/edge-cases.md)), `body_redacted`
+  (links and codes replaced in a system-identity message, [A15](../project/edge-cases.md)) and
+  `dsn_untrusted` (a delivery report that changed no delivery, [D11](../project/edge-cases.md)).
+- `headers` (with `include=headers`) is `null` once the raw MIME it is read from is gone (past
+  `retention.raw_days`).
 - `is_primary_recipient` is `true` on exactly one copy when one message reached several identities of
   the tenant ([A9](../project/edge-cases.md)).
 
@@ -1386,7 +1421,11 @@ Query: `pages=1-3` (default: all, capped at 200 KB of text).
 
 ### `POST /v1/identities/{identity_id}/messages/{message_id}/triage` — `messages:write`
 
-Re-runs triage. Returns `202`. A `message.triaged` event follows.
+Re-runs triage (FR-TRI-5). Returns `202` with no body. A `message.triaged` event follows, and the record
+then has the same `version` and a `run` one higher. A message that ingest never triages (quarantined,
+hidden, throttled, a delivery report or read receipt, or a system-identity message) gets
+`409 triage_not_eligible` with `details.reason` (`quarantined` or `not_eligible`): release a quarantined
+message instead, which triages it. Outbound messages get `400 invalid_request`.
 
 ### `POST /v1/identities/{identity_id}/messages/{message_id}/release` — `quarantine:review`
 
@@ -1464,9 +1503,24 @@ which only a dry run returns. A `200` always has `would_send: true`; each recipi
 - `kind`:
   - `transactional` (the default);
   - `marketing`, which needs an `unsubscribe` object (`{ "url": "https://…", "mailto": "…" }`) and the
-    tenant's consent attestation (`"consent": { "basis": "opt_in", "recorded_at": "…" }`);
+    tenant's consent attestation (`"consent": { "basis": "opt_in", "recorded_at": "…" }`), else
+    `400 marketing_requirements_missing`. It also needs a sending domain whose transport is `ses` or
+    `smtp` (FR-OUT-15): Cloudflare Email Service is for transactional mail only, so a marketing send from
+    the platform domain or from a `cloudflare`-transport domain gets `422 transport_unavailable` with
+    `details.reason: "marketing_needs_ses"`. The check runs again before transport; a message whose domain
+    has changed transport or fallen back to the platform domain by then ends `rejected` with reason
+    `marketing_needs_ses`;
   - `auto_reply`, which sets `Auto-Submitted: auto-replied`. It is only allowed in reply to a
     non-automated message.
+- **Known recipients** (FR-OUT-13, [E2](../project/edge-cases.md)). By default
+  (`send_policy.require_known_recipient: true`) a recipient the identity has never sent to, that no
+  send-allow entry names, and that is not the authenticated sender being answered, is not an error: its
+  delivery is `suppressed` with `policy: unknown_recipient`. Mail received from an address does not make
+  it known. Set `require_known_recipient: false` on an identity that sends to new people by design.
+- **Loops and pauses.** Any send whose hop count would reach 10 gets `409 loop_detected`
+  (`details.hop`), whatever its `kind` ([N13](../project/edge-cases.md)). A tenant or sending domain whose
+  sending was paused automatically gets `409 sending_paused` (`details.scope`: `tenant` or `domain`,
+  [G12](../project/edge-cases.md)).
 - `thread_id` continues an existing thread without quoting. References are set from the thread.
 - `from_address` must be an `active` address of the identity, or a `retiring` one on a thread that
   already uses it (G7; with `thread_id`). Otherwise `400 invalid_request` with
@@ -1604,10 +1658,13 @@ request sets `facets: false`.
   "status": "answered",
   "answer": {
     "text": "Yes. Admiral accepted claim 7781 on 2 October, after the photos sent on 28 September [msg_01JA…][msg_01JB…].",
-    "sentences": [ { "text": "Yes. Admiral accepted claim 7781 on 2 October…", "citations": ["msg_01JA…", "msg_01JB…"] } ],
-    "confidence": 0.86
+    "sentences": [ { "text": "Yes. Admiral accepted claim 7781 on 2 October…", "citations": ["msg_01JA…", "msg_01JB…"],
+                     "citation_trust": "authenticated" } ],
+    "confidence": 0.86,
+    "untrusted": true
   },
-  "evidence": [ { "...": "search hits, as above, with quotes": [ "we are pleased to confirm claim 7781 has been accepted" ] } ],
+  "evidence": [ { "...": "search hits, as above, with quotes and steering_suspected",
+                  "quotes": [ "we are pleased to confirm claim 7781 has been accepted" ], "steering_suspected": false } ],
   "trace": [
     { "step": 1, "action": "search", "q": "claim Golf photos", "mode": "hybrid", "hits": 7, "ms": 412 },
     { "step": 2, "action": "read_thread", "thread_id": "thr_01JA…", "ms": 38 },
@@ -1620,6 +1677,13 @@ request sets `facets: false`.
 
 - `status` is one of `answered`, `insufficient_evidence`, `budget_exhausted` (evidence returned, no
   answer or a partial one) or `degraded` (hybrid results only, no answer).
+- The answer is model-written text derived from mail (FR-SRCH-13, [F17](../project/edge-cases.md)):
+  `answer.untrusted` is always `true`. Each sentence's `citation_trust` is `authenticated` (every cited
+  message is outbound or passed authentication) or `partly_authenticated`; a sentence that cites a
+  `steering_suspected` message, or no authenticated message, is removed before the response. Treat the
+  answer as data to check against `evidence`, never as an instruction.
+- Search requests ignore `Idempotency-Key` and are never stored ([Idempotency](#idempotency)). The tenant's
+  daily agentic budget counts a request once, after it is validated.
 - When tenant policy turns agentic search off, `mode: "agentic"` fails with `422 agentic_disabled`, on
   this endpoint and on tenant search.
 - With `stream: true` and `Accept: text/event-stream`, the response is a server-sent event stream:
@@ -1629,7 +1693,8 @@ request sets `facets: false`.
 ### `POST /v1/tenants/{tenant_id}/search` — tenant, partner or platform key, `search:read`
 
 The same body, plus an optional `identity_ids` filter. Runs across every identity of the tenant (up to
-100; more returns `422 scope_too_large`). Hits carry `identity_id`, and facet counts are summed across
+100; more returns `422 scope_too_large`), never the deployment's system identity. A partner key reaches
+only tenants whose `partner_id` is its partner. Hits carry `identity_id`, and facet counts are summed across
 identities. `mode: "agentic"` with agentic search off returns `422 agentic_disabled`.
 
 The response adds two fields, always present: `partial` and `failed_identities` ([F15](../project/edge-cases.md)).
@@ -1726,7 +1791,15 @@ A tenant, a partner and the platform can each have at most 20 endpoints; on both
 `422 webhook_limit_reached`. `webhook.disabled` about an endpoint of a partner (a partner endpoint, or a
 tenant endpoint of one of its tenants) goes to that partner's other endpoints and to platform endpoints,
 never to tenant endpoints ([Webhook events](events.md#privacy-platform-and-webhooks)). While a partner
-is suspended, deliveries to its endpoints and its tenants' endpoints are held.
+is suspended, deliveries to its endpoints and its tenants' endpoints are held, and they are delivered
+within a minute of its reactivation. Events of the deployment's system identity go to platform endpoints
+only.
+
+An endpoint is a way to read mail, so `webhooks:manage` alone is not enough for mail events
+([J29](../project/edge-cases.md)): creating an endpoint, changing its `url` or `events`, or replaying to it
+needs `messages:read` as well when its `events` include `"*"`, any `message.*` type or
+`verification.received`, and `quarantine:review` as well when they include `"*"` or
+`message.quarantined`. Otherwise `403 permission_denied` with `details.required`.
 
 ### `GET /v1/webhooks` · `GET /v1/tenants/{tenant_id}/webhooks` · `GET|PATCH|DELETE /v1/webhooks/{webhook_id}`
 
@@ -1735,7 +1808,9 @@ platform endpoints for a platform key, the partner's endpoints for a partner key
 endpoints for a tenant or identity key. A partner key reaches its partner's endpoints and its tenants'
 endpoints by ID; any other endpoint is `404 webhook_not_found` to it.
 
-`PATCH` accepts `url`, `events`, `identity_ids`, `description` and `enabled`.
+`PATCH` accepts `url`, `events`, `identity_ids`, `description` and `enabled`. A changed `url` disables the
+endpoint with `disabled_reason: "url_changed"` until a test delivery to the new URL succeeds
+(`POST …/test`), which re-enables it; `enabled: true` on such an endpoint gets `400 invalid_request`.
 
 ### `POST /v1/webhooks/{webhook_id}/rotate-secret`
 
@@ -1744,7 +1819,8 @@ both signatures.
 
 ### `POST /v1/webhooks/{webhook_id}/test`
 
-Sends a `webhook.test` event straight away and returns the delivery attempt.
+Sends a `webhook.test` event straight away and returns the delivery attempt. A `2xx` re-enables an
+endpoint disabled with `url_changed`.
 
 ### `GET /v1/webhooks/{webhook_id}/deliveries` — `webhooks:read`
 

@@ -266,8 +266,9 @@ request fails with `422 transport_unavailable` and `details.reason = "ses_not_co
 
 - **Forwarding state ([N12](../edge-cases.md)).** Each address on a domain with `inbound: forward`
   (`send_only`, or `smtp_relay` with `inbound: forward`) has `forwarding`: `unverified` until a
-  forwarding test or any real message has arrived through forwarding, then `ok`; `failed` after a test
-  whose token did not arrive. `forwarding_checked_at` records the last change. On other domains
+  forwarding test's token has arrived through forwarding, then `ok`; `failed` after a test whose token
+  did not arrive. Ordinary mail never sets `ok`: anyone can write to the platform address directly with
+  the custom address in `To`, so only the token proves the forwarder works ([N12](../edge-cases.md)). `forwarding_checked_at` records the last change. On other domains
   `forwarding` is `null`. There is no webhook event for it.
 - **Forwarding test.** `POST /v1/identities/{identity_id}/addresses/{address_id}/test-forwarding`
   (`identities:write`) answers `202` and sends a short message, from `mailer-daemon@{platform domain}`
@@ -616,7 +617,7 @@ These rows add to [What each check verifies](identity-domains.md#what-each-check
 | SES identity | `transport = ses` or `inbound = ses`; on a Cloudflare-transport domain with `ses_identity` (the [J5](../edge-cases.md) failover identity), informational only: shown, never an issue that changes the state ([Identities and domains › What each check verifies](identity-domains.md#what-each-check-verifies)) | `GetEmailIdentity` (once a day, at the domain's hash offset, through the SES token bucket, §4.8): `VerifiedForSendingStatus = true` and `DkimAttributes.Status = SUCCESS` | `ses_dkim_failed` (fail) ([N10](../edge-cases.md)) |
 | SES DKIM CNAMEs | as above | Each CNAME points at `{token}.{SigningHostedZone}` | `dkim_missing` (fail) |
 | MAIL FROM | `transport = ses` with `mail_from_domain` set (`dns_records`, `send_only`). Not a Cloudflare-method domain sent through its J5 failover identity: that identity has no custom MAIL FROM (SES uses its default), so a failed-over domain never turns `degraded` for it | `MailFromAttributes.MailFromDomainStatus = SUCCESS`, and the MX and SPF at `pm-bounce.{domain}` match | `mail_from_failed` (degraded) ([N11](../edge-cases.md)) |
-| SES account | deployment, in `pmail doctor` and the 15-minute platform check | Production access enabled, sending not paused, the receipt rule set active and containing `pm-deliver` | `ses_sending_paused`, `ses_rule_missing` (platform alerts; every SES domain uses fallback while sending is paused) ([N10](../edge-cases.md)) |
+| SES account | deployment, in `pmail doctor` and the 15-minute platform check | Production access enabled, sending not paused, the receipt rule set active and containing `pm-deliver` | `ses_sending_paused`, `ses_rule_missing` (platform alerts; while sending is paused, sends through SES are held and never fall back to the platform domain) ([N10](../edge-cases.md)) |
 | Alignment probe | `transport = smtp` | Last probe (with the live values) passed within 26 hours | `smtp_unaligned`, `smtp_from_rewritten` (degraded for the first in a row, fail from the second; [§5.3](#53-proving-alignment-the-probe)); `smtp_probe_timeout` (fail before the first pass; after it degraded the first time, fail from the second in a row) |
 | SMTP login | `transport = smtp` | The last send or probe authenticated | `smtp_auth_failed`, `smtp_tls_required` (fail) |
 | Parent delegation | `kind = delegated` | NS for the subdomain at the parent equal the zone's `name_servers` | `nameservers_changed` (ownership) |
@@ -793,7 +794,7 @@ Sending, so a `dns_records` domain costs less to serve than one on a Cloudflare 
 | `it::domains::zone_expired` | Pending zone deleted upstream → `removed`, `zone_expired`, `domain.removed` with `reason: "zone_expired"`; the final reminder is sent on day 21 ([N23](../edge-cases.md)) |
 | `it::domains::mx_wrong_region` | An MX at another region's SES inbound host → `mx_wrong_region` (fail) ([N8](../edge-cases.md)) |
 | `it::ses::control_plane_rate` | Twenty concurrent `Acquire` calls are granted one second apart; a request-path caller past its 5-second deadline gets `429 upstream_rate_limited` with `Retry-After`; the daily checks of 1,000 fake domains fall at their hash offsets, at most one per second; an SES `ThrottlingException` re-acquires after 2 s |
-| `it::ses::dkim_failed_or_paused` | `GetEmailIdentity` without DKIM `SUCCESS` → `ses_dkim_failed` → `failing` → fallback; account sending paused → `ses_sending_paused` alert and every SES domain uses fallback ([N10](../edge-cases.md)) |
+| `it::ses::dkim_failed_or_paused` | `GetEmailIdentity` without DKIM `SUCCESS` → `ses_dkim_failed` → `failing` → fallback; account sending paused → `ses_sending_paused` alert, and queued SES sends are held (no fallback to the platform domain) until sending resumes or 24 hours pass ([N10](../edge-cases.md)) |
 | `it::ses::mail_from_mx_missing` | MX at `pm-bounce.{domain}` removed → `mail_from_failed` (degraded); sends continue with SES's default MAIL FROM ([N11](../edge-cases.md)) |
 | `it::domains::zone_create_rate_limited` | Cloudflare `1105` on zone create → `429 upstream_rate_limited`, `Retry-After: 10800` ([N22](../edge-cases.md)) |
 | `it::domains::zone_hold` | A zone-hold error on create → `409 zone_hold` ([N24](../edge-cases.md)) |
@@ -806,7 +807,7 @@ Sending, so a `dns_records` domain costs less to serve than one on a Cloudflare 
 | `it::smtp::partial_rcpt` | `4xx` on one `RCPT` → `DATA` is still sent to the others, that delivery stays `queued` and is retried later (the message stays `queued` until then; its `sends` unit stays held); `5xx` on another → that delivery is `rejected` with the code; the rest are sent in the same session ([N20](../edge-cases.md)) |
 | `it::smtp::probe_unaligned_falls_back` | A relay re-signing with its own `d=` → `smtp_unaligned` ×2 → `failing` → the next send uses the platform address ([N18](../edge-cases.md)) |
 | `it::smtp::probe_schedule_and_pending` | Fake time: a failed probe is retried after 20 minutes and is degraded; the second failure is fail-level and the domain is `failing` within 40 minutes; probes then run hourly, and daily again after a pass. A `PATCH smtp` probe that passes moves `smtp_pending_sealed` into `smtp_sealed`; one that fails changes neither column nor the live `failures_in_row` ([N18](../edge-cases.md)) |
-| `it::smtp::dsn_to_bounce` | An RFC 3464 DSN for a sent message → `bounced` (hard) and a suppression ([N19](../edge-cases.md)) |
+| `it::smtp::dsn_to_bounce` | A trusted RFC 3464 DSN for a relay send → `bounced` (hard) and a 30-day suppression ([N19](../edge-cases.md), [D11](../edge-cases.md)); the full case list is in [Inbound › Tests](inbound.md#tests) |
 | `it::forwarding::test_forwarding` | New address → `forwarding: unverified`; token arrives → `ok`; none in 10 minutes → `failed` ([N12](../edge-cases.md)) |
-| `it::forwarding::loop_capped` | An agent writing to its own external address, forwarded back, does not loop: the hop counter and the automatic-exchange cap stop it ([N13](../edge-cases.md)) |
+| `it::forwarding::loop_capped` | An agent writing to its own external address with `kind: normal` replies, forwarded back, does not loop: the send at hop 10 gets `409 loop_detected`; with auto-replies the automatic-exchange cap stops it first ([N13](../edge-cases.md)) |
 | `core::dns::doubled_name_detected` | `agents.brightwell.example.brightwell.example` matching an expected value → `record_doubled_name` ([N17](../edge-cases.md)) |

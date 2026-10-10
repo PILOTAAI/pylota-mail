@@ -155,6 +155,10 @@ whatlang  = "=0.18.0"                                           # core::triage: 
 chrono    = { version = "=0.4.45", default-features = false, features = ["alloc"] }  # local dates; no clock
 chrono-tz = { version = "=0.10.4", default-features = false }  # IANA zones for tenants.timezone
 
+# Container checks in core::attach (crates.io sparse index, read 2026-10-10; Inbound › Sniffing)
+miniz_oxide = { version = "=0.9.1", default-features = false, features = ["with-alloc"] }  # DEFLATE only, no std
+cfb         = "=0.15.0"                                         # OLE compound-file directories
+
 # Signing keys (core::jwk, core::jwt, core::httpsig, and the SDK verifier; crates.io sparse index, read
 # 2026-10-09: ed25519-dalek 3.0.0 published 2026-07-06, zeroize 1.9.0 published 2026-06-12)
 ed25519-dalek = { version = "=3.0.0", default-features = false, features = ["zeroize"] }
@@ -1109,7 +1113,9 @@ on (build plan M16). It is native only (never compiled to wasm) and depends only
 - **Idempotency.** `send_message`, `reply`, `reply_all` and `forward` take a required
   `&IdempotencyKey`, made with `IdempotencyKey::new(&str) -> Result<IdempotencyKey, Error>` (validated
   against `^[\x20-\x7E]{1,255}$`). Other `POST` methods take an optional one and generate a ULID-based key
-  when it is absent, so the SDK's own retries are safe.
+  when it is absent, so the SDK's own retries are safe, except the operations marked
+  `x-idempotency: none` (the two search methods, the signing methods and the SNS hooks), which never send
+  the header: search changes nothing, and its results must not be stored.
 - **Published examples.** Every Rust example in the docs uses only this surface, and compiles in CI
   (`sdk::doctest::published_examples`): the Rust blocks of `docs/src/quickstart.md` are rustdoc tests
   through `#[cfg(doctest)] #[doc = include_str!(…)]` on a private module (`no_run`, so nothing calls a

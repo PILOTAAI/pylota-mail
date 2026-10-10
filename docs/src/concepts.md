@@ -185,7 +185,7 @@ A **message** has a `direction` and a `status`:
 
 | Direction | Statuses |
 |---|---|
-| `inbound` | `received` (visible), `quarantined` (held for review), `throttled` (over the per-sender limit, hidden), `hidden` (from a blocked or suppressed sender, kept for audit) |
+| `inbound` | `received` (visible), `quarantined` (held for review), `throttled` (over the per-sender limit, hidden), `hidden` (from a receive-blocked sender, or a delivery report, kept for audit) |
 | `outbound` | `queued`, `submitted`, `delivered`, `deferred`, `bounced`, `complained`, `rejected`, `failed`, `uncertain`, `suppressed`, `canceled`. See [Outbound status](reference/api.md#outbound-status) |
 
 What an inbound message carries:

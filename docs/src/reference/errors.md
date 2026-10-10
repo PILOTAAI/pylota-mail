@@ -56,7 +56,7 @@ whether or not the first attempt reached the server.
 | 403 | `tenant_suspended` | no | The tenant is suspended |
 | 403 | `partner_suspended` | no | A platform operator suspended the key's partner. Every partner key of it, and every tenant and identity key of its tenants, gets this on every route, `GET /v1/me` included, until the partner is `active` again. The tenants' status does not change and their inbound mail is still stored; deliveries to the partner's and the tenants' endpoints are held ([J13](../project/edge-cases.md)) |
 | 403 | `partner_tenant_limit` | no | `POST /v1/tenants` with a partner key whose partner already has `max_tenants` tenants that are not erased (default 25; `details.max_tenants`). Erase a tenant, or ask the platform operator to raise the limit ([J18](../project/edge-cases.md)) |
-| 403 | `test_mode_recipient` | no | A test tenant tried to send outside the simulator or this deployment |
+| 403 | `test_mode_recipient` | no | A test tenant tried to send to an address that is neither on the simulator nor an identity of its own tenant or of a tenant with the same partner ([L3](../project/edge-cases.md)) |
 | 403 | `policy_denied` | no | The tenant's policy forbids the action. In v1.0: a signed HTTP request (`POST …/http-signatures`) while tenant policy `web_bot_auth.allowed` is `false`, the default ([O13](../project/edge-cases.md)); a platform operator turns it on in the tenant's policy. And `wait` with `kind=verification` for a sender domain without an approved service-ledger entry while the tenant's `accounts.require_approval` is `true` (`details.reason = "account_not_approved"`, `details.service_domain`, [E9](../project/edge-cases.md)); request an entry and wait for its approval |
 | 403 | `invalid_signature` | no | An SNS message to `POST /hooks/ses` (SES delivery events) or `POST /hooks/ses/inbound` (SES inbound mail) failed verification: `SignatureVersion` not `2`, a bad signature, a signing certificate not on `sns.{PM_SES_REGION}.amazonaws.com`, another topic, or a stale `Timestamp`. Not returned to API callers |
 
@@ -118,6 +118,9 @@ whether or not the first attempt reached the server.
 | 409 | `auto_reply_not_allowed` | no | An auto-reply to automated mail, or over the automatic-exchange limit ([D6](../project/edge-cases.md)) |
 | 409 | `account_exists` | no | `POST …/accounts` while the identity already has a pending or approved service-ledger entry for the same service and account identifier. `details.account_id` and `details.status` name it ([E12](../project/edge-cases.md)) |
 | 409 | `account_not_pending` | no | `approve` or `reject` on a service-ledger entry that is no longer `pending_approval` (already decided the other way, closed, or expired after 7 days). `details.status` is its state. Repeating the decision it already has answers `200` instead ([E12](../project/edge-cases.md)) |
+| 409 | `loop_detected` | no | A send of any `kind` whose computed hop count (`X-Pylota-Mail-Hop`) would reach the limit of 10: the thread looks like a loop between automated senders. `details.hop` is the hop it would have had ([N13](../project/edge-cases.md)) |
+| 409 | `sending_paused` | no | The tenant's sending (`details.scope = "tenant"`) or the sending domain (`details.scope = "domain"`, `details.domain_id`) was paused automatically because its complaint or bounce rate reached the provider's review level; `details.reason` is `abuse_threshold`. Only a platform key can resume it ([G12](../project/edge-cases.md)) |
+| 409 | `triage_not_eligible` | no | Re-running triage on a message that is never triaged: quarantined (release it instead, which triages it), hidden, throttled, a delivery report or read receipt, or a message of the system identity. `details.reason` is `quarantined` or `not_eligible` |
 | 410 | `raw_expired` | no | Raw MIME is past retention |
 | 410 | `cursor_expired` | no | A pagination cursor older than 24 hours |
 | 423 | `legal_hold` | no | `DELETE …/messages/{message_id}` on a message whose thread is under a legal hold. Nothing was created. Erasure requests (`POST /v1/erasure-requests`) never return it: they skip held threads and list them in the receipt |
@@ -170,10 +173,11 @@ in `data.reason` are:
 |---|---|---|
 | `provider_validation` | `rejected` | The transport refused the content (header, size, format) |
 | `sender_domain_unavailable` | `rejected` | The domain is not onboarded with the transport |
-| `recipient_suppressed_by_provider` | per recipient `suppressed` | The provider's own suppression list. Synced into ours |
+| `recipient_suppressed_by_provider` | per recipient `suppressed` | The provider's own suppression list. Synced into ours, except a suppression scoped to the shared platform domain, which may come from another workspace and is not copied |
 | `quota_exhausted` | `failed` | The provider's rate limit or daily limit, still refusing after 24 hours of back-off (rate-limit back-offs are capped at 24 hours too), or an SMTP relay still unavailable after 24 hours of retries |
 | `transport_timeout` | `uncertain` | No answer from the transport. It may have been sent |
 | `transport_connection_lost` | `uncertain` | The connection dropped after the request was written |
+| `provider_outcome_unknown` | `uncertain` | The transport reported a delivery failure for a message with several recipients without saying which recipients it refused, so some may have received it |
 | `resolved_not_sent` | `failed` | A human resolved an uncertain send as not sent |
 | `domain_failing_no_fallback` | `failed` | The domain failed and fallback was disabled by policy |
 | `marketing_needs_ses` | `rejected` | A `kind: marketing` message whose sending domain used the `cloudflare` transport when it reached the transport: the domain's transport changed, or fallback moved the message to the platform domain, after it was accepted. Cloudflare Email Service is for transactional mail only. At submit the same check returns `422 transport_unavailable` |
@@ -187,7 +191,8 @@ could send twice. `uncertain` sends are **never resent automatically**.
 | Provider answer | Status | Reason | Retried |
 |---|---|---|---|
 | Cloudflare validation and header codes (`E_VALIDATION_ERROR`, `E_FIELD_MISSING`, `E_TOO_MANY_RECIPIENTS`, `E_CONTENT_TOO_LARGE`, `E_HEADER_*`, `E_HEADERS_*`, `E_TOO_MANY_ATTACHMENTS`, `E_RECIPIENT_NOT_ALLOWED`); SES `MessageRejected`, `BadRequestException` and other 4xx | `rejected` | `provider_validation` | never |
-| Cloudflare `E_DELIVERY_FAILED` (the recipient server refused the message) | `rejected` | `provider_validation` | never |
+| Cloudflare `E_DELIVERY_FAILED` (the recipient server refused the message) on a message with one recipient | `rejected` | `provider_validation` | never |
+| Cloudflare `E_DELIVERY_FAILED` on a message with several recipients (the error does not say which recipients were refused; spike S1 records the semantics) | `uncertain` | `provider_outcome_unknown` | never |
 | A per-recipient provider event `failed` or `rejected` (Cloudflare event subscription, SES `Reject` or `Rendering Failure`) | that recipient `failed` or `rejected`; the message rolls up | `provider_validation` | never |
 | Cloudflare `E_SENDER_DOMAIN_NOT_AVAILABLE`, `E_SENDER_NOT_VERIFIED`; SES `MailFromDomainNotVerifiedException`, `NotFoundException` | `rejected` | `sender_domain_unavailable` | never |
 | Cloudflare `E_RECIPIENT_SUPPRESSED` | the recipient `suppressed` (or `rejected` when it cannot be identified) | `recipient_suppressed_by_provider` | the other recipients, once |

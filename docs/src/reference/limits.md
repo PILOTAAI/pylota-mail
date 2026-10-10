@@ -20,7 +20,15 @@ Pylota Mail. Cloudflare's and Amazon's were read from their documentation on 202
 | Archive expansion checked | ratio ≤ 100:1, ≤ 100 MB | Pylota Mail | Larger means `risk: archive_bomb`, quarantined |
 | Local part length | 64 characters, including the thread token | RFC 5321 | Username plus suffix at most 40 |
 | References kept on our replies | 20: the first plus the 19 most recent | Pylota Mail | The ones between are trimmed ([C2](../project/edge-cases.md)) |
-| Daily sending | Account quota, set and raised by Cloudflare. It is not exposed to the Worker | Cloudflare | Queue backs off for up to 24 hours. An alert fires at 80% of `PM_DAILY_SEND_QUOTA` when you set it to your quota, otherwise on the first quota error ([G3](../project/edge-cases.md)) |
+| Daily sending | Account quota, set and raised by Cloudflare. It is not exposed to the Worker, and the limits page does not say whether it counts messages or recipients, so the alert counts accepted recipients plus the strategy-B journal copy (`cf_recipients`) | Cloudflare | Queue backs off for up to 24 hours. An alert fires at 80% of `PM_DAILY_SEND_QUOTA` when you set it to your quota, otherwise on the first quota error ([G3](../project/edge-cases.md)) |
+| Stored message row (Durable Object SQLite) | 1,900,000 bytes per message row, inbound and outbound: `text` 512 KiB, `html_sanitized` 1 MiB, `extracted_text` 256 KiB, `references_json` 200 msg-ids and 32 KiB, `to` and `cc` 200 addresses each, DSN recipients 100; when the sum would pass the budget, `html_sanitized` is cut first, then `text`, then `extracted_text` | Cloudflare (2 MB per row, string or BLOB; 100 bound parameters per query; 100 KB per statement; 100 columns per table: [Durable Objects limits](https://developers.cloudflare.com/durable-objects/platform/limits/), read 2026-10-10) / Pylota Mail | Flag `body_truncated`; the full message stays in the raw MIME ([Inbound › Storage caps](../project/design/inbound.md#storage-caps)) |
+| Inbound volume per identity | 60 an hour per sender (`unauth:` + address when authentication fails), 120 an hour across unauthenticated senders who are not known correspondents | Policy (`inbound.*`) | Stored `throttled`: not triaged, embedded or evented, not counted in `storage_gb` ([D5](../project/edge-cases.md), [D13](../project/edge-cases.md)) |
+| Inbound volume per tenant | 2,000 an hour from senders who are not known correspondents | Policy (`inbound.per_tenant_per_hour`) | As above |
+| Unknown recipients per domain | 20 misses a second | Pylota Mail | Further mail to unknown addresses on the domain gets a temporary failure for the rest of the second ([A16](../project/edge-cases.md)) |
+| Role mail relayed (`postmaster@`, `abuse@` and the other RFC 2142 names) | 30 an hour per domain, 5 an hour per envelope sender | Pylota Mail | A temporary failure; the sender's server retries ([D14](../project/edge-cases.md)) |
+| Hop count of a send (`X-Pylota-Mail-Hop`) | Below 10, for every `kind` | Pylota Mail | `409 loop_detected` ([N13](../project/edge-cases.md)) |
+| Unknown transport outcomes in a row | 3 per transport (Cloudflare account, SES region, SMTP relay) | Pylota Mail | The transport's breaker opens for 5 minutes, doubling to at most 1 hour; queued messages wait unclaimed instead of becoming `uncertain` ([J28](../project/edge-cases.md)) |
+| Tenant and domain complaint and bounce rates | Complaints 0.1%, bounces 5%, over 7 UTC days with at least 500 outcomes | Policy (`abuse.tenant_*`); the complaint default is Amazon SES's review rate ([SES sending review FAQ](https://docs.aws.amazon.com/ses/latest/dg/faqs-enforcement.html), read 2026-10-10) | Sending paused: `409 sending_paused`, no fallback; a platform key resumes ([G12](../project/edge-cases.md)) |
 
 ## Domains and addresses
 
@@ -76,7 +84,9 @@ Applies to domains connected with `smtp_relay`.
 | Requests per partner, all its partner keys together (`RL_PARTNER_API`) | 1,800 per minute (`429 rate_limited`, `details.bucket: "partner"`) |
 | Active API keys | 100 tenant and identity keys per tenant, 10 partner keys per partner; revoked and expired keys do not count (`422 key_limit_reached`). Platform keys are not capped |
 | Search per key | 120 per minute |
-| Agentic search per key | 20 per minute. Tenant daily cap 500 by default |
+| Agentic search per key | 20 per minute. Tenant daily cap 500 by default, counted once per validated request |
+| Workers AI per tenant (`RL_AI`, `RL_EMBED`) | 60 text-generation calls (triage, agentic planning and answers) and 600 embedding requests a minute; the account's limits, shared by every tenant, are 300 and 3,000 a minute ([Workers AI limits](https://developers.cloudflare.com/workers-ai/platform/limits/), read 2026-10-10). Triage and embedding jobs over the share wait and retry; interactive search degrades ([F16](../project/edge-cases.md)) |
+| Model-backed triage per tenant | 2,000 a day by default (`triage.daily_model_cap`); then rules-only until local midnight |
 | Sends per identity | 120 per minute. Daily caps from policy |
 | Signing per identity (`RL_SIGN`): agent assertions and signed HTTP requests together | 600 per minute. Not counted against any plan allowance |
 | Tenant creation and invitations per partner (`RL_PARTNER`) | 10 per minute together, across all of the partner's keys |

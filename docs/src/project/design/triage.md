@@ -1,8 +1,9 @@
 # Triage
 
 Binding design for triage: the category, needs-reply score, urgency, summary, language and risk flags
-attached to every inbound message that agents can see. It implements FR-TRI-1 to FR-TRI-4 and
-NFR-QUAL-3, and the edge-case rows D8, E1 and B11 in the [edge-case register](../edge-cases.md).
+attached to every inbound message that agents can see. It implements FR-TRI-1 to FR-TRI-5 and
+NFR-QUAL-3, and the edge-case rows D8, D13 (the daily model cap), E1, F16 (Workers AI fair use) and B11
+in the [edge-case register](../edge-cases.md).
 
 The triage object is part of the [Message object](../../reference/api.md#message-object) and the
 `message.triaged` [event](../../reference/events.md#messages). Tenant settings live in
@@ -15,7 +16,7 @@ The triage object is part of the [Message object](../../reference/api.md#message
 | Pure logic (`crates/core`) | `triage_rules.rs` (built-in rules, tenant rule evaluation, rules-only summaries), `injection.rs` (shared with search: fence, steering patterns) |
 | Worker (`crates/worker`) | `triage/{mod.rs, rules.rs, model.rs, schema.rs, prompts.rs}`, the triage job in `consumers/index.rs`, `mailbox/triage.rs` (load, commit, roll-up) |
 | Model | `PM_TRIAGE_MODEL`, default `@cf/openai/gpt-oss-20b` |
-| External facts verified on 2026-10-09 | Workers AI `gpt-oss-20b` model page and raw input/output schemas; Workers AI JSON Mode page (last updated 14 September 2026) |
+| External facts verified on 2026-10-09 | Workers AI `gpt-oss-20b` model page and raw input/output schemas; Workers AI JSON Mode page (last updated 14 September 2026). On 2026-10-10: the Workers AI limits page (300 text-generation requests a minute per account; the model page does not mark `gpt-oss-20b` as needing the Workers Paid plan) |
 
 Triage is **advisory** (FR-TRI-3). It never sends, deletes, releases or quarantines a message. The only
 state it changes besides its own fields is adding labels named by a tenant rule's `labels_add`, which
@@ -42,6 +43,7 @@ Triage runs asynchronously on `pm-index` (FR-TRI-1). Ingest sets `triage_status`
 | Inbound, status `received`, triage disabled by policy | `skipped` (reason `policy_disabled`) | none |
 | Inbound, status `quarantined` | `NULL` until released ([Inbound](inbound.md)) | none |
 | Inbound, status `hidden` or `throttled`, or kind `dsn` or `mdn` | `skipped` (reason `not_eligible`) | none |
+| Any message of the system identity's mailbox ([Inbound › The system identity's mailbox](inbound.md#the-system-identitys-mailbox)) | `skipped` (reason `not_eligible`) | none |
 | Outbound | `NULL` | none |
 
 Later triggers:
@@ -49,14 +51,16 @@ Later triggers:
 | Event | Effect |
 |---|---|
 | A quarantined message is released (`message.released`) | `triage_status = 'pending'`, `Triage { reason: Release }` |
-| `POST …/messages/{id}/triage` | `triage_status = 'pending'`, `Triage { reason: Rerun }` ([§10](#10-re-run-endpoint)) |
+| `POST …/messages/{id}/triage` on an eligible message (FR-TRI-5) | `triage_status = 'pending'`, `Triage { reason: Rerun }` ([§10](#10-re-run-endpoint)) |
 | A `reparse` job re-ingests a message ([J3]) | `Triage { reason: Reprocess }` |
 
 ```rust
 // crates/api-types/src/internal/index_job.rs (variant of IndexJob, see search.md §6)
 Triage { tenant_id: String, identity_id: String, message_id: String,
-         #[serde(default)] reason: TriageReason, #[serde(default)] attempt: u32 }
-// attempt: retries are counted in the body and re-enqueued with a delay (search.md § 6)
+         #[serde(default)] reason: TriageReason, #[serde(default)] attempt: u32,
+         #[serde(default)] deferrals: u32 }
+// attempt: retries are counted in the body and re-enqueued with a delay (search.md § 6);
+// deferrals: RL_AI refusals (search.md § 6, Workers AI fair use), which are not failures
 #[derive(Default)]
 pub enum TriageReason { #[default] Ingest, Release, Rerun, Reprocess }
 ```
@@ -74,7 +78,16 @@ pub enum TriageReason { #[default] Ingest, Release, Rerun, Reprocess }
    the first 500 characters of the `.md` text from R2. Triage does not wait for pending extraction.
 4. **Policy.** Read the tenant's effective policy from D1 (cached per isolate for 60 seconds).
 5. **Rules.** Run tenant rules, then built-in rules ([§5](#5-evaluation-order)).
-6. **Model**, unless the rules set `skip_model` ([§6](#6-model-call)).
+6. **Model**, unless the rules set `skip_model` ([§6](#6-model-call)). Before the call, two checks
+   ([§12](#12-cost-controls)):
+   - `QuotaRequest::CountTriageModel { tz, cap, r#ref }` with `cap = policy.triage.daily_model_cap`
+     and `ref` = the message ID. On `CapReached` the model is not called and the record is the
+     rules-only record of [§5.1](#51-rules-only-record) (`model: "rules"`), stored as `done`;
+     `triage_model_cap_total` is incremented. `TenantQuota` counts a `ref` once per day (meta
+     `tm:{ref}`, deleted after 2 days), so a redelivered or deferred job is not counted twice.
+   - `RL_AI` for the tenant. A refusal defers the job: the hold is released, the job is re-enqueued
+     with the same `attempt`, `deferrals + 1` and a 60–90 s delay, and acked. After 120 deferrals the
+     record is `skipped` with reason `ai_unavailable` and the deterministic risk flags.
 7. **Validate** the model output ([§7](#7-validation-and-failure-handling)).
 8. **Commit.** Call `triage.commit(message_id, record, labels_add)`. In one transaction the mailbox
    writes `triage_json` and `triage_status`, inserts the labels, updates the thread roll-up
@@ -136,7 +149,7 @@ pub struct TriageInput {
     pub auth: AuthSummary,                     // spf, dkim, dmarc results
     pub known_sender: bool,
     pub spam_score: f32,
-    pub trust_flags: Vec<TrustFlag>,           // display_name_spoof, lookalike_domain, reply_to_mismatch, thread_join_unverified
+    pub trust_flags: Vec<TrustFlag>,           // display_name_spoof, lookalike_domain, reply_to_mismatch, thread_join_unverified, shared_domain_sender
     pub message_flags: Vec<MessageFlag>,       // hidden_text, encrypted, parse_degraded, …
     pub attachments: Vec<AttachmentMeta>,      // { id, filename, effective_type, size, risk, text_status, excerpt }
     pub refs: Vec<RefValue>,
@@ -156,7 +169,9 @@ pub struct TriageRecord {                      // serialised into messages.triag
     pub language: Option<String>,              // BCP 47, or "und"
     pub risk_flags: Vec<RiskFlag>,
     pub model: Option<String>,                 // model ID, or "rules" when the model was skipped
-    pub version: u32,                          // TRIAGE_VERSION used
+    pub version: u32,                          // TRIAGE_VERSION used (a constant per release, § 11)
+    pub run: u32,                              // completed runs for this message: 0 for a record ingest
+                                               // wrote, 1 for the first job's commit, + 1 per later commit
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub rules: Vec<String>,                    // stored only: IDs of the rules that matched, in order
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -167,7 +182,8 @@ pub struct TriageRecord {                      // serialised into messages.triag
 pub enum TriageReasonCode {
     Allowance,          // skipped: the workspace's triage allowance is spent (FR-BILL-7, edge case W7)
     PolicyDisabled,     // skipped: policy.triage.enabled = false
-    NotEligible,        // skipped: hidden, throttled, DSN or MDN
+    NotEligible,        // skipped: hidden, throttled, DSN or MDN, or the system identity's mailbox
+    AiUnavailable,      // skipped: RL_AI deferred the job 120 times (Workers AI fair use, F16)
     InvalidOutput,      // failed: model output invalid after one retry
     ModelUnavailable,   // failed: model errors at attempt 9, the last re-enqueued try
     InputUnavailable,   // failed: message or R2 data needed for the input is missing
@@ -191,12 +207,17 @@ pub struct RuleOutcome {
 pub enum RuleSource { Tenant(String), BuiltIn(&'static str) }
 ```
 
-The API serialises the first nine fields of `TriageRecord` (the object in the API reference), plus
+The API serialises the first ten fields of `TriageRecord` (the object in the API reference), plus
 `reason`, which is present only when the status is `skipped` or `failed`: edge case W7 requires a skipped
-triage to report reason `allowance`. `rules` stays in `triage_json` for audit and debugging.
+triage to report reason `allowance`. `rules` stays in `triage_json` for audit and debugging. `commit`
+sets `run` to the stored record's `run` + 1, so a re-run is visible as a higher `run` with the same
+`version`.
 
-The ingest path writes the skipped records for policy and eligibility directly
-(`{ "status": "skipped", "reason": "policy_disabled", "risk_flags": [], "version": N }`), with no job.
+The ingest path writes the skipped records for policy and eligibility directly, as the `triage_json`
+parameter (`?36`) of the message `INSERT` ([Inbound › IdentityMailbox.ingest](inbound.md#identitymailboxingest)):
+`{ "status": "skipped", "reason": "policy_disabled", "risk_flags": [], "model": null, "version": N, "run": 0 }`
+(or `"reason": "not_eligible"`), with no job. Every other inbound message is inserted with
+`triage_json` `NULL` and `triage_status` `pending` or `NULL` as in the table above.
 
 ## 3. Built-in rules
 
@@ -468,6 +489,14 @@ Filenames, display names and addresses are untrusted, so they appear only inside
 lists the fields set by rules (`category=pcn (tenant rule pcn-council)`, `needs_reply=0.9`);
 `rule_flags` lists flags already raised; `hints` lists rule hints.
 
+**References in `FACTS`.** A reference value is text from the mail, so the `references:` line lists only
+values that `core::injection::fact_ref` accepts: after upper-casing, the value matches
+`^[A-Z0-9][A-Z0-9:.+/-]{0,39}$` and its kind is not `email` or `domain`
+([Inbound › Reference extraction](inbound.md#reference-extraction)). Every other value (an address, a
+domain, a custom ref with `normalise: none` or `lower` that contains spaces or other characters) is
+listed in the `EMAIL` block instead, fenced as `field=references`, so attacker-chosen words never appear
+in the trusted block ([E1]).
+
 **Input budget.** The message is cut to 6,000 estimated tokens using the estimator in
 [Search §6.2](search.md#62-chunking). Each part has a cap, applied in this order:
 
@@ -582,13 +611,16 @@ FR-TRI-4 requires that output is validated against the schema and that invalid o
 | Message or R2 data needed for input missing | `failed` | `reason: input_unavailable` | ack; hold released | `message.triaged` |
 | Rules-only | `done` | [§5.1](#51-rules-only-record) | ack; hold consumed | `message.triaged` |
 | Hold denied (allowance spent) | `skipped` | `reason: allowance`; model fields `null`; rule risk flags kept | ack; no model call | none |
+| Tenant's daily model cap reached (`CountTriageModel` answers `CapReached`) | `done` | rules-only record ([§5.1](#51-rules-only-record)), `model: "rules"` | ack; hold consumed | `message.triaged` |
+| `RL_AI` refusal | stays `pending` | – | hold released; re-enqueue with the same `attempt`, `deferrals + 1`, 60–90 s delay, then ack | none |
+| `RL_AI` refusal at `deferrals = 120` | `skipped` | `reason: ai_unavailable`; model fields `null`; rule risk flags kept | ack; hold released | none |
 
 A valid result consumes the hold. Every other outcome releases it, so a failed analysis is refunded
 (FR-BILL-7).
 
 Rule-derived risk flags are kept on a failed record because they are deterministic facts, not
 guesses. The `message.triaged` payload carries the API triage object (`status`, `category`,
-`needs_reply`, `urgency`, `summary`, `language`, `risk_flags`, `model`, `version`).
+`needs_reply`, `urgency`, `summary`, `language`, `risk_flags`, `model`, `version`, `run`).
 
 ## 8. Custom categories
 
@@ -634,13 +666,20 @@ WHERE seq = ?1
 `POST /v1/identities/{identity_id}/messages/{message_id}/triage` (`messages:write`), described in the
 [API reference](../../reference/api.md#threads-and-messages).
 
-1. Load the message with the caller's visibility: a quarantined message is visible only with
-   `quarantine:review`, else `404 message_not_found`. A reviewer may triage a quarantined message.
+1. Load the message with the caller's visibility: a `quarantined`, `hidden` or `throttled` message is
+   visible only with `quarantine:review`, else `404 message_not_found`.
 2. Outbound messages return `400 invalid_request` with message "Triage applies to inbound messages only."
-3. If `triage_status = 'pending'` and a job was enqueued less than 60 seconds ago, enqueue nothing.
+3. **Eligibility** (FR-TRI-5). A message that ingest would not triage cannot be re-run: status
+   `quarantined`, `hidden` or `throttled`, kind `dsn` or `mdn`, or a message of the system identity's
+   mailbox → `409 triage_not_eligible` with `details.reason` (`quarantined`, `not_eligible`), and
+   nothing changes. A reviewer who wants a quarantined message triaged releases it, which triages it
+   ([Inbound › Read path and release](inbound.md#read-path-and-release)). The consumer's `Skip` for these
+   statuses ([§1.1](#11-consumer-steps)) therefore never leaves a re-run `pending`.
+4. If `triage_status = 'pending'` and a job was enqueued less than 60 seconds ago, enqueue nothing.
    Otherwise set `triage_status = 'pending'` and enqueue `Triage { reason: Rerun }`.
-4. Return `202` with `{ "message_id": "msg_…", "triage": { "status": "pending", … } }`. A
-   `message.triaged` event follows when the job finishes.
+5. Return `202` with no body ([API](../../reference/api.md#post-v1identitiesidentity_idmessagesmessage_idtriage--messageswrite)).
+   A `message.triaged` event follows when the job finishes; `GET` on the message shows the new record,
+   with `run` one higher.
 
 `Idempotency-Key` is optional, as for every non-mail `POST`.
 
@@ -648,7 +687,9 @@ WHERE seq = ?1
 
 - `TRIAGE_VERSION: u32` in `triage/mod.rs` is bumped whenever the system prompt, the output schema,
   the built-in rules or the merge logic changes. Version 1 ships with v1.0.
-- Each record stores the `version` and `model` it was produced with.
+- Each record stores the `version` and `model` it was produced with. `version` is the constant of the
+  release that produced it, never a count; how many times triage ran for the message is `run`
+  ([§2](#2-data-structures)).
 - A version bump does not re-triage stored messages automatically (cost). New messages, releases and
   re-runs use the current version. A `reparse` job ([J3]) re-triages what it re-ingests.
 - A change of `PM_TRIAGE_MODEL` takes effect for the next job; no migration is needed.
@@ -665,6 +706,8 @@ WHERE seq = ?1
 | Debounced re-runs (60 s) | Repeated `POST …/triage` calls cost one job |
 | One `triage` allowance hold per message, consumed only for a stored analysis ([§1.2](#12-metering)) | Spent allowances stop model calls; failures are refunded |
 | `ai_neurons` counted per tenant in `TenantQuota` and `usage_daily` | Visible in `GET /v1/usage/daily`. It has no cap, so it never raises `quota.warning` |
+| Daily model cap per tenant: `policy.triage.daily_model_cap` (default 2,000; platform and partner ceilings apply), counted by `CountTriageModel` in the tenant's time zone | A workspace with billing `exempt` or `disabled` (whose `triage` hold always succeeds) still cannot spend more than the cap on model calls; past it, triage is rules-only for the rest of the day ([D13](../edge-cases.md)) |
+| `RL_AI` per tenant (60 a minute) with deferral | One tenant cannot take more than a fifth of the account's Workers AI text-generation limit ([F16](../edge-cases.md)) |
 
 ## 13. Evaluation set and NFR-QUAL-3
 
@@ -710,7 +753,11 @@ validation and failure handling without network access.
 | `it::billing::w7_inbound_never_refused` | With the triage allowance spent, mail is stored and triage ends `skipped` with reason `allowance`, rule risk flags kept, no model call and no event | FR-BILL-7, FR-BILL-8, [W7] |
 | `it::triage::events` | `message.triaged` is emitted for `done` and `failed`, not for `skipped` | FR-TRI-1, FR-WH-4 |
 | `it::triage::thread_rollup` | The roll-up follows the latest triaged inbound message; a later outbound keeps `needs_reply = 0` | FR-TRI-1 |
-| `it::triage::rerun` | `POST …/triage` returns `202`, debounces, refuses outbound, honours quarantine visibility | FR-TRI-1 |
+| `it::triage::rerun` | `POST …/triage` returns `202` with no body, debounces, refuses outbound with `400`; a `quarantined`, `hidden`, `throttled`, DSN or system-mailbox message gets `409 triage_not_eligible` (and `404` without `quarantine:review`) and keeps its `triage_status`; after the job the record has the same `version` and `run` one higher | FR-TRI-5, FR-TRI-1 |
+| `it::triage::skipped_record_at_ingest` | A message stored with triage disabled, or `hidden`, `throttled` or a DSN, has `triage_json` with `status: skipped`, its reason, `version` and `run: 0` in the same transaction, and no job | FR-TRI-1 |
+| `it::triage::f16_rl_ai_deferral` | With `RL_AI` at 60 per minute, 500 triage jobs of one tenant are deferred (the hold released, `deferrals` incremented, `attempt` unchanged) while another tenant's triage runs at once; a job past 120 deferrals ends `skipped` with reason `ai_unavailable` and its rule flags | [F16](../edge-cases.md) |
+| `it::triage::daily_model_cap` | With `daily_model_cap: 3` on an `exempt` tenant, the fourth message is triaged rules-only (`model: "rules"`), the cap resets at the tenant's local midnight, and a redelivered job is counted once | FR-IN-12, [D13](../edge-cases.md) |
+| `core::injection::e1_fact_refs_normalised` | `fact_ref` accepts `AB12CDE`, `GBP:412.80` and `INV-88213`, and refuses an `email` or `domain` value, a value with a space, a quote or a newline, and any value over 40 characters; in the triage input and the planner's `why=` line a refused value appears only inside a fence | [E1] |
 | `it::triage::advisory_only` | A triage run never changes message status, quarantine, deliveries or sends; it only adds labels from `labels_add` | FR-TRI-3 |
 | `xtask eval-triage` (nightly) | Category accuracy ≥ 0.85 | NFR-QUAL-3 |
 
