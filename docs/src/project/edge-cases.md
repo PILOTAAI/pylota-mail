@@ -1,9 +1,9 @@
 # Edge-case register
 
-Every row is a required behaviour. The register has 213 rows in 15 sections (A–L, N, O and W). The 207 rows
+Every row is a required behaviour. The register has 275 rows in 15 sections (A–L, N, O and W). The 269 rows
 that Pylota Mail owns (`S` or `S+I`) each name a test; the 6 integrator-owned rows (C5, E6, E7, K1, K2 and
 K4) are tested in the integrator's own suites. Section W was section M; it was renamed so that its rows
-(W1–W34) can never be mistaken for build-plan milestones (M0–M26).
+(W1–W46) can never be mistaken for build-plan milestones (M0–M28).
 The **Owner** column says where the behaviour is enforced:
 
 - **S**: Pylota Mail;
