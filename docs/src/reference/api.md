@@ -1560,7 +1560,7 @@ within a minute of its reactivation. Events of the deployment's system identity 
 only.
 
 An endpoint is a way to read mail, so `webhooks:manage` alone is not enough for mail events
-([J21](../project/edge-cases.md)): creating an endpoint, changing its `url` or `events`, or replaying to it
+([J29](../project/edge-cases.md)): creating an endpoint, changing its `url` or `events`, or replaying to it
 needs `messages:read` as well when its `events` include `"*"`, any `message.*` type or
 `verification.received`, and `quarantine:review` as well when they include `"*"` or
 `message.quarantined`. Otherwise `403 permission_denied` with `details.required`.

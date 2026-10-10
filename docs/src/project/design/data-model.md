@@ -275,7 +275,7 @@ CREATE TABLE webhook_endpoints (
   enabled                INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
   disabled_reason        TEXT                              -- manual | failing (a 410 is 'failing'; the event says gone)
                          CHECK (disabled_reason IN ('manual','failing','url_changed')),  -- | url_changed: a PATCH
-                                                           -- changed the URL; a passing test re-enables (J21)
+                                                           -- changed the URL; a passing test re-enables (J29)
   secret_enc             TEXT NOT NULL,                    -- AES-256-GCM(PM_MASTER_KEY), base64
   prev_secret_enc        TEXT,
   prev_secret_expires_at INTEGER,
@@ -318,7 +318,7 @@ CREATE TABLE webhook_held (
 );
 CREATE INDEX webhook_held_partner ON webhook_held(partner_id, held_at);
 
--- Transport circuit breakers (Outbound › Transport circuit breaker, J20). One row per transport scope:
+-- Transport circuit breakers (Outbound › Transport circuit breaker, J28). One row per transport scope:
 -- 'cloudflare' (the account), 'ses:{region}', 'smtp:{domain_id}'.
 CREATE TABLE transport_breakers (
   scope               TEXT PRIMARY KEY,

@@ -514,7 +514,7 @@ temporarily failed mail.
   replaying `webhook.test` (`it::webhooks::replay_by_ids_and_window`). M8 also adds the endpoint routes to
   J10's matrix (another partner's endpoint by ID, in `it::partners::j10_foreign_partner_not_found` and
   `it::security::cross_tenant_matrix`).
-- J21 (`it::webhooks::j21_mail_events_need_messages_read`): endpoints that receive mail events need
+- J29 (`it::webhooks::j29_mail_events_need_messages_read`): endpoints that receive mail events need
   `messages:read` (and `quarantine:review` for `message.quarantined`) to create, change or replay, and a
   changed URL waits for a passing test.
 - The system identity's events reach platform endpoints only, by fan-out and replay
@@ -556,7 +556,7 @@ lazily and reconciliation is event-driven, so neither has an alarm; no cron is i
 signed links; G9's re-check of the marketing transport at `BeginTransport`, which needs an `ses` domain, is
 accepted in M13), G12 (`it::delivery::g12_tenant_domain_pause` and `it::send::sending_paused_refuses`; the
 domain part seeds a tenant domain row through the itest hooks), I9 (`it::erasure::orphan_objects_swept`,
-with the mailbox's daily sweep in `mailbox/alarms.rs`), J20 (`it::send::j20_transport_breaker`), the loop
+with the mailbox's daily sweep in `mailbox/alarms.rs`), J28 (`it::send::j28_transport_breaker`), the loop
 guard of N13 (`it::send::n13_loop_guard`; the forwarding part in M23), K3, L1–L4. J13
 (`it::partners::j13_suspended_partner`, whose authentication part runs from M5): no send is accepted for
 a suspended partner's tenants, their inbound mail is stored, and with M8's held deliveries the row is

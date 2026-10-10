@@ -4139,7 +4139,7 @@ paths:
       x-required-permission: ['webhooks:manage']
       x-key-levels: [platform, partner]
       x-permission-notes: >-
-        Mail events need more than `webhooks:manage` ([J21]): when the endpoint's `events` include `*`, any
+        Mail events need more than `webhooks:manage` ([J29]): when the endpoint's `events` include `*`, any
         `message.*` type or `verification.received`, the key must also hold `messages:read`, and when they
         include `*` or `message.quarantined`, `quarantine:review` as well; otherwise `403 permission_denied`
         with `details.required`.
@@ -4230,7 +4230,7 @@ paths:
       x-required-permission: ['webhooks:manage']
       x-key-levels: [platform, partner, tenant]
       x-permission-notes: >-
-        Mail events need more than `webhooks:manage` ([J21]): when the endpoint's `events` include `*`, any
+        Mail events need more than `webhooks:manage` ([J29]): when the endpoint's `events` include `*`, any
         `message.*` type or `verification.received`, the key must also hold `messages:read`, and when they
         include `*` or `message.quarantined`, `quarantine:review` as well; otherwise `403 permission_denied`
         with `details.required`.
@@ -4345,7 +4345,7 @@ paths:
       x-required-permission: ['webhooks:manage']
       x-key-levels: [platform, partner, tenant]
       x-permission-notes: >-
-        Mail events need more than `webhooks:manage` ([J21]): when the endpoint's `events` include `*`, any
+        Mail events need more than `webhooks:manage` ([J29]): when the endpoint's `events` include `*`, any
         `message.*` type or `verification.received`, the key must also hold `messages:read`, and when they
         include `*` or `message.quarantined`, `quarantine:review` as well; otherwise `403 permission_denied`
         with `details.required`.
@@ -4533,7 +4533,7 @@ paths:
       x-required-permission: ['webhooks:manage']
       x-key-levels: [platform, partner, tenant]
       x-permission-notes: >-
-        Mail events need more than `webhooks:manage` ([J21]): when the endpoint's `events` include `*`, any
+        Mail events need more than `webhooks:manage` ([J29]): when the endpoint's `events` include `*`, any
         `message.*` type or `verification.received`, the key must also hold `messages:read`, and when they
         include `*` or `message.quarantined`, `quarantine:review` as well; otherwise `403 permission_denied`
         with `details.required`.
@@ -11793,7 +11793,7 @@ components:
           type: [string, 'null']
           description: >-
             `manual`, `failing` (a `410` or 100 failures over 24 hours), or `url_changed` (a `PATCH` changed the
-            URL; a passing test delivery re-enables it, [J21]).
+            URL; a passing test delivery re-enables it, [J29]).
           enum: [manual, failing, url_changed, null]
         created_at:
           type: string

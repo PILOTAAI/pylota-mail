@@ -27,7 +27,7 @@ Pylota Mail. Cloudflare's and Amazon's were read from their documentation on 202
 | Unknown recipients per domain | 20 misses a second | Pylota Mail | Further mail to unknown addresses on the domain gets a temporary failure for the rest of the second ([A16](../project/edge-cases.md)) |
 | Role mail relayed (`postmaster@`, `abuse@` and the other RFC 2142 names) | 30 an hour per domain, 5 an hour per envelope sender | Pylota Mail | A temporary failure; the sender's server retries ([D14](../project/edge-cases.md)) |
 | Hop count of a send (`X-Pylota-Mail-Hop`) | Below 10, for every `kind` | Pylota Mail | `409 loop_detected` ([N13](../project/edge-cases.md)) |
-| Unknown transport outcomes in a row | 3 per transport (Cloudflare account, SES region, SMTP relay) | Pylota Mail | The transport's breaker opens for 5 minutes, doubling to at most 1 hour; queued messages wait unclaimed instead of becoming `uncertain` ([J20](../project/edge-cases.md)) |
+| Unknown transport outcomes in a row | 3 per transport (Cloudflare account, SES region, SMTP relay) | Pylota Mail | The transport's breaker opens for 5 minutes, doubling to at most 1 hour; queued messages wait unclaimed instead of becoming `uncertain` ([J28](../project/edge-cases.md)) |
 | Tenant and domain complaint and bounce rates | Complaints 0.1%, bounces 5%, over 7 UTC days with at least 500 outcomes | Policy (`abuse.tenant_*`); the complaint default is Amazon SES's review rate ([SES sending review FAQ](https://docs.aws.amazon.com/ses/latest/dg/faqs-enforcement.html), read 2026-10-10) | Sending paused: `409 sending_paused`, no fallback; a platform key resumes ([G12](../project/edge-cases.md)) |
 
 ## Domains and addresses

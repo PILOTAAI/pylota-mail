@@ -78,7 +78,7 @@ Payloads are **thin**. They carry IDs, a summary, verdicts and up to `policy.web
 Because the `message.*` and `verification.received` payloads carry mail, an endpoint that receives them
 can only be created, re-pointed or replayed by a key that also holds `messages:read` (and
 `quarantine:review` for `message.quarantined`) ([REST API › Webhooks](api.md#webhooks),
-[J21](../project/edge-cases.md)). Events of the deployment's system identity go to platform endpoints
+[J29](../project/edge-cases.md)). Events of the deployment's system identity go to platform endpoints
 only.
 
 ## Event types

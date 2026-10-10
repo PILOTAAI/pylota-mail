@@ -6,7 +6,7 @@ signed HTTPS deliveries with retries, dead letters and replay.
 | | |
 |---|---|
 | Requirements | FR-WH-1 … FR-WH-5, NFR-REL-3, NFR-REL-4, FR-PRV-6, FR-IDN-6 (key events), FR-CON-14 (the Notifier hand-off), FR-KEY-4 (partner endpoints) |
-| Edge cases | [J4](../edge-cases.md), [J13](../edge-cases.md) (held deliveries), [J15](../edge-cases.md), [J21](../edge-cases.md) (mail events need `messages:read`), [A15](../edge-cases.md) (system identity events), [I5](../edge-cases.md), [K1](../edge-cases.md) (integrator side), [C5](../edge-cases.md) (sequence), [O14](../edge-cases.md), [O16](../edge-cases.md) (Notifier hand-off) |
+| Edge cases | [J4](../edge-cases.md), [J13](../edge-cases.md) (held deliveries), [J15](../edge-cases.md), [J29](../edge-cases.md) (mail events need `messages:read`), [A15](../edge-cases.md) (system identity events), [I5](../edge-cases.md), [K1](../edge-cases.md) (integrator side), [C5](../edge-cases.md) (sequence), [O14](../edge-cases.md), [O16](../edge-cases.md) (Notifier hand-off) |
 | Code | `crates/worker/src/mailbox/outbox.rs` (and the outbox modules of `DomainMonitor` and `JobRunner`), `webhooks/envelope.rs` (build plan M6: the envelope, `WebhookJob` and the identity payload builders), `handlers/webhooks.rs`, `consumers/webhooks.rs`, `webhooks/{sign.rs, client.rs, replay.rs, payloads.rs}` (build plan M8), `crons/outbox_sweep.rs`; the SSRF guard is `crates/core/src/ssrf.rs` and `crates/worker/src/net.rs` ([Security](security.md#9-ssrf-controls)) |
 | Contract | [Webhook events](../../reference/events.md) (envelope, types, signing, retry schedule), [REST API › Webhooks](../../reference/api.md#webhooks) |
 
@@ -205,12 +205,12 @@ decide which endpoints receive an event.
 
 An endpoint created after an event occurred does not receive it, except through replay.
 
-### Who may subscribe to mail events (J21)
+### Who may subscribe to mail events (J29)
 
 An endpoint is a way to read mail: `message.received` carries up to 64 KB of `extracted_text`, and every
 `message.*` and `verification.received` event carries subjects, addresses or senders. `webhooks:manage`
 alone must not reach that, so the handler (`handlers/webhooks.rs`) checks, for a create, for a `PATCH`
-that changes `url` or `event_types`, and for a replay ([J21](../edge-cases.md)):
+that changes `url` or `event_types`, and for a replay ([J29](../edge-cases.md)):
 
 | The endpoint's `event_types` (after the change) | The key must also hold |
 |---|---|
@@ -545,7 +545,7 @@ event and endpoint IDs, status codes and durations, never payloads or URLs' quer
 | `it::webhooks::j4_retry_schedule` | A time-controlled harness sees 13 attempts at the scheduled delays (±10%), then `dead` ([J4](../edge-cases.md), FR-WH-3) |
 | `it::webhooks::disable_on_410` | `410 Gone` disables at once and emits `webhook.disabled` to other platform endpoints |
 | `it::webhooks::j13_held_while_partner_suspended` | While a partner is `suspended`, deliveries to its partner endpoint and to an endpoint of one of its tenants are parked in `webhook_held` with no `webhook_deliveries` row, no change to `consecutive_failures` and no queue message left waiting, while a platform endpoint receives the same events; within a minute of `active`, both endpoints receive every held event once and the rows are gone; a row held past the replay window is recorded `dead` with `event_unavailable` ([J13](../edge-cases.md), FR-KEY-4) |
-| `it::webhooks::j21_mail_events_need_messages_read` | A tenant key with `webhooks:manage` but not `messages:read` gets `403 permission_denied` (`details.required: ["messages:read"]`) creating an endpoint for `["*"]` or `message.received`, changing one to them, or replaying to one, and succeeds for `["domain.*"]`; `message.quarantined` also needs `quarantine:review`; a `PATCH` of `url` disables the endpoint with `url_changed`, `PATCH enabled: true` then gets `400`, and a passing test re-enables it ([J21](../edge-cases.md)) |
+| `it::webhooks::j29_mail_events_need_messages_read` | A tenant key with `webhooks:manage` but not `messages:read` gets `403 permission_denied` (`details.required: ["messages:read"]`) creating an endpoint for `["*"]` or `message.received`, changing one to them, or replaying to one, and succeeds for `["domain.*"]`; `message.quarantined` also needs `quarantine:review`; a `PATCH` of `url` disables the endpoint with `url_changed`, `PATCH enabled: true` then gets `400`, and a passing test re-enables it ([J29](../edge-cases.md)) |
 | `it::webhooks::system_identity_events_platform_only` | Events of the system identity reach a platform endpoint subscribed to `*` and never a tenant or partner endpoint of the default tenant, by fan-out or by replay, and are never handed to a Notifier ([A15](../edge-cases.md)) |
 | `it::webhooks::deleted_identity_event_unavailable` | A delivery for an event of an identity deleted after the event was queued gets `identity_not_found` from the owner and is recorded `dead` with `event_unavailable` on that attempt, with no retry |
 | `it::webhooks::j15_partner_scope_filter` | With partners P and Q, each with a partner endpoint subscribed to `*`: events of P's tenants reach P's endpoint and platform endpoints, never Q's; events of a tenant no partner created reach no partner endpoint; a tenant endpoint still receives only its tenant; replay to P's endpoint never selects Q's or an unpartnered tenant's events; a `410` on P's endpoint sends `webhook.disabled` to P's other endpoint and to platform endpoints, never to Q's or to tenant endpoints; `POST /v1/webhooks` with a partner key returns `scope: "partner"` and `partner_id`, and the 21st partner endpoint gets `422 webhook_limit_reached` ([J15](../edge-cases.md), FR-WH-1, FR-KEY-4) |
