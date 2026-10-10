@@ -136,7 +136,7 @@ alarm; an expired key behaves as new.
 | 1 | Identity `deleting`/`deleted` | `404 identity_not_found` |
 | 2 | Tenant `suspended` (FR-TEN-3). Checked before the identity's pause: a suspension pauses every identity with `pause_reason = 'tenant_suspended'`, so with the opposite order this error could never be returned | `403 tenant_suspended` |
 | 3 | Identity `paused` ([A7](../edge-cases.md), FR-IDN-3) | `409 identity_paused`, `details.reason` = `pause_reason` |
-| 3a | Tenant sending paused (`tenants.sending_paused_at` set, [Tenant and domain auto-pause](#tenant-and-domain-auto-pause-g12)) | `409 sending_paused`, `details.scope = "tenant"`, `details.reason = "abuse_threshold"` |
+| 3a | Tenant sending paused (`tenants.sending_paused_at` set, [Tenant and domain auto-pause](#tenant-and-domain-auto-pause-g12)) | `409 sending_paused`, `details.scope = "tenant"`, `details.reason` = the tenant's `sending_pause_reason` (`abuse_threshold` or `abuse_burst`) |
 | 4 | No accountable human: `owner_name` or `owner_email` is null ([A8](../edge-cases.md), FR-IDN-2) | `409 identity_owner_required` |
 | 5 | Target: for reply, reply-all and forward the message exists in this mailbox and is visible to the key (`hidden` and `throttled` never; `quarantined` only with `quarantine:review`); for `send` with `thread_id`, the thread exists | `404 message_not_found` / `404 thread_not_found` |
 | 6 | Recipients ([Recipients](#recipients)): each is a valid RFC 5321 address with an ASCII local part; duplicates removed case-insensitively; at least one | `400 address_invalid`; `400 address_unsupported` for a non-ASCII (SMTPUTF8) local part ([A3](../edge-cases.md)); `400 invalid_request` when there is no recipient |

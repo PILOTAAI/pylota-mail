@@ -6297,20 +6297,31 @@ paths:
       tags: [Audit]
       summary: List audit events
       description: >-
-        Audit entries, newest first. They never hold message content or clear-text addresses. Audit rows
-        cover administrative actions: keys (`key.create`, `key.rotate`, `key.revoke`), partners
-        (`partner.create`, `partner.update`, `partner.delete`), tenants (`tenant.create`, with the
-        `partner_id` when a partner key created it), identity status, identity signing keys
-        (`identity_key.create`, `identity_key.rotate`, `identity_key.revoke`), quarantine releases, holds,
-        suppression removals, erasure, resolve, members, billing, platform operations (`ops.switch`,
-        `mailbox.restore`, `master_key.activated`, `master_key.resealed`), automatic containment (`partner.auto_suspend`,
-        `tenant.auto_pause`, `domain.auto_pause`), and reads of mail content by platform and partner keys (`mail.read`, one row
-        per request, written before the response). **Sends are not
-        audit rows**: each send is recorded by its message, its events (`message.sent` and the delivery
-        events) and its per-recipient delivery log. To review what a key sent, list the outbound messages
-        of the identities it reaches for the period; request logs also carry the key ID for 7 days. A partner
-        key reads the rows of its own tenants only; rows about a partner itself have no `tenant_id` and are
-        for platform keys.
+        Audit entries, newest first. They never hold message content or clear-text addresses. Audit rows cover
+        administrative actions; the `action` values are keys: `key.create`, `key.rotate`, `key.revoke`; identity
+        signing keys `identity_key.create`, `identity_key.rotate`, `identity_key.revoke`; deployment signing
+        keys `signing_key.rotate`; partners: `partner.create`, `partner.update`, `partner.delete`; tenants:
+        `tenant.create` (with the `partner_id` when a partner key created it), `tenant.policy_update` (every
+        policy write), `tenant.ramp_held`, `tenant.ramp_lifted`; identities: `identity.create`,
+        `identity.update` (a status change by a key or a person, with `details.from` and `details.to`),
+        `identity.delete`, `identity.auto_pause`; domains: `domain.create` (with any MX records `replace_mx`
+        deleted), `domain.transport`, `domain.evict`; service accounts: `account.request`, `account.approve`,
+        `account.reject`, `account.close`, `account.delete`; mail: `quarantine.release`, `message.cancel`,
+        `message.resolve`, `suppression.remove` (only for a `complaint` suppression); privacy: `erasure.create`,
+        `hold.set`, `hold.removed`, `hold.expired`, `export.delete`; people: `member.invite`,
+        `member.invite_resend`, `member.invite_revoke`, `member.join`, `member.role_change`, `member.leave`,
+        `member.remove`, `member.ownership_transfer`, `user.delete`, `user.notifications_resume`,
+        `user.oauth_unlink`, `waitlist.invite`; billing: `billing.checkout_started`, `billing.portal_opened`,
+        `billing.mode_change`, `billing.plan_set`, `billing.plan_changed`, `billing.duplicate_cancelled`,
+        `billing.dispute_opened`, `billing.dispute_closed`, `billing.refund_recorded`; platform operations:
+        `ops.switch`, `mailbox.restore`, `master_key.activated`, `master_key.resealed`; automatic containment:
+        `partner.auto_suspend`, `tenant.auto_pause`, `domain.auto_pause`; and `mail.read`, one row per request
+        by a platform or partner key to a route that returns mail content, written before the response. **Sends
+        are not audit rows**: each send is recorded by its message, its events (`message.sent` and the delivery
+        events) and its per-recipient delivery log. To review what a key sent, list the outbound messages of the
+        identities it reaches for the period; request logs also carry the key ID for 7 days. A partner key reads
+        the rows of its own tenants only; rows about a partner itself have no `tenant_id` and are for platform
+        keys.
       x-required-permission: ['audit:read']
       x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
@@ -10043,8 +10054,10 @@ components:
           format: date-time
           description: >-
             When the tenant's sending was paused automatically because its complaint or bounce rate reached
-            the provider's review level (FR-DLV-6, [G12]); `null` while it may send. Every send then gets
-            `409 sending_paused`. Only a platform key can resume it (`sending_paused: false`).
+            the provider's review level over 7 days (FR-DLV-6, [G12]) or one of its domains had a burst far
+            above it ([J33]); `null` while it may send. Every send then gets `409 sending_paused`, whose
+            `details.reason` (`abuse_threshold` or `abuse_burst`) says which. Only a platform key can resume
+            it (`sending_paused: false`).
         created_at:
           type: string
           format: date-time

@@ -382,7 +382,9 @@ ceiling. Each write writes the audit row `tenant.policy_update` and emits `tenan
 Errors: `400 invalid_request`, `403 permission_denied`, `403 scope_denied`, `404 tenant_not_found`
 (out of scope, or a write to an `erasing` or `erased` tenant), `503 unavailable`.
 - **Automatic sending pause.** `sending_paused_at` is set when the tenant's complaint or bounce rate
-  reaches the provider's review level ([G12](../project/edge-cases.md)). `"sending_paused": false` lifts
+  reaches the provider's review level over 7 days ([G12](../project/edge-cases.md)), or when one of its
+  domains has a burst far above it within an hour or a day ([J33](../project/edge-cases.md)); the
+  `409 sending_paused` a send gets names which in `details.reason`. `"sending_paused": false` lifts
   it, audit-logged; only a platform key may send it (`403 scope_denied`, `details.field:
   "sending_paused"`), and no key can set a pause by hand.
 
@@ -1861,7 +1863,7 @@ and `expires_at`.
 ### `DELETE /v1/tenants/{tenant_id}/suppressions/{address}`
 
 Removes a `manual`, `unsubscribe`, `hard_bounce` or `provider` suppression. Removing a `complaint`
-suppression needs `"confirm_complaint_removal": true` in the body and is audit-logged.
+suppression needs `"confirm_complaint_removal": true` in the body and is audit-logged (`suppression.remove`).
 
 ### `GET|PUT|DELETE /v1/tenants/{tenant_id}/lists/{direction}/{kind}/{entry}`
 
@@ -2113,19 +2115,27 @@ key reads the rows of its own tenants only; rows about a partner itself (`partne
   "details": {}, "request_id": "req_01JA…", "created_at": "…" } ], "next_cursor": null }
 ```
 
-Audit rows cover administrative actions: keys (`key.create`, `key.rotate`, `key.revoke`), partners
-(`partner.create`, `partner.update`, `partner.delete`), tenants (`tenant.create`, with the `partner_id`
-when a partner key created it, and `tenant.policy_update` for every policy write), service accounts
-(`account.request`, `account.approve`, `account.reject`, `account.close`, `account.delete`), identity status, identity signing keys
-(`identity_key.create`, `identity_key.rotate`, `identity_key.revoke`), quarantine releases, holds,
-suppression removals, erasure, resolve, members, billing, platform operations (`ops.switch`,
-`mailbox.restore`, `master_key.activated`, `master_key.resealed`), automatic containment (`partner.auto_suspend`,
-`tenant.auto_pause`, `domain.auto_pause`), and **reads of mail content by platform and partner keys** (`mail.read`): every
-request by a platform or partner key to a route that returns mail content (`GET …/threads/{thread_id}`,
+Audit rows cover administrative actions. These are every `action` value:
+
+- keys: `key.create`, `key.rotate`, `key.revoke`; identity signing keys `identity_key.create`, `identity_key.rotate`, `identity_key.revoke`; deployment signing keys `signing_key.rotate`;
+- partners: `partner.create`, `partner.update`, `partner.delete`;
+- tenants: `tenant.create` (with the `partner_id` when a partner key created it), `tenant.policy_update` (every policy write), `tenant.ramp_held`, `tenant.ramp_lifted`;
+- identities: `identity.create`, `identity.update` (a status change by a key or a person, with `details.from` and `details.to`), `identity.delete`, `identity.auto_pause`;
+- domains: `domain.create` (with any MX records `replace_mx` deleted), `domain.transport`, `domain.evict`;
+- service accounts: `account.request`, `account.approve`, `account.reject`, `account.close`, `account.delete`;
+- mail: `quarantine.release`, `message.cancel`, `message.resolve`, `suppression.remove` (only for a `complaint` suppression);
+- privacy: `erasure.create`, `hold.set`, `hold.removed`, `hold.expired`, `export.delete`;
+- people: `member.invite`, `member.invite_resend`, `member.invite_revoke`, `member.join`, `member.role_change`, `member.leave`, `member.remove`, `member.ownership_transfer`, `user.delete`, `user.notifications_resume`, `user.oauth_unlink`, `waitlist.invite`;
+- billing: `billing.checkout_started`, `billing.portal_opened`, `billing.mode_change`, `billing.plan_set`, `billing.plan_changed`, `billing.duplicate_cancelled`, `billing.dispute_opened`, `billing.dispute_closed`, `billing.refund_recorded`;
+- platform operations: `ops.switch`, `mailbox.restore`, `master_key.activated`, `master_key.resealed`;
+- automatic containment: `partner.auto_suspend`, `tenant.auto_pause`, `domain.auto_pause`;
+- reads of mail content by platform and partner keys: `mail.read`.
+
+Every request by a platform or partner key to a route that returns mail content (`GET …/threads/{thread_id}`,
 `GET …/messages`, `GET …/messages/{message_id}`, its `raw`, `attachments/{attachment_id}`,
 `attachments/{attachment_id}/text` and `related`, `GET …/quarantine`, `GET …/wait`,
 `POST …/identities/{identity_id}/search`, `POST /v1/tenants/{tenant_id}/search`, and the MCP tools that
-read the same) writes one row before the response, with `target_type` `message`, `thread` or `identity`,
+read the same) writes one `mail.read` row before the response, with `target_type` `message`, `thread` or `identity`,
 `target_id` and `details.route`; if the row cannot be written the request fails with
 `503 unavailable`. **Sends are not
 audit rows**: each send is recorded by its message, its events (`message.sent` and the delivery events)

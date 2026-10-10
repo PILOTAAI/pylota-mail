@@ -146,7 +146,7 @@ reused; the others are defined in section 13.
 | S | Integrator receives forged events | Standard Webhooks HMAC-SHA256 with a per-endpoint secret; 5-minute timestamp window documented for receivers (FR-WH-2) | `it::webhooks::signature_vectors` |
 | T | Payload altered | Signature covers `{id}.{timestamp}.{body}` | `it::webhooks::signature_vectors` |
 | R | Delivery disputes | `webhook_deliveries` row per attempt with status, HTTP status and error code | `it::webhooks::j4_retry_schedule` |
-| I | Content over-shared | Thin payloads, `extracted_text` capped by `webhook_text_bytes` (≤ 64 KB), none for quarantined mail (FR-WH-4) | `it::webhooks::thin_payloads` |
+| I | Content over-shared | Thin payloads, `extracted_text` capped by `webhook_text_bytes` (≤ 64 KB), none for quarantined mail (FR-WH-4) | `it::webhooks::payload_text_cap` |
 | I/E | SSRF into private networks or the deployment itself | Section 9 guard at create, update and every attempt; no redirects; 15 s; 4 KB response read | `core::ssrf::*`, `it::webhooks::ssrf_refused`, `it::webhooks::no_redirects_and_caps` |
 | D | Slow or failing endpoints exhaust the consumer | Per-attempt timeout, retry schedule, disable after 100 failures over ≥ 24 h, `410` disables | `it::webhooks::j4_retry_schedule` |
 

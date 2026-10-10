@@ -27,12 +27,12 @@ confirm are marked "verify at build time" with the spike that settles them.
 | – | `POST …/identities` | Valid body; username free; `client_id` new | `inboxes` hold; insert identity, addresses and the mailbox `init` intent (D1 batch); `MailboxRequest::Init`, which emits `identity.created` | `active` |
 | – | `POST …/identities` with a known `client_id` | Same `client_fingerprint` | Return `200` with the existing identity; call `Init` again (idempotent, repairs a lost first call) | unchanged |
 | – | `POST …/identities` with a known `client_id` | Different fingerprint | `409 client_id_conflict` | – |
-| `active` | `PATCH status: paused` | `identities:write` | `pause_reason = 'manual'`; `identity.paused` | `paused` |
+| `active` | `PATCH status: paused` | `identities:write` | `pause_reason = 'manual'`; `identity.paused`; audit `identity.update` | `paused` |
 | `active` | Abuse threshold ([Outbound](outbound.md#abuse-auto-pause-fr-dlv-3)) | – | `pause_reason = 'abuse_threshold'`; `identity.paused` with `metrics` | `paused` |
 | `active` | Tenant suspended | – | `pause_reason = 'tenant_suspended'`; `identity.paused` | `paused` |
-| `paused` | `PATCH status: active` | reason `manual`: `identities:write`; reason `abuse_threshold`: platform, partner or tenant key, audit-logged, and only a platform key on a tenant a partner's key created ([J17](../edge-cases.md)); reason `tenant_suspended`: refused (`409 identity_paused`) | `pause_reason = NULL`; `identity.resumed` | `active` |
+| `paused` | `PATCH status: active` | reason `manual`: `identities:write`; reason `abuse_threshold`: platform, partner or tenant key, audit-logged (`identity.update`, as is every status change made through `PATCH`), and only a platform key on a tenant a partner's key created ([J17](../edge-cases.md)); reason `tenant_suspended`: refused (`409 identity_paused`) | `pause_reason = NULL`; `identity.resumed` | `active` |
 | `paused` (`tenant_suspended`) | Tenant resumed | – | `identity.resumed` | `active` |
-| `active`, `paused` | `DELETE` | `identities:write` and `erasure:manage` | Tombstone and remove every address; create the identity-scope erasure ([Privacy](privacy.md)) | `deleting` |
+| `active`, `paused` | `DELETE` | `identities:write` and `erasure:manage` | Tombstone and remove every address; create the identity-scope erasure ([Privacy](privacy.md)); audit `identity.delete` | `deleting` |
 | `deleting` | Erasure completed with no holds left | – | `identity.deleted`, once, from the erasure job's outbox with `identity_id` set ([Privacy § 6.5](privacy.md#65-identity-scope-fr-idn-4)) | `deleted` |
 | `deleting`, `deleted` | `DELETE` again | `identities:write` and `erasure:manage` | None: `200` with the existing identity-scope erasure request (the same `era_` ID) | unchanged |
 | `deleting`, `deleted` | `PATCH`, or any other write by identity ID | – | `404 identity_not_found`, nothing changes. The legal-hold routes are the exception: they stay usable on a `deleting` identity ([Privacy § 6.5](privacy.md#65-identity-scope-fr-idn-4)) | unchanged |
@@ -595,7 +595,7 @@ The `cloudflare_zone` method. Needs `PM_CF_API_TOKEN` (`422 cf_token_required` w
    the request lacks `"replace_mx": true`, refuse with `409 existing_mx` and a fix saying that existing
    mail would stop. With `replace_mx`,
    delete those MX records through the DNS records API before enabling routing. The deleted records are
-   written to the `audit_log` row of the domain create; they are not restored on removal.
+   written to the `audit_log` row of the domain create (`domain.create`); they are not restored on removal.
 3. **SPF preflight ([H2](../edge-cases.md)).** If the apex already publishes SPF, count the DNS lookups
    of the record Email Routing will need merged with the existing one
    ([SPF lookup count](#spf-lookup-count)). More than 10, or more than 2 void lookups: refuse with
@@ -1241,6 +1241,7 @@ forwarded).
 | `core::dns::h3_strict_alignment` | `adkim=s`/`aspf=s` against Cloudflare and SES signing domains ([H3](../edge-cases.md)) |
 | `it::domains::h4_ownership_change` | NS move, ownership TXT removed, RDAP change → `suspended`; reprove → `verifying` ([H4](../edge-cases.md)). A `cloudflare_zone` domain has `expected_ns_json` from its zone at insert; a weekly NS mismatch is re-queried on the confirming check 5 minutes later and suspends after two agreeing cycles; one RDAP change is not an issue until a second query an hour later confirms it, after which it is in every check's outcome until reprove |
 | `it::domains::h5_existing_mx` | Apex with existing MX refused without `replace_mx` ([H5](../edge-cases.md)) |
+| `it::domains::verify_rate_limited` | A second `POST /v1/domains/{domain_id}/verify` within a minute of the first gets `429 rate_limited` with `Retry-After`, and the `DomainMonitor` runs one check; the same for `POST …/probe` on an `smtp` domain ([Security § 10](security.md#10-rate-limiting-and-abuse)) |
 | `it::domains::h8_zone_permission` | With the Cloudflare fake holding a zone claimed by tenant B, a zone listed in tenant A's `domains.cloudflare_zones`, an unlisted zone, and the zone of `PM_PLATFORM_DOMAIN`: a tenant key and a partner key of tenant A get `403 scope_denied` (`zone_not_allowed`, the same body for an existing and a missing zone) for `cloudflare_zone` on B's zone (also when A's policy lists it, and for a name under a listed parent zone that resolves to B's zone), on the unlisted zone, and with `replace_mx` on any of them, and for `nameservers` or `delegated_subdomain` under the platform zone or B's zone; nothing is written and no MX record is deleted; the listed zone and a zone created for A by `nameservers` are accepted; the `zone_claims` row is written with the domain and deleted by `delete_zone` and by `zone_expired`; a platform key may use every zone; a partner key cannot set `domains.cloudflare_zones` (`403 scope_denied`); with `domains.cloudflare_zones: ["pylota.io"]` listed, a tenant key adds `notify.pylota.io`, but adding the `pylota.io` apex, or `replace_mx` there, gets `403 scope_denied` (`zone_not_allowed`) ([H8](../edge-cases.md)) |
 | `it::domains::h6_rule_failure` | Literal rule creation fails → address stays `pending` with `routing_rule_failed`, retried, activated only with its rule ([H6](../edge-cases.md)) |
 | `core::domain_fsm::h7_resolver_disagreement` | One resolver erroring or disagreeing never changes state; two consecutive agreeing cycles do ([H7](../edge-cases.md), FR-DOM-4) |

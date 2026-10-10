@@ -772,7 +772,8 @@ CLI `pmail domains subscribe`. The other connection methods, `nameservers` inclu
   retire and rollback flows
   (`it::addresses::promote_retire_rollback`, `it::addresses::retirement_cron`), and the API part of J5
   (`it::domains::transport_patch`, including the SES identity that `cloudflare_zone` onboarding creates
-  for the failover when SES is configured). J5's live part, `live::transport::j5_ses_failover`, runs in
+  for the failover when SES is configured), and the per-domain limits on verify and probe
+  (`it::domains::verify_rate_limited`). J5's live part, `live::transport::j5_ses_failover`, runs in
   M20.
 - The spike S9 fallback path for `cloudflare_zone`, whatever S9's result
   (`it::domains::s9_manual_delivery_events`, `cli::domains::subscribe_manual`), with its sends from the
