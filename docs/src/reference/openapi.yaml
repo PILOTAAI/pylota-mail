@@ -165,7 +165,9 @@ paths:
       summary: Health check
       description: >-
         No authentication. Reports that the Worker is serving, with its version, commit and `env`
-        (`PM_ENV`). With an invalid configuration it returns `503 unavailable`.
+        (`PM_ENV`); also `ses_region` when SES is configured, `frozen: true` while the deployment is frozen
+        for a restore, and `status: degraded` with `ses` or `billing` when a feature is off. With an invalid
+        configuration it returns `503 unavailable`.
       security: []
       x-rate-limit-buckets: []
       x-idempotency: none
@@ -5025,7 +5027,9 @@ paths:
         | `tenant` | none | Everything in the tenant. Then the tenant is marked `erased`, once no held thread remains |
 
         A failing step is retried automatically until `deadline_at` − 4 hours (20 hours after the first
-        request); then the request ends `failed`, and submitting it again restarts it.
+        request); then the request ends `failed`, and a new request for the same scope and target resumes it
+        at its failed step (`resumes_id` names it, `deadline_at` is copied), for every scope. At most one
+        request resumes a given request; a second one racing it gets `200` with the first.
 
         A `tenant` request for a tenant that is already `erasing` depends on the tenant's latest
         tenant-scope request: `queued` or `running` returns it with `200` (the same `era_` ID) and starts
@@ -5056,9 +5060,9 @@ paths:
       responses:
         '202':
           description: >-
-            The erasure request. It completes asynchronously (within 24 hours, NFR-PRV-1). For a tenant whose
-            latest tenant-scope request `failed` or ended `completed_with_holds`, a new request with
-            `resumes_id` set.
+            The erasure request. It completes asynchronously (within 24 hours, NFR-PRV-1). When the latest request with the
+            same scope and target `failed`, or the tenant's latest tenant-scope request ended
+            `completed_with_holds`, a new request with `resumes_id` set.
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
@@ -5069,7 +5073,8 @@ paths:
         '200':
           description: >-
             A `tenant` request for a tenant already being erased whose latest tenant-scope request is still
-            `queued` or `running`: that request, unchanged.
+            `queued` or `running`: that request, unchanged. Also the resumption of a failed request that a
+            concurrent request created first.
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
@@ -5541,7 +5546,7 @@ paths:
         `partner_id` when a partner key created it), identity status, identity signing keys
         (`identity_key.create`, `identity_key.rotate`, `identity_key.revoke`), quarantine releases, holds,
         suppression removals, erasure, resolve, members, billing, platform operations (`ops.switch`,
-        `mailbox.restore`, `master_key.activated`), automatic containment (`partner.auto_suspend`,
+        `mailbox.restore`, `master_key.activated`, `master_key.resealed`), automatic containment (`partner.auto_suspend`,
         `tenant.auto_suspend`), and reads of mail content by platform and partner keys (`mail.read`, one row
         per request, written before the response). **Sends are not
         audit rows**: each send is recorded by its message, its events (`message.sent` and the delivery
@@ -6173,7 +6178,11 @@ paths:
         Creates a new erasure request that repeats the stored one: the same tenant, scope, `identity_id`
         and `target_id`, reason `reapply_after_restore:{erasure_id}` and its own `deadline_at`. A
         counterparty erasure matches by the stored keyed hash of the address, which is never needed in
-        clear. No body. Runs even while the deployment is frozen.
+        clear. No body. Runs even while the deployment is frozen. Only a request that ended `completed` or
+        `completed_with_holds` can be re-applied (`409 erasure_not_completed` otherwise). A tenant-scope
+        request is re-applied although the tenant is `erased`: the job erases the mailboxes of the
+        identities in the source receipt's `identities_affected` and sweeps the tenant's objects and
+        vectors.
       x-required-permission: ['platform:ops', 'erasure:manage']
       x-key-levels: [platform]
       x-rate-limit-buckets: [api]
@@ -6193,7 +6202,16 @@ paths:
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
-        '409': {$ref: '#/components/responses/IdempotencyConflict'}
+        '409':
+          description: >-
+            The request did not end `completed` or `completed_with_holds` (`erasure_not_completed`), or the
+            idempotency key is in use.
+          x-error-codes: [erasure_not_completed, idempotency_conflict, request_in_progress]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
         '429': {$ref: '#/components/responses/TooManyRequests'}
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
@@ -8806,6 +8824,7 @@ components:
         - cursor_expired
         - legal_hold
         - not_frozen
+        - erasure_not_completed
         # Policy and limits
         - all_recipients_suppressed
         - recipient_blocked
@@ -8963,7 +8982,8 @@ components:
       properties:
         status:
           type: string
-          enum: [ok]
+          description: '`degraded` when a feature is off because its configuration is incomplete (`ses` or `billing` names it).'
+          enum: [ok, degraded]
         version:
           type: string
           description: The deployed release, for example `1.0.0`.
@@ -8974,6 +8994,20 @@ components:
           type: string
           description: '`PM_ENV` of the deployment.'
           enum: [production, staging, local]
+        ses_region:
+          type: string
+          description: '`PM_SES_REGION`, present only when SES is configured.'
+        ses:
+          type: string
+          description: 'With `degraded`: `sns_topic_missing` (the SES transport is off).'
+          enum: [sns_topic_missing]
+        billing:
+          type: string
+          description: 'With `degraded`: `stripe_secrets_missing` (billing is not started).'
+          enum: [stripe_secrets_missing]
+        frozen:
+          type: boolean
+          description: 'Present and `true` while the deployment is frozen for a restore (`PM_FREEZE = "on"`).'
 
     # ── Tenants ──────────────────────────────────────────────────────────────────────────────────
 
@@ -12878,7 +12912,7 @@ components:
                 format: date-time
         master_key:
           type: object
-          required: [active_slot, slots, remaining, activated_at]
+          required: [active_slot, slots, remaining, activated_at, resealed_at]
           properties:
             active_slot:
               type: string
@@ -12905,6 +12939,10 @@ components:
               type: [string, 'null']
               format: date-time
               description: When the Worker first saw the active key.
+            resealed_at:
+              type: [string, 'null']
+              format: date-time
+              description: When `remaining` first reached 0 under the active key; a next rotation is allowed without `--discard-previous` 30 days later.
         capacity:
           type: object
           required: [d1_bytes, d1_pct, vectors, vectors_pct, tenants, namespaces_pct, measured_at]

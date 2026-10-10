@@ -76,6 +76,7 @@ pub enum CliError {
     DoctorFailed(u32),                                 // exit 12
     Timeout(String),                                   // exit 13
     Aws { step: &'static str, status: Option<u16>, code: Option<String> }, // exit 14
+    Precondition(String),                              // exit 15
     Interrupted,                                       // exit 130
     Internal(String),                                  // exit 1
 }
@@ -304,8 +305,9 @@ JSON mode prints strings exactly as the API returned them (JSON escaping makes t
 | 10 | `cloudflare` | A Cloudflare API call or Wrangler run failed, or a prerequisite is missing (Node.js 22+, Wrangler) or not met (foreign MX records at the mail domain, `existing_mx`), during `setup`, `setup ses`, `deploy`, `upgrade`, `destroy`, `secrets`, `domains add --local-token` or `domains subscribe`. `doctor` never exits 10: a failed Cloudflare call is a failing check (exit 12) |
 | 11 | `verification` | A release signature or checksum did not verify; `webhooks verify` found no valid signature; `assertions verify` found the assertion invalid |
 | 12 | `doctor_failed` | `doctor` reported at least one `fail` |
-| 13 | `timeout` | `wait` returned `timed_out: true`; a polling step (health, re-seal, erasure, SNS subscription confirmation) passed its deadline |
+| 13 | `timeout` | `wait` returned `timed_out: true`; a polling step (health, erasure, SNS subscription confirmation) passed its deadline |
 | 14 | `aws` | During `setup ses` or `destroy --include-ses`: an AWS API call failed (including access denied), or the AWS account is not ready (SES production access missing; the console steps are printed) |
+| 15 | `precondition` | A deployment state the command needs is not there: `secrets rotate-master` with an unfinished rotation and no `--resume`, or within 30 days of the previous re-seal without `--discard-previous`; `ops restore d1` while the deployment is not frozen |
 | 130 | `interrupted` | SIGINT or Ctrl-C |
 
 Exit codes are part of the CLI contract ([AGENTS.md](https://github.com/PILOTAAI/pylota-mail/blob/main/AGENTS.md):
@@ -1081,11 +1083,11 @@ CLI's part needs the Cloudflare token (Workers Scripts · Edit, to write secrets
 `audit:read` (to read `GET /v1/platform/status`); it makes no D1 query.
 
 1. Read `master_key` from `GET /v1/platform/status`: `active_slot`, the two slots with `present` and
-   `kid`, `remaining` and `activated_at`.
-2. `remaining > 0`: a rotation is unfinished. Without `--resume`, exit 13 with the fix
+   `kid`, `remaining`, `activated_at` and `resealed_at`.
+2. `remaining > 0`: a rotation is unfinished. Without `--resume`, exit 15 with the fix
    `pmail secrets rotate-master --resume`. With `--resume`, go to step 5.
-3. The inactive slot holds a key and `activated_at` is less than 30 days ago: exit 13, naming the date
-   from which a rotation is allowed, unless `--discard-previous`, which prints that a D1 restore to before `activated_at` will no longer
+3. The inactive slot holds a key and `resealed_at` is less than 30 days ago: exit 15, naming the date
+   from which a rotation is allowed, unless `--discard-previous`, which prints that a D1 restore to before `resealed_at` may no longer
    open sealed values and asks for confirmation (`--yes` in scripts).
 4. Generate `K2` (32 bytes, OS CSPRNG) and compute `kid(K2)` = first 8 bytes of `SHA-256(K2)`,
    lower-case hex ([Security §7.2](security.md#72-encryption-envelope)). Write it to the inactive slot
@@ -1098,7 +1100,7 @@ CLI's part needs the Cloudflare token (Workers Scripts · Edit, to write secrets
    stops the polling only; the sweep continues in the Worker, and `--resume` polls again. There is no
    deadline.
 6. Print the new active slot and `kid`, and the first date a next rotation is allowed without
-   `--discard-previous` (`activated_at` + 30 days).
+   `--discard-previous` (30 days after `resealed_at`).
 
 `PM_MASTER_KEY_B` and `PM_MASTER_KEY_ACTIVE` are defined by Security §6.2 and listed in
 [Configuration › Secrets](../../reference/configuration.md#secrets). While `remaining > 0`, `doctor` warns
@@ -1614,7 +1616,7 @@ have no command: they are set only in the console ([Notifications §2](notificat
 | `suppressions list\|add\|remove` | `GET\|POST /v1/tenants/{t}/suppressions`; `DELETE /v1/tenants/{t}/suppressions/{address}` |
 | `lists list\|add\|remove` | `GET /v1/tenants/{t}/lists/{direction}/{kind}`; `PUT …/{entry}`; `DELETE …/{entry}` |
 | `erasure create\|get\|list` | `POST /v1/erasure-requests`; `GET /v1/erasure-requests/{id}`; `GET /v1/erasure-requests` |
-| `erasure retry` | `GET /v1/erasure-requests/{id}`, then `POST /v1/erasure-requests` with the same `tenant_id`, `scope`, `identity_id` and target (`--address` for counterparty scope) and reason `retry:{era_id}` ([Privacy §6.1](privacy.md#61-request)) |
+| `erasure retry` | `GET /v1/erasure-requests/{id}`, then `POST /v1/erasure-requests` with the same `tenant_id`, `scope`, `identity_id` and target (`--address` for counterparty scope) and reason `retry:{era_id}`; the API makes it a resumption of the failed request ([Privacy §6.1](privacy.md#61-request)) |
 | `erasure reapply` | `POST /v1/platform/erasure-requests/{id}/reapply` (platform key, `platform:ops`) |
 | `export create\|get` | `POST /v1/exports`; `GET /v1/exports/{id}` |
 | `members list\|invite\|remove` | `GET /v1/tenants/{t}/members` (`members:read`); `POST /v1/tenants/{t}/invitations`; `DELETE /v1/tenants/{t}/members/{user_id}` (`members:manage`, tenant, partner or platform key) |
@@ -1650,7 +1652,7 @@ runbook](observability.md#55-alert-email-and-the-external-heartbeat)). Built by 
 
 Rules for `ops restore d1`:
 
-- It refuses (exit 13) unless `GET /health` reports `frozen: true`.
+- It refuses (exit 15) unless `GET /health` reports `frozen: true`.
 - Working files go to `<dir>/restore-<UTC timestamp>/`, created `0700`, files `0600`: `before.sql`,
   `after.sql`, `undo-bookmark`, `replay.sql`, `summary.json`. The undo bookmark is printed as soon as the
   restore returns, before anything else can fail.
@@ -1713,7 +1715,7 @@ reached, and every step can be re-run.
 | `cli::doctor::ses_check` | `skip` without `PM_SES_REGION` or AWS credentials; `fail` on no production access, paused sending, an inactive rule set or a missing `pm-deliver`; `warn` `ses_identities_90pct` at 9,000 identities and `fail` at 10,000 | FR-OPS-3, FR-DOM-9, [N26] |
 | `cli::destroy::confirmation` | Without the typed platform domain nothing is deleted; `--dry-run` changes nothing; an erasure ending `completed_with_holds` lists the held threads and exits 6 before any domain, Worker or storage is deleted | FR-OPS-1, FR-PRV-4 |
 | `cli::destroy::include_ses` | Without `--include-ses`, the plan and the final output list the `setup ses` resources as left in place and no AWS call is made; with it and no AWS credentials, exit 3 before anything is deleted; with credentials, every resource of §6.9 is deleted in reverse order against the recorded AWS fake, an operator's own active rule set is kept without `pm-deliver`, and a re-run after a failure continues | FR-OPS-1, FR-DOM-8 |
-| `cli::secrets::rotate_master` | The flow of §12.1 against the harness writes the new key to the inactive slot, then switches `PM_MASTER_KEY_ACTIVE`, and ends with no ciphertext under the old `kid` while the old key stays in its slot; a second rotation within 30 days is exit 13 without `--discard-previous`; an interrupted run is finished by `--resume` with no key generated; a failure between the two writes leaves the old slot active | [Security §6.2](security.md#62-rotation-procedures) |
+| `cli::secrets::rotate_master` | The flow of §12.1 against the harness writes the new key to the inactive slot, then switches `PM_MASTER_KEY_ACTIVE`, and ends with no ciphertext under the old `kid` while the old key stays in its slot; a second rotation within 30 days of the previous re-seal's end is exit 15 without `--discard-previous`; an interrupted run is finished by `--resume` with no key generated; a failure between the two writes leaves the old slot active | [Security §6.2](security.md#62-rotation-procedures) |
 | `cli::secrets::rotate_signing_key` | `keys rotate thread\|link\|cursor\|web_bot_auth` calls the platform endpoint, `--revoke-previous` adds `revoke_previous=true`, and the output shows the new kid (a 43-character thumbprint for `web_bot_auth`) and the previous kid with `verify_until` or `revoked`, never key material; `422 web_bot_auth_disabled` is exit 7; `keys rotate key_…` still rotates an API key; mixed flags are exit 2 | [Security §6.2](security.md#62-rotation-procedures), FR-IDN-8 |
 | `cli::ops::sqldump_parses_export` | A recorded `wrangler d1 export` file parses into the expected rows (strings with quotes, blobs, nulls, reals) | §20 |
 | `cli::ops::restore_replay_diff` | From two parsed exports, the replay inserts rows created after `T`, deletes rows deleted after `T`, updates changed rows, skips `--exclude` tables, columns and rows, orders statements by foreign key, and refuses an unknown exclude name with exit 2; `ops restore d1` refuses with exit 13 unless `/health` reports `frozen: true` | §20, [I6](../edge-cases.md) |

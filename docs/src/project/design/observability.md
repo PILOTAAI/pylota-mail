@@ -311,8 +311,8 @@ the window (the Custom Alert "minimum event count").
 |---|---|---|---|---|
 | `dlq:{queue}` | B | The oldest open `dlq_items` row of a queue is older than 15 minutes ([J8](../edge-cases.md)) | page | [DLQ growth](#dlq-growth) |
 | `vector_drift` | B | Tonight's and the previous night's reconciliation both put `drift_pct` more than 1 away from zero ([Search › Nightly reconciliation](search.md#66-nightly-reconciliation)) | ticket | Re-run the reconciliation; if the drift persists, start a `reembed` job for each affected tenant (`POST /v1/platform/jobs` with `{ "kind": "reembed", "tenant_id": … }`, and `identity_ids` to limit it to the identities whose `index_reconcile` rows show the gap; `platform:ops`). A `reindex` job rebuilds only the keyword index and does not touch Vectorize |
-| `bounce_rate:{tenant_id}:{domain_id}` | B | Bounced outcomes / all outcomes > 2% over the last hour, with ≥ 50 outcomes, for one tenant's sends through one domain (the platform domain counts per tenant). Evaluated by `TenantQuota` from its per-domain hourly outcome counters each time `RecordOutcome` runs ([Outbound › Abuse auto-pause](outbound.md#abuse-auto-pause-fr-dlv-3)), so one rule covers every domain without a Custom Alert per domain. At twice the threshold (4% with ≥ 100 outcomes) the tenant is suspended automatically (section 5.6) | page | [Bounce spike](#bounce-spike) |
-| `complaint_rate:{tenant_id}:{domain_id}` | B | Complained outcomes / all outcomes > 0.1% over the last 24 hours, with ≥ 200 outcomes, for one tenant and domain, evaluated the same way. At twice the threshold (0.2% with ≥ 500 outcomes) the tenant is suspended automatically (section 5.6) | page | [Complaint spike](#complaint-spike) |
+| `bounce_rate:{tenant_id}:{domain_id}` | B | Bounced outcomes / all outcomes > 2% over the last hour, with ≥ 50 outcomes, for one tenant's sends through one domain (the platform domain counts per tenant). Evaluated by `TenantQuota` from its per-domain hourly outcome counters each time `RecordOutcome` runs ([Outbound › Abuse auto-pause](outbound.md#abuse-auto-pause-fr-dlv-3)), so one rule covers every domain without a Custom Alert per domain. Above 10% with ≥ 200 outcomes the tenant is suspended automatically (section 5.6; never the default tenant) | page | [Bounce spike](#bounce-spike) |
+| `complaint_rate:{tenant_id}:{domain_id}` | B | Complained outcomes / all outcomes > 0.1% over the last 24 hours, with ≥ 200 outcomes, for one tenant and domain, evaluated the same way. Above 0.6% with ≥ 1,000 outcomes the tenant is suspended automatically (section 5.6; never the default tenant) | page | [Complaint spike](#complaint-spike) |
 | `inbound_reject_spike` | A | Anomaly detection on `inbound_received_total{result=rejected_unknown}`: spike, 15-minute evaluation window, 24 h baseline, minimum 50 events | ticket | [Domain failing](#domain-failing) (routing checks) |
 | `inbound_tempfail` | A | `inbound_received_total{result=tempfail_storage}` > 0 over 5 minutes | page | [DLQ growth](#dlq-growth) (storage path) |
 | `inbound_lost` | B | `inbound_lost_total` or `inbound_raw_missing_total` > 0 | page | [Restore from PITR](#restore-from-pitr) (re-ingest step) |
@@ -335,13 +335,13 @@ the window (the Custom Alert "minimum event count").
 | `billing_cancel_failed:{tenant_id}` | B | Tenant erasure's `cancel_billing` step failed for the third time ([Privacy › Tenant scope](privacy.md#66-tenant-scope)) | page | [Erasure failure](#erasure-failure) (cancel the customer's subscriptions in the Stripe Dashboard; the step's next attempt then finds none and the erasure continues) |
 | `billing_cancelled_after_erasure:{tenant_id}` | B | A Stripe webhook for an erasing or erased workspace showed a live subscription, and the handler cancelled it ([Billing › Webhook handling](billing.md#webhook-endpoint)) | ticket | Check in the Stripe Dashboard that the subscription is canceled and that no invoice was paid after the workspace was deleted; refund any that was |
 | `erasure_stalled:{erasure_id}` | B | A step of the erasure job failed three times in a row; the job keeps retrying until `deadline_at − 4 h` ([Privacy § 4](privacy.md#4-jobrunner)). The detail names the step and error code | page | [Erasure failure](#erasure-failure) |
-| `erasure_failed:{erasure_id}` | B + C | Erasure request `failed` (`erasure.failed`): its step still failed after `deadline_at − 4 h` | page | [Erasure failure](#erasure-failure) |
+| `erasure_failed:{erasure_id}` | B + C | Erasure request `failed` (`erasure.failed`): its step still failed at the end of its retry window, and no request resumes it yet. It resolves once a resumption exists (`resumes_id`), which raises its own alerts if it fails too | page | [Erasure failure](#erasure-failure) |
 | `erasure_overdue:{erasure_id}` | B | Erasure still `queued` or `running` after `deadline_at − 4 h` (20 hours after the first request) | page | [Erasure failure](#erasure-failure) |
 | `job_failed:{kind}` | B | A job of that kind ended `failed` in the last 7 days and no later job of the same kind and tenant has completed. Page for `retention` (personal data kept past its retention), `domain_remove` (provider resources left behind) and `restore_reconcile`; ticket for `backup`, `export`, `reembed`, `reparse` and `reindex`. The detail lists the job IDs, tenants, failed steps and error codes | page / ticket | [Job failed](#job-failed) |
-| `heartbeat_missing` | B | Only when `PM_HEARTBEAT_KEY_ID` is set: that key's `last_used_at` is more than 1 hour old, so the external heartbeat (section 5.5) has stopped: the workflow was disabled, GitHub Actions is not running, or the key was revoked | page | [Heartbeat](#heartbeat) |
+| `heartbeat_missing` | B | Only when `PM_HEARTBEAT_KEY_ID` is set: that key's `last_used_at` (before its first use, its `created_at`) is more than 1 hour old, so the external heartbeat (section 5.5) has stopped: the workflow was disabled, GitHub Actions is not running, or the key was revoked | page | [Heartbeat](#heartbeat) |
 | `capacity_70:{resource}` | B | `resource` is `d1` (the D1 database's size against 10 GB, read as 10,000,000,000 bytes), `vectors` (the nightly reconciliation's `index_count` against 20,000,000 vectors) or `namespaces` (tenants that are not erased, one Vectorize namespace each, against 50,000) at 70% or more ([Limits](../../reference/limits.md#storage), [J21](../edge-cases.md), [J22](../edge-cases.md)) | ticket | [Capacity](#capacity) |
 | `capacity_80:{resource}` | B | The same at 80% or more | page | [Capacity](#capacity) |
-| `containment:{rule}` | B | An automatic containment rule of section 5.6 acted: `read_only`, `partner_suspended`, `tenant_suspended`, `free_sending_off` or `emergency_prune`. The detail names the target and the values that triggered it | page | [Automatic containment](#automatic-containment) |
+| `containment:{rule}` | B | An automatic containment rule of section 5.6 acted: `read_only`, `partner_suspended`, `tenant_suspended`, `free_sending_off` or `emergency_prune`. The detail names the target and the values that triggered it. It stays firing while the rule's effect lasts (section 5.4), so the heartbeat sees it too | page | [Automatic containment](#automatic-containment) |
 | `rpc_owner_mismatch` | B | `rpc_owner_mismatch_total` ≥ 1. The deployment turns read-only at once (section 5.6) | page | [Compromised key](#compromised-key) (treat as a security incident) |
 | `uncertain_spike` | A | `transport_outcomes_total{outcome=uncertain}` > 5 over 15 minutes | page | [Email Sending outage](#email-sending-outage) |
 | `delivery_orphaned` | A | `delivery_orphaned_total` > 10 over 1 h | ticket | [Email Sending outage](#email-sending-outage) |
@@ -362,12 +362,12 @@ The `* * * * *` cron runs `ops::alerts::evaluate`:
    - `webhook_endpoints` with `enabled = 1 AND consecutive_failures >= 10`, and those disabled with
      `failing` in the last minute;
    - `domains` in `failing` or `suspended`;
-   - `erasure_requests` with `status = 'failed'`, or `status IN ('queued','running')` and
-     `deadline_at − 4 h` passed;
+   - `erasure_requests` with `status = 'failed'` and no request whose `resumes_id` is its ID (indexed
+     by `erasure_requests_resumes`), or `status IN ('queued','running')` and `deadline_at − 4 h` passed;
    - `jobs` other than erasure with `status = 'failed'` and `updated_at` in the last 7 days, with no later
      `completed` job of the same `kind` and `tenant_id` (`job_failed:{kind}`);
-   - when `PM_HEARTBEAT_KEY_ID` is set: that `api_keys` row's `last_used_at` older than 1 hour, or the
-     row revoked or missing (`heartbeat_missing`);
+   - when `PM_HEARTBEAT_KEY_ID` is set: that `api_keys` row's `last_used_at` (or, before its first use, `created_at`) older than
+     1 hour, or the row revoked or missing (`heartbeat_missing`);
    - every 15th run (every 15 minutes): capacity. D1's size is the `meta.size_after` that D1 returns with
      every query result ([D1 result object](https://developers.cloudflare.com/d1/worker-api/return-object/),
      read 2026-10-10), taken from the result of the evaluator's own tenant-count query below; the vector count is `index_count` on the
@@ -408,7 +408,12 @@ The `* * * * *` cron runs `ops::alerts::evaluate`:
    (another `alert_fired` point and, for `page`, another email; no audit row) every 6 hours. A firing key
    whose condition has been false on two consecutive runs writes `alert.resolved`. A condition reported
    by an object or cron is true only in the run that reads the report; its key resolves after two runs
-   without a new report.
+   without a new report, with three exceptions that stay firing while their cause lasts:
+   `erasure_stalled` and `billing_cancel_failed`, which the erasure job resolves itself (it writes
+   `alert.resolved`) when the step next succeeds or the job ends; and `containment:{rule}`, which the
+   evaluator re-reads as a level on every run: true while a switch is away from its default (`read_only`
+   on, `free_sending` off, `emergency_prune` on), or while a partner or tenant that the rule suspended is
+   still `suspended`.
 4. Alert rows use `tenant_id` of the affected tenant, or NULL for deployment-level alerts. They contain
    IDs and numbers only.
 
@@ -429,7 +434,9 @@ still reports the page alert.
 
 Alert email is a second channel beside Custom Alerts, and it shares a weakness with all system mail: it
 cannot leave while the platform domain is failing or the system identity is refused
-(`system_mail_blocked`). The heartbeat below does not depend on the deployment sending anything.
+(`system_mail_blocked`), nor while the deployment is frozen for a restore, when every send waits. The
+`read_only` switch does not hold it back: sends from the system identity are exempt (section 5.6). The
+heartbeat below does not depend on the deployment sending anything.
 
 **The heartbeat.** `.github/workflows/heartbeat.yml` in `PILOTAAI/pylota-mail` runs on GitHub's
 infrastructure, outside the Cloudflare account it watches:
@@ -440,7 +447,7 @@ infrastructure, outside the Cloudflare account it watches:
 - It installs the released `pmail` binary of the deployed version, verifies its signature, and runs
   `pmail doctor --json --check health --check alerts` against production, with `PYLOTA_MAIL_API_URL` and
   `PYLOTA_MAIL_KEY` from the GitHub Environment `ops` (secret `HEARTBEAT_KEY`).
-- Once a day (the 06:00 UTC run) it also runs `pmail doctor --json --mail-test` with the secret
+- Once a day (the 06:00 UTC run) it also runs `pmail doctor --json --mail-test --check mail_test` (only that check) with the secret
   `HEARTBEAT_MAIL_TEST_KEY`, so mail flow end to end is proven daily.
 - The job fails when `doctor` exits non-zero, when `GET /health` does not answer within 20 seconds, when a
   page alert is firing, when `alert_email` is `missing` in `GET /v1/platform/status` (no alert address
@@ -453,8 +460,14 @@ infrastructure, outside the Cloudflare account it watches:
   `HEARTBEAT_KEY` is a platform key holding only `audit:read` (it reads `GET /v1/platform/status`); its ID
   is set as `PM_HEARTBEAT_KEY_ID`. `HEARTBEAT_MAIL_TEST_KEY` is a tenant key of the default tenant with
   exactly the permissions `--mail-test` needs ([CLI and setup §10](cli.md#10-doctor)). Both expire after
-  90 days; the owner rotates them every quarter with `pmail keys rotate` (the break-glass review,
-  section 5.7). A key that expires anyway stops the heartbeat, which `heartbeat_missing` reports.
+  90 days. A rotation keeps a key's `expires_at` ([Security § 4.5](security.md#45-rotation)), so every
+  quarter (the break-glass review, section 5.7) the owner **replaces** them: creates a new platform key
+  (`pmail keys create --level platform --permissions audit:read --expires-in 90d`), sets
+  `PM_HEARTBEAT_KEY_ID` to its ID under `[vars]` and runs `pmail deploy` (a variable change only),
+  stores it as `HEARTBEAT_KEY` (`gh secret set HEARTBEAT_KEY --env ops`), runs the workflow once
+  (`gh workflow run heartbeat.yml`), and only then revokes the old key. The mail-test key is replaced the
+  same way, without the redeploy. A key that expires anyway stops the heartbeat, which
+  `heartbeat_missing` reports.
 
 **Watching the watcher.** GitHub disables scheduled workflows in a public repository after 60 days with
 no repository activity, and a failed or disabled run reports nothing on its own. The Worker therefore
@@ -472,9 +485,9 @@ alert evaluator for D1 conditions, the delivery-event consumer for outcome rates
 
 | Rule | Trigger | Action | Undone by |
 |---|---|---|---|
-| `read_only` | Any `rpc_owner_mismatch` (a Durable Object received a request for another owner: a possible isolation bug) | The `ops_switches` row `read_only` becomes `on`: every request that is not a `GET` from a non-platform key gets `503 unavailable` with `details.reason = "read_only"`, and the outbound consumer re-enqueues sends with a 5-minute delay instead of sending them (they stay `queued`; nothing is canceled). Inbound mail is still accepted and stored. Audit `ops.switch` | `PUT /v1/platform/switches` `{"name": "read_only", "state": "off"}` |
-| `partner_suspended` | For one partner, from `audit_log`: 5 or more `identity.auto_pause` rows on its tenants in the last hour, or 3 or more of its tenants suspended by `tenant_suspended` below in the last 24 hours. A stolen partner key used to send abuse shows up this way within the hour; key creation alone is not a trigger, because a partner onboarding many tenants creates many keys legitimately | `partners.status = 'suspended'` (every key of the partner and of its tenants gets `403 partner_suspended`, deliveries to their endpoints are held, inbound is still stored: [J13](../edge-cases.md)). Audit `partner.auto_suspend` with the trigger | `PATCH /v1/partners/{partner_id}` `{"status": "active"}` |
-| `tenant_suspended` | For one tenant and domain, twice a reputation threshold: bounced > 4% of outcomes over the last hour with ≥ 100 outcomes, or complained > 0.2% over 24 hours with ≥ 500 outcomes | `tenants.status = 'suspended'`, `suspended_by = 'platform'` (sends refused, queued sends canceled by the consumer, inbound temporarily failed so senders retry). Audit `tenant.auto_suspend` | `PATCH /v1/tenants/{tenant_id}` `{"status": "active"}` (platform key) |
+| `read_only` | Any `rpc_owner_mismatch` (a Durable Object received a request for another owner: a possible isolation bug) | The `ops_switches` row `read_only` becomes `on`: every request that is not a `GET` from a non-platform key gets `503 unavailable` with `details.reason = "read_only"`, and the outbound consumer re-enqueues sends with a 5-minute delay instead of sending them (they stay `queued`; nothing is canceled), except sends from the system identity, so sign-in, invitation and alert email still leave. Inbound mail is still accepted and stored. Audit `ops.switch` | `PUT /v1/platform/switches` `{"name": "read_only", "state": "off"}` |
+| `partner_suspended` | For one partner, from `audit_log`: 5 or more `identity.auto_pause` rows in the last hour spread over at least 3 of its tenants (one abusive tenant is contained by its own identity pauses and by `tenant_suspended`, not by suspending every tenant of the partner), or 3 or more of its tenants suspended by `tenant_suspended` below in the last 24 hours. A stolen partner key used to send abuse shows up this way within the hour; key creation alone is not a trigger, because a partner onboarding many tenants creates many keys legitimately | `partners.status = 'suspended'` (every key of the partner and of its tenants gets `403 partner_suspended`, deliveries to their endpoints are held, inbound is still stored: [J13](../edge-cases.md)). Audit `partner.auto_suspend` with the trigger | `PATCH /v1/partners/{partner_id}` `{"status": "active"}` |
+| `tenant_suspended` | For one tenant and domain: bounced > 10% of outcomes over the last hour with ≥ 200 outcomes, or complained > 0.6% over 24 hours with ≥ 1,000 outcomes. That is above both the alert thresholds (2% and 0.1%) and the identity auto-pause thresholds (5% of 200 and 0.3% of 1,000, [Outbound](outbound.md#abuse-auto-pause-fr-dlv-3)), so the identities causing it are normally paused first and this rule catches abuse spread over many identities. Outcomes of the system identity are not counted, and the default tenant is never suspended: its system identity sends every sign-in, invitation and alert email | `tenants.status = 'suspended'`, `suspended_by = 'platform'` (sends refused, queued sends canceled by the consumer, inbound temporarily failed so senders retry). Audit `tenant.auto_suspend` | `PATCH /v1/tenants/{tenant_id}` `{"status": "active"}` (platform key) |
 | `free_sending_off` | Only with `PM_BILLING=stripe` or partners with ramped tenants: in the last hour, 5 or more distinct workspaces on the Free plan or still in the new-workspace send ramp had an identity auto-paused for abuse | The `ops_switches` row `free_sending` becomes `off`: every send from a workspace on the Free plan or still ramped is refused at submit with `403 policy_denied` (`details.reason = "free_sending_off"`), and queued ones are re-enqueued with the `Paused` back-off. Paid workspaces and partner tenants that are not ramped are unaffected | `PUT /v1/platform/switches` `{"name": "free_sending", "state": "on"}` |
 | `emergency_prune` | `capacity` for `d1` at 90% or more | The `ops_switches` row `emergency_prune` becomes `on`: the next tenant retention runs use a 7-day cutoff for `event_index` and `webhook_deliveries` whatever `retention.events_days` says, so webhook replay reaches back 7 days at most meanwhile ([J21](../edge-cases.md)) | `PUT /v1/platform/switches` `{"name": "emergency_prune", "state": "off"}` |
 
@@ -519,7 +532,9 @@ capacity alerts (section 5.3) give warning; this is what happens if a limit is r
 - **D1 full.** D1 refuses writes with "Exceeded maximum DB size" ([Debug D1](https://developers.cloudflare.com/d1/observability/debug-d1/),
   read 2026-10-10). `platform::db` maps that error to `DbError::Full`. A request whose write fails this
   way answers `503 unavailable` with `details.reason = "storage_full"`; nothing was written, so a retry
-  with the same `Idempotency-Key` is safe. Reads keep working. `email()` writes only to R2 and the queue,
+  with the same `Idempotency-Key` is safe. Reads keep working, except reads of mail content by
+  platform and partner keys, which must write their `mail.read` audit row first and so get
+  `503 unavailable` (`storage_full`) too ([Security § 3.6](security.md#36-tb6-operators-of-the-deployment)). `email()` writes only to R2 and the queue,
   so inbound mail is still accepted; the inbound consumer commits the message to its mailbox, and the
   outbox dispatch, whose `event_index` and `webhook_deliveries` inserts fail, keeps the events in the
   mailbox outbox and retries every 5 minutes (they are durable there). Sends already queued continue,
@@ -673,7 +688,7 @@ incident with the alert key, the times, the commands run and any follow-up.
    `GET /v1/identities/{id}/messages?status=bounced` for samples; group `deliveries.smtp_code` and
    `bounce_type`. Hard bounces from one recipient domain usually mean stale addresses; soft bounces with
    `4.7.x` mean throttling or reputation.
-2. **Mitigate.** At twice the threshold the tenant is already suspended (`containment:tenant_suspended`,
+2. **Mitigate.** Above 10% with ≥ 200 outcomes in an hour the tenant is already suspended (`containment:tenant_suspended`,
    section 5.6). Otherwise pause the sending identities (`PATCH /v1/identities/{id} {"status": "paused"}`)
    if the integrator is sending to a bad list. Hard bounces already create suppressions (FR-DLV-2). If a
    recipient provider is throttling, lower `identity_daily_send_cap` for the affected tenant.
@@ -684,7 +699,7 @@ incident with the alert key, the times, the commands run and any follow-up.
 1. **Diagnose.** Which identities and message kinds. Check that marketing mail carries consent and
    unsubscribe headers (FR-OUT-8) and that the AI disclosure policy is applied.
 2. **Mitigate.** Identities above 0.3% complaints over their last 1,000 sends are already paused
-   (FR-DLV-3), and a tenant at twice the domain threshold is already suspended (section 5.6). Pause the
+   (FR-DLV-3), and a tenant above 0.6% with ≥ 1,000 outcomes in 24 hours is already suspended (section 5.6). Pause the
    rest of the affected identities; suspend the tenant if the content is abusive
    (`PATCH /v1/tenants/{id} {"status": "suspended"}`). Complaint suppressions are permanent.
 3. **Verify.** No new complaints for 24 hours before resuming, then watch the rate for a week.
@@ -868,13 +883,12 @@ incident with the alert key, the times, the commands run and any follow-up.
      Dashboard (immediately, without proration or refund); the step's next attempt finds none left. Check
      `stripe_api_errors_total{call=subscription_cancel}` for the cause. Do it at once: until the
      subscriptions are canceled Stripe can still charge the workspace.
-   - `erasure_failed` (the deadline passed with the step still failing): fix the cause, then restart.
-     For tenant scope, `pmail erasure retry <era_id>` sends a new tenant-scope request, which resumes
-     the failed job at its failed step and keeps `deadline_at`
-     ([Privacy § 6.1](privacy.md#61-request)). For the other scopes, submit the same erasure again
-     (`pmail erasure retry` does it for message, thread and identity scope; a counterparty erasure needs
-     `--counterparty-address` again, because the failed job deleted its copy). Erasure is idempotent;
-     the new receipt shows what was still left.
+   - `erasure_failed` (the retry window ended with the step still failing): fix the cause, then run
+     `pmail erasure retry <era_id>`. It sends a new request for the same scope and target, which resumes
+     the failed job at its failed step and keeps `deadline_at`, for every scope
+     ([Privacy § 6.1](privacy.md#61-request)); a counterparty erasure needs `--address` again, because the
+     failed job deleted its copy. The alert resolves once the resumption exists; the receipt is
+     cumulative.
    - `erasure_overdue` with no stall: the job is progressing but slowly (a very large tenant). Watch the
      receipt counts grow; there is nothing to restart.
 3. **Verify.** The request (or its resumption) is `completed` (or `completed_with_holds`) with zero probe
@@ -905,8 +919,7 @@ incident with the alert key, the times, the commands run and any follow-up.
    account's Actions spending limit and billing, which can stop every run before it starts; the
    `HEARTBEAT_KEY` (an expired or revoked key gets `401`).
 2. **Mitigate.** Re-enable the workflow (`gh workflow enable heartbeat.yml`; the person who re-enables a
-   scheduled workflow becomes the one GitHub notifies), rotate an expired key and update the Actions
-   secret, or fix the billing. Until the heartbeat runs again, run
+   scheduled workflow becomes the one GitHub notifies), replace an expired key as section 5.5 describes (a rotation keeps the expiry), or fix the billing. Until the heartbeat runs again, run
    `pmail doctor --check health --check alerts` by hand twice a day.
 3. **Verify.** A heartbeat run passes and `heartbeat_missing` resolves.
 
@@ -1045,7 +1058,8 @@ The tooling is built by M17 Completion ([Build plan](../build-plan.md#m17--obser
    D1, which step 3 brought up to date), the CLI calls
    `POST /v1/platform/erasure-requests/{erasure_id}/reapply`, which re-runs it from the stored row with
    reason `reapply_after_restore:{era_id}`: message and thread scope from `identity_id` and `target_id`,
-   counterparty scope by `counterparty_hash` ([Privacy § 11](privacy.md#11-what-remains-after-deletion)).
+   identity scope from `identity_id`, tenant scope over the identities its receipt lists (the tenant
+   stays `erased`), counterparty scope by `counterparty_hash` ([Privacy § 11](privacy.md#11-what-remains-after-deletion)).
    The CLI waits until every re-applied request and reconcile job has completed.
 6. **Unfreeze and verify:** `pmail ops unfreeze`, then `pmail doctor --mail-test`. Queued work drains,
    senders' retries arrive, and the alert evaluator resumes. Last, `pmail ops restore cleanup` deletes
@@ -1070,12 +1084,12 @@ drill.
 | `it::ops::restore_replays_changes` | With the D1 export and restore steps faked by two SQLite snapshots (before and after a restore to `T`), the replay re-inserts an API key, an identity, a domain, a webhook endpoint, a signing key, an identity key and a `ses_ingest` row created after `T`; re-applies a suppression added, a member removed, a session revoked, a tenant suspended, an address tombstoned and a domain removed after `T`; leaves an `--exclude`d column at its restored value; and orders statements so no foreign key fails | [I6](../edge-cases.md) |
 | `it::ops::j21_d1_capacity` | With the D1 size faked through `meta.size_after`: `capacity_70:d1` (ticket) at 70%, `capacity_80:d1` (page, emailed) at 80%, the `emergency_prune` switch and `containment:emergency_prune` at 90%, after which retention prunes `event_index` and `webhook_deliveries` at 7 days; a write failing with "Exceeded maximum DB size" answers `503 unavailable` (`storage_full`) while an inbound message is still accepted and its outbox event waits | [J21](../edge-cases.md) |
 | `it::ops::j22_vector_capacity` | `capacity_70:vectors`, `capacity_80:vectors` and `capacity_70:namespaces` fire from the reconciliation's `index_count` and the tenant count; while `capacity_80:vectors` fires, a failing upsert leaves chunks `pending`, acks the index job without a retry and puts nothing in the dead-letter queue, and hybrid search reports `degraded` | [J22](../edge-cases.md) |
-| `it::ops::j23_alert_channels` | A page alert sends one alert email through the system identity to `PM_ALERT_EMAIL` and another after 6 hours; ticket alerts arrive in one summary at 08:00 UTC; more than 20 emails in an hour collapse into one; `GET /v1/platform/status` reports `alert_email: missing` when no address is configured; `pmail doctor --check alerts` fails on a firing page alert and on `missing` | [J23](../edge-cases.md), section 5.5 |
-| `it::ops::heartbeat_missing` | With `PM_HEARTBEAT_KEY_ID` set, `heartbeat_missing` fires when that key's `last_used_at` is more than an hour old, or the key is revoked, and resolves after the key is used again | [J23](../edge-cases.md) |
-| `it::ops::j24_auto_containment` | An `rpc_owner_mismatch` turns `read_only` on (non-platform writes `503 read_only`, queued sends re-enqueued and not canceled, inbound still stored); five auto-paused identities of one partner's tenants within an hour suspend the partner; a tenant at twice the bounce threshold on one domain is suspended with `suspended_by = 'platform'`; five auto-paused Free workspaces within an hour turn `free_sending` off (`403 policy_denied`, `free_sending_off`); each writes its audit row and pages `containment:{rule}`; only a platform key undoes each | [J24](../edge-cases.md), section 5.6 |
+| `it::ops::j23_alert_channels` | A page alert sends one alert email through the system identity to `PM_ALERT_EMAIL` and another after 6 hours; ticket alerts arrive in one summary at 08:00 UTC; more than 20 emails in an hour collapse into one; `GET /v1/platform/status` reports `alert_email: missing` when no address is configured; `pmail doctor --check alerts` fails on a firing page alert and on `missing`; with the `read_only` switch on, an alert email from the system identity still leaves while a tenant's queued send is re-enqueued | [J23](../edge-cases.md), section 5.5 |
+| `it::ops::heartbeat_missing` | With `PM_HEARTBEAT_KEY_ID` set, `heartbeat_missing` fires when that key's `last_used_at` (or, never used, its `created_at`) is more than an hour old, or the key is revoked, and resolves after the key is used again; a replacement key the heartbeat has not used yet does not fire in its first hour | [J23](../edge-cases.md) |
+| `it::ops::j24_auto_containment` | An `rpc_owner_mismatch` turns `read_only` on (non-platform writes `503 read_only`, queued sends re-enqueued and not canceled, inbound still stored); five auto-paused identities across three of one partner's tenants within an hour suspend the partner, and five in one tenant do not; a tenant above 10% bounces with ≥ 200 outcomes on one domain is suspended with `suspended_by = 'platform'`, and the default tenant is not, whatever its system identity's bounces; five auto-paused Free workspaces within an hour turn `free_sending` off (`403 policy_denied`, `free_sending_off`); each writes its audit row and pages `containment:{rule}`, which stays firing while the switch is set or the target is suspended and resolves two runs after a platform key undoes it; only a platform key undoes each | [J24](../edge-cases.md), section 5.6 |
 | `it::ops::job_failed_alerts` | A retention job failing its tenth attempt fires `job_failed:retention` (page); a failed backup fires `job_failed:backup` (ticket); each resolves once a later job of the same kind and tenant completes | section 5.3 |
-| `it::ops::domain_rate_state_alerts` | `RecordOutcome` with `domain_id` keeps hourly per-domain counters; 2 bounces in 51 outcomes within an hour fire `bounce_rate:{tenant_id}:{domain_id}` and 1 complaint in 200 outcomes within 24 hours fires `complaint_rate:{tenant_id}:{domain_id}`, for two domains of one tenant independently, with no Custom Alert | section 5.3 |
-| `it::ops::platform_status` | `GET /v1/platform/status` with a platform key holding `audit:read` returns the freeze flag, the switches, `alert_email`, the firing alerts, the master-key slots with `remaining` and `activated_at`, and the capacity figures; a partner key gets `403` | section 5.5 |
+| `it::ops::domain_rate_state_alerts` | `RecordOutcome` with `domain_id` keeps hourly per-domain counters; 2 bounces in 51 outcomes within an hour fire `bounce_rate:{tenant_id}:{domain_id}` and 1 complaint in 200 outcomes within 24 hours fires `complaint_rate:{tenant_id}:{domain_id}`, for two domains of one tenant independently, with no Custom Alert; outcomes of the system identity are not counted | section 5.3 |
+| `it::ops::platform_status` | `GET /v1/platform/status` with a platform key holding `audit:read` returns the freeze flag, the switches, `alert_email`, the firing alerts, the master-key slots with `remaining`, `activated_at` and `resealed_at`, and the capacity figures; a partner key gets `403` | section 5.5 |
 | `it::logs::i5_no_content_in_logs` | No canary content or address in any captured log line, including `metric` lines | [I5](../edge-cases.md), FR-PRV-6 |
 | `it::ops::metrics_emitted` | Each catalogued metric with its labels appears as `event = "metric"` lines for the flows that emit it; no metric carries a message or identity ID as a label | section 3 |
 | `it::ops::alert_evaluator_transitions` | Fire on a true condition, one audit row, re-notify after 6 h, resolve after two false runs | section 5.4 |

@@ -183,7 +183,10 @@ The code catalogue is in [Errors](errors.md).
 ### `GET /health`
 
 No auth. Returns `{ "status": "ok", "version": "1.0.0", "commit": "abc1234", "env": "production" }`.
-`env` is `PM_ENV`. With an invalid configuration it returns `503 unavailable`.
+`env` is `PM_ENV`. The body also has `ses_region` when SES is configured, `"frozen": true` while the
+deployment is frozen for a restore, and `"status": "degraded"` with `ses` or `billing` when a feature is
+off ([Observability § 7.1](../project/design/observability.md#71-get-health)). With an invalid
+configuration it returns `503 unavailable`.
 
 ### `GET /openapi.json`
 
@@ -1628,7 +1631,9 @@ because of a hold (it never returns `423 legal_hold`). The request's `status` is
 `completed`, `completed_with_holds` (finished, but at least one held thread was skipped), `failed`, or
 `canceled` (a tenant erasure superseded it). Returns `202` with the object below. An erasure that keeps
 failing is retried automatically until 20 hours after the request (`deadline_at` − 4 hours), then ends
-`failed`; submit it again to restart it. A `tenant` request for a tenant already `erasing` depends on the
+`failed`; a new request for the same scope and target then resumes it at its failed step, for every scope
+(`202`, `resumes_id` names it, `deadline_at` is copied; a counterparty request carries the address again).
+At most one request resumes a given request; a second one racing it gets `200` with the first. A `tenant` request for a tenant already `erasing` depends on the
 tenant's latest tenant-scope request ([I8](../project/edge-cases.md)): `queued` or `running` returns it
 with `200` (same `era_` ID); `failed` returns `202` with a new request that resumes the failed one at its
 failed step (`resumes_id` names it; `deadline_at` is copied); `completed_with_holds` returns `202` with a
@@ -1773,7 +1778,7 @@ Audit rows cover administrative actions: keys (`key.create`, `key.rotate`, `key.
 when a partner key created it), identity status, identity signing keys
 (`identity_key.create`, `identity_key.rotate`, `identity_key.revoke`), quarantine releases, holds,
 suppression removals, erasure, resolve, members, billing, platform operations (`ops.switch`,
-`mailbox.restore`, `master_key.activated`), automatic containment (`partner.auto_suspend`,
+`mailbox.restore`, `master_key.activated`, `master_key.resealed`), automatic containment (`partner.auto_suspend`,
 `tenant.auto_suspend`), and **reads of mail content by platform and partner keys** (`mail.read`): every
 request by a platform or partner key to a route that returns mail content (`GET …/threads/{thread_id}`,
 `GET …/messages`, `GET …/messages/{message_id}`, its `raw`, `attachments/{attachment_id}`,
@@ -1919,6 +1924,7 @@ operational state, read by `pmail doctor`, `pmail ops status` and the heartbeat
   "alert_email": "configured",
   "firing": [ { "alert": "dlq:pm-inbound", "severity": "page", "fired_at": "2026-10-10T03:12:00Z" } ],
   "master_key": { "active_slot": "a", "remaining": 0, "activated_at": "2026-07-01T09:00:00Z",
+                  "resealed_at": "2026-07-01T09:40:00Z",
                   "slots": [ { "slot": "a", "present": true, "kid": "3f9a0c1d2e4b5a67" },
                              { "slot": "b", "present": true, "kid": "88c1d0e2f3a4b596" } ] },
   "capacity": { "d1_bytes": 1840000000, "d1_pct": 18.4, "vectors": 2100000, "vectors_pct": 10.5,
@@ -1928,7 +1934,8 @@ operational state, read by `pmail doctor`, `pmail ops status` and the heartbeat
 
 `alert_email` is `configured` or `missing` (neither `PM_ALERT_EMAIL` nor a `mailto:` `PM_SECURITY_CONTACT`).
 `firing` lists every state alert that is firing. `master_key.remaining` counts sealed values not yet
-re-sealed with the active slot's key; `activated_at` is when the Worker first saw that key
+re-sealed with the active slot's key; `activated_at` is when the Worker first saw that key, and
+`resealed_at` when `remaining` first reached 0 under it (`null` until then)
 ([Security § 6.2](../project/design/security.md#62-rotation-procedures)). Key IDs are not secret: every
 ciphertext carries one. Key material is never returned.
 
@@ -1966,6 +1973,11 @@ and `target_id`, reason `reapply_after_restore:{erasure_id}` and its own `deadli
 erasure matches by the stored keyed hash of the address, which is never needed in clear
 ([Privacy design § 11](../project/design/privacy.md#11-what-remains-after-deletion)). Returns `202` with
 the new erasure request. It runs even while the deployment is frozen. `Idempotency-Key` is optional.
+Only a request that ended `completed` or `completed_with_holds` can be re-applied; any other gets
+`409 erasure_not_completed` (a `queued` or `running` request erases the restored data itself, and a
+`failed` one is resumed with a new request). A tenant-scope request is re-applied although the tenant
+is `erased`: the new job erases the mailboxes of the identities in the source receipt's
+`identities_affected` and sweeps the tenant's objects and vectors, and the tenant stays `erased`.
 
 ### `POST /v1/platform/waitlist/invite`
 

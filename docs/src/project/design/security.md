@@ -588,8 +588,8 @@ For each request, before any Durable Object or R2 call:
      Reads still resolve; for a partner key `GET /v1/tenants/{tenant_id}` and its tenant's erasure
      requests are the reads that remain useful, because the erasure deleted the rest. A platform key's
      write to such a tenant follows the route (a `PATCH` with `status` gets `409 tenant_erased`, a new
-     tenant-scope erasure request returns the existing one or `409 tenant_erased`,
-     [Privacy § 6.6](privacy.md#66-tenant-scope)).
+     tenant-scope erasure request returns the running one, starts a resumption or continuation (`202`),
+     or answers `409 tenant_erased`, [Privacy § 6.1](privacy.md#61-request)).
 5. **Body and query parameters naming a tenant or identity** (`tenant_id` in `POST /v1/keys`,
    `POST /v1/erasure-requests`, `POST /v1/exports`, `identity_ids` filters, `tenant_id` filters):
    for non-platform keys, a value outside the key's scope returns `404 tenant_not_found` or
@@ -752,15 +752,17 @@ previous key stays in the other slot until the next rotation overwrites it.
    key ID, `remaining` (sealed values whose `kid` is not the active key's, counted by the Worker over
    the sealed-column registry `crates/core/src/sealed.rs`) and `activated_at` (when the Worker first
    saw the active key ID: the every-minute cron writes the audit row `master_key.activated`, target the
-   key ID, whenever the active key ID differs from the latest such row's).
+   key ID, whenever the active key ID differs from the latest such row's) and `resealed_at` (when
+   `remaining` first reached 0 under the active key: the same cron writes `master_key.resealed`, target
+   the key ID, once per key).
 2. `remaining > 0` means the previous rotation's sweep has not finished. The CLI refuses unless
    `--resume` is given, which skips to step 5: the new key is already in its slot, so nothing needs to
    be known or generated again.
-3. When the inactive slot holds a key and `activated_at` is less than 30 days ago, the CLI refuses unless
+3. When the inactive slot holds a key and `resealed_at` is less than 30 days ago, the CLI refuses unless
    `--discard-previous` is given (the first rotation, into an empty slot, is never refused).
-   The inactive slot holds the key that sealed the values D1 held before `activated_at`, and a D1 Time
-   Travel restore reaches back 30 days: overwriting that key would leave a restore to before
-   `activated_at` unable to open any sealed value. `--discard-previous` (after a suspected leak of the
+   The inactive slot holds the key that sealed values in D1 until the previous re-seal finished at
+   `resealed_at`, and a D1 Time Travel restore reaches back 30 days: overwriting that key would leave a
+   restore to any earlier point unable to open the values still sealed with it. `--discard-previous` (after a suspected leak of the
    previous key) prints that consequence and continues.
 4. The CLI generates `K2` (32 bytes from the OS CSPRNG), writes it to the inactive slot with
    `wrangler secret put` (value on stdin), drops it from memory, then writes that slot's letter to
@@ -775,7 +777,7 @@ previous key stays in the other slot until the next rotation overwrites it.
    `remaining` with an estimate (`remaining / 500` minutes) until it is 0. There is no deadline:
    interrupting the CLI changes nothing, and `--resume` goes back to polling.
 6. The CLI prints the new key ID and the first date a next rotation is allowed without
-   `--discard-previous` (`activated_at` + 30 days).
+   `--discard-previous` (30 days after `resealed_at`).
 
 `PM_MASTER_KEY_B` and `PM_MASTER_KEY_ACTIVE` are listed in
 [Configuration › Secrets](../../reference/configuration.md#secrets). `pmail doctor` warns while
@@ -783,7 +785,7 @@ previous key stays in the other slot until the next rotation overwrites it.
 
 **Restores and rotation.** A D1 Time Travel restore to a point before the last rotation brings back
 values sealed under the previous key, which the inactive slot still holds; the sweep then re-seals them
-under the active key. Because a rotation within 30 days of the previous one needs `--discard-previous`,
+under the active key. Because a rotation within 30 days of the previous re-seal's end needs `--discard-previous`,
 every restore inside D1's 30-day window can open its sealed values unless the operator chose otherwise
 after a leak ([Observability › Restore from PITR](observability.md#restore-from-pitr)).
 
@@ -1198,7 +1200,7 @@ address used by the integration suite, captures all Worker output, and fails if 
 | `it::security::response_headers` | Global headers present; no CORS headers; no `Set-Cookie` | section 8.5 |
 | `core::crypto::envelope_round_trip` | Seal/open round trip; wrong AAD, wrong key or flipped bit fails | SEC-3 |
 | `it::security::mail_reads_audited` | A platform key and a partner key reading a message, its raw MIME, an attachment, a thread and a search each write one `mail.read` audit row (target and route, no content) before the response; a tenant or identity key's reads write none; with the audit insert failing, the platform key's read gets `503 unavailable` and returns no content | section 3.6, [ADR 0011](../adr/0011-plan-items-changed-for-v1.md) |
-| `it::secrets::master_key_rotation` | With a key in each slot and `PM_MASTER_KEY_ACTIVE` switched to the new one, old and new ciphertexts open, new ones use the new kid; `GET /v1/platform/status` reports `remaining` falling to 0 and `activated_at`; a D1 state from before the rotation (restored from a snapshot) still opens and is re-sealed; with only the active slot set, a ciphertext of the overwritten key reports `secret_unavailable`; and the sweep re-seals every column of the sealed-column registry, with one case per registered column: `signing_keys` (the `web_bot_auth` seed too), the webhook secrets, `identity_keys`, the `domains` SMTP credentials, the `users` second factors and `oauth_states.pkce_sealed`; the registry names exactly the sealed columns of `0001_init.sql` (those ending `_enc` or `_sealed`, and `signing_keys.ciphertext`) | section 6.2 |
+| `it::secrets::master_key_rotation` | With a key in each slot and `PM_MASTER_KEY_ACTIVE` switched to the new one, old and new ciphertexts open, new ones use the new kid; `GET /v1/platform/status` reports `remaining` falling to 0, `activated_at` and then `resealed_at` (a second rotation inside 30 days of `resealed_at` is refused, even when `activated_at` is older); a D1 state from before the rotation (restored from a snapshot) still opens and is re-sealed; with only the active slot set, a ciphertext of the overwritten key reports `secret_unavailable`; and the sweep re-seals every column of the sealed-column registry, with one case per registered column: `signing_keys` (the `web_bot_auth` seed too), the webhook secrets, `identity_keys`, the `domains` SMTP credentials, the `users` second factors and `oauth_states.pkce_sealed`; the registry names exactly the sealed columns of `0001_init.sql` (those ending `_enc` or `_sealed`, and `signing_keys.ciphertext`) | section 6.2 |
 | `it::secrets::rotate_master_reseals_identity_keys` | Assertions signed before and after a master-key rotation verify with the same public key and kid | [O8](../edge-cases.md) |
 | `core::jwk::thumbprint_rfc8037_vector`, `core::jwt::eddsa_rfc8037_vector`, `core::httpsig::signature_base_rfc9421` | The RFC 8037 thumbprint and signing vectors; RFC 9421 signature bases, an IDN host as its A-label, non-ASCII components refused | section 7.1, [O10](../edge-cases.md) |
 | `it::assertions::sdk_verifies` | The SDK verifier accepts a fresh assertion and rejects a wrong audience, an expired token, an unknown kid and `alg: none` | section 3.8 |

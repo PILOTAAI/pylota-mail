@@ -496,7 +496,8 @@ For `Send`:
    deliveries already `submitted` (an SMTP relay that deferred only some recipients), re-enqueue with the
    `Paused` back-off, so the remaining recipients go out if the identity and tenant are active again
    within 24 hours of submit and otherwise end `failed` (`quota_exhausted`), as every back-off does. While
-   the deployment is frozen, or the `read_only` switch is on, or the `free_sending` switch is off for a
+   the deployment is frozen, or the `read_only` switch is on (except for a send from the system identity,
+   so sign-in, invitation and alert email still leave), or the `free_sending` switch is off for a
    Free or ramped workspace, the consumer re-enqueues the message with a delay instead (300 s, or the
    `Paused` back-off for `free_sending`) and cancels nothing ([Observability § 5.6](observability.md#56-automatic-containment)).
 2. **`BeginTransport { message_id, domain_state, fallback }`** in the mailbox:
@@ -840,8 +841,12 @@ They are never pruned (three rows a day at most); tenant erasure's `delete_all` 
 (`domain_id` is the sending domain the delivery used: the platform domain for a fallback send), and
 deletes that domain's windows older than 25 hours. It then sums the last hour's and the last 24 hours'
 windows of that domain and answers `domain_alert` when bounced/outcomes > 2% with ≥ 50 outcomes in the
-hour, or complained/outcomes > 0.1% with ≥ 200 outcomes in 24 hours, and `suspend` at twice either
-threshold (4% with ≥ 100, or 0.2% with ≥ 500). The delivery-event consumer reports `domain_alert` as the
+hour, or complained/outcomes > 0.1% with ≥ 200 outcomes in 24 hours, and `suspend` when
+bounced/outcomes > 10% with ≥ 200 outcomes in the hour, or complained/outcomes > 0.6% with ≥ 1,000
+outcomes in 24 hours: above the alert thresholds and above the identity pause thresholds (5% and 0.3%),
+so the identities that cause it are normally paused first and suspension catches abuse spread over many
+identities. Outcomes of the system identity are not added to these counters, and `suspend` is never
+answered for the default tenant, whose system identity must keep sending. The delivery-event consumer reports `domain_alert` as the
 state alert `bounce_rate:{tenant_id}:{domain_id}` or `complaint_rate:{tenant_id}:{domain_id}`, and on
 `suspend` runs `UPDATE tenants SET status = 'suspended', suspended_by = 'platform', suspended_at = ?2
 WHERE id = ?1 AND status = 'active'`, which pauses the tenant's identities as any suspension does, then

@@ -168,6 +168,7 @@ Errors print the API's error envelope: in human mode as `error: <code> (<status>
 | 12 | `doctor` found at least one failure |
 | 13 | Timed out: `wait` returned nothing, or a polling step passed its deadline |
 | 14 | `setup ses` or `destroy --include-ses`: an AWS API call failed, or the AWS account has no SES production access |
+| 15 | A precondition is not met: `secrets rotate-master` with an unfinished rotation (use `--resume`) or within 30 days of the last re-seal (use `--discard-previous`), or `ops restore d1` while the deployment is not frozen |
 | 130 | Interrupted (Ctrl-C) |
 
 ## Naming identities and tenants
@@ -457,7 +458,7 @@ pmail secrets rotate-master [--resume] [--discard-previous] [--yes] [--dir <path
 ```
 
 `--resume` follows an interrupted rotation to its end; nothing is generated again. A second rotation
-within 30 days of the previous one is refused unless `--discard-previous` is given (after a suspected
+within 30 days of the end of the previous rotation's re-seal is refused (exit 15) unless `--discard-previous` is given (after a suspected
 leak of the previous key), because it would overwrite the key that a restore to before the last rotation
 needs. Needs your Cloudflare token and a platform key with `audit:read`. Identity signing keys and the
 Web Bot Auth key are re-sealed with everything else; their public keys do not change. The thread, link,
@@ -1975,10 +1976,9 @@ pmail erasure list --tenant acme --status completed --json
 
 ### `erasure retry`
 
-Restarts a `failed` erasure: it submits the same scope and target again. For a tenant erasure the new
-request resumes the failed job at the step that failed and keeps the original 24-hour deadline; for the
-other scopes it is a new request (erasure is idempotent). A counterparty erasure needs the address again,
-because it is never stored.
+Restarts a `failed` erasure: it submits the same scope and target again, and the new request resumes
+the failed job at the step that failed and keeps the original 24-hour deadline, for every scope. A
+counterparty erasure needs the address again, because it is never stored.
 
 ```text
 pmail erasure retry <erasure-id> [--address <counterparty-address>] [--wait]
@@ -1989,6 +1989,8 @@ pmail erasure retry <erasure-id> [--address <counterparty-address>] [--wait]
 Platform keys only (`platform:ops`). Runs a completed erasure again from its stored record, after a
 restore brought erased data back. A counterparty erasure is matched by the address's keyed hash, so the
 address is not needed. `pmail ops restore reconcile` calls it for every erasure after the restore point.
+A request that did not complete is refused (`409 erasure_not_completed`, exit 6): resume a failed one with
+`erasure retry`.
 
 ```bash
 pmail erasure reapply era_01JA9M0R6AW7X2M5N6P8R0T1YW

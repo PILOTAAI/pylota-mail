@@ -113,6 +113,7 @@ whether or not the first attempt reached the server.
 | 409 | `not_cancelable` | no | The message is past `queued` |
 | 409 | `not_uncertain` | no | `resolve` was called on a message that is not `uncertain` |
 | 409 | `auto_reply_not_allowed` | no | An auto-reply to automated mail, or over the automatic-exchange limit ([D6](../project/edge-cases.md)) |
+| 409 | `erasure_not_completed` | no | `POST /v1/platform/erasure-requests/{erasure_id}/reapply` for a request that did not end `completed` or `completed_with_holds`. A `queued` or `running` request erases the restored data itself; resume a `failed` one with a new request for the same scope and target |
 | 409 | `not_frozen` | no | `POST /v1/platform/identities/{identity_id}/restore` while the deployment is not frozen for a restore. Run `pmail ops freeze` first ([Restore from PITR](../project/design/observability.md#restore-from-pitr)) |
 | 410 | `raw_expired` | no | Raw MIME is past retention |
 | 410 | `cursor_expired` | no | A pagination cursor older than 24 hours |

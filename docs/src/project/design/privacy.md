@@ -184,7 +184,7 @@ Retention, erasure and export run as `JobRunner` state machines driven by the ob
  queued/running ── cancel (tenant erasure supersedes) ──▶ finalise ──▶ canceled
 
  retry limit: the 10th failed attempt on one step; for erasure jobs, the first failed attempt
-              after deadline_at − 4 h (section 4, "Errors")
+              after meta.retry_until, normally deadline_at − 4 h (section 4, "Errors")
 ```
 
 - **Creation.** The handler inserts the `jobs` row (status `queued`, a new `runner_do_id` from
@@ -193,7 +193,8 @@ Retention, erasure and export run as `JobRunner` state machines driven by the ob
   scope, `created_by_key_id`, `deadline_at`, and `resumes_id` when it resumes or continues an earlier
   request, section 6.1), or, for an export, the `exports` row (status `queued`, `scope`, `job_id`, and
   `identity_id` for identity scope),
-  in one D1 batch; then sends `JobRequest::Start { job_id, kind, tenant_id, params }`. If `Start` fails, the every-minute cron
+  in one D1 batch; then sends `JobRequest::Start { job_id, kind, tenant_id, params, resume_job_id }`
+  (`resume_job_id` is set only for a resumption, section 6.1). If `Start` fails, the every-minute cron
   starts any job still `queued` after 60 seconds.
 - **Steps.** `Start` writes the step list for the job kind into `steps` (all `pending`) and arms
   `alarm:step` for now. Each alarm runs the first non-finished step for a slice of at most 20 seconds or
@@ -205,13 +206,17 @@ Retention, erasure and export run as `JobRunner` state machines driven by the ob
   after `30 s × 2^(attempts − 1)`, capped at 1 hour. A successful slice resets `attempts` to 0.
   - Jobs other than erasure: after 10 failed attempts on one step the job is `failed`, and the
     `job_failed:{kind}` alert fires ([Observability › Alert list](observability.md#53-alert-list)).
-  - Erasure jobs retry automatically with no attempt limit until `erasure_requests.deadline_at − 4 h`
-    (20 hours after the first request, section 6.1). The third consecutive failed attempt of any step
-    fires `erasure_stalled:{erasure_id}` (page), so the operator learns of it with about 19 hours left;
-    the first failed attempt after `deadline_at − 4 h` makes the job `failed`: the request becomes
+  - Erasure jobs retry automatically with no attempt limit until `meta.retry_until`, which `Start`
+    sets to `erasure_requests.deadline_at − 4 h` (20 hours after the first request, section 6.1), or to
+    4 hours after the job starts if that is later. Only a resumption of a failed request (section 6.1)
+    starts that late: it keeps `deadline_at`, so `erasure_overdue` still reports it as late, but it gets
+    a working window instead of failing on its first transient error. The third consecutive failed
+    attempt of any step fires `erasure_stalled:{erasure_id}` (page), so the operator learns of it with
+    about 19 hours left; the job resolves that alert itself when the step next succeeds or the job ends.
+    The first failed attempt after `meta.retry_until` makes the job `failed`: the request becomes
     `failed`, `erasure.failed` (with `step` and `error`) is emitted, and the `erasure_failed` alert
     fires ([Observability](observability.md#erasure-failure)). A failed erasure is restarted with a new
-    request (section 6.1), which for tenant scope resumes at the failed step.
+    request for the same scope and target, which resumes it at the failed step (section 6.1).
 - **Finalise on every end.** A job that fails or is canceled runs its kind's `finalise` step before the
   status is mirrored, exactly as a completed job does. `finalise` touches only the runner's own storage
   and R2, so it cannot be blocked by the fault that failed the job; a crash before it finishes re-runs
@@ -280,7 +285,8 @@ once per day for control-plane tables.
 | 3 | `messages` | Only when `message_days` is set: for each identity, `RetentionPlan` for message cutoff → `deleteByIds` for the vector IDs → delete every R2 key of the batch → `EraseRows` |
 | 4 | `events` | For each identity, `PurgeEvents { events_cutoff }`. In D1, in batches (section 6.12): `DELETE FROM event_index WHERE rowid IN (SELECT rowid FROM event_index WHERE tenant_id = ?1 AND occurred_at < ?2 LIMIT 1000)`, repeated until it deletes nothing, and the same for `webhook_deliveries.created_at` |
 | 5 | `hygiene` | For each identity, `Hygiene`. Expire exports: `exports` rows past `expires_at` → delete the ZIP object → status `expired` |
-| 6 | `audit` | One `audit_log` row per step that deleted anything: `action = "retention.purge"`, `target_type = "tenant"`, `details_json = { "step", "cutoff_ms", "identities", "r2_objects_deleted", "messages_deleted", "vectors_deleted", "events_deleted" }` (FR-PRV-2) |
+| 6 | `holds` | For each identity, `ActiveHolds`, which clears holds whose `until` has passed (audit `hold.expired`, section 8). For an identity still `deleting` whose latest identity-scope erasure request is `completed_with_holds`, an answer of 0 creates the continuation: an identity-scope request with reason `hold_released:{era_id}` and `resumes_id` = that request, audit-logged (`erasure.create`; section 6.5) |
+| 7 | `audit` | One `audit_log` row per step that deleted anything: `action = "retention.purge"`, `target_type = "tenant"`, `details_json = { "step", "cutoff_ms", "identities", "r2_objects_deleted", "messages_deleted", "vectors_deleted", "events_deleted" }` (FR-PRV-2) |
 
 Every R2 delete in steps 2, 3 and 5 is sent to `BACKUP` too when it is configured (section 5.4).
 
@@ -333,8 +339,8 @@ records why a nightly copy replaces the event-driven copy the plan proposed):
 - Once per UTC day the `*/15` cron starts a `backup` job (`jobs.kind = 'backup'`, `tenant_id = NULL`).
   Its one step lists `t/` in key order (cursor = the last key) and copies to `BACKUP`, under the same
   key and with the same custom metadata, every object uploaded since the previous run's start. Errors
-  retry under the JobRunner backoff; the result counts copied, skipped and failed objects
-  (`backup_objects_total`).
+  retry under the JobRunner backoff; the result counts copied, skipped and errored objects
+  (`backup_objects_total{result=copied|skipped|error}`).
 - The backup never deletes an object that still exists in `BLOBS`. Retention and erasure delete each
   key from `BLOBS` first and then from `BACKUP`, in the same step, and tenant erasure sweeps
   `t/{tenant_id}/` in both. A copy can still be in flight when an erasure runs: the job has read the
@@ -358,15 +364,28 @@ reason `identity_deleted`), or `DELETE …/messages/{id}` (message scope, reason
 
 - Validation runs before anything is written: the target must exist and be in the key's scope
   ([Security › Authorisation](security.md#5-authorisation-and-tenant-isolation)); otherwise the
-  resource's `*_not_found`.
+  resource's `*_not_found`. A resumption (below) is the exception: the failed job may already have
+  deleted the target's rows, so it is validated against the failed request instead (the same tenant,
+  and its `identity_id` in the key's scope).
 - For `counterparty`, the address is normalised (lower case, IDNA A-label domain) and
   `counterparty_hash = hex(HMAC-SHA256(PM_HASH_KEY, address))` is stored in D1. The clear address is
   passed only to the JobRunner, which keeps it in `meta.target_address` until the `finalise` step.
 - The response is `202` with the erasure request object (`status: "queued"`, `deadline_at` =
   `created_at` + 24 hours). Repeating a request creates a new request and job; erasure is idempotent,
-  so a second run deletes nothing and reports zero counts. This is also how a `failed` message, thread,
-  counterparty or identity erasure is restarted: submit it again (the counterparty address is needed
-  again, because the failed job's `finalise` deleted it).
+  so a second run deletes nothing and reports zero counts.
+- **Resuming a failed erasure, every scope.** When the latest request of the tenant with the same scope
+  and target (`target_id` for message and thread scope, the keyed hash of the address for counterparty
+  scope, `identity_id`, or the tenant) is `failed`, the new request resumes it: `202` with a new request
+  whose `resumes_id` is the failed one and whose `deadline_at` is copied from it, because NFR-PRV-1
+  counts from the first request. A counterparty request carries the address as always (the failed job's
+  `finalise` deleted its copy). The new job resumes the failed one: `JobRequest::Start` carries
+  `resume_job_id`, and the new runner first calls `JobRequest::Snapshot` on the failed job's runner, which
+  returns its `steps`, `held` and `deleted_vectors` rows ([Data model › Other Durable Objects](data-model.md#3-other-durable-objects)),
+  copies them with `attempts` reset to 0, and continues at the failed step from its cursor. The copied
+  vector IDs matter for identity scope: after `WipeAll` the mailbox can no longer list them, and the
+  semantic probe and any re-sent `deleteByIds` need them. The receipt is cumulative. At most one request
+  resumes or continues a given request: `erasure_requests.resumes_id` has a partial unique index, and a
+  second request racing the first gets `200` with the first.
 - Tenant scope is different, because its job is the only writer of the tenant's status from `erasing` on
   ([I8](../edge-cases.md)). On a tenant already `erasing`, what happens depends on the latest
   tenant-scope request of that tenant:
@@ -374,7 +393,7 @@ reason `identity_deleted`), or `DELETE …/messages/{id}` (message scope, reason
   | Latest tenant-scope request | Answer |
   |---|---|
   | `queued` or `running` | `200` with that request (the same `era_` ID); nothing starts |
-  | `failed` | `202` with a new request whose `resumes_id` is the failed one and whose `deadline_at` is copied from it. Its job **resumes** the failed job: `JobRequest::Start` carries `resume_job_id`, and the new runner first reads the failed runner's `steps` rows (status, cursor, attempts reset to 0, `counts_json`) and its `held` list with `JobRequest::Snapshot`, copies them, and continues at the failed step from its cursor. The receipt is cumulative. A tenant left `erasing` by a failed job is therefore never stuck |
+  | `failed` | A resumption, as above: `202` with a new request whose `resumes_id` is the failed one and whose `deadline_at` is copied, continuing at the failed step. A tenant left `erasing` by a failed job is therefore never stuck |
   | `completed_with_holds` | `202` with a new request whose `resumes_id` is that one: a continuation that runs every step again and finishes the erasure if no hold remains, or ends `completed_with_holds` again (section 6.6, "Holds in a tenant being erased") |
 
   On an `erased` tenant the request returns `409 tenant_erased`. For a non-platform key, any other
@@ -382,7 +401,7 @@ reason `identity_deleted`), or `DELETE …/messages/{id}` (message scope, reason
   ([Security § 5.2](security.md#52-order-of-checks), step 4), except the hold routes on a tenant that is
   `erasing` with holds (section 8); reading the tenant and its erasure requests keeps working for its
   partner key (section 6.10). The CLI command `pmail erasure retry <era_id>` submits the same scope and
-  target again ([CLI and setup](cli.md#19-command-to-endpoint-map)).
+  target again, which resumes the failed request ([CLI and setup](cli.md#19-command-to-endpoint-map)).
 - An erasure request never returns `423 legal_hold`: held items are skipped and listed (FR-PRV-4,
   api.md). Only the single-message `DELETE …/messages/{message_id}` checks the thread's hold first and
   answers `423 legal_hold` without creating a request.
@@ -459,7 +478,7 @@ those identities.
 **Holds on an identity being deleted.** The request completes as `completed_with_holds`: everything
 outside held threads is gone, the addresses are tombstoned, and the identity stays `deleting`. The hold
 routes stay usable on a `deleting` identity for tenant, partner and platform keys with `erasure:manage`. When the
-daily retention job finds a `deleting` identity with no remaining holds (removed, or `until` passed),
+daily retention job (its `holds` step, section 5.2) finds a `deleting` identity with no remaining holds (removed, or `until` passed),
 it creates a new identity-scope erasure request with reason `hold_released:{era_id}` and `resumes_id` =
 that request, audit-logged, which finishes the deletion and emits `erasure.completed`. Identities of a
 tenant that is being erased are handled by the global job's `held_erasures` step instead (section 6.6).
@@ -516,7 +535,7 @@ thread, in any step, and the tenant is not `erased` while one remains:
 | Probe | How | Receipt field |
 |---|---|---|
 | Keyword | For each affected identity, `ProbeKeyword { target }`: a search for the erased message IDs and, for counterparty scope, the address as a `participant:` filter ([Search §6.7](search.md#67-deletion-on-erasure)); it must return no hits | `probe.keyword_hits` (sum) |
-| Semantic | `getByIds` over every vector ID deleted by the job, in batches (section 6.8); count IDs still returned. Tenant scope adds the namespace query of step 6 | `probe.semantic_hits` |
+| Semantic | `getByIds` over every vector ID deleted by the job (kept in the runner's `deleted_vectors` table), in batches (section 6.8); count IDs still returned. Tenant scope adds the namespace query of step 6 | `probe.semantic_hits` |
 | Objects | `head` on every deleted R2 key (or a prefix list for identity and tenant scope) | not in the receipt; a non-zero result re-runs the deleting step |
 
 A non-zero probe re-runs the step that should have deleted the item (counted as an attempt). The job
@@ -605,12 +624,24 @@ An export ZIP and a backup copy are copies of mail, so an erasure must reach the
   `status = 'expired'`. All of them, not only the ones that could hold the erased data: an export lives
   7 days and can be made again, so the simple rule is also the safe one. The export's
   `export.completed` event already went out; a later `GET /v1/exports/{export_id}` shows `expired`.
-- **An export running during an erasure.** Its `complete` step (section 9.1) first checks
-  `SELECT 1 FROM erasure_requests WHERE tenant_id = ?1 AND completed_at > ?2` with the export's
-  `created_at`. If an erasure of the tenant completed after the export started, the ZIP may hold what it
-  erased: the job deletes the ZIP, aborts nothing (the upload is complete) and restarts at `init`. A
-  second such conflict fails the export (`exports.status = 'failed'`, `details.reason =
-  "superseded_by_erasure"` in `jobs.result_json`), and the caller asks again.
+- **An export running during an erasure.** `init` waits, re-arming every 60 seconds without counting
+  an attempt, while an erasure of the tenant is `queued` or `running`, then records
+  `meta.collect_started_at`. The `complete` step (section 9.1) marks the export completed with one
+  conditional statement, so no erasure can slip in between a check and the update:
+
+  ```sql
+  UPDATE exports SET status = 'completed', r2_key = ?2, size = ?3, expires_at = ?4
+  WHERE id = ?1 AND NOT EXISTS (
+    SELECT 1 FROM erasure_requests WHERE tenant_id = ?5
+      AND (status IN ('queued', 'running') OR completed_at > ?6));
+  ```
+
+  with `?6` = `meta.collect_started_at`. An erasure created after this statement finds the export
+  `completed` and expires it (above). When the statement changes no row, an erasure ran, or is running,
+  since collection started, and the ZIP may hold what it erased: the job deletes the ZIP, aborts nothing
+  (the upload is complete) and restarts at `init`, which waits for that erasure to end. A second such
+  conflict fails the export (`exports.status = 'failed'`, `details.reason = "superseded_by_erasure"` in
+  `jobs.result_json`), and the caller asks again.
 - **The backup copy.** Section 5.4: after each `put` to `BACKUP` the job checks that `BLOBS` still has the
   key, and deletes its copy when it does not.
 
@@ -695,7 +726,8 @@ tenant's policy says (section 5.2). Deleting the person erases it at once (secti
   `threads.hold_json = { reason, until, set_by, set_at }`; `DELETE …/hold` clears it. Both need
   `erasure:manage` and write `audit_log` rows (`hold.set`, `hold.removed`).
 - A hold is active while `hold_json` is set and `until` is `null` or later than now. An expired hold is
-  ignored and cleared by the next retention run (audit `hold.expired`).
+  ignored and cleared by the next tenant retention run's `holds` step (section 5.2), or, on a tenant being erased, by
+  the global `held_erasures` step (audit `hold.expired` either way).
 - A hold covers the whole thread, including messages that arrive after it was set.
 - While active: retention skips the thread (raw and messages); every erasure scope skips it and lists
   `{ thread_id, reason }` in `receipt.held`, and the request ends `completed_with_holds` (FR-PRV-4,
@@ -716,10 +748,10 @@ tenant's policy says (section 5.2). Deleting the person erases it at once (secti
 
 | # | Step | Does |
 |---|---|---|
-| 1 | `init` | Stores the target (clear address in JobRunner `meta` for counterparty scope); starts an R2 multipart upload at `t/{ten}/exports/{exp}.zip` and stores its upload ID in `meta.upload_id` |
+| 1 | `init` | Waits while an erasure of the tenant is `queued` or `running`, then records `meta.collect_started_at` (section 6.11); stores the target (clear address in JobRunner `meta` for counterparty scope); starts an R2 multipart upload at `t/{ten}/exports/{exp}.zip` and stores its upload ID in `meta.upload_id` |
 | 2 | `collect` | For each identity, `ExportBatch`: for each message, read `raw.eml` (inbound) or `out/{msg}.eml` (outbound) from R2. If the raw object is past `raw_days`, rebuild the message with `mail-builder` from the stored fields and attachments (`eml_source: "reconstructed"`). Remove any `Bcc:` header (`bcc_redacted: true`). Append ZIP entries to the current part; upload a part when it reaches at least 5 MiB. The ZIP central-directory entries for each batch are stored in JobRunner `meta` under `zip_cd:{n}` |
 | 3 | `finish_zip` | Writes `messages.json`, the central directory and the end record; completes the multipart upload and deletes `meta.upload_id` |
-| 4 | `complete` | If an erasure of the tenant completed after the export's `created_at`, delete the ZIP and restart at `init`, at most once (section 6.11). Otherwise `exports`: `status = 'completed'`, `r2_key`, `size`, `expires_at = created_at + 7 days`; emit `export.completed`; audit `export.completed` |
+| 4 | `complete` | One conditional `UPDATE exports` (section 6.11) sets `status = 'completed'`, `r2_key`, `size` and `expires_at = created_at + 7 days`, only while no erasure of the tenant is `queued` or `running` and none completed after `meta.collect_started_at`. When it changes no row, delete the ZIP and restart at `init`, at most once. Otherwise emit `export.completed`; audit `export.completed` |
 | 5 | `finalise` | Deletes `meta.target_address` and `zip_cd:*`. Also runs when the export fails or is canceled (section 4): if `meta.upload_id` is still set, it aborts that multipart upload (`R2MultipartUpload.abort()`) so no uploaded part is left behind, and it deletes a completed ZIP of a canceled export |
 
 R2 keeps the uploaded parts of an incomplete multipart upload until it is completed or aborted, and
@@ -878,7 +910,13 @@ data. The restore runbook ([Observability](observability.md#restore-from-pitr)) 
    `reapply_after_restore:{era_id}` from the stored row alone. Message and thread scope use the stored
    `identity_id` and `target_id`; identity and tenant scope the stored IDs; counterparty scope matches by
    the stored `counterparty_hash` (`CounterpartyHash` target, section 4.1), because the address itself
-   is kept nowhere. Erasure requests and their receipts are never lost to a D1 restore, because step 1
+   is kept nowhere. The D1 side of every erasure is already back (step 1), so a re-applied
+   identity-scope request runs only `erase_mailbox`, `probe` and `receipt`, and a re-applied
+   tenant-scope request runs `erase_identities` (the mailbox step only) over the source receipt's
+   `identities_affected`, then `sweep_vectors`, `sweep_r2`, `probe` and `receipt`; the tenant stays
+   `erased`. Only a request that ended `completed` or `completed_with_holds` is re-applied
+   (`409 erasure_not_completed` otherwise: a `queued` or `running` one erases the restored data itself,
+   and a `failed` one is resumed). Erasure requests and their receipts are never lost to a D1 restore, because step 1
    re-inserts the rows written after `T`.
 
 ## 12. Logs
@@ -900,7 +938,7 @@ canaries.
 | `it::privacy::system_mail_retention_and_person_delete` | The system identity's mailbox drops messages after 30 days and raw MIME after 7 even when the default tenant keeps mail forever; deleting a person erases the sign-in, invitation and notification mail sent to them at once, through a counterparty erasure whose `identity_ids` is the system identity alone: mail to or from the same address in the default tenant's other identities is untouched, and the receipt's `identities_affected` names only the system identity | FR-PRV-2, FR-PRV-3, section 6.4 |
 | `it::erasure::i6_backup_purge` | With `BACKUP` bound, every erasure scope leaves no object under erased prefixes in either bucket; no R2 binding other than `BLOBS` and `BACKUP` | [I6](../edge-cases.md) |
 | `it::erasure::i6_reapply_by_hash` | After a simulated mailbox restore to before a counterparty, a message and an identity erasure, `POST /v1/platform/erasure-requests/{id}/reapply` erases the same data again from the stored rows alone: the counterparty one by `counterparty_hash` with no address supplied; the new requests carry reason `reapply_after_restore:{era_id}`; probes are zero | [I6](../edge-cases.md), section 11 |
-| `it::erasure::i9_inflight_copies` | An erasure expires the tenant's completed exports (ZIP deleted, status `expired`); an export running across a completed erasure deletes its ZIP and restarts once, and a second conflict fails it; a backup copy written after an erasure deleted its key from both buckets is removed by the backup job's own check (`backup_objects_total{result=revoked}`) | [I9](../edge-cases.md), sections 5.4, 6.11 |
+| `it::erasure::i9_inflight_copies` | An erasure expires the tenant's completed exports (ZIP deleted, status `expired`); an export whose collection overlapped an erasure (completed after `meta.collect_started_at`, or still `queued` or `running` at `complete`) deletes its ZIP and restarts once, its `init` waiting until the erasure ends, and a second conflict fails it; an erasure created just after an export completed expires it; a backup copy written after an erasure deleted its key from both buckets is removed by the backup job's own check (`backup_objects_total{result=revoked}`) | [I9](../edge-cases.md), sections 5.4, 6.11 |
 | `it::erasure::i10_provider_suppressions` | With the Cloudflare API fake holding an `account` entry, a `sending_domain` entry on the tenant's domain, one on another tenant's domain and a `read_only` entry for the erased address, counterparty erasure deletes only the tenant's `sending_domain` entry; without `PM_CF_API_TOKEN` it skips and counts `provider_suppressions_skipped`; domain removal deletes every `sending_domain` entry of the domain | [I10](../edge-cases.md), sections 2, 6.4 |
 | `it::jobs::i11_finalise_on_fail_and_cancel` | A counterparty erasure failed past its deadline and one canceled by a tenant erasure both end with no `target_address` in the runner's `meta`; a failed and a canceled export leave no open multipart upload (the R2 fake lists none) and no ZIP | [I11](../edge-cases.md), section 4 |
 | `it::erasure::batched_deletes` | Tenant erasure and the retention `events` step delete 5,000 `event_index` and `webhook_deliveries` rows of one tenant in statements of at most 1,000 rows each, resuming from the cursor after an injected failure | section 6.12 |
@@ -925,6 +963,7 @@ canaries.
 | `it::erasure::person_scope` | Account deletion is refused while the person owns a workspace; otherwise it ends each membership, deletes sessions, tokens, `oauth_identities`, every `notification_prefs` row and the `waitlist` row, scrubs the address of the invitations they accepted, and scrubs the `users` row | section 6.9, [W34](../edge-cases.md) |
 | `it::notify::member_removed_drops_pending` | Removing a member deletes their notification preferences in that workspace and drops their pending items | [O19](../edge-cases.md) |
 | `core::notify::no_content_in_body`, `it::notify::invisible_mail_never_notifies` | A rendered notification holds no subject, sender, snippet or attachment name from the source message; mail that is not visible in the inbox is never counted | section 7.5, [O15](../edge-cases.md) |
+| `it::erasure::resume_failed_any_scope` | For message, thread, counterparty and identity scope, a request made to fail at the end of its retry window is resumed by a new request with the same scope and target: `202`, `resumes_id` = the failed request, `deadline_at` copied; the message resumption is accepted although the message rows are already gone; the identity resumption after `WipeAll` probes the vector IDs the failed job deleted (copied by `Snapshot`) and finds none; the resumed job keeps retrying for 4 hours although `deadline_at − 4 h` has passed; two concurrent resumptions create one request (the second gets `200` with it); `erasure_failed` resolves once the resumption exists; `erasure_stalled` stays firing between the step's hourly attempts and resolves when the step succeeds | sections 4, 6.1 |
 | `it::erasure::step_retry_and_fail` | Injected R2 and Vectorize faults retry with backoff and resume from the cursor without double counting; the third consecutive failure fires `erasure_stalled`; the job keeps retrying hourly past 10 attempts and becomes `failed`, with a partial receipt and `erasure.failed`, only on the first failed attempt after `deadline_at − 4 h`; a non-erasure job fails after 10 attempts and fires `job_failed:{kind}` | NFR-PRV-1 |
 | `it::identities::a5_tombstone_blocks_reuse` | A deleted address cannot be assigned to any identity in any tenant | [A5](../edge-cases.md) |
 | `it::export::i3_counterparty` | ZIP layout, one `.eml` per message, `messages.json` schema, reconstructed messages after `raw_days`, Bcc redaction, a 7-day signed link that fails when tampered or expired | [I3](../edge-cases.md), FR-PRV-5 |

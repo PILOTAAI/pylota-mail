@@ -137,14 +137,14 @@ t/{tenant_id}/i/{identity_id}/m/{message_id}/a/{attachment_id}.md      extracted
 t/{tenant_id}/i/{identity_id}/out/{message_id}.eml                     composed outbound MIME
 t/{tenant_id}/i/{identity_id}/out/{message_id}/a/{attachment_id}       outbound attachment
 t/{tenant_id}/exports/{export_id}.zip
-inbound-staging/{yyyy}/{mm}/{dd}/{ulid}.eml                            before routing resolves (≤ 24 h)
-inbound-staging/ses/{key}                                              SES object copied from S3 (≤ 24 h)
+inbound-staging/{yyyy}/{mm}/{dd}/{ulid}.eml                            before routing resolves (≤ 15 days)
+inbound-staging/ses/{key}                                              SES object copied from S3 (≤ 15 days)
 ```
 
 R2 has no versioning, point-in-time recovery or replication (R2 S3 API compatibility page, last updated
 2026-07-31, read 2026-10-09). Its durability protects blobs against infrastructure loss, not against a
 bug that deletes them. For that, an optional nightly job copies new `t/` objects to a second bucket
-(`PM_BACKUP_BUCKET`, off by default); retention and erasure delete from both
+(`PM_BACKUP_BUCKET`, off by default, on for Pylota Mail Cloud); retention and erasure delete from both
 ([Privacy › R2 backup copy](design/privacy.md#54-optional-r2-backup-copy)).
 
 The full schema is in [Data model](design/data-model.md).

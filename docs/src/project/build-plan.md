@@ -707,7 +707,8 @@ this is O7), J12 (a partner whose tenants are all erased can be deleted, softly,
 `it::partners::j12_delete_with_tenants`), I8 (writes to an `erasing` or `erased` tenant refused for
 non-platform keys, reads kept for its partner key, a second tenant-scope erasure answered `200` or
 `409 tenant_erased`, a failed tenant erasure resumed at its failed step by a new request, and the
-tenant's idempotency records deleted by `tenant_id`: `it::erasure::i8_erasing_tenant_frozen`), the optional backup copy (`it::retention::backup_copy`), and
+tenant's idempotency records deleted by `tenant_id`: `it::erasure::i8_erasing_tenant_frozen`), a failed
+erasure of any scope resumed by a new request for the same scope and target (`it::erasure::resume_failed_any_scope`), the optional backup copy (`it::retention::backup_copy`), and
 `it::logs::i5_no_content_in_logs`, which greps captured Worker logs for any test-message body string and
 any test address. NFR-PRV-1: in a time-controlled harness every erasure scope completes within 24 hours,
 and a step that keeps failing is retried until 20 hours after the request, pages `erasure_stalled`

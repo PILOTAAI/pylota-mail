@@ -49,7 +49,7 @@ Every control that relied on a second person is replaced by a mechanical one:
    page condition relies on a Custom Alert alone ([Observability § 5.5](../design/observability.md#55-alert-email-and-the-external-heartbeat)).
 5. **Automatic containment.** Conditions that need a safe action at once act on their own and fail
    closed: read-only mode on `rpc_owner_mismatch`, partner suspension on defined anomalies, tenant
-   suspension at twice the reputation thresholds, a `free_sending` switch, an emergency prune near D1's
+   suspension well above the reputation alert and identity auto-pause thresholds, a `free_sending` switch, an emergency prune near D1's
    limit, and erasure retries until 20 hours after the request
    ([Observability § 5.6](../design/observability.md#56-automatic-containment)).
 6. **Recovery.** A break-glass record lists where every recovery credential is kept, in two places
@@ -64,8 +64,9 @@ Every control that relied on a second person is replaced by a mechanical one:
   test (`live::ops::fresh_deploy_rehearsal`, `it::ops::j23_alert_channels`, `it::ops::j24_auto_containment`,
   `live::ops::heartbeat_workflow`).
 - Containment can stop legitimate traffic (a partner's whole fleet, a tenant's sends). Every rule pages,
-  writes an audit row and is undone by one platform-key call; the thresholds are twice the alert
-  thresholds so that a page normally comes first.
+  writes an audit row and is undone by one platform-key call; the thresholds sit above the alert
+  thresholds (and tenant suspension above the identity auto-pause thresholds) so that a page, or a
+  narrower action, normally comes first.
 - The owner remains a single point of failure for decisions. The break-glass record and the alert
   channels make recovery possible, not automatic.
 - A fresh agent session is a weaker test of the docs' clarity for people than a human tester; it is a
