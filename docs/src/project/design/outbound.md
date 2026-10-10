@@ -53,8 +53,9 @@ pm-delivery-events ─▶ delivery consumer ─▶ ApplyDeliveryEvent ─▶ per
 6. **D1 context** in one `batch` (5-second deadline; `503 unavailable` on failure): the identity row
    (`status`, `pause_reason`, `owner_*`, `display_name`, `signature_*`, `send_policy_json`, `is_system`),
    the tenant (`status`, `mode`, `policy_json`, `timezone`, `created_at`, `ramp_lifted_at`,
-   `partner_id`) with its `billing_accounts` `mode` and `plan_id` and its partner's `ramp_exempt` (for the
-   send ramp of step 18), all of the identity's addresses
+   `partner_id`) with its `billing_accounts` `mode`, `plan_id` and `dispute_open_at` and its partner's
+   `ramp_exempt` (for the send ramp and the stops of step 18), the `platform_state` row `send_breaker`
+   (cached for 60 seconds per isolate), all of the identity's addresses
    with their domains (`state`, `kind`, `transport`, `reply_token`, `sending`), the platform domain, suppressions for every
    requested recipient (`address_hash IN (…)`), send-list entries for each recipient address and
    `@domain`, and, for a test tenant, the directory rows of the recipients (policy step 8).
@@ -134,7 +135,7 @@ alarm; an expired key behaves as new.
 | 15 | Transport: `ses` configured (the SES secrets and region); and for `kind: marketing`, the domain of the From address resolved at step 13 has `transport` `ses` or `smtp`, because Cloudflare Email Service is for transactional mail only ([Cloudflare Email Service FAQ](https://developers.cloudflare.com/email-service/reference/faq/), read 2026-10-10). The platform domain and every `cloudflare`-transport domain fail this. `BeginTransport` checks it again with the transport actually chosen ([The outbound consumer](#the-outbound-consumer)) | `422 transport_unavailable`, `details.reason = "ses_not_configured"` or `"marketing_needs_ses"` |
 | 16 | Per recipient: suppression, send-block, `send_allowlist_only`, `require_known_recipient` ([Recipient filters](#recipient-filters)) | not an error: the recipient's delivery is `suppressed` (FR-OUT-4, [G4](../edge-cases.md), [E2](../edge-cases.md)) |
 | 17 | Size after composition ([Attachments and size](#attachments-and-size)) | `413 message_too_large`, unless `large_attachments: "link"` |
-| 18 | Plan allowance and daily caps, in one `TenantQuota` request and one transaction ([TenantQuota](#tenantquota)). First the **`sends` hold** (FR-BILL-4, FR-BILL-5): `units` = recipients left after step 16, `ref` = the new `msg_` ID, gate `storage_gb` when the message has attachments; a send whose recipients are all suppressed takes no hold. Then the **daily-cap reserve** (identity cap: `send_policy.daily_cap`, else `policy.identity_daily_send_cap`; tenant cap: `policy.tenant_daily_send_cap`), counted per accepted message in the tenant's time zone ([E3](../edge-cases.md)). The tenant cap is min(`policy.tenant_daily_send_cap`, 50) while the **new-workspace send ramp** applies: `tenants.ramp_lifted_at IS NULL` and either the tenant has a partner whose `ramp_exempt` is `0` (whatever `PM_BILLING` and its billing mode), or it has no partner, `PM_BILLING=stripe` and the workspace is `metered` on the catalog's `default_plan` ([Cloud sign-up › New-workspace send ramp](cloud-signup.md#101-new-workspace-send-ramp), [W30](../edge-cases.md)). The **system identity** (`is_system = 1`) is exempt from the tenant cap: its reserve passes `tenant_cap: None`, so the tenant `sends` counter is neither checked nor incremented, and only its own `send_policy.daily_cap` (50,000) applies ([Identities and domains › The system identity](identity-domains.md#the-system-identity)). If either check fails, neither is kept | `402 billing_limit` (`details.feature` = `sends` or `storage_gb`); `429 daily_cap_reached`, `details.resets_at` |
+| 18 | Plan allowance and daily caps, in one `TenantQuota` request and one transaction ([TenantQuota](#tenantquota)). First the **`sends` hold** (FR-BILL-4, FR-BILL-5): `units` = recipients left after step 16, `ref` = the new `msg_` ID, gate `storage_gb` when the message has attachments; a send whose recipients are all suppressed takes no hold. Then the **daily-cap reserve** (identity cap: `send_policy.daily_cap`, else `policy.identity_daily_send_cap`; tenant cap: `policy.tenant_daily_send_cap`), counted per accepted message in the tenant's time zone ([E3](../edge-cases.md)). The tenant cap is min(`policy.tenant_daily_send_cap`, 50) while the **new-workspace send ramp** applies: `tenants.ramp_lifted_at IS NULL` and either the tenant has a partner whose `ramp_exempt` is `0` (whatever `PM_BILLING` and its billing mode), or it has no partner, `PM_BILLING=stripe` and the workspace is `metered` on the catalog's `default_plan` ([Cloud sign-up › New-workspace send ramp](cloud-signup.md#101-new-workspace-send-ramp), [W30](../edge-cases.md)). The **system identity** (`is_system = 1`) is exempt from the tenant cap: its reserve passes `tenant_cap: None`, so the tenant `sends` counter is neither checked nor incremented, and only its own `send_policy.daily_cap` (50,000) applies ([Identities and domains › The system identity](identity-domains.md#the-system-identity)). Two **stops** refuse a send before any counter moves, and never the system identity's: a workspace whose `billing_accounts.dispute_open_at` is set ([Billing › Disputes and refunds](billing.md#disputes-and-refunds)), and the shared-domain breaker, at stage 1 for a ramped workspace or one `metered` on the catalog's `default_plan`, and at stage 2 for every tenant ([Cloud sign-up § 10.3](cloud-signup.md#103-shared-domain-breaker)). If either check fails, neither is kept | `402 billing_limit` (`details.feature` = `sends` or `storage_gb`); `429 daily_cap_reached` with `details.cap` (`identity`, `tenant`, `shared_domain` or `billing_dispute`) and `details.resets_at` (`null` for `billing_dispute`) |
 | 19 | Thread lock ([C4](../edge-cases.md), FR-OUT-9) | `409 thread_busy`, `details.retry_after` |
 
 The allowance is checked before the daily caps, so a request that would fail both gets the `402`, which
@@ -1079,10 +1080,17 @@ pub enum QuotaRequest {
                                                      // tenant): stores the owner in meta; the only request
                                                      // an object without an owner accepts
     Reserve { identity_id: String, day: String, identity_cap: u32, tenant_cap: Option<u32>,
-              hold: Option<SendsHold> },             // policy step 18: the sends hold, checked first;
+              hold: Option<SendsHold>, stop: Option<SendStop> },
+                                                     // policy step 18: a stop refuses first, then the
+                                                     // sends hold, then the caps;
                                                      // tenant_cap None = the system identity (is_system = 1):
                                                      // the tenant `sends` counter is neither checked nor
-                                                     // incremented
+                                                     // incremented, and no stop is ever passed
+    SystemMail { class: SystemMailClass, keys: Vec<String>, day: String },
+                                                     // default tenant only (Cloud sign-up § 10.2): checks and
+                                                     // counts every budget of one system-identity email in
+                                                     // one transaction (sysmail:{class}:{key} counters)
+                                                     // → Ok | Spent { scope }
     Release { identity_id: String, day: String, tenant_counted: bool },
                                                      // undoes a Reserve; tenant_counted is false exactly when
                                                      // that Reserve had tenant_cap None
@@ -1110,9 +1118,13 @@ pub enum QuotaRequest {
 }
 pub enum UsageMetric { Inbound, Outbound, Search, AiNeurons, Assertions, HttpSignatures }
 pub struct SendsHold { pub units: u32, pub r#ref: String, pub gates: Vec<Feature> }  // ref = msg_ ID
+pub enum SendStop { BillingDispute, SharedDomain { resets_at: i64 } }
+pub enum SystemMailClass { Signin, Invitation, Notification, Account }
 // Reserve → Ok { identity_used, tenant_used, warnings: Vec<QuotaWarning>, held: Option<Held> }
 //         | Denied { feature, granted, used, resets_at, first_in_period }   → 402 billing_limit
-//         | CapReached { scope: "identity" | "tenant", resets_at: i64 }      → 429 daily_cap_reached
+//         | CapReached { scope: "identity" | "tenant" | "shared_domain" | "billing_dispute",
+//                        resets_at: Option<i64> }                           → 429 daily_cap_reached,
+//                                                                              details.cap = scope
 ```
 
 `Reserve` runs in one transaction. With `hold`, it first takes the `sends` hold exactly as `Hold` does

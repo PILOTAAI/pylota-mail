@@ -69,6 +69,7 @@ info:
     | `x-rate-limit-buckets` | operation | Rate-limit buckets the request counts against (`api`, `search`, `agentic`, `send`, `sign`, `partner`; `partner` only for a partner key's calls) |
     | `x-idempotency` | operation | `required`, `optional` or `none` for the `Idempotency-Key` header. `required` means a request without it fails with `400 idempotency_key_required`, except a dry run (`dry_run=true`). `none` means the header is ignored and never recorded |
     | `x-error-codes` | response | The `error.code` values this operation can return with that status |
+    | `x-sdk` | operation | `false` when the Rust SDK has no method for the operation: the SES hooks, which only Amazon SNS calls, and `security.txt`. Every other operation has exactly one SDK method |
 
     ## Licence
 
@@ -268,7 +269,9 @@ paths:
         made by `pmail setup`) can have an empty suffix. `policy` is merged over the defaults (built-in
         defaults, then `PM_DEFAULT_POLICY`). `owner` (optional) creates the workspace's console owner and
         emails them a sign-in link; without it, a platform or partner key can add an owner later with an invitation
-        and an ownership transfer in the console. `billing.mode` defaults to `metered` (plan `free`) on a
+        and an ownership transfer in the console. An owner address that this deployment hosts (on the
+        platform domain, or an identity's address) gets `400 invalid_request` with
+        `details.errors[0].path = "owner.email"`. `billing.mode` defaults to `metered` (plan `free`) on a
         deployment with billing on, and to `disabled` otherwise. With a partner key, the tenant's
         `partner_id` is the key's partner, for good, and its billing mode is the partner's
         `default_billing_mode`; `billing` is platform-only. A partner key's `policy` is checked field by
@@ -5175,8 +5178,9 @@ paths:
         Builds a ZIP holding one `.eml` per message plus `messages.json`. `scope` is `counterparty` (with
         `counterparty_address`: every message to or from it across the tenant's identities, FR-PRV-5) or
         `identity` (with `identity_id`: the whole mailbox). Returns `202` with the export
-        (`status: "queued"`). When finished, the export has a `download_url` (a signed link valid until
-        `expires_at`, 7 days) and an `export.completed` event is emitted.
+        (`status: "queued"`). When finished, the export has a `download_url` (a signed link valid for one
+        hour, minted again on each `getExport`) until `expires_at`, 7 days later, and an `export.completed`
+        event is emitted.
       x-required-permission: ['erasure:manage']
       x-key-levels: [platform, partner, tenant, identity]
       x-permission-notes: '`counterparty` scope needs a tenant, partner or platform key. An identity key can export only its own identity.'
@@ -5221,9 +5225,10 @@ paths:
       tags: [Privacy]
       summary: Get an export
       description: >-
-        `status` is `queued`, `running`, `completed`, `failed` or `expired`. A `completed` export has
-        `download_url`, a signed link (`getSignedLink`) valid until `expires_at`. The link is minted again on
-        each `GET`.
+        `status` is `queued`, `running`, `completed`, `failed`, `canceled` or `expired`. A `completed`
+        export has `download_url`, a signed link (`getSignedLink`) minted on each `GET` and valid for one
+        hour from it, or until `expires_at` if that is sooner. An earlier link stops working when its hour
+        ends, or at once when the export is deleted (`deleteExport`).
       x-required-permission: ['erasure:manage']
       x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
@@ -5246,6 +5251,33 @@ paths:
                 created_at: '2026-10-09T10:00:00Z'
                 expires_at: '2026-10-16T10:00:00Z'
                 download_url: https://mail.example.com/v1/links/bDE6Mz
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    delete:
+      operationId: deleteExport
+      tags: [Privacy]
+      summary: Delete an export and revoke its links
+      description: >-
+        Revokes every download link of the export at once. A `completed` export's ZIP is deleted and its
+        status becomes `expired`; a `queued` or `running` export is stopped and becomes `canceled`; an
+        export that is already `expired`, `failed` or `canceled` is left as it is. Returns `204` in every
+        case. A signed link of a deleted export answers `404 export_not_found`. Audit-logged
+        (`export.delete`).
+      x-required-permission: ['erasure:manage']
+      x-key-levels: [platform, partner, tenant, identity]
+      x-permission-notes: An identity key can delete only exports of its own identity.
+      x-rate-limit-buckets: [api]
+      x-idempotency: none
+      responses:
+        '204':
+          description: The export is deleted or stopped, and its links no longer work.
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
@@ -5641,11 +5673,17 @@ paths:
       tags: [Members]
       summary: Invite a member
       description: >-
-        Sends an invitation email from the deployment's platform identity. A pending invitation uses a seat;
+        Sends an invitation email from the deployment's system identity. A pending invitation uses a seat;
         with no seat left the request fails with `402 billing_limit` (`details.feature: "seats"`). Roles:
         `admin`, `member`, `viewer`. The owner is set at workspace creation (`owner` in `createTenant`) or by
         an ownership transfer in the console. A partner key's invitations count in the `partner` bucket
-        (`RL_PARTNER`, 10 a minute per partner, shared with tenant creation).
+        (`RL_PARTNER`, 10 a minute per partner, shared with tenant creation). A tenant sends at most 50
+        invitation emails (new and re-sent) per UTC day: past that, `429 daily_cap_reached` with
+        `details.cap: "invitations"` and `details.resets_at`, before anything is written. An address that
+        this deployment hosts (on the platform domain, or an identity's address) cannot be invited:
+        `400 invalid_request` with `details.errors[0].path = "email"`. Accepting an invitation is always an
+        explicit click in the console, and a person enrolled in two-step verification passes it before the
+        membership exists.
       x-required-permission: ['members:manage']
       x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api, partner]
@@ -5679,7 +5717,18 @@ paths:
         '404': {$ref: '#/components/responses/NotFound'}
         '409': {$ref: '#/components/responses/IdempotencyConflict'}
         '413': {$ref: '#/components/responses/PayloadTooLarge'}
-        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '429':
+          description: >-
+            The `partner` or `api` rate limit (`rate_limited`, with `Retry-After`), or the tenant's 50
+            invitation emails a day (`daily_cap_reached`, `details.cap: "invitations"`, with
+            `details.resets_at`).
+          x-error-codes: [rate_limited, daily_cap_reached]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            Retry-After: {$ref: '#/components/headers/Retry-After'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
 
@@ -6121,6 +6170,7 @@ paths:
             description: The deployment's API host (`PM_API_HOST`).
     post:
       operationId: receiveSesNotification
+      x-sdk: false
       tags: [Links and hooks]
       summary: Amazon SES delivery events (SNS)
       description: >-
@@ -6168,6 +6218,7 @@ paths:
             description: The deployment's API host (`PM_API_HOST`).
     post:
       operationId: receiveSesInboundNotification
+      x-sdk: false
       tags: [Links and hooks]
       summary: Amazon SES inbound mail notifications (SNS)
       description: >-
@@ -6221,6 +6272,7 @@ paths:
             description: The deployment's API host (`PM_API_HOST`).
     get:
       operationId: getSecurityTxt
+      x-sdk: false
       tags: [Well-known]
       summary: Security contact
       description: RFC 9116 `security.txt`, built from `PM_SECURITY_CONTACT`. `404` when the variable is unset.
@@ -8176,8 +8228,10 @@ components:
                 retry_after: 12
     SendTooManyRequests:
       description: >-
-        A per-key or per-identity rate limit (`rate_limited`, with `Retry-After`), or a tenant or identity
-        daily cap (`daily_cap_reached`, with `details.resets_at`). Retry with the same `Idempotency-Key`.
+        A per-key or per-identity rate limit (`rate_limited`, with `Retry-After`), or a daily cap
+        (`daily_cap_reached`, with `details.cap` and `details.resets_at`): the tenant or identity cap, the
+        shared-domain breaker, or a workspace whose payment is disputed (`resets_at` null). Retry with the
+        same `Idempotency-Key`.
       x-error-codes: [rate_limited, daily_cap_reached]
       headers:
         Request-Id: {$ref: '#/components/headers/Request-Id'}
@@ -8506,7 +8560,15 @@ components:
         resets_at:
           type: [string, 'null']
           format: date-time
-          description: '`daily_cap_reached` and `billing_limit`: when the cap or allowance resets (`null` for counts such as `inboxes`).'
+          description: '`daily_cap_reached` and `billing_limit`: when the cap or allowance resets (`null` for counts such as `inboxes`, and for `daily_cap_reached` with `cap: billing_dispute`, which ends when the dispute does).'
+        cap:
+          type: string
+          description: >-
+            `daily_cap_reached`: which cap refused the request. `identity` and `tenant` are the daily send
+            caps of tenant policy (the tenant one lowered by the new-workspace ramp); `invitations` is the
+            tenant's 50 invitation emails a day; `shared_domain` is the deployment's shared-domain breaker;
+            `billing_dispute` stops a workspace's sends while one of its payments is disputed.
+          enum: [identity, tenant, invitations, shared_domain, billing_dispute]
         feature:
           description: '`billing_limit`: the spent allowance.'
           $ref: '#/components/schemas/UsageFeatureName'
@@ -12117,12 +12179,13 @@ components:
           type: [string, 'null']
           format: uri
           description: >-
-            Set when `completed`: a signed link (`getSignedLink`), valid until `expires_at` (7 days), to a ZIP
-            holding one `.eml` per message plus `messages.json`. Minted again on each `GET`.
+            Set when `completed`: a signed link (`getSignedLink`) to a ZIP holding one `.eml` per message
+            plus `messages.json`. Minted again on each `GET`, and valid for one hour from it, or until
+            `expires_at` if that is sooner.
         expires_at:
           type: [string, 'null']
           format: date-time
-          description: When the download link expires.
+          description: When the export and its ZIP are deleted (7 days after it completed). No link works after it.
         created_at:
           type: string
           format: date-time
@@ -14259,8 +14322,8 @@ components:
           examples: [developer]
         reason:
           type: string
-          description: '`payment_recovered`: the plan was restored after a late payment.'
-          enum: [checkout, portal, payment_failed_grace_ended, payment_recovered, canceled, operator]
+          description: '`payment_recovered`: the plan was restored after a late payment, or when a dispute was closed in the workspace''s favour. `dispute`: a payment was disputed, so the default plan applies until the dispute closes.'
+          enum: [checkout, portal, payment_failed_grace_ended, payment_recovered, canceled, operator, dispute]
     BillingPaymentFailedData:
       type: object
       required: [grace_until]

@@ -213,9 +213,12 @@ GROUP BY domain_id
 | `quota_hold_expired_total` | counter | feature | `TenantQuota` alarm `alarm:holds`: a hold released because it expired unsettled, meaning a request died without settling ([W6](../edge-cases.md)) |
 | `quota_consumed_without_hold_total` | counter | – | `TenantQuota` `Settle`: units consumed with no matching hold, for example a reconciled uncertain send ([W5](../edge-cases.md)) |
 | `quota_count_drift_total` | counter | feature (`inboxes`, `custom_domains`, `seats`) | `TenantQuota` `Reconcile`: a count corrected from D1 by the hourly roll-up ([Billing › Reconciliation against D1](billing.md#reconciliation-against-d1)) |
-| `stripe_webhook_total` | counter | type (the Stripe event type), outcome (`applied`, `ignored_stale`, `ignored_erased`, `cancelled_after_erasure`, `duplicate`, or the `error:` code) | `fetch`: `POST /billing/stripe/webhook`, once per verified event ([Billing › Webhook endpoint](billing.md#webhook-endpoint)) |
+| `stripe_webhook_total` | counter | type (the Stripe event type), outcome (`applied`, `ignored_stale`, `ignored_erased`, `ignored_unresolved`, `cancelled_after_erasure`, `duplicate`, or the `error:` code) | `fetch`: `POST /billing/stripe/webhook`, once per verified event ([Billing › Webhook endpoint](billing.md#webhook-endpoint)) |
 | `stripe_webhook_rejected_total` | counter | – | `fetch`: a Stripe webhook refused with `400 invalid_request` by signature verification ([W14](../edge-cases.md)) |
-| `stripe_api_errors_total` | counter | call (`checkout_create`, `checkout_retrieve`, `portal_create`, `subscriptions_list`, `subscription_cancel`) | worker: a Stripe API call that failed with a network error, a timeout or a non-`2xx` answer ([Billing › Stripe integration](billing.md#stripe-integration)) |
+| `stripe_api_errors_total` | counter | call (`customer_create`, `checkout_create`, `checkout_retrieve`, `portal_create`, `subscriptions_list`, `charge_retrieve`, `subscription_cancel`) | worker: a Stripe API call that failed with a network error, a timeout or a non-`2xx` answer ([Billing › Stripe integration](billing.md#stripe-integration)) |
+| `stripe_duplicate_subscriptions_total` | counter | – | `fetch`: the webhook's state application cancelled a duplicate subscription ([Billing › Applying state](billing.md#applying-state), [W37](../edge-cases.md)) |
+| `billing_increase_held_total` | counter | feature (`plan`, or the top-up feature) | `fetch`: the webhook's state application kept an increase back because the subscription's latest invoice is not `paid` ([Billing › Allowances and periods](billing.md#allowances-and-periods), [W35](../edge-cases.md)) |
+| `system_mail_budget_denied_total` | counter | class (`signin`, `invitation`, `notification`, `account`), scope (`recipient`, `network`, `asn`, `tenant`, `class`) | `TenantQuota` of the default tenant: a system-identity send refused by a budget ([Cloud sign-up › System mail budgets](cloud-signup.md#102-system-mail-budgets), [W42](../edge-cases.md)) |
 | `ses_control_throttled_total` | counter | – | SES control-plane callers: SES answered `ThrottlingException` or `TooManyRequestsException` although `SesControl` granted the slot ([Domains on any DNS host §4.8](domain-connections.md#48-ses-api-rate-one-request-per-second)) |
 | `search_requests_total` | counter | mode, scope, result (`ok`, `degraded`, `partial`, code) | `fetch` |
 | `search_ms` | observation | mode, scope, fanout (`1`, `2-10`, `11-100`) | `fetch` |
@@ -321,6 +324,9 @@ the window (the Custom Alert "minimum event count").
 | `abuse_pause:{identity_id}` | B + C | An identity paused with `abuse_threshold` (`identity.paused`) | ticket | [Abusive identity](#abusive-identity) |
 | `signup_ramp_review:{tenant_id}` | B | Only with `PM_BILLING=stripe`: the third failed daily evaluation of a new Free workspace's send ramp (audit `tenant.ramp_held`); nothing is suspended automatically ([Cloud sign-up › New-workspace send ramp](cloud-signup.md#101-new-workspace-send-ramp)) | ticket | [Abusive identity](#abusive-identity) (review the workspace's identities; suspend the tenant if it is abuse) |
 | `system_mail_blocked` | B | The Notifier's submit through the system identity was refused with `429 daily_cap_reached`, `409 identity_paused` or `409 domain_not_ready` (the code is in the detail); the items are kept and retried hourly ([Notifications §7](notifications.md#7-when-system-mail-cannot-be-sent)) | page | [Domain failing](#domain-failing) for `domain_not_ready`; otherwise read the system identity with a platform key and resume it or raise its `send_policy.daily_cap`. Sign-in and invitation mail is blocked by the same refusal |
+| `billing_dispute:{tenant_id}` | B | Only with `PM_BILLING=stripe`: a charge of the workspace's customer is disputed (`billing_accounts.dispute_open_at` is set); its sends are stopped until the dispute closes ([Billing › Disputes and refunds](billing.md#disputes-and-refunds), [W36](../edge-cases.md)) | page | [Billing dispute](#billing-dispute) |
+| `shared_domain_breaker` | B | Only when `PM_DAILY_SEND_QUOTA` is set: the `*/15` cron set stage 1 (60% of the day's quota) or stage 2 (90%) of the shared-domain breaker ([Cloud sign-up › Shared-domain breaker](cloud-signup.md#103-shared-domain-breaker), [W44](../edge-cases.md)); it resolves when the row is deleted at 00:00 UTC | ticket (stage 1), page (stage 2) | [Quota exhausted](#quota-exhausted) |
+| `system_mail_budget` | A | `system_mail_budget_denied_total` ≥ 1,000 over 1 h: system mail refused by its budgets ([Cloud sign-up › System mail budgets](cloud-signup.md#102-system-mail-budgets), [W42](../edge-cases.md)) | ticket | [Abusive identity](#abusive-identity) (the `scope` label says whether one tenant's invitations, one network or one ASN is the cause; suspend a tenant that invites strangers) |
 | `billing_cancel_failed:{tenant_id}` | B | Tenant erasure's `cancel_billing` step failed for the third time ([Privacy › Tenant scope](privacy.md#66-tenant-scope)) | page | [Erasure failure](#erasure-failure) (cancel the customer's subscriptions in the Stripe Dashboard; the step's next attempt then finds none and the erasure continues) |
 | `billing_cancelled_after_erasure:{tenant_id}` | B | A Stripe webhook for an erasing or erased workspace showed a live subscription, and the handler cancelled it ([Billing › Webhook handling](billing.md#webhook-endpoint)) | ticket | Check in the Stripe Dashboard that the subscription is canceled and that no invoice was paid after the workspace was deleted; refund any that was |
 | `erasure_failed:{erasure_id}` | B + C | Erasure request `failed` (`erasure.failed`) | page | [Erasure failure](#erasure-failure) |
@@ -368,6 +374,8 @@ The `* * * * *` cron runs `ops::alerts::evaluate`:
      | `billing_cancelled_after_erasure` | The Stripe webhook handler, when it cancels a live subscription of an erasing or erased workspace ([Billing › Webhook endpoint](billing.md#webhook-endpoint)) |
      | `vector_drift` | The `*/15` cron's reconciliation drift evaluation, when this run's and the previous run's `drift_pct` are both more than 1 from zero ([Search › Nightly reconciliation](search.md#66-nightly-reconciliation)) |
      | `signup_ramp_review` | The daily ramp evaluation (`crons/signup_ramp.rs`) |
+     | `billing_dispute` | The Stripe webhook handler, when `charge.dispute.created` sets `dispute_open_at`; resolved when `charge.dispute.closed` clears it ([Billing › Disputes and refunds](billing.md#disputes-and-refunds)) |
+     | `shared_domain_breaker` | The breaker cron (`crons/send_breaker.rs`), when it writes a stage; resolved when it deletes the row ([Cloud sign-up › Shared-domain breaker](cloud-signup.md#103-shared-domain-breaker)) |
      | `ses_sending_paused`, `ses_rule_missing` | The 15-minute SES platform check, which reads `GetAccount` and the receipt rule set |
 2. Read the current state: for each alert key, the latest `audit_log` row with
    `action IN ('alert.fired', 'alert.resolved') AND target_id = <alert key>`.
@@ -489,7 +497,7 @@ wraps it as `pmail dlq list` and `pmail dlq redrive` ([CLI and setup](cli.md)).
 |---|---|
 | [Bounce spike](#bounce-spike) | `bounce_rate:{domain_id}` |
 | [Complaint spike](#complaint-spike) | `complaint_rate:{domain_id}` |
-| [Quota exhausted](#quota-exhausted) | `provider_quota`, `provider_quota_80`, `quota_warning` |
+| [Quota exhausted](#quota-exhausted) | `provider_quota`, `provider_quota_80`, `quota_warning`, `shared_domain_breaker` |
 | [Email Sending outage](#email-sending-outage) | `uncertain_spike`, `delivery_orphaned`, outbound burn rules, `notification_send_failures` |
 | [Domain failing](#domain-failing) | `domain_failing:{domain_id}`, `inbound_reject_spike`, `notification_send_failures` |
 | [SES account and receiving](#ses-account-and-receiving) | `ses_object_lost`, `ses_sending_paused`, `ses_rule_missing`, `ses_identities_90pct` |
@@ -497,8 +505,9 @@ wraps it as `pmail dlq list` and `pmail dlq redrive` ([CLI and setup](cli.md)).
 | [Integrator API down](#integrator-api-down) | `webhook_failing`, `webhook_disabled` |
 | [Parser bug](#parser-bug) | `panics`, reports of mis-parsed mail |
 | [Compromised key](#compromised-key) | Report, unusual usage, `rpc_owner_mismatch` |
-| [Abusive identity](#abusive-identity) | `abuse_pause`, `mailbox_size` |
+| [Abusive identity](#abusive-identity) | `abuse_pause`, `mailbox_size`, `system_mail_budget` |
 | [Erasure failure](#erasure-failure) | `erasure_failed`, `erasure_overdue` |
+| [Billing dispute](#billing-dispute) | `billing_dispute:{tenant_id}` |
 | [Restore from PITR](#restore-from-pitr) | Data corruption, a bad migration, `inbound_lost` |
 
 Every runbook ends by recording what was done in the incident log and checking that the alert resolved.
@@ -535,7 +544,10 @@ Every runbook ends by recording what was done in the incident log and checking t
    24 hours ([G3](../edge-cases.md)). Request a higher limit from Cloudflare; move urgent domains to SES
    ([Email Sending outage](#email-sending-outage)) if they are pre-verified there. For a tenant's own
    cap (`quota.warning`, `429 daily_cap_reached`), raise `identity_daily_send_cap` or
-   `tenant_daily_send_cap` in the tenant policy.
+   `tenant_daily_send_cap` in the tenant policy. For `shared_domain_breaker`, find the workspaces with
+   the most sends today in `usage_daily`; suspend any that is sending spam (FR-TEN-3). The breaker ends
+   by itself at 00:00 UTC; do not raise `PM_DAILY_SEND_QUOTA` above the figure Cloudflare shows to end
+   it early.
 3. **Verify.** `transport_outcomes_total{outcome=accepted}` resumes; no message reaches
    `failed: quota_exhausted`.
 
@@ -698,6 +710,19 @@ Every runbook ends by recording what was done in the incident log and checking t
    subscriptions in the Stripe Dashboard (immediately, without proration or refund) and the step's next
    attempt finds none left; check `stripe_api_errors_total{call=subscription_cancel}` for the cause.
 3. **Verify.** The new request is `completed` (or `completed_with_holds`) with zero probe hits.
+
+### Billing dispute
+
+1. **Diagnose.** The alert names the workspace. The audit row `billing.dispute_opened` holds the dispute
+   and charge IDs; open the dispute in the Stripe Dashboard and read its reason. A stolen card
+   (`fraudulent`) on a new workspace with fresh identities is the usual pattern.
+2. **Mitigate.** Sends are already stopped and the workspace is on the default plan. If it looks like
+   fraud, suspend the tenant (`PATCH /v1/tenants/{id} {"status": "suspended"}`) and accept the dispute in
+   the Dashboard. Otherwise submit evidence in the Dashboard before Stripe's deadline. Nothing else is
+   changed by hand: `charge.dispute.closed` restores the plan when the dispute is won, and cancels every
+   subscription when it is lost ([Billing › Disputes and refunds](billing.md#disputes-and-refunds)).
+3. **Verify.** After the close event, `billing_accounts.dispute_open_at` is `NULL`, the audit row
+   `billing.dispute_closed` exists, and the alert resolved.
 
 ### Restore from PITR
 

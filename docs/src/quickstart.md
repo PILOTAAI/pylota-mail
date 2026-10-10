@@ -188,24 +188,33 @@ Add the SDK, pinned to the same version as your deployment (`GET /health` return
 pylota-mail = "=X.Y.Z"   # replace with your deployment's version
 ```
 
-```rust
-use pylota_mail::Client;
+```rust,no_run
+use pylota_mail::{Client, IdempotencyKey};
+use pylota_mail::types::{Recipient, SendRequest};
 
 async fn confirm_booking(key: String) -> Result<(), pylota_mail::Error> {
-    let client = pylota_mail::Client::new("https://mail.example.com", key);
-    let sent = client
-        .identity("idn_01J9Z3K8V4")
-        .send()
-        .to("renter@example.org")
-        .subject("Your booking BK-2291")
-        .text("Your car is ready at 9:00.")
-        .idempotency_key("bk-2291-confirm")
-        .await?;
+    let client = Client::builder()
+        .base_url("https://mail.example.com")
+        .api_key(key)
+        .build()?;
+    let request = SendRequest {
+        to: vec![Recipient::from("renter@example.org")],
+        subject: "Your booking BK-2291".into(),
+        text: Some("Your car is ready at 9:00.".into()),
+        ..Default::default()
+    };
+    let key = IdempotencyKey::new("bk-2291-confirm")?;
     // a retry with the same key returns this same message
-    println!("{} deduplicated={}", sent.id, sent.deduplicated);
+    let sent = client.send_message("idn_01J9Z3K8V4", &request, &key).await?;
+    println!("{} deduplicated={}", sent.message.id, sent.deduplicated);
     Ok(())
 }
 ```
+
+Every SDK method is named after an operation of the [REST API](reference/api.md) (`sendMessage` →
+`send_message`), and the request and response types carry the schema names of `openapi.yaml`
+([Rust workspace § 11](project/design/rust-workspace.md#11-the-rust-sdk-fr-sdk-1)). This example is
+compiled in CI, so it matches the SDK.
 
 ### With the CLI
 

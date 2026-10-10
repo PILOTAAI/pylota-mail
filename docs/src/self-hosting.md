@@ -644,10 +644,11 @@ serves the landing page and these docs at `/docs/`.
 cargo install mdbook --version 0.5.4 --locked
 mdbook build docs                         # writes the docs into site/public/docs
 cd site
-npx --yes wrangler@4.139.0 deploy         # deploys the Worker pylota-mail-site
+npm ci --ignore-scripts                   # Wrangler 4.139.0 from package-lock.json, hash-checked
+./node_modules/.bin/wrangler deploy       # deploys the Worker pylota-mail-site
 ```
 
-From the repository root, `npx --yes wrangler@4.139.0 deploy --config site/wrangler.jsonc` does the
-same. To serve the site on your own hostname, uncomment the `routes` entry in `site/wrangler.jsonc`
+`site/package-lock.json` pins Wrangler and every package it pulls in, each with its integrity hash, so
+a deploy never fetches a tool by name. To serve the site on your own hostname, uncomment the `routes` entry in `site/wrangler.jsonc`
 and set the hostname (its zone must be on Cloudflare). Security headers, including the content
 security policy, are in `site/public/_headers`.

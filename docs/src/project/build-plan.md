@@ -102,6 +102,7 @@ M5, M6 ─▶ M25 agent signing keys, assertions and signed requests ─▶ M15 
    (S13 gates signed HTTP requests only)
 M22 billing ─▶ M15 MCP (mail_get_usage calls M22's GET /v1/usage)
 M9, M10, M21, M22, M24 (and M6's system identity) ─▶ M26 notifications and usage alerts
+M16 SDK/CLI ─▶ M19 release pipeline (a release ships the CLI binaries; the site half of M19 needs only M5)
 M5 ─▶ M17 Foundation (metrics writer, alert evaluator, alert table, re-seal sweep) ─▶ M7, M8, M9
    (M17 Completion, the checks that measure later milestones, is accepted at M20)
 ```
@@ -113,7 +114,7 @@ After M5, these tracks can run in parallel, each in its own branch and worktree:
 - **Track 2:** M8, once M6 lands (M8 imports M6's `webhooks/envelope.rs`: the event envelope, the
   `WebhookJob` queue message and the identity payload builders that M6's outbox already needs);
 - **Track 3:** M17 Foundation first (it must merge before M7, M8 and M9), then M16 and M17 Completion;
-- **Track 4:** M19;
+- **Track 4:** M19 (its site half from M5; its release half once M16 has landed);
 - **Track 5:** M25, once M6 lands (it needs only M5 and M6).
 
 Once M7 lands, M10 and M12 also run in parallel with M9. M23 follows M13 on the domains track. M21
@@ -139,13 +140,15 @@ rule of their own:
   `BillingMode`, `Allowances`, the `Hold` and `SetPlan` payloads and the `Held` and `Denied` answers), so
   later milestones replace the behaviour of the variants they own and never change a signature: M9
   (`Reserve`, `Release`, `RecordOutcome`), M11 (`CountAgentic`), M22 (the allowance variants, through
-  `billing/quota.rs`), M24 (`OutcomeRates`) and M26 (the `NotifierRequest::UsageThreshold` hook).
+  `billing/quota.rs`), M24 (`OutcomeRates`, `SystemMail`) and M26 (the `NotifierRequest::UsageThreshold`
+  hook).
 - `consumers/index.rs`, the `pm-index` consumer. M7 creates it for attachment text, M10 adds chunking,
   embedding and reconciliation, and M12 the triage job. M7 writes the whole `IndexJob` enum
   ([Search § 6](design/search.md#6-indexing-pipeline-pm-index)), so each later milestone fills in only the
   arm of its own job kind.
-- `billing/webhook.rs`, the Stripe webhook handler. M22 creates it; M24 adds the `ramp_lifted_at` update
-  when a workspace moves to a paid plan, and M26 the `Account { event: payment_failed }` hook.
+- `billing/webhook.rs`, the Stripe webhook handler. M22 creates it; M24 adds the `ramp_lifted_at` updates
+  (set when a workspace's paid plan is paid for, cleared when a dispute opens), and M26 the
+  `Account { event: payment_failed }` hook.
 - `jobs/erasure.rs`, tenant and person erasure. M14 creates it with every step and the named stubs of its
   table (below); M21 (console rows), M22 (`cancel_billing` and the billing rows), M23 (the
   `pm-retired-{n}` entries), M24 (person deletion) and M26 (the Notifier rows) each fill in their own stub.
@@ -156,7 +159,8 @@ rule of their own:
 - `crates/core/src/sealed.rs`, the registry of columns sealed under `PM_MASTER_KEY`. M17 Foundation
   creates it with the columns written by then (`signing_keys.ciphertext`); each milestone that writes a
   sealed column adds its entry and its case in `it::secrets::master_key_rotation`: M8 (webhook secrets),
-  M23 (SMTP credentials), M24 (second factors and PKCE verifiers) and M25 (identity keys). M25 is the only
+  M23 (SMTP credentials), M24 (second factors, the pending enrolment secret and PKCE verifiers) and M25
+  (identity keys). M25 is the only
   one that can land before M17 Foundation; if it does, M17 Foundation adds its entry.
 
 Each change to one of these files has one owner, the milestone that needs it. When two tracks change the
@@ -193,9 +197,13 @@ environment named in brackets. Nothing in this table is ever committed.
 | Gmail (Google Workspace) and Microsoft 365 test mailboxes holding only synthetic mail, with API access for the harness | Owner | M20 (the live suite) | Actions: `STAGING_GMAIL_CLIENT_ID`, `STAGING_GMAIL_CLIENT_SECRET`, `STAGING_GMAIL_REFRESH_TOKEN`, `STAGING_M365_TENANT_ID`, `STAGING_M365_CLIENT_ID`, `STAGING_M365_CLIENT_SECRET` [`staging`] |
 | A domain at an external DNS provider (not Cloudflare) and that provider's API token | Owner | M20 step 5 (`live::domains::dns_records_external_host`) | Actions: `STAGING_EXTERNAL_DNS_TOKEN`, `STAGING_EXTERNAL_DOMAIN` [`staging`] |
 | A staging platform key (90-day expiry) | Created by the agent with `pmail keys create` on staging; stored by a person | M20 | Actions: `STAGING_PLATFORM_KEY` [`staging`] |
-| A Stripe account in test mode | Owner | M22 (recorded fixtures), M20 step 11 | `PM_STRIPE_SECRET_KEY` (a restricted key, `rk_test_…`) and `PM_STRIPE_WEBHOOK_SECRET` (Worker secrets on staging); Actions: `STAGING_STRIPE_SECRET_KEY`, `STAGING_STRIPE_WEBHOOK_SECRET` [`staging`] |
+| A Stripe account in test mode | Owner | M22 (recorded fixtures), M20 step 11 | `PM_STRIPE_SECRET_KEY` (a restricted key, `rk_test_…`) and `PM_STRIPE_WEBHOOK_SECRET` (Worker secrets on staging); Actions: `STAGING_STRIPE_SECRET_KEY`, `STAGING_STRIPE_WEBHOOK_SECRET` [`staging`]; `STRIPE_SETUP_KEY` (a test-mode restricted key on the owner's machine for `cargo xtask stripe-setup`, [Billing › Stripe account setup](design/billing.md#stripe-account-setup)) |
 | A Google OAuth client and a GitHub OAuth app, with redirect URLs on the staging and production console hosts | Owner | M24 (its gate re-reads both providers' documentation), M20 step 10 | `PM_OAUTH_GOOGLE_CLIENT_ID`, `PM_OAUTH_GITHUB_CLIENT_ID` (variables); `PM_OAUTH_GOOGLE_CLIENT_SECRET`, `PM_OAUTH_GITHUB_CLIENT_SECRET` (Worker secrets) |
 | The minisign release key pair, generated offline by a person (`minisign -G`) | Owner | M19 | Secret key: Actions `MINISIGN_SECRET_KEY` and `MINISIGN_PASSWORD` [`release`]. Public key: compiled into `pmail` as the `current` key ([CLI and setup §8.2](design/cli.md#82-signature-and-checksums)); a second key pair becomes `next` before the first rotation |
+| The GitHub environment `production` (deployments from `main` only; the owner is the only person who can start `cloud-deploy.yml`) | Owner | M19 (site deploy); the Cloud rollout after v1.0 | Actions [`production`]: `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` for `site.yml`, a token with the per-Worker Editor role on `pylota-mail-site` and Workers Routes · Edit on the `pylotamail.com` zone, nothing else (the header of `.github/workflows/site.yml`); `PROD_CLOUDFLARE_API_TOKEN` and `PROD_CLOUDFLARE_ACCOUNT_ID` for `cloud-deploy.yml`, a token with the "Your token" permissions of [Deploy › step 2](../self-hosting.md#2-create-a-cloudflare-api-token), except that account-wide Workers Scripts · Edit is replaced by the per-Worker Editor role on the Cloud Worker and the zones are named, never **All zones**. The account is shared with Pylota, so neither token may reach Pylota's Workers or zones |
+| Terms of service, privacy notice and data processing agreement for Pylota Mail Cloud, published by TREFT LTD | Owner (TREFT LTD) | M24 (sign-up does not start without them), M20 step 10 | `PM_TERMS_URL`, `PM_PRIVACY_URL`, `PM_DPA_URL` and `PM_TERMS_VERSION` (variables on staging and production) |
+| Stripe live mode for TREFT LTD: business details, bank account and identity checks done, Stripe Tax on, and the UK VAT registration date | Owner | Cloud launch after M20 (no milestone waits for it) | `STRIPE_SETUP_KEY` (a live restricted key on the owner's machine, for `cargo xtask stripe-setup --live --vat-from <date>`); `PM_STRIPE_SECRET_KEY` and `PM_STRIPE_WEBHOOK_SECRET` (Worker secrets on production) |
+| The Email Sending daily quota that the Cloudflare dashboard shows for the account shared with Pylota | Owner | M24 (system-mail budgets and the shared-domain breaker), M20 | `PM_DAILY_SEND_QUOTA` (variable on staging and production); updated when Cloudflare raises the quota |
 | Optional: registration of the production deployment's Web Bot Auth key directory (`https://{PM_API_HOST}/.well-known/http-message-signatures-directory`) with Cloudflare's verified-bot programme (dashboard, "Bot Submission Form", verification method "Request Signature"; [Deploy › Signed HTTP requests](../self-hosting.md#signed-http-requests-web-bot-auth)) | Owner, after M25 ships with S13 passed and `PM_WEB_BOT_AUTH=on` | No milestone or test: signatures verify for any Web Bot Auth verifier without it, and S13 expects the unregistered `401` | None (a dashboard form; nothing to store) |
 | The GitHub repository `PILOTAAI/pylota-mail` (created 2026-10-09), with Actions enabled, the environments `staging` (one required reviewer, `main` and `v*` tags only) and `release` (`v*` tags only), and branch protection on `main` | Owner | M0 | Actions: `CARGO_REGISTRY_TOKEN` [`release`], for `cargo publish`; every other secret above |
 
@@ -746,6 +754,8 @@ signing tools of M25 (`mail_sign_assertion`, `mail_sign_http_request`).
 - Error mapping.
 - Revision 2026-07-28 has no sessions: the server never mints `Mcp-Session-Id`, and `GET` and `DELETE`
   on `/mcp` answer `405`.
+- `it::mcp::input_schemas_plain_objects`: every tool's `inputSchema` is a plain object at the top level,
+  with no `oneOf`, `anyOf`, `allOf` or `not`.
 - A recorded MCP Inspector session replays green.
 
 ---
@@ -766,7 +776,9 @@ signing tools of M25 (`mail_sign_assertion`, `mail_sign_http_request`).
   duplicate resources.
 - `pmail deploy` verifies checksums and refuses a tampered bundle.
 - `pmail doctor` reports every check with a fix.
-- The landing-page CLI examples run as tests.
+- The landing-page CLI examples run as tests, and `sdk::doctest::published_examples` compiles the Rust
+  examples of `quickstart.md` and checks that the landing page's example equals
+  `crates/sdk/examples/confirm_booking.rs`.
 
 ---
 
@@ -830,17 +842,30 @@ regression of more than 1 point.
 
 ---
 
-## M19 · Site, docs and release pipeline (Track 4)
+## M19 · Site, docs and release pipeline (Track 4; the release half after M16)
 
-**Files:** `site/` (exists), `.github/workflows/release.yml`, `xtask release`.
+**Files:** `site/` (exists, with Wrangler pinned in `site/package.json` and `site/package-lock.json`),
+`.github/workflows/{site.yml (exists), release.yml, cloud-deploy.yml}`, `release-gates/`, and the xtask
+commands `release` and `release-gate`.
+
+**Implements:** the release pipeline of [Rust workspace § 10](design/rust-workspace.md#10-ci-pipeline),
+which is its one definition, and PRD release criterion 7.
 
 **Acceptance:**
 
 - `mdbook build docs` writes into `site/public/docs`, and the site Worker serves both. The landing
   page's links to docs anchors resolve (link check in CI).
-- A tagged release produces `pylota-mail-worker-<v>.tar.gz`, CLI binaries for macOS (arm64, x64),
-  Linux (x64, arm64) and Windows (x64), and signed `SHA256SUMS`.
-- `pmail deploy --version <v>` deploys that bundle.
+- `site.yml` installs Wrangler with `npm ci --ignore-scripts` from the committed lockfile and deploys
+  with the per-Worker token of the `production` environment
+  ([Security § 11](design/security.md#11-supply-chain)).
+- `xtask::release_version_matches_tag` and `xtask::release_gate_refuses` pass.
+- The first release candidate, `v1.0.0-rc.1`, is tagged once M16 has landed. Its run produces a GitHub
+  pre-release with `pylota-mail-worker-1.0.0-rc.1.tar.gz`, CLI binaries for macOS (arm64, x64), Linux
+  (x64, arm64) and Windows (x64), the SBOMs, `SHA256SUMS` and `SHA256SUMS.sig` with the trusted comment
+  `pylota-mail v1.0.0-rc.1`, and an attestation for every file; its `staging` job deploys it with
+  `pmail deploy --version 1.0.0-rc.1`. Its `live` job may fail before M20; a failed run is never
+  promoted, and a pre-release never reaches crates.io.
+- `cloud-deploy.yml` refuses a pre-release version and a binary whose attestation does not verify.
 
 ---
 
@@ -856,6 +881,8 @@ including identity-key management on the identity page ([Agent signing keys §6]
 **Acceptance:**
 
 - Edge rows W9, W10, W15–W18.
+- `it::console::attachments_and_inline_images`: the console serves attachments and inline images
+  itself, so a page never loads anything from the API host.
 - Every console route works with JavaScript disabled, checked by the browser suite
   (`browser::console::no_js`, Playwright with `javaScriptEnabled: false`), which `cargo xtask itest` runs
   from this milestone on ([Testing §2](design/testing.md#2-test-layers)).
@@ -879,13 +906,19 @@ including identity-key management on the identity page ([Agent signing keys §6]
 
 **Files:** `crates/worker/src/billing/{mod.rs, catalog.rs, quota.rs (TenantQuota allowances and holds), stripe.rs, webhook.rs, usage.rs}`,
 `handlers/{usage.rs, plans.rs, billing.rs}` (`GET /v1/usage` and `GET /v1/usage/daily`),
-console pages `plan.rs`. No migration: `billing_accounts` and `billing_events` are in `0001_init.sql`.
+console pages `plan.rs`, and the dispute check in outbound policy step 18 (`details.cap:
+"billing_dispute"`). No migration: `billing_accounts` (with `dispute_open_at`) and `billing_events` are in
+`0001_init.sql`.
 
-**Implements:** FR-BILL-1–12, NFR-BILL-1/2, the metering points in [Billing design](design/billing.md).
+**Implements:** FR-BILL-1–12, FR-BILL-14, NFR-BILL-1/2, the metering points in [Billing design](design/billing.md).
 
 **Acceptance:**
 
-- Edge rows W1–W8, W11–W14, W19.
+- Edge rows W1–W8, W11–W14, W19 and W35–W37 (the `ramp_lifted_at` assertions of W35 and W36 are added
+  by M24, which owns the ramp), and `it::billing::unresolved_event_ignored`.
+- `xtask::stripe_setup_idempotent`: `cargo xtask stripe-setup` creates the products, prices, the three
+  Portal configurations and the webhook endpoint once, and writes a catalog that `pmail deploy`
+  accepts ([Billing › Stripe account setup](design/billing.md#stripe-account-setup)).
 - Every metered action is wired to a hold and a settlement, checked by a table test that lists each metering
   point. A new metered action without a row fails.
 - A Stripe test-mode run (CLI `stripe trigger` fixtures recorded as JSON) covers checkout completed,
@@ -895,7 +928,8 @@ console pages `plan.rs`. No migration: `billing_accounts` and `billing_events` a
   granted allowance. NFR-BILL-2: `it::billing::w2_stripe_down_sends_ok` fails no metered action while
   Stripe is unreachable.
 - Erasure extension: the billing stub of tenant erasure, that is the `cancel_billing` step (step 2, right
-  after routing stops: the plan and every top-up subscription cancelled at once, no proration, no refund) and `billing_events` and
+  after routing stops: the plan and every top-up subscription cancelled at once with `invoice_now=true`
+  and `prorate=false`, so no credit and no refund) and `billing_events` and
   `billing_accounts` in `delete_d1_rows` ([Privacy §6.6](design/privacy.md#66-tenant-scope)), with
   `it::erasure::tenant_cancels_billing`; webhooks for an erased tenant are answered `200` and recorded
   `ignored_erased`, except that a live subscription created after the deletion is cancelled
@@ -913,17 +947,27 @@ than 30 days old when the code is written).
 **Files:** `crates/worker/src/console/{signup.rs, oauth.rs, totp.rs, landing.rs, onboarding.rs, pages/overview.rs}`,
 `crates/core/src/totp.rs` (RFC 6238 codes, pure; the console module only stores and checks them),
 `handlers/platform.rs` (`POST /v1/platform/waitlist/invite`), no migration (the `users` sign-in
-columns, `oauth_identities`, `oauth_states`, `waitlist` and `tenants.{require_two_factor,
-onboarding_dismissed_at, ramp_lifted_at}` and the `login_tokens` sign-up columns are in `0001_init.sql`),
-the host split for `PM_CONSOLE_HOST` in `router.rs`, CLI `pmail waitlist invite`, the new-workspace send
-ramp (`crons/signup_ramp.rs`, run once a day by the `*/15` cron; the ramp check in outbound policy
-step 18; the `ramp_lifted_at` update in `billing/webhook.rs`; `QuotaRequest::OutcomeRates`), and person
-deletion (`console/pages/settings.rs` and the person step of `jobs/erasure.rs`).
+columns, `oauth_identities`, `oauth_states`, `pending_auth`, `waitlist`, `platform_state` and
+`tenants.{require_two_factor, onboarding_dismissed_at, ramp_lifted_at}` and the `login_tokens` sign-up
+columns are in `0001_init.sql`), the pending step (`console/pending.rs`, [Cloud sign-up
+§5.1](design/cloud-signup.md#51-the-pending-step)), the host split for `PM_CONSOLE_HOST` in `router.rs`,
+CLI `pmail waitlist invite`, the new-workspace send ramp (`crons/signup_ramp.rs`, run once a day by the
+`*/15` cron; the ramp check in outbound policy step 18; the `ramp_lifted_at` updates in
+`billing/webhook.rs`; `QuotaRequest::OutcomeRates`), the system-mail budgets and the form ticket
+(`console/sysmail.rs`, `QuotaRequest::SystemMail`), the shared-domain breaker (`crons/send_breaker.rs`
+and its check in outbound policy step 18), and person deletion (`console/pages/settings.rs` and the
+person step of `jobs/erasure.rs`).
 
-**Implements:** FR-CON-8–13, [Cloud sign-up, sign-in and first run](design/cloud-signup.md).
+**Implements:** FR-CON-8–13, FR-CON-16–18, [Cloud sign-up, sign-in and first run](design/cloud-signup.md).
 
 **Acceptance:**
 
+- Edge rows W38–W44 (W41's `sign_in_codes_locked` email assertion is added by M26), with
+  `it::members::w38_invitation_needs_second_factor`, `it::totp::w39_pending_auth_single_use`,
+  `it::oauth::w40_link_needs_code`, `it::console::w41_failed_code_daily_cap`,
+  `it::abuse::w42_system_mail_budgets`, `it::console::w43_hosted_address_refused` and
+  `it::abuse::w44_shared_domain_breaker`, and the ramp assertions of `it::billing::w35_grant_after_payment`
+  and `it::billing::w36_dispute_and_refund`.
 - Edge rows W20–W34, with the tests named in the register (`it::oauth::*`, `it::signup::*`, `it::totp::*`,
   `it::landing::routing_table`, `it::checkout::*`, `it::abuse::free_ramp`, `it::abuse::ramp_evaluator`,
   `it::abuse::partner_ramp` (W30's partner part: a partner's tenants are ramped unless `ramp_exempt`),
@@ -939,10 +983,11 @@ deletion (`console/pages/settings.rs` and the person step of `jobs/erasure.rs`).
   `it::onboarding::derived_steps` and `it::hosts::console_api_split`.
 - The new pages pass the M21 checks: they join `browser::console::no_js` and `browser::console::axe_scan`
   (no JavaScript needed, no axe violation of impact `serious` or `critical`).
-- `users.totp_sealed`, `users.recovery_codes_sealed` and `oauth_states.pkce_sealed` are registered in
+- `users.totp_sealed`, `users.totp_pending_sealed`, `users.recovery_codes_sealed` and `oauth_states.pkce_sealed` are registered in
   `crates/core/src/sealed.rs`, so M17 Foundation's re-seal sweep covers them, with their cases in
   `it::secrets::master_key_rotation`.
-- The global retention job's `signup` step (`oauth_states`, `waitlist`): `it::retention::global_signup_rows`.
+- The global retention job's `signup` step (`oauth_states`, `pending_auth`, `waitlist`):
+  `it::retention::global_signup_rows`.
 
 **Gate:** Google's and GitHub's endpoints and claim names are re-read from their current documentation
 and recorded in the design before the OAuth code is written ([Cloud sign-up §4](design/cloud-signup.md#4-google-and-github)).
@@ -1028,7 +1073,8 @@ column are in `0001_init.sql`). Hooks in other milestones' files, each reviewed 
 | `quota/mod.rs` (M22's `TenantQuota`) | `NotifierRequest::UsageThreshold` |
 | `members/mod.rs` and `handlers/members.rs` (M21) | `NotifierRequest::MemberRemoved` on removal and leaving; `Account { event: ownership_transferred }` on a transfer |
 | `console/totp.rs` (M24) | `Account { event: two_factor_disabled }` |
-| `console/oauth.rs` (M24) | `Account { event: sign_in_method_linked }` |
+| `console/pending.rs` (M24) | `Account { event: sign_in_method_linked }` when the emailed code links a provider identity |
+| `console/signin.rs` (M21) | `Account { event: sign_in_codes_locked }` when an address reaches 30 failed codes in a UTC day |
 | `billing/webhook.rs` (M22) | `Account { event: payment_failed }` when the status becomes `past_due` |
 | `jobs/erasure.rs` (M14) | The Notifier stub of tenant erasure (`notification_prefs`, `Notifier` `delete_all`), and the `notification_prefs` rows of person deletion |
 
@@ -1065,8 +1111,11 @@ column are in `0001_init.sql`). Hooks in other milestones' files, each reviewed 
   without a session and with `PM_CONSOLE=off`.
 - The cross-tenant suite covers the unsubscribe route: a token never changes another person's or
   workspace's preferences (O18).
-- `it::notify::system_mail_blocked_retries`, and `it::console::account_emails` for all four `account`
-  events.
+- `it::notify::system_mail_blocked_retries`, and `it::console::account_emails` for all five `account`
+  events; the `sign_in_codes_locked` assertion of `it::console::w41_failed_code_daily_cap`.
+- `it::notify::unsubscribe_token_format`: the token layout of
+  [Notifications § 5](design/notifications.md#5-the-emails) round-trips and every malformed token is
+  refused.
 - Erasure extension: `it::erasure::tenant_console_rows` and `it::erasure::person_scope` gain their
   `notification_prefs` and `Notifier` assertions, and `it::notify::member_removed_drops_pending` covers
   `held` rows.
@@ -1080,7 +1129,8 @@ NFR-PERF-4, NFR-OPS-2 and NFR-COST-1 (step 13). M17 Completion is accepted here 
 gate once every milestone it measures has landed.
 
 Deploy to staging with `pmail setup` and `pmail deploy` from the docs alone, as if you were a new
-self-hoster. Then run `live::*`. Each step names its tests in [Testing §10](design/testing.md#10-live-end-to-end-suite-live);
+self-hoster, using the latest release candidate that M19's pipeline published (`v1.0.0-rc.N`); each fix
+found here ships as the next candidate. Then run `live::*`. Each step names its tests in [Testing §10](design/testing.md#10-live-end-to-end-suite-live);
 the ones marked manual there need a person in a browser and run with `cargo xtask live --manual`:
 
 1. Inbound from Gmail and Outlook test mailboxes. The verdicts are correct, and HTML-only mail
@@ -1122,4 +1172,7 @@ the ones marked manual there need a person in a browser and run with `cargo xtas
     mailbox with no content from the mail (`live::notify::new_mail_no_content`); Gmail's one-click
     unsubscribe turns that kind off (`live::notify::gmail_one_click_unsubscribe`, manual).
 
-**v1.0 release criteria:** [PRD §9](prd.md#9-release-criteria-v10).
+**v1.0 release criteria:** [PRD §9](prd.md#9-release-criteria-v10). `v1.0.0` is tagged on a commit that
+changes only the workspace version of the last candidate that passed this milestone, once
+`release-gates/v1.0.0.md` is ticked (criterion 7). Its `publish` job is the first to publish the crates to
+crates.io, so an integrator that takes the SDK from crates.io waits for it.

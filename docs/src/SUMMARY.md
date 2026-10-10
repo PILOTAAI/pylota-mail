@@ -68,3 +68,5 @@
   - [0007 Agentic search with verified citations](project/adr/0007-agentic-search.md)
   - [0008 Domains on any DNS host](project/adr/0008-domains-on-any-dns-host.md)
   - [0009 Local MCP protocol types](project/adr/0009-local-mcp-protocol-types.md)
+  - [0010 Partner keys as a fourth key level](project/adr/0010-partner-keys.md)
+  - [0011 Marketing mail only through SES or SMTP](project/adr/0011-marketing-needs-ses.md)

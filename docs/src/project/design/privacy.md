@@ -263,7 +263,7 @@ delivery log longer but never extends replay past 30 days ([Webhooks › Replay]
 | `billing_events` | `DELETE FROM billing_events WHERE received_at < ?now − 400 days` (batches of 1,000) ([Billing › Webhook endpoint](billing.md#webhook-endpoint)) | `it::retention::global_billing_events` |
 | `ses_ingest` | `ses_ingest` rows whose `done_at` (set with `done`, `dropped` or `lost`) is more than 30 days ago. `queued` and `held` rows are never pruned: the backstop cron owns them | `it::retention::global_ses_ingest` |
 | `console` | `login_tokens` rows 24 hours past `expires_at`; `sessions` 30 days after expiry or revocation; `invitations` with status `expired` or `revoked` 30 days after `expires_at` | `it::retention::global_console_rows` |
-| `signup` | `oauth_states` rows 24 hours past `expires_at`; `waitlist` rows 30 days after their invitation (there are no unconfirmed rows: an unused confirmation link simply expires after 10 minutes) | `it::retention::global_signup_rows` |
+| `signup` | `oauth_states` and `pending_auth` rows 24 hours past `expires_at`; `users.totp_pending_sealed` and `totp_pending_expires_at` cleared 24 hours past `totp_pending_expires_at`; `waitlist` rows 30 days after their invitation (there are no unconfirmed rows: an unused confirmation link simply expires after 10 minutes) | `it::retention::global_signup_rows` |
 | `staging` | Reconciliation of `inbound-staging/` older than 1 hour against mailbox records: an unrouted object is re-queued once; objects are never deleted here (the 1-day lifecycle rule does that) | `it::retention::global_job_steps` |
 | `audit` | One `audit_log` row per step with counts (`tenant_id = NULL`) | `it::retention::global_job_steps` |
 
@@ -403,7 +403,7 @@ Order: stop routing, then billing (money stops before anything else is removed),
 | # | Step | Does |
 |---|---|---|
 | 1 | `stop_routing` | `tenants.status = 'erasing'`, which only this job changes afterwards (a `PATCH` with `status` gets `409 tenant_erased`, and non-platform keys can no longer write to the tenant) (inbound for every tenant address now gets `550 5.1.1`; outbound consumers drop messages for the tenant); revoke every tenant and identity key; disable the tenant's webhook endpoints (`enabled = 0`, `disabled_reason = 'manual'`); cancel the tenant's other running jobs |
-| 2 | `cancel_billing` | Skipped when `PM_BILLING=off`, or when the tenant has no `billing_accounts.stripe_customer_id`. Otherwise read the customer's subscriptions (`GET /v1/subscriptions?customer=…`, every status except canceled) and cancel each one, the plan subscription and every top-up subscription, at once: immediate cancellation, with no proration credit and no refund ([Billing › Stripe integration](billing.md#stripe-integration)). The step is done when the read returns none, so a re-run after a partial failure cancels only what is left; a customer Stripe no longer knows counts as done. Failures retry under the job's backoff (section 4). The third failed attempt fires `billing_cancel_failed:{tenant_id}` (page; [Observability › Alert list](observability.md#53-alert-list)), so an operator can cancel in the Stripe Dashboard before the tenth attempt fails the job like any step. Webhooks for this tenant afterwards are answered `200` and recorded `ignored_erased`, except that a live subscription created after the deletion is cancelled (`cancelled_after_erasure`; [Billing › Webhook endpoint](billing.md#webhook-endpoint)) |
+| 2 | `cancel_billing` | Skipped when `PM_BILLING=off`, or when the tenant has no `billing_accounts.stripe_customer_id`. Otherwise read the customer's subscriptions (`GET /v1/subscriptions?customer=…`, every status except canceled) and cancel each one, the plan subscription and every top-up subscription, at once: immediate cancellation with `invoice_now=true` and `prorate=false`, so anything not yet invoiced is billed on a final invoice, with no proration credit and no refund ([Billing › Stripe integration](billing.md#stripe-integration) records why). The step is done when the read returns none, so a re-run after a partial failure cancels only what is left; a customer Stripe no longer knows counts as done. Failures retry under the job's backoff (section 4). The third failed attempt fires `billing_cancel_failed:{tenant_id}` (page; [Observability › Alert list](observability.md#53-alert-list)), so an operator can cancel in the Stripe Dashboard before the tenth attempt fails the job like any step. Webhooks for this tenant afterwards are answered `200` and recorded `ignored_erased`, except that a live subscription created after the deletion is cancelled (`cancelled_after_erasure`; [Billing › Webhook endpoint](billing.md#webhook-endpoint)) |
 | 3 | `remove_domains` | For each tenant domain, run the `domain_remove` steps of [Identities and domains › Domain removal](identity-domains.md#domain-removal) inline (literal rules, catch-all, routing, sending onboarding, event subscription, the SES identity with `DeleteEmailIdentity` and its DKIM CNAMEs, including a failover identity, the domain's addresses in `pm-retired-{n}` receipt rules, ownership record, zone); then `DomainMonitor` `delete_all` |
 | 4 | `erase_identities` | For each identity: identity steps 2 and 3 (tombstone every address, including retired ones; erase the mailbox) |
 | 5 | `delete_d1_rows` | In this order, all `WHERE tenant_id = ?1`: `webhook_deliveries`, `webhook_endpoints`, `event_index`, `suppressions`, `sender_lists`, `idempotency_records` (`scope = ?1 OR tenant_id = ?1`: the tenant's own records, and the records of platform and partner keys whose stored response belongs to the tenant, such as the `POST /v1/tenants` that created it), `usage_daily`, `identity_keys` (after `INSERT OR IGNORE INTO key_tombstones` of every row's `id`, as in identity scope), `notification_prefs`, `api_keys`, `identities`, `domains`, `exports`, non-erasure `jobs`, `invitations`, `sessions` (active workspace = this tenant), `members`, `billing_events`, `billing_accounts`, `audit_log` rows whose `action` does not start with `erasure.`; then `tenants` set `status = 'erased'`, `name = ''`, `policy_json = '{}'` (the row, slug and suffix stay, so neither is reused); `TenantQuota` `delete_all` and `Notifier` `delete_all`, so no pending notification survives. Every person the `members` delete left with no workspace is then deleted as in section 6.9, which also removes their `oauth_identities`, `login_tokens` and `waitlist` row |
@@ -447,8 +447,8 @@ deletion for every person it leaves with no workspace (section 6.6, step 5).
    [Console › Members](console.md#members): the `members` row and the person's `notification_prefs` rows
    for that workspace are deleted, their pending notifications there are dropped
    ([O19](../edge-cases.md)), the seat is released and `member.removed` is emitted.
-2. In one D1 batch: delete the person's `sessions`, the `login_tokens` for their address, their
-   `oauth_identities`, their `notification_prefs` rows in every workspace, and any `waitlist` row for
+2. In one D1 batch: delete the person's `sessions`, `pending_auth` rows, the `login_tokens` for their
+   address, their `oauth_identities`, their `notification_prefs` rows in every workspace, and any `waitlist` row for
    their address; and scrub the address of the invitations they accepted
    (`UPDATE invitations SET email = ?usr_id WHERE status = 'accepted' AND email = ?address`), whose rows
    stay with their workspaces as the record of who invited the member.
@@ -648,11 +648,17 @@ the signed link format of [Security › Signed links](security.md#73-signed-link
 
 ```text
 https://mail.example.com/v1/links/{token}
-payload = "l1:{kid}:export:{tenant_id}:{export_id}:{expires_unix_s}"     expires = the export's expires_at
+payload = "l1:{kid}:export:{tenant_id}:{export_id}:{expires_unix_s}"
+expires = min(now + 1 hour, the export's expires_at)
 ```
 
 - The download needs no API key; the MAC authenticates it. A bad MAC, an expired link or an expired
   export returns `404 export_not_found`.
+- A link is a bearer URL, so it lives one hour, and a new one is minted on every `GET`; the export
+  itself stays downloadable until `expires_at` (7 days). `DELETE /v1/exports/{export_id}`
+  (`erasure:manage`, audit `export.delete`) revokes every link at once: it deletes the ZIP of a
+  `completed` export and sets `expired`, or stops a `queued` or `running` one (`canceled`), and the link
+  check's "the target still exists" step then refuses every earlier link.
 - The response is the ZIP with `Content-Type: application/zip`,
   `Content-Disposition: attachment; filename="exp_….zip"` and the attachment-serving headers of
   [Security](security.md#85-serving-attachments-and-raw-mime).
@@ -762,7 +768,7 @@ canaries.
 | `core::notify::no_content_in_body`, `it::notify::invisible_mail_never_notifies` | A rendered notification holds no subject, sender, snippet or attachment name from the source message; mail that is not visible in the inbox is never counted | section 7.5, [O15](../edge-cases.md) |
 | `it::erasure::step_retry_and_fail` | Injected R2 and Vectorize faults retry with backoff and resume from the cursor without double counting; after 10 attempts the request is `failed` with a partial receipt | NFR-PRV-1 |
 | `it::identities::a5_tombstone_blocks_reuse` | A deleted address cannot be assigned to any identity in any tenant | [A5](../edge-cases.md) |
-| `it::export::i3_counterparty` | ZIP layout, one `.eml` per message, `messages.json` schema, reconstructed messages after `raw_days`, Bcc redaction, a 7-day signed link that fails when tampered or expired | [I3](../edge-cases.md), FR-PRV-5 |
+| `it::export::i3_counterparty` | ZIP layout, one `.eml` per message, `messages.json` schema, reconstructed messages after `raw_days`, Bcc redaction; a signed link that fails when tampered, after its hour, or after the export's 7 days; each `GET` mints a new link; `DELETE /v1/exports/{export_id}` makes every earlier link answer `404 export_not_found` at once | [I3](../edge-cases.md), FR-PRV-5 |
 | `it::retention::i4_raw` | Raw MIME older than `raw_days` deleted, `410 raw_expired` afterwards, audit row written | [I4](../edge-cases.md), FR-PRV-2 |
 | `it::retention::i4_messages` | With `message_days` set, messages, attachments, index rows and vectors are purged, except held threads | [I4](../edge-cases.md) |
 | `it::retention::i4_events` | Outbox, `event_index` and `webhook_deliveries` older than `events_days` purged; with `events_days` = 10, replay reaches back 10 days, and with `events_days` = 90, still only 30 | [I4](../edge-cases.md), section 5.2 |

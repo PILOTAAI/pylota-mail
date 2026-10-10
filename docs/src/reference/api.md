@@ -231,7 +231,9 @@ own tenant; it cannot list tenants or change them.
 - `policy` is merged over the defaults. See [Configuration › Tenant policy](configuration.md#tenant-policy).
 - `owner` (optional) creates the workspace's console owner and emails them a sign-in link. Without it, a
   platform or partner key can add an owner later with an invitation and an ownership transfer in the
-  console.
+  console. An address this deployment hosts (on the platform domain, or an identity's address) cannot
+  be an owner: `400 invalid_request` with `details.errors[0].path = "owner.email"`, because any key that
+  reads that mailbox could read the sign-in codes.
 - `billing.mode` defaults to `metered` on a deployment with billing on (plan `free`) and to `disabled`
   otherwise.
 - **With a partner key**, the new tenant's `partner_id` is the key's partner, for good, and its billing
@@ -1648,7 +1650,7 @@ tenant it returns `409 tenant_erased` ([I8](../project/edge-cases.md)):
 `erasure.completed` event is emitted. The partner key of an erased tenant's partner can still read the
 tenant's erasure requests and their receipts.
 
-### `POST /v1/exports` · `GET /v1/exports/{export_id}`
+### `POST /v1/exports` · `GET|DELETE /v1/exports/{export_id}`
 
 ```json
 { "tenant_id": "ten_01J9…", "scope": "counterparty", "counterparty_address": "jo@example.net" }
@@ -1666,9 +1668,14 @@ identities) or `identity` (with `identity_id`: the whole mailbox). Returns `202`
 
 `status` is `queued`, `running`, `completed`, `failed`, `canceled` (a tenant erasure superseded it) or
 `expired`. The finished export has
-`download_url`: a [signed link](#get-v1linkstoken) valid until `expires_at` (7 days) to a ZIP holding
-one `.eml` per message plus `messages.json`. The link is minted again on each `GET`. An
-`export.completed` event is emitted.
+`download_url`: a [signed link](#get-v1linkstoken) to a ZIP holding one `.eml` per message plus
+`messages.json`, minted again on each `GET` and valid for one hour from it (or until `expires_at`, 7 days
+after completion, if that is sooner). An `export.completed` event is emitted.
+
+`DELETE /v1/exports/{export_id}` (`erasure:manage`) revokes every link at once: a `completed` export's
+ZIP is deleted and it becomes `expired`, a `queued` or `running` one is stopped and becomes `canceled`,
+and any other is left as it is. It returns `204`, and a link of a deleted export answers
+`404 export_not_found`. Audit-logged (`export.delete`).
 
 ---
 
@@ -1786,7 +1793,12 @@ Not paginated: a workspace's members and pending invitations are bounded by its 
 system identity (`PM_SYSTEM_FROM`), also when the console is off (`PM_CONSOLE=off`). A pending invitation uses a seat; with no seat left the request fails with
 `402 billing_limit` (`details.feature: "seats"`). Roles: `admin`, `member`, `viewer`. The owner is set at
 workspace creation (`owner` in `POST /v1/tenants`) or by an ownership transfer in the console. Returns
-`201` with the invitation (`id`, `email`, `role`, `expires_at`).
+`201` with the invitation (`id`, `email`, `role`, `expires_at`). A tenant sends at most 50 invitation
+emails (new and re-sent) per UTC day; past that the request gets `429 daily_cap_reached` with
+`details.cap: "invitations"` and `details.resets_at`, before anything is written. An address this
+deployment hosts cannot be invited (`400 invalid_request`, path `email`). The person accepts in the
+console with an explicit click; when they are enrolled in two-step verification, the membership is
+created only after their second factor.
 
 ### `DELETE /v1/tenants/{tenant_id}/invitations/{invitation_id}` · `DELETE /v1/tenants/{tenant_id}/members/{user_id}` — `members:manage`
 

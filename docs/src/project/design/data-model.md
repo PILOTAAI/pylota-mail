@@ -380,7 +380,9 @@ CREATE TABLE exports (
   status        TEXT NOT NULL CHECK (status IN ('queued','running','completed','failed','canceled','expired')),
   r2_key        TEXT,
   size          INTEGER,
-  expires_at    INTEGER,                                   -- download available for 7 days
+  expires_at    INTEGER,                                   -- the ZIP is kept 7 days; each download link lives
+                                                           -- 1 hour (Privacy § 9.4); DELETE /v1/exports/{id}
+                                                           -- deletes the ZIP at once and sets 'expired'
   created_at    INTEGER NOT NULL
 );
 
@@ -555,6 +557,9 @@ CREATE TABLE users (
   totp_window_count     INTEGER NOT NULL DEFAULT 0,        -- two-step attempts in that window (at most 5)
   totp_failures         INTEGER NOT NULL DEFAULT 0,        -- failed codes in a row; 10 sets totp_locked_until
   totp_locked_until     INTEGER,                           -- two-step sign-in locked until (15 minutes)
+  totp_pending_sealed   BLOB,                              -- enrolment: pm1 envelope of the candidate secret
+  totp_pending_expires_at INTEGER,                         -- enrolment: refused after this (10 minutes); both
+                                                           -- cleared on confirm, and by the retention job
   created_at            INTEGER NOT NULL,
   last_login_at         INTEGER
 );
@@ -587,8 +592,10 @@ CREATE UNIQUE INDEX invitations_pending ON invitations(tenant_id, email) WHERE s
 CREATE TABLE login_tokens (                                -- magic links and six-digit codes
   id          TEXT PRIMARY KEY,
   email       TEXT NOT NULL,
-  purpose     TEXT NOT NULL CHECK (purpose IN ('sign_in','sign_up','waitlist')),  -- what using it does
-                                                           -- (Cloud sign-up § 6); re-authentication is sign_in
+  purpose     TEXT NOT NULL CHECK (purpose IN ('sign_in','sign_up','waitlist','oauth_link')),
+                                                           -- what using it does (Cloud sign-up § 6);
+                                                           -- re-authentication is sign_in; oauth_link confirms
+                                                           -- a Google or GitHub link (Cloud sign-up § 4)
   plan        TEXT,                                        -- sign_up: plan intent; waitlist: plan of interest
   next_path   TEXT,                                        -- sign_up: validated next (Cloud sign-up § 7)
   terms_version TEXT,                                      -- sign_up: PM_TERMS_VERSION accepted; copied to users
@@ -641,10 +648,32 @@ CREATE TABLE oauth_states (                                -- one row per starte
   plan        TEXT,
   terms_version TEXT,                                      -- intent sign_up: PM_TERMS_VERSION accepted at the start;
                                                            -- copied to the new user by the callback
+  invitation_id TEXT REFERENCES invitations(id),           -- set when the flow started on an invitation's accept
+                                                           -- page; the callback accepts that invitation only
   created_at  INTEGER NOT NULL,
   expires_at  INTEGER NOT NULL,                            -- created + 10 minutes
   used_at     INTEGER
 );
+
+-- A first factor passed and a second step is outstanding (Cloud sign-up § 5.1): no session exists yet.
+CREATE TABLE pending_auth (
+  id_hash        TEXT PRIMARY KEY,                         -- HMAC(link key {key_kid}, __Host-pm_pending value)
+  key_kid        TEXT NOT NULL,                            -- signing_keys kid (purpose 'link') of id_hash
+  user_id        TEXT NOT NULL REFERENCES users(id),
+  step           TEXT NOT NULL CHECK (step IN ('link_code','two_factor')),
+  next_path      TEXT,                                     -- validated next (Cloud sign-up § 7)
+  plan           TEXT,                                     -- sign-up plan intent, carried to § 7
+  invitation_id  TEXT REFERENCES invitations(id),          -- accepted, in the batch that creates the session
+  oauth_provider TEXT CHECK (oauth_provider IN ('google','github')),  -- link_code: the identity to link
+  oauth_subject  TEXT,
+  oauth_email    TEXT,                                     -- becomes oauth_identities.email_at_link
+  login_token_id TEXT REFERENCES login_tokens(id),         -- link_code: the emailed code (purpose oauth_link)
+  attempts       INTEGER NOT NULL DEFAULT 0,               -- wrong link codes; at 5 the row is used up
+  created_at     INTEGER NOT NULL,
+  expires_at     INTEGER NOT NULL,                         -- two_factor: + 5 minutes; link_code: + 10 minutes
+  used_at        INTEGER                                   -- single use
+);
+CREATE INDEX pending_auth_user ON pending_auth(user_id);
 
 CREATE TABLE waitlist (                                    -- PM_SIGNUP = waitlist (Cloud sign-up § 6.1)
   email        TEXT PRIMARY KEY,                           -- needed to send the invitation; deleted as in the notes
@@ -692,6 +721,12 @@ CREATE TABLE billing_accounts (
   stripe_customer_id   TEXT UNIQUE,
   stripe_subscription_id TEXT UNIQUE,                     -- the plan subscription; written by Applying state,
                                                            -- read by the plan_managed_by_stripe check (Billing)
+  topup_subscriptions_json TEXT NOT NULL DEFAULT '{}',    -- {"sends":"sub_…"}: live top-up subscriptions by
+                                                           -- feature; written by Applying state, read by the
+                                                           -- console's Portal deep links (Billing)
+  dispute_open_at      INTEGER,                            -- a charge of the customer is disputed: default plan
+                                                           -- and no sends until the dispute closes (Billing ›
+                                                           -- Disputes and refunds); read by outbound step 18
   cancel_at_period_end INTEGER NOT NULL DEFAULT 0,
   updated_at           INTEGER NOT NULL
 );
@@ -702,8 +737,17 @@ CREATE TABLE billing_events (                              -- Stripe webhook ded
   tenant_id    TEXT,
   received_at  INTEGER NOT NULL,
   processed_at INTEGER,
-  outcome      TEXT                                        -- applied | ignored_stale | ignored_erased | cancelled_after_erasure | error:<code>
-               CHECK (outcome IN ('applied','ignored_stale','ignored_erased','cancelled_after_erasure') OR outcome LIKE 'error:%')
+  outcome      TEXT                                        -- applied | ignored_stale | ignored_erased | ignored_unresolved
+                                                           -- | cancelled_after_erasure | error:<code>
+               CHECK (outcome IN ('applied','ignored_stale','ignored_erased','ignored_unresolved',
+                                  'cancelled_after_erasure') OR outcome LIKE 'error:%')
+);
+
+-- Deployment-wide switches written by crons (Cloud sign-up § 10.3).
+CREATE TABLE platform_state (
+  key        TEXT PRIMARY KEY CHECK (key IN ('send_breaker')),
+  value_json TEXT NOT NULL,                                -- send_breaker: {"stage": 1 | 2, "until": <ms>, "share": <0..1>}
+  updated_at INTEGER NOT NULL
 );
 
 CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);
@@ -741,8 +785,8 @@ CREATE TABLE platform_objects (
   creates the first key of each purpose on first use (`INSERT … ON CONFLICT DO NOTHING`, then a re-read,
   so two isolates racing end with one key).
   `POST /v1/platform/keys/{purpose}/rotate` inserts a new current key and sets `verify_until` on the old
-  one: 90 days for `thread`, 7 days for `link` (the longest link lifetime: `link_ttl_hours` ≤ 168 and
-  export links 7 days), 24 hours for `cursor` (the cursor lifetime). With `?revoke_previous=true` the
+  one: 90 days for `thread`, 7 days for `link` (the longest link lifetime: `link_ttl_hours` ≤ 168; export
+  links live 1 hour), 24 hours for `cursor` (the cursor lifetime). With `?revoke_previous=true` the
   old row is deleted in the same D1 batch instead, so what it signed stops verifying at once. Rows past
   `verify_until` are deleted by the global retention job. Isolates cache the opened keyring for 5 minutes
   and re-read it at once when a token names an unknown kid (at most once a minute per isolate).
@@ -767,7 +811,8 @@ CREATE TABLE platform_objects (
   `pm1|{table}|{column}|{row id}` (for example `pm1|domains|smtp_sealed|{domain_id}`):
   `webhook_endpoints.secret_enc` and `prev_secret_enc`, `identity_keys.private_enc`,
   `signing_keys.ciphertext`, `domains.smtp_sealed` and `smtp_pending_sealed`, `users.totp_sealed`,
-  `users.recovery_codes_sealed` and `oauth_states.pkce_sealed`. Each is an entry of the sealed-column
+  `users.totp_pending_sealed`, `users.recovery_codes_sealed` and `oauth_states.pkce_sealed`. Each is an
+  entry of the sealed-column
   registry (`crates/core/src/sealed.rs`), which the re-seal sweep and the count query of
   `pmail secrets rotate-master` read, so the rotation covers every one of them. Recovery codes are sealed, not hashed under a `link` key, because link keys are deleted 7 days
   after a rotation and recovery codes live for months.
@@ -826,7 +871,8 @@ CREATE TABLE platform_objects (
   partner to be `active` in its own insert. `tenants.partner_id` keeps pointing at the deleted row
   ([Privacy § 6.10](privacy.md#610-partners)).
 - **Console token hashes** (`invitations.token_hash`, `login_tokens.token_hash` and `code_hash`,
-  `sessions.id_hash`, `oauth_states.state_hash` and `cookie_hash`) use the current `link` key and record
+  `sessions.id_hash`, `pending_auth.id_hash`, `oauth_states.state_hash` and `cookie_hash`) use the current
+  `link` key and record
   its kid in `key_kid`. A lookup computes the HMAC under each `link` key still inside its verify window,
   newest first. A session used while its `key_kid` is not current is re-hashed under the current key in
   the same `UPDATE` that moves `last_seen_at`; a session idle past its 7-day rolling lifetime is expired
@@ -845,13 +891,18 @@ CREATE TABLE platform_objects (
   `event_index` after the tenant's `policy.retention.events_days` (default 30; rows with
   `tenant_id IS NULL` after 30 days), and `idempotency_records` and `ses_ingest` after 30 days.
 - **Console retention.** `oauth_states` rows expire 10 minutes after creation and are deleted 24 hours
-  after expiry, as `login_tokens` are. `waitlist` entries exist only once confirmed and are deleted 30
+  after expiry, as `login_tokens` are; so are `pending_auth` rows (5 or 10 minutes), and the
+  `users.totp_pending_*` columns are cleared 24 hours after they expire. `waitlist` entries exist only once confirmed and are deleted 30
   days after invitation (Cloud sign-up § 6.1). `invitations` with status `expired` or `revoked` are
   deleted 30 days after `expires_at`; accepted ones stay with the workspace. Erasure of a person deletes
   their `oauth_identities` and any `waitlist` row and scrubs the address of their accepted invitations
   ([Privacy § 6.9](privacy.md#69-people-console-accounts)).
 - **Billing events retention.** `billing_events` rows are deleted 400 days after `received_at` by the
   global retention job ([Privacy § 5.3](privacy.md#53-global-retention-job)).
+- **Platform state.** `platform_state` holds one row per deployment-wide switch. `send_breaker` is
+  written and deleted by the `*/15` cron's shared-domain breaker and read, through a 60-second isolate
+  cache, by the send handler for outbound policy step 18
+  ([Cloud sign-up § 10.3](cloud-signup.md#103-shared-domain-breaker)). It holds no personal data.
 
 ## 2. `IdentityMailbox` Durable Object (SQLite)
 
@@ -1202,10 +1253,13 @@ CREATE TABLE counters (
                                                            --   http_signatures};
                                                            -- tenant outcomes: outcomes, bounced, complained
                                                            --   (RecordOutcome; summed by OutcomeRates; never
-                                                           --   pruned, ForgetIdentity leaves them)
+                                                           --   pruned, ForgetIdentity leaves them);
+                                                           -- default tenant only: sysmail:{class}:{key}, the
+                                                           --   system-mail budgets (SystemMail; Cloud sign-up
+                                                           --   § 10.2), keys hashed with PM_HASH_KEY
   window TEXT NOT NULL,                                    -- YYYY-MM-DD: the tenant's time zone for daily caps,
-                                                           -- UTC for usage:* (flushed to usage_daily) and for
-                                                           -- the tenant outcome counters
+                                                           -- UTC for usage:* (flushed to usage_daily), for
+                                                           -- the tenant outcome counters and for sysmail:*
   value  INTEGER NOT NULL,
   PRIMARY KEY (metric, window)
 );

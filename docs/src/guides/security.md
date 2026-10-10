@@ -183,12 +183,21 @@ logged; only daily counts are kept.
 People who use the console never have a password:
 
 - **Email link or code.** One request sends a link and a six-digit code, each valid for 10 minutes and
-  usable once. An address can ask 3 times in 10 minutes, and a code allows 10 tries.
+  usable once. An address can ask 3 times in 10 minutes, a code allows 10 tries, and after 30 wrong codes
+  in a day only the link works until midnight UTC; you get an email when that happens.
 - **Continue with Google or GitHub**, where the deployment has turned them on. Only an address the
-  provider has verified is accepted, and it signs you in to the account with that same address.
-- **Two-step verification.** Add an authenticator app under **Settings › Security**. You get ten recovery
-  codes, shown once; keep them somewhere safe, because each works once and they are the way back in if
-  you lose the app. A workspace owner can require two-step verification for everyone in the workspace.
+  provider has verified is accepted. The first time you use a provider with an address that already has
+  an account, a code sent to that address confirms the link. You can unlink a provider under
+  **Settings › Security**.
+- **Two-step verification.** Add an authenticator app under **Settings › Security**. Once it is on, no
+  sign-in creates a session without it, accepting an invitation included. You get ten recovery codes,
+  shown once; keep them somewhere safe, because each works once and they are the only way back in if you
+  lose the app: there is no support route around two-step verification. A workspace owner can require it
+  for everyone in the workspace.
+- **Invitations** are accepted only with a click on **Accept**, never by signing in.
+- **Addresses that this deployment receives mail for** (on the shared mail domain, or an agent's own
+  address) cannot be console sign-in addresses, because any key that reads that mailbox could read the
+  codes.
 - **Confirming it is you.** Creating keys, changing members or domains, releasing quarantined mail and
   billing need a sign-in within the last 10 minutes, so an unattended browser cannot do them.
 

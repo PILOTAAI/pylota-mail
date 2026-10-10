@@ -109,8 +109,12 @@ normal outbound pipeline.
    `{username}{tenant.address_suffix}@{PM_PLATFORM_DOMAIN}` (FR-DOM-1), `role = 'primary'` without
    `domain_id`, else `role = 'alias'`. With `domain_id` it also gets `{username}@{domain}` as the
    primary, `active` when the domain can route it ([Routing an address](#routing-an-address)), else
-   `pending`. Each address is checked against `addresses_address` (`409 address_taken`) and against
-   `address_tombstones` ([Tombstones](#tombstones-a5)).
+   `pending`. Each address is checked against `addresses_address` (`409 address_taken`), against
+   `address_tombstones` ([Tombstones](#tombstones-a5)), and against `users.email`: an address that is
+   a console user's sign-in address is refused with `409 address_taken` too, because every key that reads
+   the mailbox could then read that person's sign-in codes. The same check runs when `POST …/addresses`
+   adds an address ([Cloud sign-up §10](cloud-signup.md#10-abuse-and-safety-on-cloud),
+   [W43](../edge-cases.md)).
 5. `mailbox_do_id = objects.new_object_id(Mailbox)`.
 6. One D1 `batch`: `INSERT INTO identities …`, `INSERT INTO addresses …` (one or two rows),
    `INSERT INTO audit_log …` (`identity.create`).

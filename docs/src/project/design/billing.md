@@ -1,8 +1,9 @@
 # Plans, metering and billing
 
 Binding design for plans, allowances, metering and payment. It implements FR-BILL-1 to FR-BILL-12,
-NFR-BILL-1 and NFR-BILL-2, build plan milestone M22, and the edge-case rows W1–W8, W11–W14 and W19 in
-the [edge-case register](../edge-cases.md). Usage alerts by email (FR-BILL-13, rows O20, O21 and O23) are
+FR-BILL-14, NFR-BILL-1 and NFR-BILL-2, build plan milestone M22, and the edge-case rows W1–W8, W11–W14,
+W19 and W35–W37 in the [edge-case register](../edge-cases.md). Usage alerts by email (FR-BILL-13, rows
+O20, O21 and O23) are
 designed in [Notifications and usage alerts](notifications.md#4-usage-alerts); this page owns the
 `TenantQuota` side of them ([Usage thresholds](#usage-thresholds)). The user-facing description is
 [Plans and billing](../../guides/plans.md); the prices and allowances are set in
@@ -14,7 +15,7 @@ designed in [Notifications and usage alerts](notifications.md#4-usage-alerts); t
 | Tables | D1 `billing_accounts`, `billing_events`; `TenantQuota` `allowances`, `holds` ([Data model](data-model.md#1-d1-control-plane), [Other Durable Objects](data-model.md#3-other-durable-objects)) |
 | Configuration | `PM_BILLING`, `PM_PLAN_CATALOG`, `PM_BILLING_GRACE_DAYS`, `PM_STRIPE_SECRET_KEY`, `PM_STRIPE_WEBHOOK_SECRET` ([Configuration](../../reference/configuration.md#variables)) |
 | Contracts | `GET /v1/usage`, `GET /v1/usage/daily`, `GET /v1/plans`, `GET`/`PATCH /v1/tenants/{id}/billing` ([REST API](../../reference/api.md#usage-and-audit)). The usage routes need `usage:read`, which every tenant and identity key holds implicitly for its own workspace; a platform or partner key must hold it explicitly and pass `tenant_id` (`400 invalid_request` without it); `402 billing_limit`, `409 plan_managed_by_stripe` ([Errors](../../reference/errors.md#policy-and-limits)); `billing.*` events ([Webhook events](../../reference/events.md#workspaces-members-and-billing)) |
-| External facts | Stripe documentation, read on 2026-10-09 (see the `Verified` line at the end) |
+| External facts | Stripe documentation, read on 2026-10-09 and 2026-10-10 (see the `Verified` line at the end) |
 
 ## Principles
 
@@ -88,7 +89,11 @@ A deployment that sells plans sets `PM_PLAN_CATALOG` with its own Stripe price I
   "topup": {
     "price": 1,
     "units": { "inboxes": 1, "sends": 1000, "triage": 1000 },
+    "max_quantity": 100,
     "stripe_price_ids": { "inboxes": "price_…inb", "sends": "price_…snd", "triage": "price_…tri" }
+  },
+  "stripe": {
+    "portal_configurations": { "account": "bpc_…acc", "plan": "bpc_…pln", "topup": "bpc_…top" }
   }
 }
 ```
@@ -103,9 +108,11 @@ A deployment that sells plans sets `PM_PLAN_CATALOG` with its own Stripe price I
 | `plans[].included` | All six features: `inboxes`, `sends`, `triage`, `custom_domains`, `storage_gb`, `seats`. Non-negative integers, or `null` for unlimited (allowed for custom plans) |
 | `plans[].topups` | Whether top-ups can be bought on this plan |
 | `plans[].support` | `github_issues`, `email` or `priority_email`. Shown in `GET /v1/plans` |
-| `plans[].stripe_price_id` | Required for a paid plan when `PM_BILLING=stripe`. `null` means the plan cannot be bought through Checkout (it can still be given with `PATCH …/billing`) |
+| `plans[].stripe_price_id` | Required for a paid plan when `PM_BILLING=stripe`. `null` means the plan cannot be bought through Checkout (it can still be given with `PATCH …/billing`). Each price is the only monthly price of its own Stripe Product: the Customer Portal cannot offer two prices with the same product and interval (Stripe "Customer portal › Limitations", read 2026-10-10) |
 | `topup.units` | Exactly `inboxes`, `sends` and `triage`. Custom domains, storage and seats have no top-up (PRD §13) |
-| `topup.stripe_price_ids` | One monthly price per top-up feature, each priced at `topup.price` per unit |
+| `topup.max_quantity` | 1–1,000, default 100: the most units of one top-up feature a workspace can hold. The console's top-up form and the Portal's `adjustable_quantity.maximum` both use it |
+| `topup.stripe_price_ids` | One monthly price per top-up feature, each priced at `topup.price` per unit, each the only price of its own Product |
+| `stripe.portal_configurations` | Required when `PM_BILLING=stripe`: the IDs of the three Customer Portal configurations `account`, `plan` and `topup` ([Customer Portal](#customer-portal)). `cargo xtask stripe-setup` writes them ([Stripe account setup](#stripe-account-setup)) |
 
 `GET /v1/plans` and the `plans` array of `GET /v1/usage` expose each plan as `plan_id`, `name`, `price`,
 `currency`, `interval`, `included`, `topups` and `support`. Stripe price IDs are never returned.
@@ -152,14 +159,32 @@ current period, and `allowances.resets_at` holds `period_end` for the two monthl
 of that feature are refused until the next reset (monthly) or until the count falls (counts). Nothing is
 deleted (FR-BILL-9, [W11]).
 
-**Which plan applies.** `billing_accounts.plan_id` always names the plan whose allowances apply:
+**Which plan applies.** `billing_accounts.plan_id` always names the plan whose allowances apply. The
+first matching row gives the candidate plan, and then the payment gate below applies:
 
-| Stripe subscription status | Allowances |
+| Stripe state | Candidate allowances |
 |---|---|
+| A dispute is open on one of the customer's charges (`billing_accounts.dispute_open_at` is set) | The default plan with no top-ups, and the workspace sends nothing ([Disputes and refunds](#disputes-and-refunds)) |
 | `active`, `trialing` | The subscribed plan |
 | `past_due`, `unpaid` | The subscribed plan until `grace_until`, then the default plan ([Grace](#grace)) |
 | `incomplete` (first payment not made) | The default plan until the first invoice is paid |
 | `incomplete_expired`, `paused`, `canceled`, or no subscription | The default plan, or a complimentary plan set by the operator |
+
+**Paid before granted (FR-BILL-14, [W35]).** A subscription's status alone never raises an allowance.
+Stripe says `active` "doesn't necessarily indicate that all outstanding invoices associated with the
+subscription have been paid", and a subscription is `incomplete` while a first payment is still
+processing (Stripe "Using webhooks with subscriptions", read 2026-10-10); and an update made in the
+Customer Portal can reach the subscription before its invoice is paid. So, after the candidate is
+derived, each value is compared with what `billing_accounts` stores (the plan by its catalog `price`,
+then by its position in `plans`; each top-up feature by its quantity):
+
+- A value **lower than or equal to** the stored one applies at once.
+- A value **higher** than the stored one applies only when the subscription that carries it has a latest
+  invoice with `status = 'paid'` (the list call expands `data.latest_invoice`). Otherwise the stored
+  value stays, and the `invoice.paid` event that follows the payment re-reads and applies it.
+- So during a grace period the plan that is kept is the one last paid for, never a Portal upgrade whose
+  payment failed, and the new-workspace send ramp is lifted by a paid plan only once that plan's invoice
+  is paid ([Applying state](#applying-state), step 4).
 
 ## TenantQuota allowances and holds
 
@@ -368,36 +393,54 @@ top-up and retry with the same key.
 
 ## Stripe integration
 
-Stripe is called for five things only ([Architecture › Console and billing](../architecture.md#console-and-billing)):
+Stripe is called for these things only ([Architecture › Console and billing](../architecture.md#console-and-billing)):
 
 | Call | When |
 |---|---|
+| Create a Customer (`POST /v1/customers`) | The first Checkout of a workspace ([Stripe objects](#stripe-objects)) |
 | Create a Checkout Session | [Checkout](#checkout) |
 | Retrieve a Checkout Session (`GET /v1/checkout/sessions/{id}`) | The return page ([Cloud sign-up › Coming back from Checkout](cloud-signup.md#9-coming-back-from-checkout)) |
 | Create a Customer Portal session | [Customer Portal](#customer-portal) |
-| Read subscriptions (`GET /v1/subscriptions?customer=…`) | When a webhook arrives ([Applying state](#applying-state)), and before cancelling |
-| Cancel subscriptions (`DELETE /v1/subscriptions/{id}`, at once, with no proration and no refund) | Workspace deletion ([Privacy › Tenant scope](privacy.md#66-tenant-scope), step `cancel_billing`), and the webhook handler when a live subscription appears for an erasing or erased workspace (`cancelled_after_erasure`, [Webhook endpoint](#webhook-endpoint)) |
+| Read subscriptions (`GET /v1/subscriptions?customer=…&expand[]=data.latest_invoice`) | When a webhook arrives ([Applying state](#applying-state)), and before cancelling |
+| Retrieve a charge (`GET /v1/charges/{id}`) | A dispute event, to find the charge's customer ([Disputes and refunds](#disputes-and-refunds)) |
+| Cancel subscriptions (`DELETE /v1/subscriptions/{id}`) | Workspace deletion, with `invoice_now=true` and `prorate=false` ([Privacy › Tenant scope](privacy.md#66-tenant-scope), step `cancel_billing`); a duplicate subscription, with `prorate=true` and `invoice_now=true` ([Applying state](#applying-state)); a live subscription for an erasing or erased workspace (`cancelled_after_erasure`, [Webhook endpoint](#webhook-endpoint)) and a lost dispute, with neither |
+
+**Why these cancel parameters.** Stripe's cancel call defaults to `invoice_now=false` and
+`prorate=false`, and with both false it removes pending prorations ("Cancel a subscription", read
+2026-10-10). Workspace deletion sends `invoice_now=true` so that anything not yet invoiced (normally
+nothing, because the Portal invoices every change at once) is billed on a final invoice rather than
+dropped, and `prorate=false`, so no credit is given for the unused period. Stripe stops automatic
+collection of the customer's open invoices when a subscription is cancelled (same page), so a renewal
+left unpaid during a grace period is not collected after deletion: that loss is accepted and bounded by
+`PM_BILLING_GRACE_DAYS` of one plan, because erasure cannot wait for a payment. A duplicate subscription
+is cancelled with `prorate=true` and `invoice_now=true`, so its unused time becomes a credit on the
+customer's balance at once.
 
 Its signed webhooks are the only writer of subscription state in D1 (FR-BILL-10). `PM_STRIPE_SECRET_KEY` is a
-restricted key with exactly these permissions: create and retrieve Checkout Sessions, create Customer
-Portal sessions, read subscriptions, and cancel subscriptions. Every request pins the API version in
-`Stripe-Version: 2025-03-31.basil`, because periods are read from subscription items, and the event
-destination is pinned to the same version.
+restricted key with exactly these permissions, set per resource in the Stripe Dashboard (restricted keys
+are created there only, with Read, Write or None per resource; "Restricted API keys", read 2026-10-10):
+Checkout Sessions Write, Customer portal Write, Customers Write, Subscriptions Write, Invoices Read and
+Charges Read; every other resource None. Every request pins the API version in
+`Stripe-Version: 2025-03-31.basil`, because periods are read from subscription items and invoices carry
+their subscription in `parent.subscription_details`, and the webhook endpoint is created with
+`api_version` set to the same version ([Stripe account setup](#stripe-account-setup)). The newest Stripe
+version on 2026-10-10 is `2026-09-30.endive` ("Upgrade your integration", read 2026-10-10); moving the
+pin is a change of its own, made after reading the changelog between the two versions.
 
 ### Stripe objects
 
 | Object | One per | Created by | Stored in |
 |---|---|---|---|
-| Customer | Workspace | The first Checkout Session (`subscription` mode creates one when none is given) | `billing_accounts.stripe_customer_id` |
+| Customer | Workspace | The console, before the workspace's first Checkout ([Checkout](#checkout)): `POST /v1/customers` with `email` = the owner's sign-in address, `name` = the workspace name and `metadata[tenant_id]`, sent with `Idempotency-Key: customer:{tenant_id}` | `billing_accounts.stripe_customer_id`, written with `UPDATE … SET stripe_customer_id = ?2 WHERE tenant_id = ?1 AND stripe_customer_id IS NULL`; when that changes no row, a concurrent click won and its ID is read back and used |
 | Plan subscription | Workspace | Checkout, with one line item: the plan's price, quantity 1 | `billing_accounts.stripe_subscription_id` |
-| Top-up subscription | Workspace and top-up feature (at most three) | Checkout, with one line item: the feature's top-up price, quantity = units | Units summed into `billing_accounts.topups_json` |
+| Top-up subscription | Workspace and top-up feature (at most three) | Checkout, with one line item: the feature's top-up price, quantity = units | Units in `billing_accounts.topups_json`; the subscription IDs, by feature, in `billing_accounts.topup_subscriptions_json`, which the console's top-up buttons read to deep-link the Portal |
 
 Plan and top-ups live in separate subscriptions on purpose. The Customer Portal can cancel a subscription
 with several products but cannot update one, and a Checkout Session in `subscription` mode creates a new
 subscription rather than changing an existing one. With one
 product per subscription, the Portal can switch the plan subscription between plan prices and change a
-top-up subscription's quantity, and the Worker's only write to a subscription is cancelling it when the
-workspace is deleted. Every
+top-up subscription's quantity, and the Worker's only write to a subscription is cancelling it (the
+cases in the table above). Every
 subscription carries `metadata.tenant_id` and `metadata.kind` (`plan` or `topup:{feature}`), set through
 `subscription_data.metadata` at Checkout.
 
@@ -412,18 +455,22 @@ top-ups (for example after a downgrade to Free); the console's plan page then su
 | Parameter | Value |
 |---|---|
 | `mode` | `subscription` |
-| `line_items[0]` | `price` = the plan's `stripe_price_id` and `quantity` 1; or a top-up price with the chosen quantity |
-| `customer` | `stripe_customer_id` when set; otherwise `customer_email` = the owner's sign-in address |
+| `line_items[0]` | `price` = the plan's `stripe_price_id` and `quantity` 1; or a top-up price with the chosen quantity, 1 to `topup.max_quantity` |
+| `customer` | `stripe_customer_id`. The console creates the Customer first when the column is still `NULL` ([Stripe objects](#stripe-objects)), so every session names one, two concurrent Checkouts share one Customer, and the return page can always compare it ([W26](../edge-cases.md)) |
+| `payment_method_types[0]` | `card` (cards, and the wallets that pay by card). No delayed method such as Bacs Direct Debit, so a completed Checkout means the first payment succeeded; the payment gate still applies ([Paid before granted](#allowances-and-periods)) |
 | `client_reference_id` | The tenant ID |
 | `metadata[tenant_id]`, `subscription_data[metadata][tenant_id]`, `subscription_data[metadata][kind]` | As above |
-| `automatic_tax[enabled]` | `true` (Stripe Tax). With an existing customer, `customer_update[address]=auto`, so the address entered on the page is the one taxed |
-| `tax_id_collection[enabled]` | `true`, so a business can enter its VAT number |
+| `automatic_tax[enabled]` | `true` (Stripe Tax), with `customer_update[address]=auto`, so the address entered on the page is the one taxed |
+| `tax_id_collection[enabled]` | `true`, so a business can enter its VAT number, with `customer_update[name]=auto`, which Stripe asks for when a session with an existing customer collects a tax ID, so the business name entered is saved on the Customer ("Collect customer tax IDs with Checkout", read 2026-10-10) |
 | `success_url` | `https://{PM_CONSOLE_HOST}/console/plan/return?session_id={CHECKOUT_SESSION_ID}` |
 | `cancel_url` | `https://{PM_CONSOLE_HOST}/console/plan`, or `https://{PM_CONSOLE_HOST}/console?upgrade={plan}` (the Overview; `{plan}` is the `plan_id`) when Checkout was started from sign-up, so the Overview can show "Finish upgrading to {plan name}" without stored state ([Cloud sign-up › Open sign-up](cloud-signup.md#62-after-launch-open-sign-up), [W24](../edge-cases.md)) |
 
 The session expires after Stripe's default of 24 hours. The console refuses a plan Checkout when a plan
 subscription already exists (the Portal changes plans), and a top-up Checkout when the plan does not allow
-top-ups or a top-up subscription for that feature exists (the Portal changes its quantity). Returning to
+top-ups or a top-up subscription for that feature exists (the Portal changes its quantity). Before the
+first webhook D1 cannot know about a subscription, so two plan Checkouts opened in two tabs can both be
+paid; [Applying state](#applying-state) keeps the older subscription and cancels the other ([W37]).
+Returning to
 `success_url` changes nothing by itself: the plan changes when the webhook arrives, usually within
 seconds. The return page retrieves the session, checks that its `client_reference_id` and
 `metadata.tenant_id` are this workspace (and its customer, when `stripe_customer_id` is already set), and
@@ -432,16 +479,45 @@ waits for the webhook without JavaScript ([Cloud sign-up › Coming back from Ch
 ### Customer Portal
 
 `POST /console/plan/portal` (owner only, re-authenticated, audit `billing.portal_opened`) creates a portal
-session (`POST /v1/billing_portal/sessions` with `customer` and `return_url` = `https://{PM_CONSOLE_HOST}/console/plan`)
-and answers `303` to its `url`. A portal session expires 5 minutes after creation if unused, so the console
-creates a new one on every click and never stores the URL. Buttons for one task deep-link with
-`flow_data[type]`: `subscription_update` (switch plan, or change a top-up quantity), `subscription_cancel`
-and `payment_method_update`.
+session (`POST /v1/billing_portal/sessions` with `customer`, `configuration` and `return_url` =
+`https://{PM_CONSOLE_HOST}/console/plan`) and answers `303` to its `url`. A portal session expires 5
+minutes after creation if unused, so the console creates a new one on every click and never stores the
+URL. Each button names its configuration and, for one task, deep-links with `flow_data`:
 
-The portal configuration is part of the Stripe account setup: switching plans between the plan prices,
-quantity changes for top-up prices, prorations on, cancellation at the end of the period, payment methods,
-invoice history and tax IDs. The Worker treats a plan subscription's quantity as 1 whatever the Portal
-allows.
+| Button | `configuration` | `flow_data` |
+|---|---|---|
+| Manage billing (invoices, tax IDs, address) | `account` | none |
+| Update payment method | `account` | `type=payment_method_update` |
+| Cancel plan | `account` | `type=subscription_cancel`, the plan subscription (`stripe_subscription_id`) |
+| Change plan | `plan` | `type=subscription_update`, the plan subscription |
+| Change {feature} top-ups | `topup` | `type=subscription_update`, that feature's subscription from `topup_subscriptions_json` |
+
+The three configurations are created by `cargo xtask stripe-setup` ([Stripe account setup](#stripe-account-setup))
+with exactly these settings (Stripe "Create a portal configuration", read 2026-10-10):
+
+| Configuration | Settings |
+|---|---|
+| `account` | `features.subscription_update.enabled = false`; `features.subscription_cancel` enabled with `mode = at_period_end` and `proration_behavior = none`; `features.payment_method_update`, `features.invoice_history` enabled; `features.customer_update` enabled with `allowed_updates = [address, name, tax_id]` (the email stays the owner's sign-in address); `business_profile.privacy_policy_url` and `terms_of_service_url` from `PM_PRIVACY_URL` and `PM_TERMS_URL`; `login_page.enabled = true`, so a customer who has lost console access can still reach invoices and cancellation through Stripe's own email sign-in |
+| `plan` | As `account`, plus `features.subscription_update` enabled with `default_allowed_updates = [price]`, `products` = each paid plan's product with its one price, `proration_behavior = always_invoice` and `billing_cycle_anchor = unchanged` |
+| `topup` | As `account`, plus `features.subscription_update` enabled with `default_allowed_updates = [quantity]`, `products` = each top-up product with its one price and `adjustable_quantity = { enabled: true, minimum: 1, maximum: topup.max_quantity }`, `proration_behavior = always_invoice`, and `schedule_at_period_end.conditions = [{ type: decreasing_item_amount }]` |
+
+What follows from them:
+
+- **Increases are charged at once.** `always_invoice` invoices a move to a dearer plan, or a larger top-up
+  quantity, for the rest of the period when it is made, instead of at the next renewal. The allowance
+  rises when that invoice is paid ([Paid before granted](#allowances-and-periods), [W35]).
+- **Top-up decreases wait for the period end.** A lower quantity is a decreasing item amount, so the
+  Portal schedules it (through a subscription schedule) instead of crediting units that may already have
+  been used. While it is scheduled, the Portal cannot change or cancel that subscription (Stripe "Customer
+  portal › Limitations", read 2026-10-10); the console says so.
+- **Plan downgrades apply at once.** The Portal schedules a downgrade at the period end only between
+  prices of one product ("Configure the customer portal", read 2026-10-10), and each plan has its own
+  product, so a downgrade applies when it is made, with a credit for the unused part of the dearer plan
+  on the customer's balance. `used` is kept, so the credit is at most one period's price difference for
+  units already consumed. This is accepted; the allowances fall at once.
+- The `plan` configuration offers only plan products and the `topup` configuration only top-up
+  products, so a plan subscription can never be turned into a top-up or the reverse. The Worker treats a
+  plan subscription's quantity as 1 whatever it finds.
 
 ### Webhook endpoint
 
@@ -461,17 +537,23 @@ signature, not by an API key, and lives in its own route table outside the API k
 3. **Deduplicate.** `INSERT OR IGNORE INTO billing_events (id, type, received_at)` with the Stripe event
    ID. A row with `processed_at` set means a duplicate: answer `200` at once. A row without it is an
    attempt that failed half-way and is processed again, which is safe because processing re-reads state.
-4. **Resolve the workspace.** `checkout.session.completed`: `client_reference_id`. Other events: look up
-   `billing_accounts.stripe_customer_id`; if the customer is not known yet (events arrive in any order),
-   use the subscription's `metadata.tenant_id`. The tenant must exist and be `metered`. If the workspace
+4. **Resolve the workspace.** `checkout.session.completed` and the two `async_payment` events:
+   `client_reference_id`. Other events: look up `billing_accounts.stripe_customer_id` with the event's
+   customer: the subscription's or invoice's `customer`, a refunded charge's `customer`, or, for a dispute,
+   the `customer` of the charge it names (`GET /v1/charges/{id}`). If the customer is not known (events
+   arrive in any order), use the subscription's `metadata.tenant_id`, or an invoice's
+   `parent.subscription_details.metadata.tenant_id`. An event that resolves to no workspace (a customer and
+   metadata this deployment does not know, for example another product's customers in the same Stripe
+   account) is answered `200` and recorded with outcome `ignored_unresolved`; nothing is applied and no
+   alert fires. The tenant must exist and be `metered`. If the workspace
    already has a different customer ID, the outcome is `error:customer_mismatch` and an alert fires.
    `billing_events.tenant_id` is set. A tenant that is `erasing` or `erased` is not an error: workspace
    deletion cancels its subscriptions ([Privacy › Tenant scope](privacy.md#66-tenant-scope), step
    `cancel_billing`), and the events that follow (`customer.subscription.deleted`, a final invoice) are
    answered `200` and recorded with outcome `ignored_erased`. Nothing is applied, and no alert fires.
    One exception closes a race: a subscription can be created after `cancel_billing` ran, when the owner
-   deletes the workspace between paying at Checkout and the first webhook (the customer ID was not linked
-   yet, so `cancel_billing` found nothing). When the event is `checkout.session.completed` with a
+   deletes the workspace while a Checkout page is still open and pays afterwards (`cancel_billing` listed
+   the customer's subscriptions before this one existed). When the event is `checkout.session.completed` with a
    subscription, or `customer.subscription.created` or `.updated` whose subscription is not `canceled`, the
    handler cancels that subscription at once (`DELETE /v1/subscriptions/{id}`, no proration, no final
    invoice), records outcome `cancelled_after_erasure` and fires `billing_cancelled_after_erasure`. A failed
@@ -491,24 +573,36 @@ recorded with outcome `error:unhandled_type`, so a misconfigured endpoint shows 
 
 | Stripe event | Why it matters | Action |
 |---|---|---|
-| `checkout.session.completed` | A plan or top-up was bought | Link `stripe_customer_id` to the workspace if unset; re-read |
+| `checkout.session.completed` | A plan or top-up was bought | Link `stripe_customer_id` to the workspace if unset (the console normally set it already); re-read |
+| `checkout.session.async_payment_succeeded`, `checkout.session.async_payment_failed` | A delayed payment method settled or failed. Card-only Checkout never sends them; they are subscribed so that a payment-method change in the Dashboard cannot grant a plan unseen | Re-read |
 | `customer.subscription.created` | A subscription exists (may arrive before the Checkout event) | Re-read |
 | `customer.subscription.updated` | Plan switch, quantity change, renewal (new period), `cancel_at_period_end`, status change | Re-read |
 | `customer.subscription.deleted` | A subscription ended | Re-read |
-| `invoice.paid` | A payment succeeded; a `past_due` subscription can become `active` again | Re-read |
+| `invoice.paid` | A payment succeeded: a `past_due` subscription can become `active` again, and a Portal increase waiting on its invoice is granted | Re-read |
 | `invoice.payment_failed` | A payment failed; the subscription becomes `past_due` (or stays `incomplete` on a first invoice) | Re-read |
+| `charge.dispute.created` | A customer or their bank disputed a charge | Open the dispute, then re-read ([Disputes and refunds](#disputes-and-refunds)) |
+| `charge.dispute.closed` | The dispute ended `won`, `lost` or `warning_closed` | Close the dispute, then re-read |
+| `charge.refunded` | The operator refunded a charge in the Stripe Dashboard | Record it, then re-read |
 
-Every action is the same re-read. The event only says *that* something changed; Stripe's current state
-says *what* is true now. This makes duplicates, late events and reordering harmless ([W12]).
+Every action ends in the same re-read. The event only says *that* something changed; Stripe's current
+state says *what* is true now. This makes duplicates, late events and reordering harmless ([W12]). The
+three `charge.*` events are the risk events Stripe asks a subscription integration to handle (Stripe
+"Using webhooks with subscriptions", read 2026-10-10).
 
 ### Applying state
 
 1. Record `read_started_at = now`.
-2. `GET /v1/subscriptions?customer={stripe_customer_id}` with the default status filter, which returns
-   every subscription that is not canceled (pages of 100).
+2. `GET /v1/subscriptions?customer={stripe_customer_id}&expand[]=data.latest_invoice` with the default
+   status filter, which returns every subscription that is not canceled (pages of 100), each with its
+   latest invoice's `status`.
 3. Derive:
-   - **plan subscription**: the subscription whose item price is a plan's `stripe_price_id`. If there are
-     two, the newest wins, the console shows the conflict, and `billing_plan_conflict` is logged;
+   - **duplicates** ([W37]): when two subscriptions carry a plan price, or two carry the same top-up
+     price, the one with the earliest `created` is kept and each other one is cancelled at once
+     (`DELETE /v1/subscriptions/{id}` with `prorate=true` and `invoice_now=true`, so its unused time is
+     credited to the customer's balance), with the audit row `billing.duplicate_cancelled` and the metric
+     `stripe_duplicate_subscriptions_total`. A failed cancel answers `500`, so Stripe retries the event.
+     The derivation continues with the kept subscriptions;
+   - **plan subscription**: the subscription whose item price is a plan's `stripe_price_id`;
    - **status**: Stripe's status mapped onto `billing_accounts.status`: `active` and `trialing` as they
      are, `past_due` and `unpaid` → `past_due`, `incomplete` → `incomplete`; `incomplete_expired`,
      `paused` or no plan subscription → `canceled`, or `active` when the workspace never had one. The
@@ -517,24 +611,32 @@ says *what* is true now. This makes duplicates, late events and reordering harml
      months without a subscription ([Allowances and periods](#allowances-and-periods));
    - **`cancel_at_period_end`**: copied;
    - **top-ups**: for each feature, the quantity on its top-up subscription when that subscription is
-     `active` or `trialing`, or `past_due`/`unpaid` while the workspace is within its grace period;
+     `active` or `trialing`, or `past_due`/`unpaid` while the workspace is within its grace period; and
+     **`topup_subscriptions_json`**: each live top-up subscription's ID by feature;
    - **`plan_id`**: the subscribed plan when its status grants it (table in
-     [Allowances and periods](#allowances-and-periods)), otherwise `default_plan`.
+     [Allowances and periods](#allowances-and-periods)), otherwise `default_plan`; while
+     `dispute_open_at` is set, `default_plan` and no top-ups;
+   - **the payment gate**: any plan or top-up quantity higher than the stored one is replaced by the
+     stored one unless its subscription's latest invoice is `paid`
+     ([Paid before granted](#allowances-and-periods)).
 4. Write in one D1 batch, guarded so an older read never overwrites a newer one:
 
    ```sql
    UPDATE billing_accounts
    SET plan_id = ?2, status = ?3, topups_json = ?4, period_start = ?5, period_end = ?6,
        grace_until = ?7, stripe_customer_id = ?8, stripe_subscription_id = ?9,
-       cancel_at_period_end = ?10, updated_at = ?11          -- ?11 = read_started_at
+       cancel_at_period_end = ?10, updated_at = ?11,         -- ?11 = read_started_at
+       topup_subscriptions_json = ?12
    WHERE tenant_id = ?1 AND updated_at < ?11;
    ```
 
    plus the `event_index` rows for any `billing.*` events and an `audit_log` row. When the new `plan_id`
-   is a paid plan (any plan other than `default_plan`), the batch also runs
+   is a paid plan (any plan other than `default_plan`), which the payment gate allows only once that
+   plan's invoice is `paid`, the batch also runs
    `UPDATE tenants SET ramp_lifted_at = ?now WHERE id = ?1 AND ramp_lifted_at IS NULL`, which ends the
-   new-workspace send ramp at once and keeps it ended after a later downgrade
+   new-workspace send ramp and keeps it ended after a later downgrade
    ([Cloud sign-up › Abuse and safety](cloud-signup.md#10-abuse-and-safety-on-cloud), [W30](../edge-cases.md)).
+   A dispute clears `ramp_lifted_at` again ([Disputes and refunds](#disputes-and-refunds)).
    If the `UPDATE` of `billing_accounts` changed no row, a newer read has already been applied: the
    outcome is `ignored_stale`.
 5. Send `SetPlan` to `TenantQuota` with the new `granted` values and period. If it fails, the event is
@@ -554,6 +656,7 @@ Events emitted by this step (as platform events, [Events](#events-and-errors)):
 | `plan_id` changed because a subscription ended | `billing.plan_changed`, reason `canceled` |
 | `plan_id` restored by a late payment after the grace period ended | `billing.plan_changed`, reason `payment_recovered` |
 | `plan_id` changed for any other Stripe reason (a plan switch in the Portal) | `billing.plan_changed`, reason `portal` |
+| `plan_id` changed because a dispute opened | `billing.plan_changed`, reason `dispute` |
 | Status became `past_due` | `billing.payment_failed` with `grace_until` |
 
 ### Grace
@@ -572,7 +675,38 @@ limits.
   period had already ended, it also restores the plan and emits `billing.plan_changed` with reason
   `payment_recovered`.
 - If Stripe gives up and cancels the subscription, `customer.subscription.deleted` applies the default plan
-  for good, with reason `canceled`.
+  for good, with reason `canceled`. That is the setting [Stripe account setup](#stripe-account-setup)
+  step 6 makes; with "mark as unpaid" or "leave past due" the grace logic still applies the default plan
+  after `grace_until`, but the subscription goes on invoicing.
+
+### Disputes and refunds
+
+FR-BILL-14 and [W36]: a disputed payment means the money may be taken back, and a stolen card is the
+usual cause, so the workspace is contained at once, without waiting for a person.
+
+- **`charge.dispute.created`.** The handler retrieves the disputed charge (`GET /v1/charges/{id}`) to
+  find its customer and workspace. One D1 batch:
+  `UPDATE billing_accounts SET dispute_open_at = ?now WHERE tenant_id = ?1 AND dispute_open_at IS NULL`,
+  `UPDATE tenants SET ramp_lifted_at = NULL WHERE id = ?1`, and the audit row `billing.dispute_opened`
+  (the dispute and charge IDs in `details_json`). Then the usual re-read applies the default plan with no
+  top-ups (reason `dispute`) and sends `SetPlan`. While `dispute_open_at` is set, outbound policy step 18
+  refuses every send of the workspace with `429 daily_cap_reached`, `details.cap: "billing_dispute"` and
+  `details.resets_at: null` ([Outbound › Policy pipeline](outbound.md#policy-pipeline)). Inbound mail,
+  reads and the console keep working. The state alert `billing_dispute:{tenant_id}` (page;
+  [Observability › Alert list](observability.md#53-alert-list)) points to the runbook "Billing dispute":
+  review the dispute in the Stripe Dashboard, answer it there, and suspend the tenant (FR-TEN-3) if it
+  looks like fraud.
+- **`charge.dispute.closed`** with status `won` or `warning_closed`: one batch clears `dispute_open_at`
+  and writes `billing.dispute_closed`; the re-read restores the paid plan (reason `payment_recovered`),
+  which lifts the ramp again. With status `lost`: the same batch, then the handler cancels every live
+  subscription of the customer (`DELETE /v1/subscriptions/{id}` with neither `invoice_now` nor `prorate`);
+  the workspace moves to the default plan (reason `canceled`) with `ramp_lifted_at` still `NULL`, so the
+  new-workspace send ramp applies again until the daily evaluation lifts it. A failed cancel answers
+  `500`, so Stripe retries the event.
+- **`charge.refunded`.** A refund is made by the operator in the Stripe Dashboard, so it changes no plan
+  by itself: the handler writes the audit row `billing.refund_recorded` (the charge ID, `amount_refunded`
+  and whether it was full) and re-reads. The operator cancels the subscription in the Dashboard too when
+  the refund ends the customer relationship.
 
 ## Failure modes
 
@@ -616,6 +750,40 @@ changes it with `PATCH /v1/tenants/{id}/billing`. FSL-1.1-ALv2 does not permit o
 others as a competing commercial service ([PRD §12](../prd.md#12-licensing)), so check the licence before
 charging others for a deployment.
 
+## Stripe account setup
+
+A deployment that sells plans needs one Stripe account set up exactly as below: once in test mode for
+staging, and again in live mode for production. Test and live objects are separate in Stripe, so no ID is
+shared between the two catalogs. `cargo xtask stripe-setup` does every step the API allows and prints the
+others as a checklist ([Rust workspace › xtask](rust-workspace.md#9-xtask)):
+
+```text
+cargo xtask stripe-setup --api-host api.pylotamail.com [--live] --out deploy/plan-catalog.test.json
+```
+
+It reads the key from `STRIPE_SETUP_KEY`, a restricted key kept on the operator's machine and never
+stored as a Worker secret. It refuses a live key (`rk_live_…`) unless `--live` is given, and a test key
+with `--live`. It is idempotent: it finds its own objects by `lookup_key` (prices) and
+`metadata[pm_setup]` (products, Portal configurations, the webhook endpoint) and creates only what is
+missing; a found object whose settings differ is reported, not changed.
+
+| Step | Done by | What |
+|---|---|---|
+| 1. Account | A person, in the Dashboard | TREFT LTD's business details; live mode activated (bank account and identity checks) before the live run; Stripe Tax turned on |
+| 2. Tax | `stripe-setup`: `POST /v1/tax/settings` with `defaults[tax_behavior]=exclusive`, `defaults[tax_code]=txcd_10103001` (software as a service, business use) and `head_office[address]`; `POST /v1/tax/registrations` with `country=GB`, `country_options[gb][type]=standard` and `active_from` = the UK VAT registration date given with `--vat-from` | Prices exclude VAT, as `plans[].price` says. Stripe Tax collects only where an active registration exists, so without the UK registration no VAT is charged; the run stops with a message when `--vat-from` is missing in live mode |
+| 3. Products and prices | `stripe-setup`, from the catalog given with `--catalog` (default: the built-in one) | One Product per paid plan and per top-up feature (`metadata[pm_plan_id]` or `metadata[pm_topup]`), each with exactly one Price: `currency=gbp`, `recurring[interval]=month`, `unit_amount` = the catalog price in pence, `tax_behavior=exclusive`, `lookup_key` = `pm_plan_{plan_id}` or `pm_topup_{feature}` |
+| 4. Portal | `stripe-setup`: `POST /v1/billing_portal/configurations`, three times | `account`, `plan` and `topup`, exactly as in [Customer Portal](#customer-portal) |
+| 5. Webhook endpoint | `stripe-setup`: `POST /v1/webhook_endpoints` with `url=https://{PM_API_HOST}/billing/stripe/webhook`, `api_version=2025-03-31.basil` and `enabled_events[]` = exactly the 11 events of [Events handled](#events-handled) | The Dashboard creates endpoints only at the newest API version, so the API is used ("Upgrade your integration", read 2026-10-10). The endpoint's `secret` (`whsec_…`) is printed once, for `wrangler secret put PM_STRIPE_WEBHOOK_SECRET` |
+| 6. Failed payments | A person, in the Dashboard (subscription settings, "Manage failed payments") | Any retry schedule; when all retries fail, **cancel the subscription**; subscription status follows the most recent invoice. [Grace](#grace) assumes `past_due` and then `canceled` |
+| 7. Payment methods | A person, in the Dashboard | Cards only (with the card wallets), so the Portal's payment-method update offers no delayed method; Checkout sends `payment_method_types[0]=card` anyway |
+| 8. Keys | A person, in the Dashboard (restricted keys are created there only) | The Worker key with the permissions in [Stripe integration](#stripe-integration), stored with `wrangler secret put PM_STRIPE_SECRET_KEY`; the setup key `STRIPE_SETUP_KEY` with Write on Products, Prices, Customer portal, Webhook Endpoints and Tax settings and registrations, and None elsewhere |
+| 9. Catalog | `stripe-setup` writes `--out` | The catalog JSON with every `stripe_price_id`, `topup.stripe_price_ids` and `stripe.portal_configurations` filled in. The operator sets it as `PM_PLAN_CATALOG` and runs `pmail deploy`, whose catalog validation refuses a paid plan without a price ID or a missing Portal configuration |
+
+The staging catalog of build plan M20 step 11 is a test-mode catalog made the same way, with small
+allowances. Test: `xtask::stripe_setup_idempotent` runs the command twice against the recorded Stripe
+fake and creates every object once; a live key without `--live` and a missing `--vat-from` in live mode
+stop it before any call.
+
 ## Events and errors
 
 `billing.*` and `member.*` events have no owner Durable Object. They are written to `event_index` with
@@ -626,23 +794,26 @@ charging others for a deployment.
 
 | Event | When | `data` |
 |---|---|---|
-| `billing.plan_changed` | `plan_id` changed | `from_plan`, `to_plan`, `reason` (`checkout`, `portal`, `payment_failed_grace_ended`, `payment_recovered`, `canceled`, `operator`) |
+| `billing.plan_changed` | `plan_id` changed | `from_plan`, `to_plan`, `reason` (`checkout`, `portal`, `payment_failed_grace_ended`, `payment_recovered`, `canceled`, `operator`, `dispute`) |
 | `billing.payment_failed` | Status became `past_due` | `grace_until` |
 | `billing.limit_reached` | The first `402` for a feature in a period | `feature`, `granted`, `resets_at` |
 
 | Error | When |
 |---|---|
 | `402 billing_limit` | A hold was denied. Never for inbound mail, and never for the replay of a completed request |
+| `429 daily_cap_reached` with `details.cap: "billing_dispute"` | A send while a dispute is open ([Disputes and refunds](#disputes-and-refunds)) |
 | `409 plan_managed_by_stripe` | `PATCH /v1/tenants/{id}/billing` with `plan_id` on a workspace with a Stripe plan subscription: the handler reads `billing_accounts.stripe_subscription_id` and refuses when it is not `NULL` |
 | `503 unavailable` | `TenantQuota` did not answer in time |
 
 Audit actions: `billing.checkout_started`, `billing.portal_opened`, `billing.mode_change`,
-`billing.plan_set` (operator), and `billing.plan_changed` (written by the webhook with the Stripe event ID
-in `details_json`).
+`billing.plan_set` (operator), and, written by the webhook with the Stripe event ID in `details_json`,
+`billing.plan_changed`, `billing.duplicate_cancelled`, `billing.dispute_opened`,
+`billing.dispute_closed` and `billing.refund_recorded`.
 
 Metrics: `quota_hold_denied_total{feature}`, `quota_hold_expired_total{feature}`,
 `quota_consumed_without_hold_total`, `quota_count_drift_total{feature}`, `stripe_webhook_total{type,outcome}`,
-`stripe_webhook_rejected_total`, `stripe_api_errors_total{call}`.
+`stripe_webhook_rejected_total`, `stripe_api_errors_total{call}`, `stripe_duplicate_subscriptions_total`,
+`billing_increase_held_total{feature}` (an increase kept back by the payment gate).
 
 ## Open points
 
@@ -667,7 +838,7 @@ Metrics: `quota_hold_denied_total{feature}`, `quota_hold_expired_total{feature}`
 | `it::billing::w2_stripe_down_sends_ok` | With the Stripe fake refusing connections, sends, triage and creates behave normally; Checkout and Portal show a retryable error | [W2], NFR-BILL-2 |
 | `it::billing::w3_retry_after_upgrade` | A `402` writes no idempotency row; after `SetPlan` the same key and body give one `202` and one email | [W3], FR-BILL-6 |
 | `it::billing::w4_replay_when_spent` | A completed send replays with `deduplicated: true` after the allowance is spent; no hold is taken | [W4] |
-| `it::billing::late_subscription_after_erasure` | A workspace is deleted between Checkout and the first webhook: `cancel_billing` finds no customer; the late `checkout.session.completed` and `customer.subscription.created` cancel the new subscription once (`cancelled_after_erasure`, alert fired); a failing cancel answers `500` and the retried event cancels it | [Webhook endpoint](#webhook-endpoint) |
+| `it::billing::late_subscription_after_erasure` | A workspace is deleted while its Checkout page is open and the owner pays afterwards: `cancel_billing` finds no subscription yet; the late `checkout.session.completed` and `customer.subscription.created` cancel the new subscription once (`cancelled_after_erasure`, alert fired); a failing cancel answers `500` and the retried event cancels it | [Webhook endpoint](#webhook-endpoint) |
 | `it::billing::w5_uncertain_release` | Simulator `timeout@`: the hold is released; a later reconciliation consumes one unit per recipient | [W5], FR-BILL-5 |
 | `it::billing::w6_hold_expiry` | An unsettled hold is released by the alarm after 10 minutes of test time; a count hold marks the feature stale and the next hold recounts from D1 | [W6] |
 | `it::billing::partial_smtp_settle` | An SMTP send to three recipients with `4xx` on one `RCPT`: two units consumed, one kept held with `expires_at` = retry + 10 min; the retry consumes it; after 24 h of deferral it is released and that delivery is `failed` | FR-BILL-4, FR-BILL-5, [N20](../edge-cases.md) |
@@ -686,6 +857,11 @@ Metrics: `quota_hold_denied_total{feature}`, `quota_hold_expired_total{feature}`
 | `it::billing::stripe_fixtures` | `stripe trigger` fixtures recorded as JSON: checkout completed, subscription updated, payment failed, canceled | M22 |
 | `it::billing::plan_managed_by_stripe` | `PATCH …/billing` with `plan_id` on a Stripe-paid workspace gets `409`; on others it sets a complimentary plan and emits reason `operator` | FR-BILL-1 |
 | `it::billing::usage_matches_quota` (property) | `GET /v1/usage` equals the catalog plus `TenantQuota` state for random sequences of holds, settles and plan changes | FR-BILL-11, M22 |
+| `it::billing::w35_grant_after_payment` | A Portal upgrade and a top-up increase whose `latest_invoice` is `open` keep the stored plan and quantities (`billing_increase_held_total`), and `invoice.paid` grants them; a downgrade applies at once; a subscription `active` with an unpaid first invoice grants nothing and does not lift the ramp; during grace the kept plan is the one last paid for, not a failed upgrade; the Checkout session sends `payment_method_types[0]=card`, `customer`, `customer_update[address]=auto` and `customer_update[name]=auto` | [W35], FR-BILL-14 |
+| `it::billing::w36_dispute_and_refund` | `charge.dispute.created` sets `dispute_open_at`, applies the default plan (reason `dispute`), clears `ramp_lifted_at`, fires `billing_dispute`, and every send gets `429 daily_cap_reached` with `details.cap: "billing_dispute"` while inbound is stored; `charge.dispute.closed` `won` restores the plan and sending; `lost` cancels every live subscription and leaves the workspace ramped on the default plan; `charge.refunded` writes `billing.refund_recorded` and changes no plan | [W36], FR-BILL-14 |
+| `it::billing::w37_duplicate_subscription` | Two plan Checkouts paid before the first webhook: the later subscription is cancelled once with `prorate=true` and `invoice_now=true`, the older one applies, and the same holds for two top-up subscriptions of one feature; a Customer is created once for two concurrent Checkout clicks | [W37] |
+| `it::billing::unresolved_event_ignored` | An event whose customer and metadata name no workspace is answered `200`, recorded `ignored_unresolved`, and fires no alert; an invoice event before the customer is linked resolves through `parent.subscription_details.metadata.tenant_id` | [Webhook endpoint](#webhook-endpoint) |
+| `xtask::stripe_setup_idempotent` | [Stripe account setup](#stripe-account-setup): a second run creates nothing; a live key without `--live`, or no `--vat-from` in live mode, stops before any call; the written catalog validates | M22 |
 | `it::notify::usage_once_per_threshold_per_period`, `it::notify::count_feature_cooldown`, `it::notify::billing_off_no_usage_alerts` | The `TenantQuota` side of usage alerts ([Usage thresholds](#usage-thresholds)), listed in [Notifications § 10](notifications.md#10-tests) | FR-BILL-13, [O20](../edge-cases.md), [O21](../edge-cases.md), [O23](../edge-cases.md) |
 
 [W1]: ../edge-cases.md
@@ -701,6 +877,9 @@ Metrics: `quota_hold_denied_total{feature}`, `quota_hold_expired_total{feature}`
 [W13]: ../edge-cases.md
 [W14]: ../edge-cases.md
 [W19]: ../edge-cases.md
+[W35]: ../edge-cases.md
+[W36]: ../edge-cases.md
+[W37]: ../edge-cases.md
 
 Verified (2026-10-09): Stripe documentation at docs.stripe.com, read through WebFetch on this date.
 `/api/checkout/sessions/create` (modes `payment`, `setup` and `subscription`; `client_reference_id` up to
@@ -722,4 +901,27 @@ and `customer_update[address]=auto` for existing customers). Not checked: the ex
 permissions in the Stripe Dashboard. Read on 2026-10-10 for the return-page and workspace-deletion calls:
 `/api/checkout/sessions/retrieve` (`GET /v1/checkout/sessions/{id}`) and `/api/subscriptions/cancel`
 (`DELETE /v1/subscriptions/{id}` cancels at once; `prorate` and `invoice_now` both default to `false`, so
-sending neither gives no proration credit and no final invoice).
+sending neither gives no proration credit and no final invoice). Read on 2026-10-10 for the payment gate,
+the Portal and the account setup: `/api/customer_portal/configurations/create`
+(`features.subscription_update.proration_behavior` is `none`, `create_prorations` or `always_invoice`;
+`products[].adjustable_quantity` with `enabled`, `minimum` and `maximum`;
+`schedule_at_period_end.conditions[].type` `decreasing_item_amount` or `shortening_interval`;
+`subscription_cancel.mode` `at_period_end` or `immediately`; `login_page.enabled`);
+`/customer-management` (two prices with the same product and interval are not allowed; a subscription
+with a scheduled update cannot be changed or cancelled in the Portal); `/customer-management/configure-portal`
+(scheduled downgrades only between prices of the same product); `/api/subscriptions/cancel` again (with
+`invoice_now` and `prorate` both false, an immediate cancel removes pending prorations; cancelling stops
+automatic collection of the customer's finalized invoices); `/billing/subscriptions/webhooks` (`active`
+does not mean every invoice is paid; `incomplete` while a payment is `processing`; handle
+`charge.dispute.created`, `charge.refunded` and `radar.early_fraud_warning.created`; under `2025-03-31.basil`
+an invoice names its subscription in `parent.subscription_details.subscription`);
+`/billing/subscriptions/pending-updates` (with `payment_behavior=pending_if_incomplete` an update applies
+only when paid; otherwise Stripe applies it whatever the payment); `/api/invoices/object`
+(`parent.subscription_details.metadata` is the subscription's metadata when the invoice was finalized);
+`/expand` (`expand[]=data.{field}` on lists); `/tax/checkout/tax-ids` (`customer_update[name]=auto` with an
+existing customer); `/api/tax/settings/update` and `/api/tax/registrations/create` (`country_options[gb][type]`
+`standard`); `/tax/ai` (tax code `txcd_10103001`, software as a service for business use); `/upgrades`
+(the newest version is `2026-09-30.endive`; a webhook endpoint at an older version is created through the
+API with `api_version`); `/keys/restricted-api-keys` (created in the Dashboard only, Read, Write or None per
+resource). Not verified: the Customer Portal's own use of pending updates when an `always_invoice` payment
+fails, which is why the payment gate above does not depend on it.
