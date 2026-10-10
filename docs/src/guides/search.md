@@ -93,8 +93,9 @@ Normalisation means formatting does not matter: `AB12 CDE`, `ab12cde` and `AB12C
 match `ref:AB12CDE` ([F5](../project/edge-cases.md)). Amounts are stored with their currency
 (`GBP:412.80`) and phone numbers in international form (`+447700900123`).
 
-Turn packs on, and add your own patterns, in the tenant policy (a platform key, or the tenant's partner
-key, with `tenants:manage`):
+Turn packs on, and add your own patterns, in the tenant policy: on the console's policy page (owners and
+admins), or with `PATCH /v1/tenants/{tenant_id}/policy` and a tenant key that holds `policy:write`
+(platform and partner keys can also use `PATCH /v1/tenants/{tenant_id}`):
 
 ```json
 {

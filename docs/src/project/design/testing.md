@@ -358,7 +358,8 @@ zone of `PM_PLATFORM_DOMAIN`.
 "Every permission valid at that level" follows [Security §4.6](security.md#46-creating-keys-fr-key-1):
 a tenant key holds every permission except `tenants:manage`, `partners:manage` and `platform:ops`, so it holds
 `identities:sign`; an identity key holds the same set without the tenant-only permissions
-(`members:read`, `members:manage`, `suppressions:manage`, `audit:read`, `usage:read`), plus
+(`members:read`, `members:manage`, `suppressions:manage`, `audit:read`, `usage:read`, `policy:write`,
+`accounts:approve`), plus
 `usage:read` implicitly for its own workspace. A partner key holds every permission except
 `platform:ops`, `partners:manage` and `identities:sign`.
 

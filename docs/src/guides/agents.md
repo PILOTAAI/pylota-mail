@@ -51,7 +51,14 @@ Rules:
   someone else's mail ([F2](../project/edge-cases.md)). If it needs a fact from mail, have a trusted
   agent look it up and pass on only the answer.
 - **Keep human permissions away from agents.** `quarantine:review`, `erasure:manage`, `keys:manage`,
-  `suppressions:manage` and `tenants:manage` belong to people and back-office services.
+  `suppressions:manage`, `policy:write`, `accounts:approve` and `tenants:manage` belong to people and
+  back-office services.
+- **Ask before signing up anywhere.** An agent that creates an account at a third-party service with its
+  address requests it first (`POST /v1/identities/{identity_id}/accounts`, MCP `mail_request_account`,
+  permission `accounts:request`), waits until a person approves it, then signs up and uses `wait` with
+  `kind: "verification"` for the code. Where the workspace requires approval (always on Pylota Mail
+  Cloud), codes from a service without an approved entry are held for review
+  ([Service sign-up ledger](../project/design/service-accounts.md)).
 - **Give `identities:sign` only to an agent that signs, on its own identity key.** It lets a key speak
   for an identity to the outside world: an identity key only for its own identity, a tenant key for
   every identity of the tenant. Platform and partner keys cannot hold it: creating one that lists it is
@@ -176,6 +183,9 @@ decision. Useful patterns:
 An agent that signs up to a service needs the code it emails back. Use `wait` (MCP `mail_wait`)
 ([E4](../project/edge-cases.md)):
 
+0. Where the workspace requires approval of sign-ups (`accounts.require_approval`, always on Pylota Mail
+   Cloud), request the account first and wait until it is `approved`; until then the next step fails with
+   `403 policy_denied` (`account_not_approved`) and the service's codes are held for review.
 1. Start `wait` with `from=@service.example`, `kind=verification` and a timeout (at most 60
    seconds), **before or in parallel with** triggering the email.
 2. Trigger the sign-up.

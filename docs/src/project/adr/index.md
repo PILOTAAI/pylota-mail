@@ -18,6 +18,8 @@ ADR supersedes it (AGENTS.md).
 | [0007](0007-agentic-search.md) | Agentic search with verified citations | Accepted | 2026-10-09 |
 | [0008](0008-domains-on-any-dns-host.md) | Domains on any DNS host | Accepted | 2026-10-09 |
 | [0009](0009-local-mcp-protocol-types.md) | Local MCP protocol types | Accepted | 2026-10-09 |
+| [0010](0010-workspace-policy-self-service.md) | Workspace policy self-service | Accepted | 2026-10-10 |
+| [0011](0011-service-sign-up-ledger.md) | Service sign-up ledger | Accepted | 2026-10-10 |
 
 ## When to write one
 

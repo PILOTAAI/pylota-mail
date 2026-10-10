@@ -161,6 +161,7 @@ Its `message.quarantined` event carries no `extracted_text`.
 | `spam` | `spam_score` above the threshold | `quarantine.spam_threshold` (default 0.8) |
 | `risky_attachment` | An attachment has a `risk` | Always |
 | `blocked_sender` | The sender is suppressed or matched a receive-block rule (see [Blocked senders and throttling](#blocked-senders-and-throttling)). These messages get status `hidden`, not `quarantined`: they are never evented, never shown in the quarantine and cannot be released | Tenant lists |
+| `account_unapproved` | A verification code or link from a service for which the identity has no approved service sign-up entry ([E9](../project/edge-cases.md), [Service sign-up ledger](../project/design/service-accounts.md)). Senders on your receive-allow list are exempt | `accounts.require_approval` (default `false`; `true` on Pylota Mail Cloud) |
 | `otp_unsolicited` | A password-reset or one-time-code message that no `wait` asked for in the previous 30 minutes ([E5](../project/edge-cases.md)) | `quarantine.unsolicited_otp` (default `true`) |
 
 Review and release with a key that holds `quarantine:review`:

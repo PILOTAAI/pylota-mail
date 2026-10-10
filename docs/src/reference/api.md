@@ -94,6 +94,9 @@ A key holds a list of permissions. Every endpoint below names the one it needs.
 | `suppressions:manage` | Suppressions and allow or block lists |
 | `usage:read` | Plan, allowances and usage figures. Every tenant and identity key holds it implicitly for its own workspace, without listing it. Platform and partner keys must hold it explicitly and pass `tenant_id` |
 | `audit:read` | Audit log |
+| `policy:write` | Read the per-field limits of, and change, the tenant's policy through `GET` and `PATCH /v1/tenants/{tenant_id}/policy`, within the key level's rules: a tenant key may set free fields and lower lower-only fields under its ceilings ([Configuration › Who may change a field](configuration.md#who-may-change-a-field)). Platform, partner and tenant keys; never identity keys |
+| `accounts:request` | Request, list, read and close entries of the [service sign-up ledger](#service-accounts). Every key level |
+| `accounts:approve` | Approve, reject and delete service-ledger entries. Includes `accounts:request`. Platform, partner and tenant keys; never identity keys, so an agent cannot approve its own request. Approval by an API key is also a decision reserved for people ([Approve](#post-v1identitiesidentity_idaccountsaccount_idapprove--accountsapprove)) |
 | `members:read` | List console members and pending invitations (tenant, partner and platform keys; every console role holds it) |
 | `members:manage` | Invite, revoke, change roles and remove console members (tenant, partner and platform keys). Includes `members:read` |
 | `partners:manage` | Create, list, read, update and delete partners, the integrators whose partner keys create tenants ([Partners](#partners)). Platform keys only |
@@ -122,7 +125,7 @@ lists one its level cannot hold with `400 invalid_request` and
 |---|---|
 | `platform:ops`, `partners:manage` | platform |
 | `tenants:manage` | platform, partner |
-| `members:read`, `members:manage`, `suppressions:manage`, `audit:read`, `usage:read` | platform, partner, tenant (an identity key holds `usage:read` implicitly for its own workspace, but cannot list it) |
+| `members:read`, `members:manage`, `suppressions:manage`, `audit:read`, `usage:read`, `policy:write`, `accounts:approve` | platform, partner, tenant (an identity key holds `usage:read` implicitly for its own workspace, but cannot list it) |
 | `identities:sign` | tenant, identity |
 | Every other permission | platform, partner, tenant, identity |
 
@@ -209,7 +212,9 @@ partner, and `tenant_id` and `identity_id` are `null`.
 
 Keys with `tenants:manage`: a platform key reaches every tenant, and a partner key the tenants its
 partner's keys created ([Partners](#partners)). A tenant key can `GET /v1/tenants/{tenant_id}` for its
-own tenant; it cannot list tenants or change them.
+own tenant; it cannot list tenants or change them, except its policy through
+[`PATCH /v1/tenants/{tenant_id}/policy`](#get-v1tenantstenant_idpolicy--patch-v1tenantstenant_idpolicy--policywrite)
+with `policy:write`.
 
 ### `POST /v1/tenants`
 
@@ -271,6 +276,52 @@ key cannot call this route (`403 permission_denied`: it can never hold `tenants:
 - **Erasing and erased tenants.** Once a tenant is `erasing` or `erased`, only the erasure job changes its
   status: a platform key gets `409 tenant_erased`, and any other key gets `404 tenant_not_found` here and
   on every other write to the tenant ([I8](../project/edge-cases.md)).
+- **Every policy write** goes through the same checks as `PATCH …/policy` below: it is a compare-and-set
+  (`503 unavailable` after three lost attempts), writes the audit row `tenant.policy_update` and emits
+  `tenant.policy_updated`. A lower-only value a partner key sets also becomes that field's partner ceiling
+  for the tenant's own keys and people ([J23](../project/edge-cases.md)).
+
+### `GET /v1/tenants/{tenant_id}/policy` · `PATCH /v1/tenants/{tenant_id}/policy` — `policy:write`
+
+The workspace's own policy route ([Workspace policy](../project/design/workspace-policy.md)). Platform,
+partner (its own tenants) and tenant (its own tenant) keys holding `policy:write`; identity keys can never
+hold it. `PATCH` takes a partial policy (the `policy` object of `PATCH /v1/tenants/{tenant_id}`: deep
+merge, `null` resets a field, arrays replace) and checks each field sent by the caller's level
+([Configuration › Who may change a field](configuration.md#who-may-change-a-field)). For a tenant key:
+
+- free fields take any valid value;
+- a lower-only field may be set at most to its workspace ceiling, the strictest of the deployment default,
+  the platform ceiling and the partner ceiling; above it, `403 scope_denied` with `details.field`,
+  `details.reason = "above_ceiling"`, `details.ceiling` and `details.ceiling_source`
+  ([J20](../project/edge-cases.md), [J23](../project/edge-cases.md));
+- a guard field (`send_allowlist_only`, `quarantine.on_auth_fail`, `quarantine.spam_threshold`,
+  `quarantine.unsolicited_otp`) may only be tightened, unless API keys may take decisions reserved for
+  people on this tenant (`PM_QUARANTINE_KEY_RELEASE=on`, or the tenant's `quarantine.key_release: true`);
+  otherwise `403 permission_denied` with `details.field` and `details.reason = "person_required"`
+  ([J22](../project/edge-cases.md));
+- platform-only fields and `quarantine.key_release` get `403 scope_denied` with `details.field` and
+  `details.reason = "not_writable"` ([J21](../project/edge-cases.md), [J14](../project/edge-cases.md)).
+
+One refused field refuses the whole write. Concurrent writes never lose one another: a write that keeps
+losing the compare-and-set gets `503 unavailable` (retryable) after three attempts
+([J24](../project/edge-cases.md)). Both methods return the policy view; `GET` changes nothing:
+
+```json
+{ "tenant_id": "ten_01J9…", "policy_version": 7,
+  "policy": { "...": "full effective policy" },
+  "fields": [
+    { "field": "tenant_daily_send_cap", "class": "lower_only", "writable": true, "ceiling": 1000,
+      "ceiling_source": "partner", "person_required_to_loosen": false },
+    { "field": "quarantine.on_auth_fail", "class": "guard", "writable": true, "ceiling": null,
+      "ceiling_source": null, "person_required_to_loosen": true },
+    { "field": "quarantine.key_release", "class": "partner_or_platform", "writable": false, "ceiling": null,
+      "ceiling_source": null, "person_required_to_loosen": false } ] }
+```
+
+`fields` describes what **the caller** may do: for a platform key every field is `writable` with no
+ceiling. Each write writes the audit row `tenant.policy_update` and emits `tenant.policy_updated`.
+Errors: `400 invalid_request`, `403 permission_denied`, `403 scope_denied`, `404 tenant_not_found`
+(out of scope, or a write to an `erasing` or `erased` tenant), `503 unavailable`.
 
 #### Tenant object
 
@@ -758,6 +809,91 @@ passed) and the tenant opts in. While `PM_WEB_BOT_AUTH=off`, this returns `422 w
 [Configuration › Tenant policy](configuration.md#tenant-policy)). Other errors as for assertions,
 `403 tenant_suspended` first among them. The
 operator side is in [Self-hosting › Signed HTTP requests](../self-hosting.md#signed-http-requests-web-bot-auth).
+
+---
+
+## Service accounts
+
+The service sign-up ledger: an agent records each third-party account it wants to create with its
+identity's address, and an operator approves or rejects it. Where the tenant's `accounts.require_approval`
+is `true` (the default on Pylota Mail Cloud), verification mail from a service reaches the agent only when
+an approved entry matches it; other such mail is quarantined with `account_unapproved`
+([Service sign-up ledger](../project/design/service-accounts.md)). Every change emits an `account.*`
+[event](events.md#service-accounts) and writes an audit row (`account.request`, `account.approve`,
+`account.reject`, `account.close`, `account.delete`).
+
+### `POST /v1/identities/{identity_id}/accounts` — `accounts:request`
+
+```json
+{ "service_domain": "github.com", "account_identifier": "brightwell-bookings",
+  "purpose": "Open issues on the booking widget's repository.",
+  "sender_domains": ["github.com"], "address": "bookings.brightwell@pylotamail.com" }
+```
+
+- `service_domain` is reduced to its organisational domain (A-label, lower case). `sender_domains`
+  (optional, at most 5) adds other organisational domains the service's mail comes from; the service domain
+  is always included. A public suffix, an IP literal or a non-DNS name is `400 invalid_request`; this
+  deployment's own platform, API or console domain is `400 invalid_request` with
+  `details.reason = "own_deployment"` ([E14](../project/edge-cases.md)).
+- `account_identifier` (1–254 characters) and `purpose` (1–500) are shown to the operator. `address`
+  (optional) must be an `active` or `retiring` address of the identity; it defaults to its primary address.
+- Returns `201` with the [entry](#service-account-object) in `pending_approval`, which expires after 7 days.
+- `409 account_exists` (`details.account_id`, `details.status`) when a pending or approved entry exists for
+  the same service and account identifier; `422 account_limit_reached` beyond 10 pending or 200 entries
+  for the identity ([E12](../project/edge-cases.md)); `403 tenant_suspended`; `409 identity_paused`.
+
+### `GET /v1/identities/{identity_id}/accounts` · `GET /v1/identities/{identity_id}/accounts/{account_id}` — `accounts:request`
+
+The identity's entries, newest first (filters `status`, `service_domain`), and one entry. An entry outside
+the key's scope is `404 account_not_found`.
+
+### `GET /v1/tenants/{tenant_id}/accounts` — `accounts:request`, tenant, partner or platform key
+
+The tenant's entries (filters `status`, `identity_id`, `service_domain`). An identity key gets
+`403 scope_denied`.
+
+### `POST /v1/identities/{identity_id}/accounts/{account_id}/approve` — `accounts:approve`
+
+`{ "note": "Approved for the widget repository only." }` (optional, at most 500 characters). Platform,
+partner and tenant keys. Approving lets codes reach an agent, so it is a decision reserved for people: an
+API key may approve only when `PM_QUARANTINE_KEY_RELEASE` is `on` or the tenant's policy has
+`quarantine.key_release: true`; otherwise `403 permission_denied` with
+`details.reason = "person_required"`, and a person approves in the console
+([E11](../project/edge-cases.md)). Returns `200` with the entry, now `approved`. Approving an approved
+entry again returns it unchanged; an entry that is rejected, closed or past its 7 days gets
+`409 account_not_pending` with `details.status`. Mail already held as `account_unapproved` stays
+quarantined until someone releases it.
+
+### `POST /v1/identities/{identity_id}/accounts/{account_id}/reject` — `accounts:approve`
+
+As approve, with an optional `note`, but always allowed for a key that holds `accounts:approve`. The entry
+becomes `rejected` with `rejected_reason: "operator"`.
+
+### `POST /v1/identities/{identity_id}/accounts/{account_id}/close` — `accounts:request`
+
+An optional `note`. A pending or approved entry becomes `closed`; no mail matches it afterwards
+([E13](../project/edge-cases.md)). Closing a closed or rejected entry returns it unchanged. It does not
+close the account at the service.
+
+### `DELETE /v1/identities/{identity_id}/accounts/{account_id}` — `accounts:approve`
+
+Removes the entry, closing it first (with `account.closed`) when it was pending or approved. Returns `204`.
+
+#### Service account object
+
+```json
+{ "id": "sac_01JA…", "tenant_id": "ten_01J9…", "identity_id": "idn_01J9…",
+  "service_domain": "github.com", "sender_domains": ["github.com"],
+  "account_identifier": "brightwell-bookings", "address": "bookings.brightwell@pylotamail.com",
+  "purpose": "Open issues on the booking widget's repository.", "status": "approved",
+  "rejected_reason": null, "note": "Approved for the widget repository only.",
+  "requested_by_key_id": "key_01J9…", "decided_by_key_id": null, "decided_by_user_id": "usr_01JA…",
+  "decided_at": "…", "closed_by_key_id": null, "closed_by_user_id": null, "closed_at": null,
+  "expires_at": null, "created_at": "…", "updated_at": "…" }
+```
+
+`status` is `pending_approval`, `approved`, `rejected` or `closed`. `purpose` was written by an agent: show
+it as untrusted text.
 
 ---
 
@@ -1445,7 +1581,11 @@ Query parameters:
 ```
 
 A verification code or link is released only when `from` names the expected sender domain and the
-message passed authentication (`verdict: pass`). See [E4](../project/edge-cases.md). The handler polls
+message passed authentication (`verdict: pass`). See [E4](../project/edge-cases.md). When the tenant's
+`accounts.require_approval` is `true`, `kind=verification` also needs an approved
+[service-ledger entry](#service-accounts) for the sender domain: without one the request gets
+`403 policy_denied` with `details.reason = "account_not_approved"` at once ([E9](../project/edge-cases.md)),
+and a code is released only while its entry is still approved. The handler polls
 the mailbox every second and keeps the sender domain registered for unsolicited-OTP detection while it
 waits; the full behaviour is in [Inbound › The `wait` handler](../project/design/inbound.md#the-wait-handler-e4).
 
@@ -1755,7 +1895,8 @@ key reads the rows of its own tenants only; rows about a partner itself (`partne
 
 Audit rows cover administrative actions: keys (`key.create`, `key.rotate`, `key.revoke`), partners
 (`partner.create`, `partner.update`, `partner.delete`), tenants (`tenant.create`, with the `partner_id`
-when a partner key created it), identity status, identity signing keys
+when a partner key created it, and `tenant.policy_update` for every policy write), service accounts
+(`account.request`, `account.approve`, `account.reject`, `account.close`, `account.delete`), identity status, identity signing keys
 (`identity_key.create`, `identity_key.rotate`, `identity_key.revoke`), quarantine releases, holds,
 suppression removals, erasure, resolve, members, billing, and platform operations. **Sends are not
 audit rows**: each send is recorded by its message, its events (`message.sent` and the delivery events)

@@ -52,7 +52,7 @@ increases strictly per owner: per identity for mailbox events (`message.*`, `ide
 per job for `erasure.*` and `export.*` events, and for `identity.deleted`, which the erasure job emits
 after the mailbox is gone (it still carries `identity_id`, so identity-filtered endpoints receive it). Use it to discard stale updates, for example a
 `message.deferred` arriving after `message.delivered`. Platform events (`webhook.disabled`,
-`webhook.test`, `member.*` and `billing.*`) have `sequence: null`.
+`webhook.test`, `member.*`, `billing.*`, `tenant.policy_updated` and `account.*`) have `sequence: null`.
 
 ## Envelope
 
@@ -96,7 +96,7 @@ Payloads are **thin**. They carry IDs, a summary, verdicts and up to `policy.web
 | `message.reconciled` | An uncertain send was matched to a provider event | `message_id`, `status` |
 | `message.suppressed` | Every recipient is suppressed | `message_id`, `recipients[]` |
 | `message.canceled` | Cancelled while queued | `message_id` |
-| `verification.received` | A verification code or link was found in authenticated mail | `message_id`, `sender_domain`, `kind` (`code` or `link`). The value itself is only available through `wait` |
+| `verification.received` | A verification code or link was found in authenticated mail | `message_id`, `sender_domain`, `kind` (`code` or `link`), `account_id` (the approved service-ledger entry that matched, or `null` when the tenant does not require approval). The value itself is only available through `wait` |
 
 The **message summary** used in `data.message` is:
 
@@ -164,6 +164,20 @@ The **message summary** used in `data.message` is:
 | `billing.plan_changed` | `from_plan`, `to_plan`, `reason` (`checkout`, `portal`, `payment_failed_grace_ended`, `payment_recovered` (the plan was restored after a late payment), `canceled`, `operator`) |
 | `billing.payment_failed` | `grace_until` |
 | `billing.limit_reached` | `feature`, `granted`, `resets_at` (sent once per feature per period, when the first `402` is returned) |
+| `tenant.policy_updated` | `fields` (the dotted paths written), `by` (`platform`, `partner`, `tenant` or `console`), `actor_key_id`, `actor_user_id` (one of them `null`), `policy_version`. Sent for every policy write except a tenant's creation, to the tenant's, its partner's and platform endpoints ([Workspace policy](../project/design/workspace-policy.md#7-audit-and-events)) |
+
+### Service accounts
+
+Platform events with `tenant_id` and `identity_id` set, so an endpoint's identity filter applies
+([Service sign-up ledger](../project/design/service-accounts.md#6-events)). `account` is the
+[service account](api.md#service-accounts) as the API returns it.
+
+| Type | When | `data` |
+|---|---|---|
+| `account.requested` | An agent recorded that it wants an account at a service | `account` |
+| `account.approved` | An operator approved the entry | `account` |
+| `account.rejected` | An operator rejected it, or it stayed undecided for 7 days | `account`, `reason` (`operator` or `expired`) |
+| `account.closed` | The entry was closed, or deleted while it was pending or approved | `account` |
 
 ## Versioning
 

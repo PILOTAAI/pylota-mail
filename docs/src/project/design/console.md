@@ -3,7 +3,9 @@
 Binding design for the console at `/console`, and for the workspaces, members, roles, invitations, sign-in
 and sessions behind it. It implements FR-CON-1 to FR-CON-7 and NFR-CON-1, build plan milestone M21, and
 the edge-case rows W9–W10 and W15–W18 in the [edge-case register](../edge-cases.md); and the console parts
-of agent signing keys (FR-IDN-6, M25) and of notifications (FR-CON-14, FR-CON-15, M26; rows O17–O19). The plan and usage
+of agent signing keys (FR-IDN-6, M25), of notifications (FR-CON-14, FR-CON-15, M26; rows O17–O19), of the
+workspace policy page (FR-TEN-4, [Workspace policy](workspace-policy.md)) and of the service sign-up ledger
+(FR-IDN-10, M27, [Service sign-up ledger](service-accounts.md)). The plan and usage
 page and everything about money is in [Plans, metering and billing](billing.md). Self-serve sign-up,
 Google and GitHub sign-in, two-step verification, the landing rules and the Overview (FR-CON-8 to
 FR-CON-13) are in [Cloud sign-up, sign-in and first run](cloud-signup.md), which extends this design.
@@ -53,7 +55,10 @@ webmail client: it has no compose or reply form.
   The permissions come from the member's role ([Roles](#roles)). For every level check a session acts as a
   **tenant-level** principal of its workspace (`level = tenant`, `tenant_id` the session's): it may do
   what a tenant key holding the same permissions may do (tenant search, `resume` of an abuse pause,
-  tenant-scope erasure, `nameservers` when policy allows it), and never what needs a platform key.
+  tenant-scope erasure, `nameservers` when policy allows it), and never what needs a platform key. Unlike a
+  key it is a person, so it may take the decisions reserved for people (release, loosening a guard field,
+  approving a service sign-up) whatever `PM_QUARANTINE_KEY_RELEASE` says
+  ([Workspace policy §3](workspace-policy.md#3-decisions-reserved-for-people)).
   Validation, error codes, idempotency, metering and audit are therefore identical to the API's.
 - **Budget.** Server render time p95 ≤ 300 ms (NFR-CON-1). A page makes at most one D1 query for the
   session, then the same calls the API would make.
@@ -104,14 +109,18 @@ role's session principal holds, so the same checks run as for an API key.
 | See plan and usage | Yes | Yes | Yes | Yes |
 | Upgrade, buy top-ups, open the Customer Portal (sensitive) | Yes | No | No | No |
 | See the audit log | Yes | Yes | No | No |
+| See the workspace policy | Yes | Yes | Yes | Yes |
+| Change the workspace policy (sensitive), within its ceilings ([Workspace policy](workspace-policy.md)) | Yes | Yes | No | No |
+| See service sign-up requests and their decisions | Yes | Yes | Yes | No |
+| Approve a service sign-up (sensitive); reject, close or delete one | Yes | Yes | No | No |
 | Your own notification settings for this workspace | Yes | Yes | Yes | Yes |
 | Leave the workspace | No: transfer ownership first | Yes | Yes | Yes |
 
 | Role | Permission set of the session principal |
 |---|---|
-| `owner` | Every tenant-level permission: `identities:read`, `identities:write`, `identities:sign`, `domains:read`, `domains:write`, `messages:read`, `messages:send`, `messages:write`, `attachments:read`, `search:read`, `search:agentic`, `quarantine:review`, `webhooks:read`, `webhooks:manage`, `keys:manage`, `erasure:manage`, `suppressions:manage`, `usage:read`, `audit:read`, `members:read`, `members:manage`; plus the console-only owner rights: billing, ownership transfer, deleting the workspace, and the workspace settings below |
+| `owner` | Every tenant-level permission: `identities:read`, `identities:write`, `identities:sign`, `domains:read`, `domains:write`, `messages:read`, `messages:send`, `messages:write`, `attachments:read`, `search:read`, `search:agentic`, `quarantine:review`, `webhooks:read`, `webhooks:manage`, `keys:manage`, `erasure:manage`, `suppressions:manage`, `usage:read`, `audit:read`, `members:read`, `members:manage`, `policy:write`, `accounts:request`, `accounts:approve`; plus the console-only owner rights: billing, ownership transfer, deleting the workspace, and the workspace settings below |
 | `admin` | The owner's tenant-level permissions (`identities:sign` included), without the console-only owner rights. Its `erasure:manage` covers every scope except `tenant`: the console's tenant-erasure route also checks `role = owner` |
-| `member` | `identities:read`, `domains:read`, `messages:read`, `messages:write`, `attachments:read`, `search:read`, `search:agentic`, `quarantine:review`, `usage:read`, `members:read` |
+| `member` | `identities:read`, `domains:read`, `messages:read`, `messages:write`, `attachments:read`, `search:read`, `search:agentic`, `quarantine:review`, `usage:read`, `members:read`, `accounts:request` (the console offers it only the accounts list) |
 | `viewer` | `identities:read`, `domains:read`, `messages:read`, `attachments:read`, `search:read`, `usage:read`, `members:read` |
 
 Rules:
@@ -127,14 +136,18 @@ Rules:
   [Security §4.6](security.md#46-creating-keys-fr-key-1) apply as in the API: an identity-level key never
   carries a tenant-only permission (`members:read`, `members:manage`, `suppressions:manage`,
   `audit:read`, `usage:read`), so the key form does not offer them for that level.
-- **Tenant policy** is changed with a platform key, or with the partner key of the workspace's partner,
-  as in the API (`PATCH /v1/tenants/{id}` needs `tenants:manage`). The settings page shows the effective
-  policy read-only, `quarantine.key_release` included.
+- **Tenant policy** is changed by owners and admins on `/console/settings/policy`, which calls the same
+  `policy::write` service as `PATCH /v1/tenants/{tenant_id}/policy` with the session as a person
+  ([Workspace policy §6](workspace-policy.md#6-the-console-page)): free fields, lower-only fields up to their
+  ceilings (the deployment's, the platform operator's and, for a partner's workspace, the partner's), and the
+  guard fields. Platform-only fields and `quarantine.key_release` are shown read-only to every role; members
+  and viewers see the whole policy read-only. Each save is a sensitive action, and a change that deletes mail
+  (shorter retention) asks for a second, confirmed `POST`.
 - **Workspace settings** (name, time zone, `require_two_factor`) are console-only owner rights, like
   billing: the settings form posts to a console handler that checks `role = owner` and updates exactly
   those three columns of `tenants`, with an audit row. It never calls `PATCH /v1/tenants/{tenant_id}`
-  and never touches the fields that need a key with `tenants:manage` (`policy`, `status`, `mode`, `slug`,
-  `address_suffix`, billing).
+  and never touches the fields that need a key with `tenants:manage` (`status`, `mode`, `slug`,
+  `address_suffix`, billing); the policy has its own page, above.
 - **Members list.** Every role can see members and pending invitations, through
   `GET /v1/tenants/{tenant_id}/members`, which needs `members:read` (included in `members:manage`).
 - **Quarantine release** is possible for a signed-in person with the role above. On Pylota Mail Cloud
@@ -299,7 +312,8 @@ session of the user. Revoked and expired rows are deleted 30 days later.
 Sensitive actions require a sign-in within the last 10 minutes and write an audit row (FR-CON-5):
 creating keys, creating, rotating or revoking an identity's signing keys, inviting or removing members,
 changing roles, transferring ownership, adding or removing domains, releasing quarantine, erasure and
-legal holds, and billing (Checkout and the Customer Portal). Confirming your address after a notification
+legal holds, saving the workspace policy, approving a service sign-up, and billing (Checkout and the
+Customer Portal). Confirming your address after a notification
 bounce is audited but needs no recent sign-in, because the re-authentication code would go to the
 suppressed address ([Notification settings](#notification-settings)).
 
@@ -553,7 +567,9 @@ while a person's other preferences are paused.
 | `/console/plan` | Plan, a meter per allowance, upgrade, top-ups, manage billing ([Billing](billing.md#checkout)) | View: all roles. Buy: owner |
 | `/console/plan/return` | Return from Stripe Checkout: confirms the plan once the webhook has applied it ([Cloud sign-up §9](cloud-signup.md#9-coming-back-from-checkout)) | Owner |
 | `/console/audit` | Audit log with filters | Owner, admin |
-| `/console/settings` | Your name and sessions; the terms version you accepted and when (`users.terms_version`, `terms_accepted_at`; "not recorded" for people who joined by invitation before sign-up opened); delete your account; workspace name, time zone and `require_two_factor` (owner only, through the console-only owner handler; never the platform-only tenant fields) and the effective policy (read-only) | All roles |
+| `/console/accounts` | Service sign-up requests: pending first, with inbox, service, sender domains, account identifier, purpose (escaped) and status; approve (re-authentication), reject, close, delete; a link to quarantined `account_unapproved` mail ([Service sign-up ledger §8](service-accounts.md#8-console)) | View: owner, admin, member. Change: owner, admin |
+| `/console/settings/policy` | The workspace policy, grouped by area, each field with its limit or the reason it is read-only; the form for owners and admins, and the confirmation step for changes that delete mail ([Workspace policy §6](workspace-policy.md#6-the-console-page)) | View: all roles. Change: owner, admin |
+| `/console/settings` | Your name and sessions; the terms version you accepted and when (`users.terms_version`, `terms_accepted_at`; "not recorded" for people who joined by invitation before sign-up opened); delete your account; workspace name, time zone and `require_two_factor` (owner only, through the console-only owner handler; never the platform-only tenant fields), and a link to the policy page | All roles |
 | `/console/settings/security` | Two-step verification: enrol with a QR code, recovery codes, turn off (re-authentication needed) ([Cloud sign-up §5](cloud-signup.md#5-two-step-verification)) | Signed in |
 | `/console/settings/notifications` | Your notification preferences for the active workspace: kinds, modes, followed inboxes and the `needs_reply` filter; the bounce banner and **Confirm my address**; the daily-cap notice ([Notification settings](#notification-settings)) | All roles, each for themselves |
 
@@ -597,6 +613,8 @@ Every sensitive action writes an `audit_log` row in the same D1 batch as the cha
 | `user.two_factor_enable`, `user.two_factor_disable` | Two-step verification turned on or off ([Cloud sign-up §5](cloud-signup.md#5-two-step-verification)) | – |
 | `user.notifications_resume` | A person confirmed their address after a notification bounce or complaint ([Notification settings](#notification-settings)); `tenant_id` is `NULL`, because it clears the pause in every workspace | – |
 | `identity_key.create`, `identity_key.rotate`, `identity_key.revoke` | An identity's signing key created, rotated or revoked on the identity page (the API writes the same actions) | `identity.key_created`, `identity.key_rotated`, `identity.key_revoked` |
+| `tenant.policy_update` | The policy page saved (the API writes the same action) | `tenant.policy_updated` |
+| `account.approve`, `account.reject`, `account.close`, `account.delete` | A service sign-up decided, closed or deleted on the accounts page (the API writes the same actions) | `account.approved`, `account.rejected`, `account.closed` (delete of a live entry) |
 | `waitlist.invite` | The operator invited a batch from the waitlist ([Cloud sign-up §6.1](cloud-signup.md#61-before-launch-the-waitlist)) | – |
 
 The other sensitive actions use the same audit actions as the API (for example `key.create`,
@@ -645,7 +663,9 @@ the workspace's `tenant_id` and delivered like `webhook.disabled`
 | `it::console::reauth_sensitive` | Each sensitive action redirects to re-authentication after 10 minutes, writes an audit row, and the session is rotated | FR-CON-5 |
 | `it::members::invitation_lifecycle` | Accept, re-send, revoke and expire, with the seat count after each | FR-CON-4 |
 | `it::members::ownership_transfer` | Exactly one owner before and after; concurrent transfers leave one owner | FR-CON-2 |
-| `it::console::quarantine_release` | A member releases with re-authentication and an audit row; with key release off, an API key cannot release unless the workspace's policy has `quarantine.key_release: true` (`it::quarantine::j16_key_release_override`); the settings page shows that field read-only | FR-CON-6 |
+| `it::console::quarantine_release` | A member releases with re-authentication and an audit row; with key release off, an API key cannot release unless the workspace's policy has `quarantine.key_release: true` (`it::quarantine::j16_key_release_override`); the policy page shows that field read-only | FR-CON-6 |
+| `it::console::policy_page` ([Workspace policy §9](workspace-policy.md#9-tests)) | Roles, re-authentication, changed fields only, ceilings, the deleting-change confirmation | FR-TEN-4, FR-CON-5 |
+| `it::console::accounts_page` ([Service sign-up ledger §10](service-accounts.md#10-tests)) | Roles, approval with re-authentication, the Overview item, escaped `purpose` | FR-IDN-10 |
 | `it::console::disabled` | `PM_CONSOLE=off` removes every `/console` route except the invitation-accept and unsubscribe pairs; the members API still works | FR-CON-7 |
 | `it::console::notification_settings` | Each role sees its defaults; saving writes rows for the session's person and workspace only; a mode a kind does not accept and an inbox from another workspace are refused; `account` cannot be turned off; the cap notice appears after the 50th email of the day | FR-CON-14, FR-CON-15 |
 | `it::console::identity_keys_page` | Every role sees the key list and the JWKS link; only owner and admin can create, rotate and revoke, each after re-authentication with an `identity_key.*` audit row and event; a paused identity's keys can still be revoked | FR-IDN-6, [W18] |

@@ -7,7 +7,7 @@ mailbox.
 | | |
 |---|---|
 | Requirements | FR-IN-1 … FR-IN-9, FR-THR-1, FR-THR-2, FR-ADR-3, FR-ADR-5, FR-TEN-3, FR-DLV-5, FR-DOM-9, FR-DOM-10, FR-DOM-11, FR-SRCH-2, FR-SRCH-4, NFR-REL-1, NFR-REL-2, NFR-REL-3 |
-| Edge cases | [A2](../edge-cases.md), [A6](../edge-cases.md), [A9](../edge-cases.md), [A10](../edge-cases.md), [B1–B14](../edge-cases.md), [D1–D5](../edge-cases.md), [D7](../edge-cases.md), [D9](../edge-cases.md), [E4](../edge-cases.md), [E5](../edge-cases.md), [J1–J3](../edge-cases.md), [J7](../edge-cases.md), [L3](../edge-cases.md), [N1–N7](../edge-cases.md), [N12](../edge-cases.md), [N18](../edge-cases.md), [N19](../edge-cases.md), [N27](../edge-cases.md), [N28](../edge-cases.md) |
+| Edge cases | [A2](../edge-cases.md), [A6](../edge-cases.md), [A9](../edge-cases.md), [A10](../edge-cases.md), [B1–B14](../edge-cases.md), [D1–D5](../edge-cases.md), [D7](../edge-cases.md), [D9](../edge-cases.md), [E4](../edge-cases.md), [E5](../edge-cases.md), [E9](../edge-cases.md), [E10](../edge-cases.md) and [E13](../edge-cases.md) (the ledger gate, [Service sign-up ledger](service-accounts.md)), [J1–J3](../edge-cases.md), [J7](../edge-cases.md), [L3](../edge-cases.md), [N1–N7](../edge-cases.md), [N12](../edge-cases.md), [N18](../edge-cases.md), [N19](../edge-cases.md), [N27](../edge-cases.md), [N28](../edge-cases.md) |
 | Code | `crates/worker/src/email.rs`, `handlers/wait.rs`, `handlers/hooks_ses.rs`, `crons/ses_backstop.rs`, `inbound/sources/{routing.rs, ses.rs}`, `consumers/inbound.rs`, `consumers/index.rs`, `mailbox/{ingest.rs, threads.rs, messages.rs, attachments.rs, outbox.rs}`; `crates/core/src/{mime/, sanitize.rs, text.rs, quote.rs, refs/, classify.rs, auth.rs, trust.rs, attach.rs, sns.rs}` |
 | Related | [Threading](threading.md), [Outbound](outbound.md) (delivery events, loopback), [Search](search.md) (indexing), [Triage](triage.md), [Webhooks](webhooks.md), [Domains on any DNS host](domain-connections.md) (SES receiving, probes, forwarding checks) |
 
@@ -379,7 +379,11 @@ could otherwise hold 250 MiB of raw mail in a 128 MB isolate) and acks each afte
     - sender suppressed: `SELECT 1 FROM suppressions WHERE tenant_id = ?1 AND address_hash = ?2 AND (expires_at IS NULL OR expires_at > ?3)`;
     - receive lists: `SELECT kind FROM sender_lists WHERE tenant_id = ?1 AND direction = 'receive' AND entry IN (?2, ?3)` with `?2` = sender address, `?3` = `@` + sender domain (block wins over allow);
     - tenant domains (for look-alike checks): `SELECT name FROM domains WHERE (tenant_id = ?1 OR kind = 'platform') AND state <> 'removed'`;
-    - co-recipient identities ([A9](#multiple-identities-in-one-tenant-a9)).
+    - co-recipient identities ([A9](#multiple-identities-in-one-tenant-a9));
+    - only when the effective policy has `accounts.require_approval: true` and step 11 found a
+      verification match: the identity's approved service-ledger entries,
+      `SELECT id, sender_domains_json, address FROM service_accounts WHERE identity_id = ?1 AND status = 'approved' ORDER BY created_at`,
+      passed as `IngestInput.approved_accounts` ([Service sign-up ledger §5](service-accounts.md#5-the-verification-gate)).
 13. **Call `MailboxRequest::Ingest`** with an `IngestInput` (30-second deadline).
 14. **Post-commit** ([Post-commit](#post-commit-attachments-and-index-jobs)), then ack.
 
@@ -791,6 +795,7 @@ Decided inside `ingest` (first match wins, FR-IN-5):
 | 3 | `verdict = 'fail'` and `quarantine.on_auth_fail` | `quarantined` | `auth_failed` |
 | 3a | `verdict = 'unverified'` and `quarantine.on_auth_fail` (no trusted `Authentication-Results` yet, so SPF alignment could not be checked) | `quarantined` | `auth_unverified` |
 | 4 | Any attachment has a `risk` that quarantines ([Attachment safety](#attachment-safety)), or `scan_status = 'infected'`, or the SES source's `virusVerdict` is `FAIL` ([N27](../edge-cases.md)) | `quarantined` | `risky_attachment` |
+| 4a | A verification match, `accounts.require_approval`, no approved service-ledger entry matching it, and the sender not on the receive-allow list ([E9](../edge-cases.md), [Service sign-up ledger §5](service-accounts.md#5-the-verification-gate)) | `quarantined` | `account_unapproved` |
 | 5 | Unsolicited OTP ([E5](../edge-cases.md)) and `quarantine.unsolicited_otp` | `quarantined` | `otp_unsolicited` |
 | 6 | `spam_score ≥ quarantine.spam_threshold` and the sender is not receive-allowed | `quarantined` | `spam` |
 | 7 | Otherwise | `received` | – |
@@ -799,8 +804,8 @@ Decided inside `ingest` (first match wins, FR-IN-5):
 searched and never counted for notifications. Quarantined messages are visible only to keys with
 `quarantine:review`. In mail lists none of the three appears by default: a list shows them only for an
 explicit `status` filter from a key holding `quarantine:review`
-([Security §5.3](security.md#53-cross-level-read-access)). A receive-allow entry skips rule 6 only, never
-rule 3.
+([Security §5.3](security.md#53-cross-level-read-access)). A receive-allow entry skips rules 4a and 6 only,
+never rule 3.
 
 **Per-sender throttle ([D5](../edge-cases.md)).** Inside the transaction:
 
@@ -839,9 +844,13 @@ Rules:
   waits). A message with a verification match is **unsolicited** when no `wait:{d}` exists with a value
   ≥ `received_at − 30 min`, where `d` is the sender's registrable domain.
 - A `verifications` row is inserted only when the verdict is `pass` and the status is `received`:
-  `(message_rowid, kind, value, sender_domain, received_at + 24 h, NULL)`. The outbox gets
-  `verification.received` with `message_id`, `sender_domain` and `kind`; the value itself is released
-  only through `wait` ([E4](../edge-cases.md)).
+  `(message_rowid, kind, value, sender_domain, received_at + 24 h, NULL, account_id)`, where `account_id` is
+  the service-ledger entry that rule 4a matched, or `NULL` when the tenant does not require approval. The
+  outbox gets `verification.received` with `message_id`, `sender_domain`, `kind` and `account_id`; the value
+  itself is released only through `wait` ([E4](../edge-cases.md)).
+- **The ledger gate** (rule 4a, only with `accounts.require_approval: true`): a message with a verification
+  match that no approved entry of [Service sign-up ledger §5](service-accounts.md#5-the-verification-gate)
+  matches is quarantined `account_unapproved`, whether or not a `wait` registered its domain.
 
 ## The `wait` handler (E4)
 
@@ -855,7 +864,11 @@ rule 5 (unsolicited OTP, [E5](../edge-cases.md)) depends on its registrations.
    at most 200 characters; `thread_id` a `thr_` ID; `kind` `any`, `reply` or `verification`; `since`
    RFC 3339, default the request's start. `kind=verification` without `from` is `400 invalid_request`
    (`details.errors[0].path = "from"`), because a code is released only for an expected sender domain.
-   `from_domain` is the registrable domain of `from` (the address's domain, or the `@domain`).
+   `from_domain` is the registrable domain of `from` (the address's domain, or the `@domain`). With
+   `kind=verification` and the tenant's `accounts.require_approval: true`, the handler then needs an
+   approved service-ledger entry of the identity whose `sender_domains` contains `from_domain`, or it answers
+   `403 policy_denied` with `details.reason = "account_not_approved"` and registers nothing
+   ([E9](../edge-cases.md)).
 2. **Register** (only when `from` is given). Send `MailboxRequest::RegisterWait { from_domain, ttl_ms }`
    with `ttl_ms = (timeout + 10) × 1000`. The mailbox sets
    `meta['wait:{from_domain}'] = max(stored value, now + ttl_ms)` in one transaction. The handler sends
@@ -876,7 +889,9 @@ rule 5 (unsolicited OTP, [E5](../edge-cases.md)) depends on its registrations.
    - `kind = verification`: a `verifications` row exists for the message with `expires_at > now`.
 4. **Release.** With `kind = verification` (or `any` with a match that has a verification row), the
    `verification` object is filled only when the message's verdict is `pass` and the row's
-   `sender_domain` equals `from_domain`; otherwise it is `null` and the message is still returned. The
+   `sender_domain` equals `from_domain`, and, with `accounts.require_approval: true`, the row's `account_id`
+   names an entry that is still `approved` (one D1 read by ID, [E13](../edge-cases.md)); otherwise it is
+   `null` and the message is still returned. The
    first release sets `consumed_at = now`. A later `wait` can release the same value for 1 hour after
    `consumed_at` (a client retrying after a lost response); the daily maintenance alarm deletes rows past
    `expires_at` or more than 1 hour past `consumed_at`.
@@ -933,6 +948,7 @@ pub struct IngestInput {
     pub auth: AuthSummary,                         // verdict, auth_json
     pub spam_base: f32, pub flags: Vec<String>,
     pub refs: Vec<Ref>, pub attachments: Vec<AttachmentMeta>, pub verification: Option<Verification>,
+    pub approved_accounts: Option<Vec<ApprovedAccount>>,   // step 12; None when the gate does not apply
     pub sender_suppressed: bool, pub receive_list: Option<ListKind>,
     pub tenant_domains: Vec<String>, pub is_primary_recipient: bool, pub is_bcc: bool,
     pub policy: InboundPolicy, pub parser_version: u32, pub loopback: Option<LoopbackSource>,

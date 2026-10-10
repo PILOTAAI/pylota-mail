@@ -102,6 +102,11 @@ The `Fanout` consumer sets `fanned_out_at` on a platform event once its `Deliver
 (step 3 below), also when no endpoint matched. So an event that no endpoint subscribes to is fanned out
 once, not every minute for an hour.
 
+The other events without an owner object are written the same way, in the D1 batch of the change that
+causes them, with a new event ID from that request: `member.*`, `billing.*`, `tenant.policy_updated`
+([Workspace policy §4](workspace-policy.md#4-the-write)) and `account.*` ([Service sign-up ledger §6](service-accounts.md#6-events)),
+which also set `identity_id`, so identity filters apply to them.
+
 ## Event envelope and payloads
 
 ```rust

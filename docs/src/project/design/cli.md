@@ -1589,6 +1589,8 @@ have no command: they are set only in the console ([Notifications §2](notificat
 | `tenants create\|list\|get\|update` | `POST /v1/tenants`; `GET /v1/tenants` (`--partner` sends `partner_id`); `GET /v1/tenants/{id}`; `PATCH /v1/tenants/{id}` (platform or partner key, `tenants:manage`) |
 | `partners create\|list\|get\|update\|delete` | `POST /v1/partners`; `GET /v1/partners`; `GET /v1/partners/{id}`; `PATCH /v1/partners/{id}`; `DELETE /v1/partners/{id}` (platform key, `partners:manage`) |
 | `tenants suspend\|resume` | `PATCH /v1/tenants/{id}` `{"status":"suspended"\|"active"}` |
+| `tenants policy` | Without `--set`/`--set-file`: `GET /v1/tenants/{id}/policy`; with them: `PATCH /v1/tenants/{id}/policy` (`policy:write`, platform, partner or tenant key; [Workspace policy](workspace-policy.md)) |
+| `accounts request\|list\|get\|approve\|reject\|close\|delete` | `POST /v1/identities/{id}/accounts`; `GET /v1/identities/{id}/accounts` or, with `--tenant`, `GET /v1/tenants/{t}/accounts`; `GET …/accounts/{sac}`; `POST …/{sac}/approve`; `POST …/{sac}/reject`; `POST …/{sac}/close`; `DELETE …/{sac}` (`accounts:request`; approve, reject and delete `accounts:approve`; [Service sign-up ledger](service-accounts.md)) |
 | `identities create\|list\|get\|update` | `POST /v1/tenants/{t}/identities`; `GET /v1/tenants/{t}/identities` or `GET /v1/identities`; `GET /v1/identities/{id}`; `PATCH /v1/identities/{id}` |
 | `identities pause\|resume` | `PATCH /v1/identities/{id}` `{"status":"paused"\|"active"}` |
 | `identities delete` | `DELETE /v1/identities/{id}` (typed confirmation of the address) |

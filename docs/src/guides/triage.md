@@ -83,8 +83,9 @@ model reads, so write it as a short definition:
 }
 ```
 
-Set it back to `null` to return to the built-in list. Tenant policy is changed with
-`PATCH /v1/tenants/{tenant_id}` and a platform key that holds `tenants:manage`
+Set it back to `null` to return to the built-in list. A workspace changes its own policy on the console's
+policy page (owners and admins) or with `PATCH /v1/tenants/{tenant_id}/policy` and a tenant key that holds
+`policy:write`; categories and rules are free fields, so any workspace may set them
 ([Configuration › Tenant policy](../reference/configuration.md#tenant-policy)).
 
 ## Needs-reply and urgency
