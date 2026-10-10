@@ -5,9 +5,9 @@ back to per-recipient status, without ever producing a second email for one `Ide
 
 | | |
 |---|---|
-| Requirements | FR-OUT-1 … FR-OUT-12, FR-DLV-1 … FR-DLV-5, FR-IDN-2, FR-IDN-3, FR-DOM-5, FR-DOM-6, FR-DOM-8, FR-DOM-11, FR-TEN-2, FR-TEN-3, FR-BILL-4, FR-BILL-5, FR-CON-14 (notification sends), NFR-PERF-1, NFR-PERF-2 |
-| Edge cases | [A7](../edge-cases.md), [A8](../edge-cases.md), [A10](../edge-cases.md), [C2](../edge-cases.md), [C4](../edge-cases.md), [C6](../edge-cases.md), [C7](../edge-cases.md), [D3](../edge-cases.md), [D6](../edge-cases.md), [E2](../edge-cases.md), [E3](../edge-cases.md), [E8](../edge-cases.md), [G1–G11](../edge-cases.md), [J5](../edge-cases.md), [K3](../edge-cases.md), [L1](../edge-cases.md), [L2](../edge-cases.md), [N11](../edge-cases.md), [N14–N16](../edge-cases.md), [N18](../edge-cases.md), [N19](../edge-cases.md), [O17](../edge-cases.md) |
-| Code | `crates/worker/src/handlers/send.rs`, `mailbox/{submit.rs, compose.rs, locks.rs, deliveries.rs, idempotency.rs}`, `transport/{mod.rs, cloudflare.rs, ses.rs, smtp.rs, simulator.rs, loopback.rs}`, `consumers/{outbound.rs, delivery.rs, ses_events.rs}`, `quota/mod.rs`, `billing/quota.rs`; `crates/core/src/{policy.rs, compose.rs, ses.rs, sns.rs, smtp.rs}` |
+| Requirements | FR-OUT-1 … FR-OUT-16, FR-DLV-1 … FR-DLV-7, FR-IDN-2, FR-IDN-3, FR-DOM-5, FR-DOM-6, FR-DOM-8, FR-DOM-11, FR-TEN-2, FR-TEN-3, FR-BILL-4, FR-BILL-5, FR-CON-14 (notification sends), NFR-PERF-1, NFR-PERF-2 |
+| Edge cases | [A7](../edge-cases.md), [A8](../edge-cases.md), [A10](../edge-cases.md), [A15](../edge-cases.md), [C2](../edge-cases.md), [C4](../edge-cases.md), [C6](../edge-cases.md), [C7](../edge-cases.md), [D3](../edge-cases.md), [D6](../edge-cases.md), [D11](../edge-cases.md), [E2](../edge-cases.md), [E3](../edge-cases.md), [E8](../edge-cases.md), [G1–G12](../edge-cases.md), [I9](../edge-cases.md), [J5](../edge-cases.md), [J13](../edge-cases.md), [J20](../edge-cases.md), [K3](../edge-cases.md), [L1](../edge-cases.md), [L2](../edge-cases.md), [N11](../edge-cases.md), [N13–N16](../edge-cases.md), [N18](../edge-cases.md), [N19](../edge-cases.md), [O17](../edge-cases.md) |
+| Code | `crates/worker/src/handlers/send.rs`, `mailbox/{submit.rs, compose.rs, locks.rs, deliveries.rs, idempotency.rs}`, `transport/{mod.rs, cloudflare.rs, ses.rs, smtp.rs, simulator.rs, loopback.rs, breaker.rs}`, `consumers/{outbound.rs, delivery.rs, ses_events.rs}`, `domains/cloudflare_api.rs` (the G4 suppression lookup), `quota/mod.rs`, `billing/quota.rs`; `crates/core/src/{policy.rs, compose.rs, ses.rs, sns.rs, smtp.rs}` |
 | ADR | [0004 Required idempotency](../adr/0004-idempotency.md) |
 
 ```text
@@ -15,11 +15,12 @@ POST …/messages ─▶ handler: auth, rate limit, Idempotency-Key, schema, fin
                      │  MailboxRequest::Submit
                      ▼
              IdentityMailbox.submit: idempotency lookup → in-flight check → policy pipeline →
-             compose (MIME → R2 out/{msg}.eml) → TenantQuota: sends hold + daily reserve → thread lock →
-             TRANSACTION { message queued, deliveries, idempotency row, lock } → 202
+             compose in memory → TenantQuota: sends hold + daily reserve → thread lock + compose marker →
+             R2 out/{msg}.eml → TRANSACTION { message queued, deliveries, idempotency row } → 202
                      │ after commit: pointer
                      ▼
-             pm-outbound consumer: re-read scope → BeginTransport (claim) → MailTransport.send
+             pm-outbound consumer: re-read scope, suppressions, breaker → BeginTransport → build →
+                                   ClaimTransport (claim) → MailTransport.send
                      │                                   ├─ cloudflare (send_email binding)
                      │                                   ├─ ses (SendEmail v2, raw, SigV4)
                      │                                   ├─ smtp (the customer's relay, TCP socket, TLS)
@@ -53,11 +54,14 @@ pm-delivery-events ─▶ delivery consumer ─▶ ApplyDeliveryEvent ─▶ per
 6. **D1 context** in one `batch` (5-second deadline; `503 unavailable` on failure): the identity row
    (`status`, `pause_reason`, `owner_*`, `display_name`, `signature_*`, `send_policy_json`, `is_system`),
    the tenant (`status`, `mode`, `policy_json`, `timezone`, `created_at`, `ramp_lifted_at`,
-   `partner_id`) with its `billing_accounts` `mode` and `plan_id` and its partner's `ramp_exempt` (for the
-   send ramp of step 18), all of the identity's addresses
-   with their domains (`state`, `kind`, `transport`, `reply_token`, `sending`), the platform domain, suppressions for every
-   requested recipient (`address_hash IN (…)`), send-list entries for each recipient address and
-   `@domain`, and, for a test tenant, the directory rows of the recipients (policy step 8).
+   `sending_paused_at`, `partner_id`) with its `billing_accounts` `mode` and `plan_id` and its partner's
+   `ramp_exempt` (for the send ramp of step 18), all of the identity's addresses
+   with their domains (`state`, `kind`, `transport`, `reply_token`, `sending`, `sending_paused_at`), the
+   platform domain, suppressions for every requested recipient (`address_hash IN (SELECT value FROM
+   json_each(?))`), send-list entries for each recipient address and `@domain` (one JSON array of up to 98
+   entries), and, for a test tenant, the directory rows of the recipients with their tenant and its
+   `partner_id` (policy step 8). Every list is bound as one JSON array
+   ([Inbound › Storage caps](inbound.md#storage-caps)).
 7. **Call `MailboxRequest::Submit`** (30-second deadline). The handler does **not** apply policy
    itself: a replay must return the original response even if policy would now refuse it, so the
    mailbox checks idempotency first.
@@ -94,16 +98,27 @@ every request it was running, so the set cannot hold a stale key.
    The ledger stores only the key's SHA-256, so the same value can be kept in the R2 metadata of the
    sent copy and used to rebuild the ledger after a restore ([Composition](#composition)).
 
-   - Same fingerprint → return the stored `response_json` with `deduplicated: true`. No other work.
+   - Same fingerprint → return the stored `response_json` with `deduplicated: true`, with
+     `extracted_text` filled from the message row (and `text` and `html` when the request asked for
+     them). No other work. If the message row was erased since, the replay returns the stored body with
+     those fields `null`: the key still never sends twice.
    - Different fingerprint → `409 idempotency_conflict` with `details.original_message_id`.
 2. Key in `in_flight` → `409 request_in_progress` (retryable).
 3. Insert the key into `in_flight`; a guard removes it on every exit path.
-4. Run the policy pipeline, composition, quota reservation (the `sends` hold and the daily caps) and
-   lock (below). These include `.await`s, during which other requests may run.
-5. One transaction ([Storage](#storage-of-an-accepted-send)): re-check that no `idempotency` row exists
+4. Run the policy pipeline, composition in memory (no R2 write yet), and the quota reservation (the
+   `sends` hold and the daily caps). These include `.await`s, during which other requests may run.
+5. **Lock and marker.** One small transaction takes the thread lock (below; a new thread needs none) and
+   writes `meta['compose:{msg}'] = now`. A lock that cannot be taken within 10 seconds releases both
+   reservations and returns `409 thread_busy`, with nothing written to R2.
+6. **Sent copy.** Write `out/{msg}.eml` (and any linked attachments) to R2. A failed write releases the
+   lock, the marker and both reservations, and returns `503 unavailable`.
+7. One transaction ([Storage](#storage-of-an-accepted-send)): re-check that no `idempotency` row exists
    for the key, insert the message, deliveries and the `idempotency` row (`expires_at = now + 30 days`,
-   `response_json` = the Message object returned), take the lock.
-6. After commit: queue the pointer and return.
+   `response_json` = the Message object returned, with `extracted_text`, `text` and `html` set to
+   `null` so the row stays small), keep the lock, and delete the compose marker. If this transaction
+   fails or the re-check finds a row, the sent copy and the marker are deleted (best effort) and the
+   reservations released, so no refused send leaves an object behind ([I9](../edge-cases.md)).
+8. After commit: queue the pointer and return.
 
 Only accepted sends (`202`) are recorded. A request that fails with an error records nothing, so a retry
 with the same key re-evaluates it: no email was produced, and stateful errors (`identity_paused`,
@@ -120,19 +135,22 @@ alarm; an expired key behaves as new.
 | 1 | Identity `deleting`/`deleted` | `404 identity_not_found` |
 | 2 | Tenant `suspended` (FR-TEN-3). Checked before the identity's pause: a suspension pauses every identity with `pause_reason = 'tenant_suspended'`, so with the opposite order this error could never be returned | `403 tenant_suspended` |
 | 3 | Identity `paused` ([A7](../edge-cases.md), FR-IDN-3) | `409 identity_paused`, `details.reason` = `pause_reason` |
+| 3a | Tenant sending paused (`tenants.sending_paused_at` set, [Tenant and domain auto-pause](#tenant-and-domain-auto-pause-g12)) | `409 sending_paused`, `details.scope = "tenant"`, `details.reason = "abuse_threshold"` |
 | 4 | No accountable human: `owner_name` or `owner_email` is null ([A8](../edge-cases.md), FR-IDN-2) | `409 identity_owner_required` |
 | 5 | Target: for reply, reply-all and forward the message exists in this mailbox and is visible to the key (`hidden` and `throttled` never; `quarantined` only with `quarantine:review`); for `send` with `thread_id`, the thread exists | `404 message_not_found` / `404 thread_not_found` |
 | 6 | Recipients ([Recipients](#recipients)): each is a valid RFC 5321 address with an ASCII local part; duplicates removed case-insensitively; at least one | `400 address_invalid`; `400 address_unsupported` for a non-ASCII (SMTPUTF8) local part ([A3](../edge-cases.md)); `400 invalid_request` when there is no recipient |
 | 7 | Count across `to`, `cc`, `bcc` ≤ `policy.max_recipients` (default 10, at most 49: Cloudflare's limit is 50 and strategy B's journal copy takes one, so the limit is 49 on every transport) ([E3](../edge-cases.md)) | `400 too_many_recipients` |
-| 8 | Test tenant: every recipient is `*@simulator.invalid` or an `active`/`retiring` address on this deployment (FR-OUT-12, [L1](../edge-cases.md)) | `403 test_mode_recipient` |
+| 8 | Test tenant: every recipient is `*@simulator.invalid` or an `active`/`retiring` address on this deployment of an identity in **this tenant, or in a tenant with the same non-null `partner_id`** (FR-OUT-12, [L1](../edge-cases.md), [L3](../edge-cases.md)). Loopback skips authentication and spam scoring, so it never crosses into another workspace | `403 test_mode_recipient` |
 | 9 | `kind: marketing` has `unsubscribe.url` (HTTPS) and `consent` ([G9](../edge-cases.md), FR-OUT-8). Its transport is checked at step 15, once step 13 has resolved the sending address | `400 marketing_requirements_missing` |
 | 10 | `kind: auto_reply` only for reply or reply-all, to a message whose `kind` is `normal` or `calendar`, with `policy.auto_reply.allowed`, identity `send_policy.auto_reply` not `"denied"` (the default is `"allowed"`), and under the exchange cap ([D6](../edge-cases.md), FR-OUT-7) | `409 auto_reply_not_allowed` |
+| 10a | Loop guard, for every `kind`: the computed hop (`X-Pylota-Mail-Hop` of [Headers](#headers): 1 for a new send, else 1 + the hop of the message replied to or forwarded, or of the latest message of the thread for a threaded send) must be below `MAX_HOP` (10). An agent replying with the default kind is stopped as an auto-reply is ([N13](../edge-cases.md), [D6](../edge-cases.md)) | `409 loop_detected`, `details.hop` |
 | 11 | Custom headers ([Headers](#headers)) | `400 header_not_allowed` / `400 invalid_request` |
 | 12 | Content: `text` or `html` present; subject ≤ 998 characters; ≤ 32 attachments, valid base64, `content_id` on inline parts; labels and metadata within limits | `400 invalid_request` |
 | 13 | From address ([From](#from-address-and-fallback)): an `active` address of the identity, or `retiring` on a thread that already uses it ([G7](../edge-cases.md)) | `400 invalid_request` (`details.errors[0].path = "from_address"`) |
 | 14 | Sending domain: `pending` or `verifying` (or the address is `pending`) | `409 domain_not_ready` (retryable) |
-| 15 | Transport: `ses` configured (the SES secrets and region); and for `kind: marketing`, the domain of the From address resolved at step 13 has `transport` `ses` or `smtp`, because Cloudflare Email Service is for transactional mail only ([Cloudflare Email Service FAQ](https://developers.cloudflare.com/email-service/reference/faq/), read 2026-10-10). The platform domain and every `cloudflare`-transport domain fail this. `BeginTransport` checks it again with the transport actually chosen ([The outbound consumer](#the-outbound-consumer)) | `422 transport_unavailable`, `details.reason = "ses_not_configured"` or `"marketing_needs_ses"` |
-| 16 | Per recipient: suppression, send-block, `send_allowlist_only`, `require_known_recipient` ([Recipient filters](#recipient-filters)) | not an error: the recipient's delivery is `suppressed` (FR-OUT-4, [G4](../edge-cases.md), [E2](../edge-cases.md)) |
+| 14a | Sending domain paused (`domains.sending_paused_at` set, [Tenant and domain auto-pause](#tenant-and-domain-auto-pause-g12)). A paused domain never falls back to the platform domain | `409 sending_paused`, `details.scope = "domain"`, `details.domain_id` |
+| 15 | Transport: `ses` configured (the SES secrets and region); and for `kind: marketing`, the domain of the From address resolved at step 13 has `transport` `ses` or `smtp`, because Cloudflare Email Service is for transactional mail only (FR-OUT-15, [Cloudflare Email Service FAQ](https://developers.cloudflare.com/email-service/reference/faq/), read 2026-10-10). The platform domain and every `cloudflare`-transport domain fail this. `BeginTransport` checks it again with the transport actually chosen ([The outbound consumer](#the-outbound-consumer)) | `422 transport_unavailable`, `details.reason = "ses_not_configured"` or `"marketing_needs_ses"` |
+| 16 | Per recipient: suppression, send-block, `send_allowlist_only`, `require_known_recipient` (on by default, [Recipient filters](#recipient-filters)) | not an error: the recipient's delivery is `suppressed` (FR-OUT-4, [G4](../edge-cases.md), [E2](../edge-cases.md)) |
 | 17 | Size after composition ([Attachments and size](#attachments-and-size)) | `413 message_too_large`, unless `large_attachments: "link"` |
 | 18 | Plan allowance and daily caps, in one `TenantQuota` request and one transaction ([TenantQuota](#tenantquota)). First the **`sends` hold** (FR-BILL-4, FR-BILL-5): `units` = recipients left after step 16, `ref` = the new `msg_` ID, gate `storage_gb` when the message has attachments; a send whose recipients are all suppressed takes no hold. Then the **daily-cap reserve** (identity cap: `send_policy.daily_cap`, else `policy.identity_daily_send_cap`; tenant cap: `policy.tenant_daily_send_cap`), counted per accepted message in the tenant's time zone ([E3](../edge-cases.md)). The tenant cap is min(`policy.tenant_daily_send_cap`, 50) while the **new-workspace send ramp** applies: `tenants.ramp_lifted_at IS NULL` and either the tenant has a partner whose `ramp_exempt` is `0` (whatever `PM_BILLING` and its billing mode), or it has no partner, `PM_BILLING=stripe` and the workspace is `metered` on the catalog's `default_plan` ([Cloud sign-up › New-workspace send ramp](cloud-signup.md#101-new-workspace-send-ramp), [W30](../edge-cases.md)). The **system identity** (`is_system = 1`) is exempt from the tenant cap: its reserve passes `tenant_cap: None`, so the tenant `sends` counter is neither checked nor incremented, and only its own `send_policy.daily_cap` (50,000) applies ([Identities and domains › The system identity](identity-domains.md#the-system-identity)). If either check fails, neither is kept | `402 billing_limit` (`details.feature` = `sends` or `storage_gb`); `429 daily_cap_reached`, `details.resets_at` |
 | 19 | Thread lock ([C4](../edge-cases.md), FR-OUT-9) | `409 thread_busy`, `details.retry_after` |
@@ -181,8 +199,25 @@ Each recipient that matches one of these becomes a delivery row with status `sup
 - an unexpired row in `suppressions` for `HMAC-SHA256(PM_HASH_KEY, address)` (FR-OUT-4);
 - a send-block entry for the address or `@domain`;
 - `policy.send_allowlist_only` and no send-allow entry for the address or `@domain`;
-- identity `send_policy.require_known_recipient` and no `contacts` row for the address with
-  `inbound_count > 0` or `outbound_count > 0` ([E2](../edge-cases.md)).
+- identity `send_policy.require_known_recipient` (default `true` for every identity except the system
+  identity, which setup creates with `false`) and the recipient is not **known** ([E2](../edge-cases.md)).
+
+**Known recipient.** A recipient is known when any of these holds:
+
+1. the identity has written to it before: its `contacts` row has `outbound_count > 0`. Only a
+   recipient whose delivery was not `suppressed` increments `outbound_count` (the contacts upsert of
+   [Storage](#storage-of-an-accepted-send)), so a refused attempt never makes the next one pass;
+2. a send-allow entry of the tenant names the address or its `@domain`;
+3. for `reply` and `reply_all` only, it is the reply target of the message replied to
+   ([Recipients](#recipients)), and that message is `received` with verdict `pass`: answering the
+   authenticated sender of the mail being answered is not writing to a new address.
+
+Mail the identity received does not make its sender known: `inbound_count` counts received and
+quarantined mail, so an attacker's own first message would otherwise unlock its address for the
+exfiltration that a second, spoofed message then asks for. `reply_all`'s other recipients and every
+recipient of `send` and `forward` must be known by rules 1 or 2. Integrators that send to new people by
+design (booking confirmations, a backend rather than a steered agent) set
+`send_policy.require_known_recipient: false` on that identity, or add send-allow entries.
 
 If every recipient is filtered, the send is still accepted (`202`), stored with status `suppressed`, and
 `message.suppressed` is emitted with the recipients; nothing reaches a transport
@@ -206,7 +241,12 @@ A count ≥ `policy.auto_reply.max_automatic_exchanges` (default 2) refuses the 
 thread and policy data. The result is serialised to MIME with `mail-builder` (with an explicit
 `Message-ID`, `Date` and multipart boundaries, because `mail-builder` reads the system clock otherwise;
 see [Rust workspace](rust-workspace.md#3-workspace-dependencies)) and written to
-`t/{ten}/i/{idn}/out/{msg}.eml` **before** the transaction, so the row never points to a missing object.
+`t/{ten}/i/{idn}/out/{msg}.eml` **before** the accept transaction, so the row never points to a missing
+object, but only after the quota reservation and the thread lock have succeeded (submit steps 5 and 6),
+so the usual refusals (`402`, `429`, `thread_busy`) never leave an object behind. A compose marker covers
+the remaining window, and any later refusal deletes the copy ([Inbound › Orphan objects](inbound.md#orphan-objects)).
+For the system identity, the copy holds a real sign-in link or token, so it is deleted as soon as the
+message leaves `queued` ([Inbound › The system identity's mailbox](inbound.md#the-system-identitys-mailbox)).
 The stored copy has no `Bcc` header; BCC recipients are in `bcc_json` and `deliveries`. Its custom metadata
 holds `tenant`, `identity`, `message`, `idem_key_sha256` (the ledger's `key_hash`), `fingerprint` and
 `operation`, so a point-in-time restore of the mailbox can rebuild the idempotency ledger for sends made
@@ -228,7 +268,8 @@ after the restore point ([Observability › Restore from PITR](observability.md#
    |---|---|
    | `healthy`, `degraded` | Send as composed |
    | `pending`, `verifying` (the domain changed after submit, for example a reprove moved it from `suspended` to `verifying`) | **Hold and retry:** nothing is sent and the message stays `queued`. `BeginTransport` takes no claim and answers `DomainNotReady`; the consumer re-enqueues the message with the `Paused` back-off (as `Quota`), until 24 h after submit, then the queued deliveries are `failed` (`quota_exhausted`), as for every back-off ([Back-off bookkeeping](#transport-outcome-classification)) |
-   | `failing`, `suspended`, or `transport = ses` while the platform check reports `ses_sending_paused`, with `policy.domain_fallback = true` | **Fallback:** From becomes the identity's platform-domain address with the same display name, Reply-To becomes that address with the thread token, the message gets flag `sent_via_fallback`, the transport is Cloudflare (the platform domain is always a Cloudflare zone), and the thread gets `fallback_pinned = 1`. A `kind: marketing` message never falls back (Cloudflare Email Service is transactional only): it takes the next row instead |
+   | `transport = ses` while the platform check reports `ses_sending_paused`; or the domain or the tenant is sending-paused ([G12](../edge-cases.md)) | **Hold, never fall back:** nothing is sent; the message stays `queued` and is re-enqueued with the `Paused` back-off, ending `failed` (`quota_exhausted`) 24 h after submit like every back-off. A provider pause or an abuse pause is about reputation, so moving the mail to the shared platform domain would spread the harm to every tenant |
+   | `failing` or `suspended`, with `policy.domain_fallback = true` | **Fallback:** From becomes the identity's platform-domain address with the same display name, Reply-To becomes that address with the thread token, the message gets flag `sent_via_fallback`, the transport is Cloudflare (the platform domain is always a Cloudflare zone), and the thread gets `fallback_pinned = 1`. A `kind: marketing` message is never sent through fallback (Cloudflare Email Service is transactional only): `BeginTransport` rejects it with `marketing_needs_ses` ([The outbound consumer](#the-outbound-consumer) step 2) |
    | The same, with `policy.domain_fallback = false` | Status `failed`, reason `domain_failing_no_fallback`; nothing is sent |
    | `removing`, `removed` | Status `rejected`, reason `sender_domain_unavailable` |
 
@@ -312,6 +353,7 @@ In this order:
 | `Auto-Submitted: auto-replied` | Service | `kind: auto_reply` (FR-OUT-7) |
 | `X-Pylota-Mail-Hop: n` | Service | Always: `n` = 1 for a new send, else 1 + the hop of the message replied to or forwarded (stored as `automated_json.hop` on inbound messages, 0 when absent) |
 | `X-AI-Generated: true` | Service | `ai_disclosure.mode = "header"` |
+| `X-Pylota-Mail-Role-Hop: 1`, `Auto-Submitted: auto-generated` | Service | A role-mail relay from the system identity, whose internal submit input carries `role_relay: true` ([Inbound › Role mail relay](inbound.md#role-mail-relay)); the field exists only on the internal input, and the mailbox refuses it on any other identity |
 | `List-Unsubscribe`, `List-Unsubscribe-Post` | Service | `kind: marketing`; or a `kind: transactional` notification from the system identity whose internal submit input carries `list_unsubscribe` ([Body](#body-signature-disclosure-unsubscribe)). A caller can never set either name: it falls under "anything else" |
 | `X-*` | Caller | A name matching `^X-[A-Za-z0-9_-]+$` (the `X-` prefix in either case), except the reserved `X-Pylota-*` and `X-AI-Generated`, which are refused in any case |
 | `Importance` | Caller | Value `high`, `normal` or `low` |
@@ -361,8 +403,8 @@ set by the transport.
 
 ## Thread lock (C4)
 
-A reply, reply-all, forward or threaded send takes the thread's lock in the submit transaction
-(FR-OUT-9). A new thread needs no lock.
+A reply, reply-all, forward or threaded send takes the thread's lock in the lock transaction of submit
+step 5, before the sent copy is written (FR-OUT-9). A new thread needs no lock.
 
 ```sql
 UPDATE threads SET lock_owner = ?1, lock_until = ?2
@@ -370,7 +412,7 @@ WHERE seq = ?3 AND (lock_owner IS NULL OR lock_until < ?4 OR lock_owner = ?1);
 -- ?1 the new message ID, ?2 now + 120 000 (lease), ?4 now; acquired when changes = 1
 ```
 
-- **Waiting.** If the lock is held, the transaction is abandoned (nothing written), the request waits
+- **Waiting.** If the lock is held, the lock transaction is abandoned (nothing written), the request waits
   250 ms (`worker::Delay`, re-checking `deadline_ms`), and tries again, for at most 10 seconds from the
   first attempt. Then `409 thread_busy` with
   `details.retry_after = clamp(ceil((lock_until − now) / 1000), 1, 60)`. The client retries with the
@@ -393,12 +435,16 @@ INSERT INTO messages (id, thread_seq, direction, status, provider, raw_r2_key, r
   from_address, from_name, sender_domain, reply_to_json, to_json, cc_json, bcc_json, subject, text,
   html_sanitized, extracted_text, snippet, sent_at, received_at, kind, flags_json,
   operation, in_reply_to, references_json, metadata_json)
-VALUES (?1, ?2, 'outbound', 'queued', NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?13,
+VALUES (?1, ?2, 'outbound', 'queued', NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?22,
   ?15, ?16, ?16, ?17, '[]', ?18, ?19, ?20, ?21)
 RETURNING rowid;
 -- status is 'suppressed' instead of 'queued' when every recipient was filtered
--- extracted_text = text for outbound; sent_at = received_at = submit time
+-- ?13 text (the sent text cut to 512 KiB) and ?22 extracted_text (the same text cut to 256 KiB); the row
+-- follows the 1,900,000-byte budget and cut order of Inbound › Storage caps, with flag body_truncated
+-- when a body is cut (the exact sent message is in the .eml); sent_at = received_at = submit time
 -- ?14 html_sanitized: the sent HTML passed through the inbound sanitiser (the exact sent HTML is in the .eml)
+-- system identity: text, html_sanitized, extracted_text and snippet redacted ([link], [code]), flag
+-- body_redacted (Inbound › The system identity's mailbox)
 -- the Idempotency-Key is not a messages column: it lives in the idempotency row below and, for a restore,
 -- in the .eml's R2 metadata (idem_key_sha256)
 
@@ -412,8 +458,10 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6 + 2592000000);
 ```
 
 Then: the thread row update ([Threading](threading.md#42-the-outbound-message-row)), contacts upsert for
-each recipient (`outbound_count + 1`), the lock, `meta` `dispatch:{msg} = now`, and for a fully
-suppressed send the `message.suppressed` event. Quota warnings returned by `TenantQuota` at 80% and 100%
+each recipient whose delivery is `queued` (`outbound_count + 1`; a `suppressed` recipient is not
+counted, so a refused attempt never makes it a known recipient), the lock, `meta` `dispatch:{msg} = now`,
+the deletion of `compose:{msg}`, and for a fully suppressed send the `message.suppressed` event. The
+system identity's mailbox writes no FTS row ([A15](../edge-cases.md)). Quota warnings returned by `TenantQuota` at 80% and 100%
 are emitted here as `quota.warning` (once per scope, metric and day).
 
 After commit the mailbox sends `OutboundJob::Send` to `pm-outbound`. If that fails, the message stays
@@ -454,7 +502,8 @@ pub enum TransportResult {
 pub struct RecipientRefusal { pub address: String, pub code: String, pub detail: String }
 pub enum RejectReason { ProviderValidation, SenderDomainUnavailable }
 pub enum RetryClass { RateLimit, Quota, Paused, Relay }
-pub enum UncertainReason { Timeout, ConnectionLost }
+pub enum UncertainReason { Timeout, ConnectionLost, ProviderOutcomeUnknown }   // the last: E_DELIVERY_FAILED
+                                                                                // with several recipients
 
 pub trait MailTransport {
     fn provider(&self) -> Provider;
@@ -489,41 +538,65 @@ pub enum OutboundJob {
 
 For `Send`:
 
-1. **Re-read** identity, tenant and the sending domain from D1. If the identity is now `paused` or
-   `deleting`, or the tenant `suspended`, call `Cancel` with actor `system` (status `canceled`,
-   `message.canceled`, audit entry `message.cancel` with the reason) and ack.
-2. **`BeginTransport { message_id, domain_state, fallback }`** in the mailbox:
+1. **Re-read** from D1, in one `batch`: the identity, the tenant (with `sending_paused_at`), the tenant's
+   partner (`status`), the sending domain (with `sending_paused_at`), the transport's breaker row
+   ([Transport circuit breaker](#transport-circuit-breaker-j20)), and, for the message's `queued`
+   recipients, their suppressions and the tenant's send-block entries (each list bound as one JSON array).
+   If the identity is now `paused` or `deleting`, the tenant `suspended`, or its partner `suspended`
+   ([J13](../edge-cases.md)), call `Cancel` with actor `system` (status `canceled`, `message.canceled`,
+   audit entry `message.cancel` with the reason, the `sends` hold released) and ack.
+2. **`BeginTransport { message_id, domain_state, fallback, suppressed, breaker }`** in the mailbox. It
+   decides everything except the claim:
    - status not `queued` → `NotQueued` → ack (a duplicate, or already handled);
-   - sending domain `pending` or `verifying` → `DomainNotReady` → no claim; re-enqueue with the `Paused`
-     back-off ([From address and fallback](#from-address-and-fallback));
    - a claim `meta` `claim:{msg}` younger than 5 minutes → `AlreadyClaimed` → ack;
    - a claim older than 5 minutes → the previous attempt died after claiming, so its outcome is unknown:
-     record `uncertain` with `transport_connection_lost` and ack;
-   - otherwise write `claim:{msg} = {token, claimed_at}`, refresh the lock lease, set `alarm:claim` at
-     `claimed_at + 5 min`, apply the From decision (fallback or `domain_failing_no_fallback`), and return
-     the `OutgoingMessage` inputs (the `.eml` key, `queued` recipients, From, Reply-To, transport);
+     record `uncertain` with `transport_connection_lost` and ack (the deliveries' `updated_at` is the
+     claim's `claimed_at`, the time the transport call may have happened, for
+     [reconciliation](#uncertain-sends-and-reconciliation-fr-dlv-4));
+   - **suppressions after submit** ([G4](../edge-cases.md)): each `queued` recipient in `suppressed` (a
+     suppression or send-block written since the submit) becomes a `suppressed` delivery with
+     `smtp_response = "policy: suppression (…)"` or `"policy: send_block"`; when none is left the
+     message ends `suppressed`, `message.suppressed` is emitted, the lock is released and the `sends`
+     hold settled with nothing consumed;
+   - sending domain `pending` or `verifying`, or the breaker `open` → `Hold` → no claim; re-enqueue with
+     the `Paused` back-off ([From address and fallback](#from-address-and-fallback));
+   - otherwise apply the From decision (fallback, hold, or `domain_failing_no_fallback`), refresh the lock
+     lease and return the `OutgoingMessage` inputs (the `.eml` key, `queued` recipients, From, Reply-To,
+     transport);
    - after the From decision, a `kind: marketing` message whose transport is now `cloudflare` (the
      domain's transport changed after submit, or fallback chose the platform domain) is not sent: in the
      same transaction its `queued` deliveries and the message become `rejected` with reason
      `marketing_needs_ses`, the lock is released and no claim is written; after the commit the `sends`
      hold is settled with nothing consumed, `message.rejected` is emitted, and the consumer acks.
 3. **Build** the `OutgoingMessage` (structured fields parsed back from the stored `.eml` with the core
-   parser, overridden by the fallback decision; attachments read from R2).
-4. **Send** through the chosen transport with a 30-second deadline (SMTP: the step timeouts and the
+   parser, overridden by the fallback decision; attachments read from R2). Building can take seconds, so
+   it happens before the claim.
+4. **`ClaimTransport { message_id }`**, immediately before the transport call: in one transaction,
+   re-check that the message is still `queued` with no claim younger than 5 minutes (else ack, as in
+   step 2), write `claim:{msg} = {token, claimed_at}` and set `alarm:claim` at `claimed_at + 5 min`. It
+   returns the `claim_token`.
+5. **Send** through the chosen transport with a 30-second deadline (SMTP: the step timeouts and the
    4-minute overall deadline of [SMTP relay](#smtp-relay)).
-5. **`RecordTransportOutcome { message_id, claim_token, result }`**: in one transaction, clear the claim,
-   update the message and deliveries per the classification below, release the lock where required,
-   append events. It returns the back-off delay for `RetryLater`, and for an `Accepted` result with a
-   non-empty `deferred` list. **The message stays `queued` while any delivery is still `queued`**: an
-   SMTP `Accepted` with `deferred` recipients sets the accepted deliveries to `submitted`, the refused ones
-   to `rejected`, keeps the deferred ones `queued`, and leaves the message `queued` (with
-   `provider_message_id` set from this attempt). After the commit the mailbox settles the `sends` hold
-   for the part that is decided: `Settle { consume, keep }` consumes one unit per delivery that reached
-   `submitted` in this attempt, keeps `keep` = the number of deferred deliveries held for their retry
-   (`expires_at` = the retry time + 10 minutes), and releases the rest; for `rejected`, `failed` and
-   `uncertain` it consumes nothing
+6. **`RecordTransportOutcome { message_id, claim_token, result }`**: in one transaction, check that
+   `claim:{msg}` still holds this `claim_token`, clear the claim, update the message and deliveries per
+   the classification below, release the lock where required, append events. It returns the back-off
+   delay for `RetryLater`, and for an `Accepted` result with a non-empty `deferred` list. **The message
+   stays `queued` while any delivery is still `queued`**: an SMTP `Accepted` with `deferred` recipients
+   sets the accepted deliveries to `submitted`, the refused ones to `rejected`, keeps the deferred ones
+   `queued`, and leaves the message `queued` (with `provider_message_id` set from this attempt). After the
+   commit the mailbox settles the `sends` hold for the part that is decided: `Settle { consume, keep }`
+   consumes one unit per delivery that reached `submitted` in this attempt, keeps `keep` = the number of
+   deferred deliveries held for their retry (`expires_at` = the retry time + 10 minutes), and releases the
+   rest; for `rejected`, `failed` and `uncertain` it consumes nothing
    ([Plans, metering and billing › What the Worker meters](billing.md#what-the-worker-meters)).
-6. **Ack**, or for `RetryLater` (and for `Accepted` with `deferred` recipients) call `Extend` on the
+   **A stale token** (the claim was resolved to `uncertain` by the stale-claim rule, or replaced): an
+   `Accepted` result still records what happened, because it is evidence that the mail went out: the
+   message, if it is `uncertain` with no `provider_message_id`, gets the provider ID, its `uncertain`
+   deliveries become `submitted`, the flag `reconciled` is added and `message.reconciled` is emitted, and
+   one unit per recipient is consumed without a hold. Any other result with a stale token changes nothing
+   and is counted in `stale_claim_outcome_total`. The outcome also updates the transport's breaker row
+   ([Transport circuit breaker](#transport-circuit-breaker-j20)).
+7. **Ack**, or for `RetryLater` (and for `Accepted` with `deferred` recipients) call `Extend` on the
    `sends` hold (`until` = the retry time + 10 minutes; for a partial acceptance the `keep` above already
    did it), then **re-enqueue**: send a new `OutboundJob::Send` for the message to `Q_OUTBOUND` with
    `delay_seconds = delay` and ack the current one. The retry sends only to deliveries still `queued`,
@@ -533,6 +606,31 @@ For `Send`:
 
 The claim alarm runs the same stale-claim rule for claims older than 5 minutes, so a consumer that dies
 after claiming is resolved to `uncertain` even if its queue message is never redelivered.
+
+### Transport circuit breaker (J20)
+
+During a provider outage, every send gets an unknown outcome (`E_INTERNAL_SERVER_ERROR`, SES `5xx`, a
+dropped connection) and would become `uncertain`, which only a person or a later event can settle. The
+breaker stops claiming instead ([J20](../edge-cases.md)). One D1 row in `transport_breakers` per scope:
+`cloudflare` (the account), `ses:{region}`, and `smtp:{domain_id}` for each relay.
+
+- **Count.** `RecordTransportOutcome` reports each outcome to the consumer, which updates the row: an
+  `Unknown` result increments `consecutive_unknown`; any definitive result (`Accepted`, `Rejected`,
+  `RecipientSuppressed`, `RetryLater`) sets it to 0 (only when it is not already 0, so the normal case
+  writes nothing).
+- **Open.** When `consecutive_unknown` reaches 3, the row becomes `open` with `open_until = now + 5 min ×
+  2^open_count` (at most 1 hour) and `open_count + 1`, and the `transport_breaker_open` alert fires.
+  While it is open, `BeginTransport` takes no claim: messages stay `queued` with the `Paused` back-off,
+  so they are definitely not sent and keep their place, and the 24-hour back-off limit still applies.
+- **Half-open.** After `open_until`, the first consumer that sets `state = 'half_open'` and
+  `probe_message_id` with a conditional `UPDATE … WHERE state = 'open' AND open_until <= ?now` sends its
+  message; every other message keeps waiting. A definitive outcome closes the breaker (`closed`,
+  `open_count = 0`); an `Unknown` re-opens it with the doubled period. A probe whose outcome never comes
+  back (the consumer died) is resolved by its claim alarm, and the next half-open attempt is allowed 10
+  minutes after `updated_at`.
+
+A message already claimed when the breaker opens is not affected. Failing over pre-verified domains to
+SES stays a runbook action ([J5](../edge-cases.md)); the breaker only holds.
 
 ### Transport outcome classification
 
@@ -544,7 +642,8 @@ codes are from the SES v2 `SendEmail` reference (read 2026-10-09). SMTP rows fol
 |---|---|---|---|---|
 | Accepted (Cloudflare `{messageId}`, SES `200 {MessageId}`, SMTP `250` to the final `.`, simulator, loopback) | `submitted`, `provider_message_id` set; SMTP with `deferred` recipients: stays `queued` until they are sent | `submitted` (SMTP: those in `refused` are `rejected`, those in `deferred` stay `queued`) | SMTP `deferred` only: `Relay` back-off for those deliveries, then `failed` (`quota_exhausted`) after 24 h | `message.sent` once the message leaves `queued` |
 | Cloudflare `E_VALIDATION_ERROR`, `E_FIELD_MISSING`, `E_TOO_MANY_RECIPIENTS`, `E_TOO_MANY_ATTACHMENTS`, `E_CONTENT_TOO_LARGE`, `E_HEADER_NOT_ALLOWED`, `E_HEADER_USE_API_FIELD`, `E_HEADER_VALUE_INVALID`, `E_HEADER_VALUE_TOO_LONG`, `E_HEADER_NAME_INVALID`, `E_HEADERS_TOO_LARGE`, `E_HEADERS_TOO_MANY` ([G10](../edge-cases.md)) | `rejected` | `rejected` | never | `message.rejected` (`provider_validation`) |
-| Cloudflare `E_DELIVERY_FAILED` ("SMTP delivery failure, recipient server rejection"; definitive) | `rejected` | `rejected` | never | `message.rejected` (`provider_validation`, detail from the error) |
+| Cloudflare `E_DELIVERY_FAILED` ("SMTP delivery failure, recipient server rejection") on a send with **one** queued recipient | `rejected` | `rejected` | never | `message.rejected` (`provider_validation`, detail from the error) |
+| Cloudflare `E_DELIVERY_FAILED` on a send with **several** queued recipients. The Workers API page does not say whether the error means every recipient was refused or only one, so some may have received it; spike S1 records the semantics, and until then the outcome is unknown | `uncertain` | `uncertain` | **never** | `message.uncertain` (`provider_outcome_unknown`, detail from the error) |
 | Cloudflare `E_RECIPIENT_NOT_ALLOWED` (binding restriction; never configured by us) | `rejected` | `rejected` | never | `message.rejected` (`provider_validation`); alert |
 | Cloudflare `E_SENDER_DOMAIN_NOT_AVAILABLE`, `E_SENDER_NOT_VERIFIED`; SES `MailFromDomainNotVerifiedException`, `NotFoundException` | `rejected` | `rejected` | never | `message.rejected` (`sender_domain_unavailable`); the domain gets an immediate health check |
 | Cloudflare `E_RECIPIENT_SUPPRESSED` | see [Provider suppressions](#provider-suppressions-and-resending-g4) | | | |
@@ -583,14 +682,26 @@ lost.
 Cloudflare's per-domain "drop suppressed recipients" setting is off by default, and the design keeps it
 off (onboarding sets `drop_suppressed_recipients: false`), so a send that includes a recipient on
 Cloudflare's suppression list fails as a whole with `E_RECIPIENT_SUPPRESSED`, which is definitive
-(read 2026-10-09). Then:
+(read 2026-10-09). Since 25 September 2026 Email Sending creates its bounce and complaint suppressions
+with the scope `sending_domain` (the domain of the message that bounced), and a recipient is suppressed
+when it has an `account` suppression or one for the message's sending domain
+([Suppression lists](https://developers.cloudflare.com/email-service/concepts/suppressions/), read
+2026-10-10). The platform domain is one sending domain shared by every tenant, so one tenant's bounce or
+complaint there suppresses the recipient for all of them. Then:
 
 1. **Identify** the suppressed recipients. With one queued recipient, it is that one. Otherwise, for each
    queued recipient call `GET /accounts/{PM_CF_ACCOUNT_ID}/email/sending/suppressions?email={address}`
-   with `PM_CF_API_TOKEN`; an item whose scope is the account or this sending domain counts.
+   with `PM_CF_API_TOKEN`; an item whose scope is the account or this sending domain counts. The client
+   is `domains/cloudflare_api.rs` (built in M9 with this lookup only, extended by M13).
 2. **Sync**: each suppressed recipient's delivery becomes `suppressed` with `smtp_response =
-   "provider: suppressed ({reason})"`, and a row is added to our `suppressions` with reason `provider`
-   (`INSERT OR IGNORE`, `source_message_id` = this message), with its `suppression.created` event.
+   "provider: suppressed ({reason})"`. When the matching item's scope is a tenant's own sending domain or
+   the account, a row is added to our `suppressions` with reason `provider` (`INSERT OR IGNORE`,
+   `source_message_id` = this message), with its `suppression.created` event. When the only matching
+   item is scoped to the **shared platform domain**, the outcome may belong to another tenant: the
+   delivery is `suppressed` with `smtp_response = "provider: suppressed on the shared domain"`, no row is
+   written to this tenant's `suppressions`, no event is emitted, and the outcome is not recorded in the
+   tenant's abuse windows, so nothing reveals another tenant's bounce or complaint
+   ([G4](../edge-cases.md)).
 3. **Resend** to the remaining queued recipients immediately, under the same claim. This is safe because
    the rejection was definitive. At most three rounds.
 4. If no recipient remains, the message ends `suppressed` (`message.suppressed`). If the recipients cannot
@@ -687,15 +798,24 @@ For each event (from `pm-delivery-events`, or a `TransportEvent` on `pm-outbound
    with **no status filter**, so retiring and retired addresses still route late events. Journal
    recipients are acked and ignored. No match → ack, `delivery_unroutable_total`.
 3. **`ApplyDeliveryEvent`** in the mailbox ([below](#applying-an-event-to-a-message)), which returns
-   `Applied { outcome, suppress }`, `Duplicate { suppress }`, `Reconciled { … }` or `NotFound`.
+   `Applied { outcome, suppress }`, `Duplicate { outcome, suppress }`, `Reconciled { … }` or `NotFound`.
+   `Duplicate` carries the outcome again, so a consumer that died between the mailbox write and step 6
+   still records it on the retry.
 4. **`NotFound` ([G8](../edge-cases.md))**: the event may have arrived before `RecordTransportOutcome`
-   stored the provider ID. With age = now − `occurred_at`: below 330 seconds (ten 30-second retries plus
-   margin) → `retry(Some(30))`; otherwise ack as orphaned, `delivery_orphaned_total` incremented and the
-   hashed IDs logged. (Age, not attempt count, bounds the retries; see
+   stored the provider ID, or while the message is still `queued` under a claim that the stale-claim rule
+   will turn into `uncertain` up to 5 minutes later (plus the alarm's lag). With age = now −
+   `occurred_at`: below 900 seconds → `retry(Some(60))` (at most 15 retries, within `pm-delivery-events`'
+   `max_retries` of 20); otherwise ack as orphaned, `delivery_orphaned_total` incremented and the hashed
+   IDs logged. Fifteen minutes covers the claim window and leaves room for reconciliation to find the
+   `uncertain` candidate. (Age, not attempt count, bounds the retries; see
    [Design › Idempotent queue consumers](index.md#7-idempotent-queue-consumers).)
 5. **Suppressions** for `suppress` (hard bounce → reason `hard_bounce`, complaint → `complaint`; both
-   permanent, `expires_at = NULL`), see [Suppressions](#suppressions).
-6. **Abuse windows** for `outcome` ([Abuse auto-pause](#abuse-auto-pause-fr-dlv-3)).
+   permanent, `expires_at = NULL`), see [Suppressions](#suppressions). A DSN-derived hard bounce
+   ([Inbound › DSN routing](inbound.md#dsn-routing-and-backscatter)) is written by the inbound
+   post-commit step instead, with a 30-day expiry.
+6. **Abuse windows** for `outcome` ([Abuse auto-pause](#abuse-auto-pause-fr-dlv-3)):
+   `RecordOutcome { identity_id, domain_id, outcome, at, event_id }`, idempotent by `event_id`. An event
+   with `source = Dsn` carries no outcome ([D11](../edge-cases.md)).
 7. Ack.
 
 ### Applying an event to a message
@@ -706,8 +826,9 @@ In one mailbox transaction:
    None → try [reconciliation](#uncertain-sends-and-reconciliation-fr-dlv-4); still none → `NotFound`.
 2. **Find the delivery:** `SELECT status, provider_event_ids_json FROM deliveries WHERE message_rowid = ?1 AND address = ?2`
    (recipient normalised). No row (an address we did not send to) → `Duplicate`.
-3. **Deduplicate:** `event_id` already in `provider_event_ids_json` → `Duplicate` (with the `suppress`
-   list recomputed). Otherwise append it (the list keeps the last 20).
+3. **Deduplicate:** `event_id` already in `provider_event_ids_json` → `Duplicate` (with the `outcome`
+   and the `suppress` list recomputed from the delivery's current state). Otherwise append it (the list
+   keeps the last 20).
 4. **Transition** the delivery ([G6](../edge-cases.md)):
 
    | Current \ event | delivered | deferred | bounced | failed | rejected | complained |
@@ -794,9 +915,11 @@ and sent to `pm-outbound` as `TransportEvent`, then handled by the same consumer
 ## Abuse auto-pause (FR-DLV-3)
 
 `TenantQuota.outcomes` keeps the last 1,000 outcomes per identity. For each `outcome`, the consumer calls
-`QuotaRequest::RecordOutcome { identity_id, outcome, at }`, which in one transaction inserts it with the
-next `seq`, deletes rows beyond 1,000 for that identity, increments the tenant's per-day counters (below),
-and evaluates:
+`QuotaRequest::RecordOutcome { identity_id, domain_id, outcome, at, event_id }`, which in one transaction
+first inserts `event_id` into `outcome_events` and, when it is already there (a retried event), does
+nothing and returns the current decision; otherwise it inserts the outcome with the next `seq`, deletes
+rows beyond 1,000 for that identity, increments the tenant's and the sending domain's per-day counters
+(below), and evaluates:
 
 ```text
 complaints = complained outcomes among the identity's last 1,000 rows
@@ -826,7 +949,42 @@ They are not per identity and `ForgetIdentity` leaves them, so they count every 
 workspace was created, which the per-identity `outcomes` rows cannot (they keep 1,000 per identity and are
 deleted with the identity). `OutcomeRates { since }` sums them over the UTC days from the day of `since`
 for the new-workspace send ramp ([Cloud sign-up › New-workspace send ramp](cloud-signup.md#101-new-workspace-send-ramp)).
-They are never pruned (three rows a day at most); tenant erasure's `delete_all` removes them.
+They are never pruned (three rows a day at most); tenant erasure's `delete_all` removes them. The same
+three counters per sending domain (`outcomes:dom:{domain_id}`, …) are kept for 8 days for the domain
+pause below.
+
+### Tenant and domain auto-pause (G12)
+
+The identity thresholds above are looser than the provider's own enforcement: Amazon SES places an account
+under review at a complaint rate of 0.1% and may pause it at 0.5%, and reviews it at a bounce rate of 5%
+and may pause it at 10% ([SES sending review FAQ](https://docs.aws.amazon.com/ses/latest/dg/faqs-enforcement.html),
+read 2026-10-10). Cloudflare's Email Sending quota and reputation are per account, and on Pylota Mail
+Cloud that account is shared with Pylota. A tenant that spreads its mail over many identities stays under
+every identity threshold while the account is harmed. So `RecordOutcome` also evaluates the tenant and
+each tenant sending domain over the last 7 UTC days of their counters ([G12](../edge-cases.md)):
+
+```text
+over the tenant's (or the domain's) last 7 UTC days, with outcomes ≥ 500:
+pause if complained / outcomes ≥ policy.abuse.tenant_complaint_rate_pause   (default 0.001, SES's review rate)
+      or bounced / outcomes    ≥ policy.abuse.tenant_bounce_rate_pause      (default 0.05)
+```
+
+- **Tenant pause.** `UPDATE tenants SET sending_paused_at = ?2, sending_pause_reason = 'abuse_threshold'
+  WHERE id = ?1 AND sending_paused_at IS NULL`. Every send from the tenant then gets
+  `409 sending_paused` (`details.scope = "tenant"`) at policy step 3a, and queued messages are held at
+  `BeginTransport`. The system identity is exempt (its mail is the deployment's), as from the identity
+  pause.
+- **Domain pause.** For a tenant domain (never the platform domain, whose outcomes count only towards
+  each tenant): `UPDATE domains SET sending_paused_at = ?2 WHERE id = ?1 AND sending_paused_at IS NULL`.
+  Sends from it get `409 sending_paused` (`details.scope = "domain"`) at policy step 14a, and it never
+  falls back to the platform domain.
+- Only a change writes an `audit_log` row (`tenant.auto_pause` or `domain.auto_pause`) and fires the
+  operator alert `sending_pause` (page). There is no tenant event type; the workspace sees the pause as the
+  `409` and in the console.
+- **Resume** needs a platform key: `PATCH /v1/tenants/{tenant_id}` or `PATCH /v1/domains/{domain_id}`
+  with `"sending_paused": false` (any other key gets `403 scope_denied` with
+  `details.field = "sending_paused"`), audit-logged. The counters keep their history, so a tenant that
+  is still above the rates after a resume is paused again by its next outcome.
 
 **The system identity is exempt.** For the identity with `is_system = 1` the consumer still records each
 outcome but never runs the pause: pausing it would stop every sign-in, invitation and notification email
@@ -837,7 +995,9 @@ identity.
 ## Uncertain sends and reconciliation (FR-DLV-4)
 
 An `uncertain` message is **never resent automatically** (FR-OUT-2). Its deliveries are `uncertain`
-with `updated_at` = the time it became uncertain. Its `sends` hold is released; a reconciliation below,
+with `updated_at` = the time of the transport call that may have sent it: the claim's `claimed_at`, for a
+timeout, an unknown result and the stale-claim rule alike (not the later time the rule ran, which depends
+on the alarm's lag). Its `sends` hold is released; a reconciliation below,
 or `resolve` with `sent`, then consumes one unit per recipient with a `Settle` that finds no hold
 ([W5](../edge-cases.md), [Plans, metering and billing › Settle, extend and expiry](billing.md#settle-extend-and-expiry)).
 
@@ -854,6 +1014,11 @@ WHERE m.direction = 'outbound' AND m.status = 'uncertain' AND m.provider_message
   AND d.updated_at BETWEEN ?4 AND ?5;      -- occurred_at − 30 min … occurred_at + 5 min
 ```
 
+Because `updated_at` is the transport call's time, the event (which happens after the call) always falls
+inside the window when the provider reports within 30 minutes, however late the stale-claim rule ran; the
+`NotFound` retries of the delivery consumer (15 minutes) give the rule time to turn the message
+`uncertain` first.
+
 - **One row** → set `provider_message_id` to the event's message ID, add the flag `reconciled`, apply the
   event (step 2 onwards), emit `message.reconciled { message_id, status }` with the rolled-up status, then
   the per-recipient event. Later events for other recipients match by provider ID.
@@ -863,7 +1028,7 @@ WHERE m.direction = 'outbound' AND m.status = 'uncertain' AND m.provider_message
 
 After 30 minutes without a match the message stays `uncertain` until a human resolves it.
 
-**Resolve.** `POST …/messages/{id}/resolve` with `messages:write` (`Idempotency-Key` optional, stored in
+**Resolve** (FR-DLV-7). `POST …/messages/{id}/resolve` with `messages:write` (`Idempotency-Key` optional, stored in
 D1 `idempotency_records`) calls `MailboxRequest::Resolve { outcome }`:
 
 | Current status | `outcome` | Result |
@@ -1058,8 +1223,10 @@ uncertain; else accepted with each recipient's events. Event IDs are `sim:{messa
 
 ## Loopback (L3, G11)
 
-For a test tenant, each recipient that resolves (`active` or `retiring`) to an identity on this
-deployment is delivered by injection ([L3](../edge-cases.md)):
+For a test tenant, each recipient that resolves (`active` or `retiring`) to an identity of the same
+tenant, or of a tenant with the same non-null `partner_id`, is delivered by injection
+([L3](../edge-cases.md)); policy step 8 has already refused every other address on this deployment with
+`403 test_mode_recipient`:
 
 1. Allocate an inbound `msg_` ID for the recipient's mailbox and copy the composed MIME (with its own
    `Message-ID`) to that mailbox's raw key.
@@ -1078,24 +1245,36 @@ pub enum QuotaRequest {
     Init { tenant_id: String },                      // tenant created (POST /v1/tenants, setup's default
                                                      // tenant): stores the owner in meta; the only request
                                                      // an object without an owner accepts
-    Reserve { identity_id: String, day: String, identity_cap: u32, tenant_cap: Option<u32>,
+    Reserve { identity_id: String, tz: String, identity_cap: u32, tenant_cap: Option<u32>,
               hold: Option<SendsHold> },             // policy step 18: the sends hold, checked first;
-                                                     // tenant_cap None = the system identity (is_system = 1):
-                                                     // the tenant `sends` counter is neither checked nor
-                                                     // incremented
+                                                     // tz = tenants.timezone; the object picks the day itself
+                                                     // (Day boundaries); tenant_cap None = the system identity
+                                                     // (is_system = 1): the tenant `sends` counter is neither
+                                                     // checked nor incremented
     Release { identity_id: String, day: String, tenant_counted: bool },
-                                                     // undoes a Reserve; tenant_counted is false exactly when
-                                                     // that Reserve had tenant_cap None
-    RecordOutcome { identity_id: String, outcome: Outcome, at: i64 },
-                                                     // the identity's abuse windows (outcomes rows), and the
-                                                     // tenant's per-day outcome counters
+                                                     // undoes a Reserve (day = the one its answer named);
+                                                     // tenant_counted is false exactly when that Reserve had
+                                                     // tenant_cap None
+    RecordOutcome { identity_id: String, domain_id: Option<String>, outcome: Outcome, at: i64,
+                    event_id: String },              // idempotent by event_id (outcome_events): the identity's
+                                                     // abuse windows (outcomes rows), the tenant's and the
+                                                     // sending domain's per-day counters, and the tenant and
+                                                     // domain pause evaluation (G12)
+                                                     // → { pause_identity, pause_tenant, pause_domain }
     OutcomeRates { since: i64 },                     // the daily ramp evaluation (Cloud sign-up § 10.1): sums
                                                      // the tenant's outcome counters over the UTC days from
                                                      // since's day → { outcomes, bounced, complained }
-    CountAgentic { day: String, cap: u32 },          // Search § 2 step 3: increments `agentic` for `day`
-                                                     // (tenant time zone) and `usage:agentic`
-                                                     // → Ok { used } | CapReached { resets_at }
+    CountAgentic { tz: String, cap: u32 },           // Search § 11.2 Init, once per admitted agentic search:
+                                                     // increments `agentic` for the tenant's day and
+                                                     // `usage:agentic` → Ok { used } | CapReached { resets_at }
                                                      //   → 429 agentic_budget_exhausted
+    CountTriageModel { tz: String, cap: u32, r#ref: String },
+                                                     // Triage § 1.1 step 6: one model-backed triage for the
+                                                     // tenant's day, counted once per ref (message ID)
+                                                     // → Ok | CapReached (triage runs rules-only)
+    AdmitInbound { identity_id: String, bucket: String, at: i64, cap: u32 },
+                                                     // Inbound › Inbound volume caps (D13): increments
+                                                     // inbound_hour for at's UTC hour → Admit | Throttle
     RecordUsage { metric: UsageMetric, n: u64 },     // adds n to usage:{metric} for the current UTC day
     ForgetIdentity { identity_id: String },          // identity erasure (Privacy § 6.4): deletes the
                                                      // identity's outcomes and sends:{identity_id} counters
@@ -1108,9 +1287,9 @@ pub enum QuotaRequest {
     Extend { feature: Feature, r#ref: String, until: i64 },     // a send waiting in transport back-off
     // … and Adjust, SetPlan, SetMeasured, Reconcile, GetUsage, used by billing only
 }
-pub enum UsageMetric { Inbound, Outbound, Search, AiNeurons, Assertions, HttpSignatures }
+pub enum UsageMetric { Inbound, Outbound, Search, AiNeurons, Assertions, HttpSignatures, CfRecipients }
 pub struct SendsHold { pub units: u32, pub r#ref: String, pub gates: Vec<Feature> }  // ref = msg_ ID
-// Reserve → Ok { identity_used, tenant_used, warnings: Vec<QuotaWarning>, held: Option<Held> }
+// Reserve → Ok { day, identity_used, tenant_used, warnings: Vec<QuotaWarning>, held: Option<Held> }
 //         | Denied { feature, granted, used, resets_at, first_in_period }   → 402 billing_limit
 //         | CapReached { scope: "identity" | "tenant", resets_at: i64 }      → 429 daily_cap_reached
 ```
@@ -1118,8 +1297,8 @@ pub struct SendsHold { pub units: u32, pub r#ref: String, pub gates: Vec<Feature
 `Reserve` runs in one transaction. With `hold`, it first takes the `sends` hold exactly as `Hold` does
 ([Plans, metering and billing › Hold](billing.md#hold)); a denial returns `Denied` and writes nothing
 (the caller emits `billing.limit_reached` when `first_in_period`). It then increments `counters` rows
-`sends:{identity_id}` and `sends` for `day` (YYYY-MM-DD in the tenant's time zone) when both stay within
-their caps; otherwise it returns `CapReached` and keeps no hold either. With `tenant_cap: None`, which the
+`sends:{identity_id}` and `sends` for the current day (YYYY-MM-DD in the time zone of the day-boundary
+rule below, returned as `day`) when both stay within their caps; otherwise it returns `CapReached` and keeps no hold either. With `tenant_cap: None`, which the
 mailbox passes only for the system identity (`is_system = 1`), the tenant `sends` row is neither checked
 nor incremented: only `sends:{identity_id}` is counted against `identity_cap`, the answer's `tenant_used`
 is the row's unchanged value, and no tenant warning is returned. The matching `Release` carries
@@ -1135,7 +1314,7 @@ the thread lock fails ([The outbound consumer](#the-outbound-consumer)); the ful
 
 | Counter | Day | Why |
 |---|---|---|
-| Daily caps: `sends`, `sends:{identity_id}` (and their `warned:` rows), `agentic` (no warnings) | The tenant's time zone (`tenants.timezone`, IANA, default `UTC`); `resets_at` is the next local midnight | A cap is a promise to the tenant about its own day |
+| Daily caps: `sends`, `sends:{identity_id}` (and their `warned:` rows), `agentic`, `triage_model` (no warnings) | The tenant's time zone (`tenants.timezone`, IANA, default `UTC`); `resets_at` is the next local midnight. A change of time zone takes effect at the **next local midnight of the old zone**: the object keeps `meta.tz`, and when a request carries a different `tz` it records `tz_next = {zone, from}` and switches at `from`. So changing the zone never starts a new day early, and a tenant gets at most one cap's worth of sends per 24 hours, as the notification schedule does ([O22](../edge-cases.md)) | A cap is a promise to the tenant about its own day |
 | Usage: `usage:{metric}`, flushed to D1 `usage_daily` | UTC (`usage_daily.day` is a UTC date) | One day boundary for every tenant, so deployment-wide sums (`provider_quota_80`) add up |
 
 **Usage counters.** `TenantQuota` counts usage per UTC day in `counters` rows `usage:{metric}`, and the
@@ -1155,10 +1334,15 @@ excluded.value`), then deletes `usage:*` rows older than two days. Writers:
 | `assertions` | `RecordUsage { Assertions, 1 }` from the assertion service behind `POST /v1/identities/{identity_id}/assertions` and `mail_sign_assertion` ([Agent signing keys](agent-keys.md)) | A token was signed and returned (once per token) |
 | `http_signatures` | `RecordUsage { HttpSignatures, 1 }` from the signing service behind `POST /v1/identities/{identity_id}/http-signatures` and `mail_sign_http_request` | A request was signed and returned (once per signature) |
 | `storage_bytes` | `SetMeasured`, by the roll-up itself | Hourly |
+| `cf_recipients` | `RecordUsage { CfRecipients, n }` from `RecordTransportOutcome` | The Cloudflare transport accepted a message: `n` = its accepted recipients, plus 1 for the hidden journal copy when Message-ID strategy B is in use |
 
 The provider's own daily quota is per Cloudflare account and is not visible to the Worker
-([G3](../edge-cases.md)). The deployer can copy it into `PM_DAILY_SEND_QUOTA`: the state-alert evaluator
-then fires `provider_quota_80` when today's (UTC) accepted recipients across live tenants reach 80% of it
+([G3](../edge-cases.md)). The Email Service limits page does not say whether the daily quota counts
+messages or recipients ([Limits](https://developers.cloudflare.com/email-service/platform/limits/), read
+2026-10-10; only suppressed recipients and sends to verified destination addresses are said not to count),
+so the alert counts recipients, the journal copy included, which never under-counts. The deployer can copy
+the quota into `PM_DAILY_SEND_QUOTA`: the state-alert evaluator then fires `provider_quota_80` when today's
+(UTC) `cf_recipients` across live tenants reach 80% of it
 ([Observability › Alert list](observability.md#53-alert-list)). Without the variable there is no 80%
 signal, and the first `E_DAILY_LIMIT_EXCEEDED` fires the `provider_quota` alert instead. Neither is a
 tenant event: the quota belongs to the deployment.
@@ -1195,17 +1379,18 @@ Agent        API handler      IdentityMailbox     pm-outbound consumer   Cloudfl
 |---|---|
 | `it::send::g1_same_key_same_body` / `g1_same_key_different_body` / `g1_in_flight` | Replay with `deduplicated: true` and `Idempotent-Replayed`; `409 idempotency_conflict`; `409 request_in_progress` ([G1](../edge-cases.md), FR-OUT-1) |
 | `core::policy::fingerprint_canonical` | Key order and whitespace do not change the fingerprint; any value change does |
-| `it::send::cancel_queued` | Cancel while `queued` and unclaimed → `canceled`, `message.canceled`, the `sends` hold and the day's reservation released, and the later queue message acks without sending; with an active claim, after transport, or with any delivery already `submitted` → `409 not_cancelable` (FR-OUT-11) |
+| `it::send::cancel_queued` | Cancel while `queued` and unclaimed → `canceled`, `message.canceled`, the `sends` hold and the day's reservation released, and the later queue message acks without sending; with an active claim, after transport, or with any delivery already `submitted` → `409 not_cancelable`; a queued message of a tenant whose partner is suspended before transport is cancelled by the consumer with actor `system` and never sent ([J13](../edge-cases.md), FR-OUT-11) |
 | `it::send::a7_paused_refuses_send` | `identity_paused` ([A7](../edge-cases.md)) |
 | `it::send::suspended_tenant_refuses_send` | After `PATCH /v1/tenants/{id}` with `status: suspended`, a send from any of its identities (all now paused with `tenant_suspended`) gets `403 tenant_suspended`, not `409 identity_paused` (FR-TEN-3, FR-OUT-3: the policy order) |
 | `it::send::a8_owner_required` | `identity_owner_required` ([A8](../edge-cases.md)) |
 | `it::send::a10_reply_all_excludes_bcc` | Reply-all never includes BCC recipients or own addresses ([A10](../edge-cases.md)) |
 | `core::reply::d3_reply_target` | Reply-To used only for known senders, same organisational domain or known contacts ([D3](../edge-cases.md)) |
 | `it::send::d6_exchange_cap` | The third consecutive auto-reply in a thread is refused ([D6](../edge-cases.md), FR-OUT-7) |
-| `it::send::e2_require_known_recipient` | Unknown recipients become `suppressed` deliveries ([E2](../edge-cases.md)) |
-| `it::lists::entries_crud` | `PUT`, `GET`, list and `DELETE` on `/v1/tenants/{tenant_id}/lists/{direction}/{kind}/{entry}` for both directions and kinds, an address and an `@domain` entry; entries are stored lower case with an A-label domain; `PUT` again updates only `note`; a key without `suppressions:manage` (every identity key, which can never hold it) gets `403 permission_denied`; another tenant's key gets `404 tenant_not_found` (build plan M9) |
+| `it::send::e2_require_known_recipient` | With the default `require_known_recipient: true`, a first `send` to an address the identity has only received mail from is `suppressed` with `policy: unknown_recipient`, and a second attempt is still refused (a `suppressed` delivery never increments `outbound_count`); a send-allow entry or an earlier non-suppressed send makes it known; a `reply` to a `received` `pass` message reaches its reply target, while the same reply to a `quarantined` or `fail` message is `suppressed`; `reply_all`'s other unknown recipients are `suppressed`; with the setting `false` every recipient passes; the system identity is created with `false` ([E2](../edge-cases.md), FR-OUT-13) |
+| `it::lists::entries_crud` | `PUT`, `GET`, list and `DELETE` on `/v1/tenants/{tenant_id}/lists/{direction}/{kind}/{entry}` for both directions and kinds, an address and an `@domain` entry; entries are stored lower case with an A-label domain; `PUT` again updates only `note`; a key without `suppressions:manage` (every identity key, which can never hold it) gets `403 permission_denied`; another tenant's key gets `404 tenant_not_found` (build plan M9, FR-OUT-16) |
 | `it::send::list_filters` | A send-block entry, and `policy.send_allowlist_only` without a send-allow entry, make that recipient's delivery `suppressed` with `policy: send_block` or `policy: not_on_allowlist`; a send-allow entry for the address or its `@domain` lets it through; a dry run reports the rule (build plan M9, FR-OUT-4) |
 | `it::send::e3_caps` | `max_recipients`, identity and tenant daily caps ([E3](../edge-cases.md)) |
+| `it::send::e3_timezone_change_caps` | A tenant changes `timezone` from `Europe/London` to `Pacific/Auckland` after 40 of its 50 daily sends: the change is stored in `tz_next` and the 41st–50th sends still count on the old day; the 51st gets `429 daily_cap_reached`; after the old zone's midnight the new zone applies and the count starts at 0; a `Release` for a send reserved before the change decrements the day returned by its `Reserve` ([E3](../edge-cases.md)) |
 | `it::send::e8_disclosure_footer` | Footer and header modes ([E8](../edge-cases.md)) |
 | `it::send::c4_thread_lock` | Concurrent replies: the second waits, then `thread_busy` after 10 s ([C4](../edge-cases.md), FR-OUT-9) |
 | `it::send::c6_forward_keeps_refs` | Forward with transfer note and `References` ([C6](../edge-cases.md)) |
@@ -1216,16 +1401,24 @@ Agent        API handler      IdentityMailbox     pm-outbound consumer   Cloudfl
 | `it::send::g5_large_attachment` | `413 message_too_large`; signed links with `large_attachments: link` ([G5](../edge-cases.md), FR-OUT-10) |
 | `it::delivery::g6_hard_soft_complaint_late` | Hard bounce suppresses; soft bounce does not; complaint suppresses permanently; late bounce after delivered ([G6](../edge-cases.md), FR-DLV-1, FR-DLV-2) |
 | `it::send::g7_domain_states` | Retiring only on threads using it; pending `domain_not_ready`; failing falls back or fails ([G7](../edge-cases.md), FR-DOM-6) |
-| `it::delivery::g8_race` | An event before the provider ID is stored is retried every 30 s, then orphaned ([G8](../edge-cases.md)) |
-| `it::send::g9_marketing_requirements` | Marketing needs `unsubscribe` and `consent`; headers and visible link added; from a `cloudflare`-transport domain (the platform domain included) it is refused with `422 transport_unavailable` (`marketing_needs_ses`) by step 15, with the address resolved at step 13; a marketing message accepted on an `ses` domain whose transport is changed to `cloudflare` before transport, or whose domain fails so that fallback would use the platform domain, ends `rejected` with `marketing_needs_ses` at `BeginTransport` and is never sent ([G9](../edge-cases.md), FR-OUT-8) |
+| `it::delivery::g8_race` | An event before the provider ID is stored is retried with `retry(Some(60))` while it is younger than 900 s (at most 15 attempts), then orphaned; an event for an uncertain send arriving within that window reconciles it ([G8](../edge-cases.md)) |
+| `it::send::g9_marketing_requirements` | Marketing needs `unsubscribe` and `consent`; headers and visible link added; from a `cloudflare`-transport domain (the platform domain included) it is refused with `422 transport_unavailable` (`marketing_needs_ses`) by step 15, with the address resolved at step 13 ([G9](../edge-cases.md), FR-OUT-8, FR-OUT-15) |
+| `it::send::g9_marketing_transport_recheck` | A marketing message accepted on an `ses` domain whose transport is changed to `cloudflare` before transport, or whose domain fails so that fallback would use the platform domain, ends `rejected` with `marketing_needs_ses` at `BeginTransport`, is never sent, and its `sends` hold is settled with nothing consumed ([G9](../edge-cases.md), FR-OUT-15; build plan M13, which builds the SES transport) |
 | `it::send::notification_list_unsubscribe` | A `usage`, `new_mail`, `needs_person` or `digest` notification from the system identity is `transactional` and carries `List-Unsubscribe` and `List-Unsubscribe-Post` (the `digest` token names the kind `digest`, and its one-click `POST` sets `usage`, `new_mail` and `needs_person` to `off`); an `account` notification carries neither; a REST send naming either header gets `400 header_not_allowed`; `list_unsubscribe` on any other identity is refused |
 | `it::send::header_rules` | `X-Booking-Ref`, `x-booking-ref` and the six allowed names pass in any case (`importance: high` is sent as `Importance: high`); `X-Bad Name`, `X-`, `Importance ` and the reserved `x-pylota-trace` and `x-ai-generated` get `400 header_not_allowed`; `Importance: urgent`, `priority: high` and `Sensitivity: secret` get `400 invalid_request` with the header's path, and so do `Importance` and `importance` in one request; nothing is stored, so no send ends `rejected` for a header |
 | `it::send::idempotency_key_pattern` | An empty key, a 256-byte key and a key with a byte outside 0x20–0x7E get `400 invalid_idempotency_key`; a 255-byte key with spaces is accepted |
 | `it::notify::bounce_pauses_prefs` ([Notifications §10](notifications.md#10-tests)) | A hard bounce on a notification suppresses the address on the default tenant and pauses every preference of the person ([O17](../edge-cases.md)) |
 | `it::send::g10_provider_validation` | Every validation code in the table → `rejected: provider_validation`, never retried ([G10](../edge-cases.md)) |
-| `it::send::g11_loopback` | Live tenant to a local address goes through the transport; test tenant through loopback ([G11](../edge-cases.md)) |
+| `it::send::g11_loopback` | Live tenant to a local address goes through the transport; test tenant through loopback to an identity of its own tenant and of a tenant with the same `partner_id`; a test tenant's send to an identity of an unrelated tenant gets `403 test_mode_recipient` and nothing is injected ([G11](../edge-cases.md), [L3](../edge-cases.md)) |
 | `it::delivery::uncertain_reconciled` | A later event reconciles an uncertain send and emits `message.reconciled` (FR-DLV-4) |
-| `it::delivery::abuse_auto_pause` | Four complaints in a 1,000 window or eleven bounces in a 200 window pause the identity once (FR-DLV-3) |
+| `it::delivery::abuse_auto_pause` | Four complaints in a 1,000 window or eleven bounces in a 200 window pause the identity once; the same event delivered twice (same `event_id`) is recorded once, so ten bounces redelivered do not pause (FR-DLV-3) |
+| `it::delivery::g12_tenant_domain_pause` | 600 outcomes spread over 30 identities of one tenant, with 1 complaint per 600 (0.17%), pause no identity but set `tenants.sending_paused_at`: the next send gets `409 sending_paused` (`scope: tenant`), a queued message is held, the system identity still sends; the same rates on one tenant domain pause that domain only (`scope: domain`), and it does not fall back to the platform domain; outcomes on the platform domain never pause it; a tenant key's `PATCH … sending_paused: false` gets `403 scope_denied`, a platform key's resumes; one audit row and one `abuse_pause` alert per pause ([G12](../edge-cases.md), FR-DLV-6) |
+| `it::send::j20_transport_breaker` | Three Cloudflare `E_INTERNAL_SERVER_ERROR` results in a row (three `uncertain` messages) open the breaker and fire `transport_breaker_open`; the next 20 queued messages are neither claimed nor made `uncertain`, and stay `queued` with the `Paused` back-off; after `open_until` exactly one probe is claimed; a probe accepted closes the breaker and the held messages send; a probe that fails again doubles the period; a definitive `Rejected` resets the count ([J20](../edge-cases.md)) |
+| `it::send::g4_suppressed_after_submit` | A recipient suppressed (a hard bounce from another send) between submit and transport becomes a `suppressed` delivery at `BeginTransport` and is never handed to the transport; with no recipient left the message ends `suppressed` and the `sends` hold settles with nothing consumed; a provider suppression scoped to the shared platform domain makes the delivery `suppressed` without writing a `suppressions` row or emitting `suppression.created` ([G4](../edge-cases.md)) |
+| `it::send::stale_claim_outcome` | A claim older than 5 minutes is resolved to `uncertain` with the deliveries' `updated_at` = `claimed_at`; a late `RecordTransportOutcome` with that stale token and `Accepted` sets the provider ID, makes the deliveries `submitted`, adds `reconciled` and emits `message.reconciled`; a late `Unknown` with the stale token changes nothing and increments `stale_claim_outcome_total` ([G2](../edge-cases.md)) |
+| `it::send::g2_delivery_failed_recipients` | Cloudflare `E_DELIVERY_FAILED` on a one-recipient send → `rejected` (`provider_validation`); on a three-recipient send → `uncertain` (`provider_outcome_unknown`), never resent ([G2](../edge-cases.md)) |
+| `it::send::n13_loop_guard` | Two identities that reply to each other with `kind: normal` are stopped at hop 10 with `409 loop_detected` (`details.hop: 10`); a fresh `send` starts at hop 1; a forward of a hop-9 message is refused ([N13](../edge-cases.md), FR-OUT-14) |
+| `it::send::sending_paused_refuses` | A send from a tenant with `sending_paused_at` set gets `409 sending_paused` before any recipient check, and a dry run reports the same error ([G12](../edge-cases.md)) |
 | `it::send::system_identity_exemptions` | With the default tenant's `tenant_daily_send_cap` set to 2 and the system identity's `send_policy.daily_cap` to 4 (platform key), the system identity's third and fourth sends are accepted and the fifth gets `429 daily_cap_reached`; the system identity's sends neither are checked against nor increment the tenant `sends` counter (its `Reserve` passes `tenant_cap: None`, and a cancelled send's `Release` leaves the tenant count unchanged), so another identity of the default tenant is still held to the tenant cap of 2 after them; eleven bounces in the system identity's 200 window are recorded but never pause it |
 | `it::send::k3_failure_reason` | `message.failed` / `message.rejected` carry the reason and detail ([K3](../edge-cases.md)) |
 | `it::testmode::l1_refuse_external` | `test_mode_recipient` ([L1](../edge-cases.md), FR-TEN-2) |

@@ -208,7 +208,9 @@ An unknown plan value means `free`.
    OAuth flow), shown when the person has no workspace and no pending invitation. The fields are the
    workspace name, the address suffix (pre-filled from the name, for example `.brightwell`, with the
    resulting example address shown under it) and the time zone, plus the plan in a hidden field. A taken
-   suffix returns the form with `suffix_taken` ([W33](../edge-cases.md)). On success the tenant is
+   suffix, or one whose confusable fold equals another workspace's, returns the form with `suffix_taken`
+   ([W33](../edge-cases.md)), and one that folds to a reserved name with `address_reserved`
+   ([D12](../edge-cases.md), [REST API › Tenants](../../reference/api.md#post-v1tenants)). On success the tenant is
    created on the Free plan with this person as owner, and `users.last_tenant_id` is set.
 4. **Pay, when a paid plan was chosen.** The owner goes straight to Stripe Checkout for that plan
    ([Billing › Checkout](billing.md#checkout)). Coming back from Checkout is [§9](#9-coming-back-from-checkout).

@@ -280,7 +280,10 @@ attachments, passes `gates: [StorageGb]`. While storage is over its allowance, t
 The hourly usage roll-up (below) computes stored bytes per workspace as the sum, over its identities, of
 what each `IdentityMailbox` reports: `messages.raw_size` for messages whose raw MIME is still stored
 (`raw_r2_key` not null, so retention purges lower it), `attachments.size`, and its own SQLite size
-(`page_count × page_size`). It calls `SetMeasured`, which sets `storage_gb.used = ceil(bytes / 2^30)`, and
+(`page_count × page_size`). Messages with status `throttled` or `hidden` and their attachments are left
+out of the first two sums, so a flood of unsolicited mail cannot push a workspace over its storage
+allowance and block its sends ([Inbound › Inbound volume caps](inbound.md#inbound-volume-caps-d5-d13),
+[D13](../edge-cases.md)). It calls `SetMeasured`, which sets `storage_gb.used = ceil(bytes / 2^30)`, and
 writes `usage_daily.storage_bytes`.
 
 ### Reconciliation against D1

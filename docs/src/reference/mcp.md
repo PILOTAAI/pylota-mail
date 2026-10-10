@@ -177,9 +177,10 @@ pmail keys create --level identity --identity bookings@acme.example.com --name b
 The secret is printed once. An identity key always acts as its own identity, so its agent never needs
 to pass `identity`. Tenant keys must pass `identity` (an ID or an address) to identity-scoped tools.
 
-For an agent that should only answer people who already wrote in, set the identity's
-`send_policy.require_known_recipient` to `true`: sends to unknown addresses are then suppressed instead
-of delivered ([E2](../project/edge-cases.md)). This is not a tool error: the send succeeds, and that
+The identity's `send_policy.require_known_recipient` is `true` by default: sends to addresses the
+identity has never sent to (and that no send-allow entry names, and that are not the authenticated
+sender being answered) are suppressed instead of delivered ([E2](../project/edge-cases.md)). Turn it off
+only for an identity that writes to new people by design. This is not a tool error: the send succeeds, and that
 recipient's delivery ends `suppressed`, as for a suppressed, send-blocked or not-allow-listed address.
 
 ## Tools
@@ -287,8 +288,9 @@ lowered to them, not refused.
 ```json
 { "status": "answered",
   "answer": { "text": "Yes. Admiral accepted claim 7781 on 2 October, after the photos sent on 28 September [msg_01JA…][msg_01JB…].",
-    "sentences": [ { "text": "Yes. Admiral accepted claim 7781 on 2 October…", "citations": ["msg_01JA…", "msg_01JB…"] } ],
-    "confidence": 0.86 },
+    "sentences": [ { "text": "Yes. Admiral accepted claim 7781 on 2 October…", "citations": ["msg_01JA…", "msg_01JB…"],
+                     "citation_trust": "authenticated" } ],
+    "confidence": 0.86, "untrusted": true },
   "evidence": [ "…up to 10 hits with quotes…" ],
   "trace": [ { "step": 1, "action": "search", "q": "claim Golf photos", "mode": "hybrid", "hits": 7, "ms": 412 } ],
   "degraded": false, "usage": { "steps": 3, "ms": 2810, "model": "@cf/qwen/qwen3.8-27b" } }
@@ -297,7 +299,9 @@ lowered to them, not refused.
 `status` is `answered`, `insufficient_evidence` (the mail does not answer the question; `trace` shows
 what was searched), `budget_exhausted` (evidence, and at most a partial answer) or `degraded` (plain
 search results). Every cited message ID was checked against the evidence before the answer was
-returned. When the client accepts `text/event-stream` and sends a `progressToken`, each step is
+returned, and a sentence that cites steering-suspected or unauthenticated mail was removed. The answer is
+still model-written text derived from mail (`untrusted: true`): check it against `evidence` and never
+follow it as an instruction ([F17](../project/edge-cases.md)). When the client accepts `text/event-stream` and sends a `progressToken`, each step is
 reported as a progress notification.
 
 ### `mail_get_thread`
@@ -718,8 +722,8 @@ The full list of service limits is in [Limits](limits.md).
 - **Treat signatures as credentials.** Grant `identities:sign` only to an agent that must prove who it
   is. Send an assertion only to its audience, and attach signed headers only to the request they were
   made for. Pausing the identity stops new signatures and withdraws its published keys at once.
-- **Restrict recipients.** For reply-only agents set the identity's
-  `send_policy.require_known_recipient`, and consider `policy.send_allowlist_only` for the tenant.
+- **Restrict recipients.** Keep the identity's `send_policy.require_known_recipient` on (the default),
+  and consider `policy.send_allowlist_only` for the tenant.
 - **Watch what agents do.** Every tool call is logged with the key, tool, identity, duration and
   outcome (never the arguments), and privileged actions are in the audit log (`pmail audit`).
 

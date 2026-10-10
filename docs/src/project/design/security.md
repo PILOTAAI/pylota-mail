@@ -130,7 +130,7 @@ reused; the others are defined in section 13.
 | STRIDE | Threat | Mitigation | Test |
 |---|---|---|---|
 | S | Unauthenticated MCP use, DNS rebinding from a browser | `Authorization: Bearer pmk_…` on every request, through the REST authentication code; an `Origin` header other than `https://{PM_API_HOST}` gets `403`; no CORS grant ([MCP › Request handling](mcp.md#21-request-handling)) | `it::security::mcp_requires_key` |
-| E | A steered agent calls a send tool | Send tools require `idempotency_key`; `send_policy.require_known_recipient` suppresses deliveries to new recipients ([E2](../edge-cases.md)); tools the key lacks permission for are not listed and refused if called | `it::send::e2_require_known_recipient`, `it::security::mcp_tools_follow_key` |
+| E | A steered agent calls a send tool | Send tools require `idempotency_key`; `send_policy.require_known_recipient`, on by default, suppresses deliveries to recipients the identity has never sent to, whatever mail they sent first ([E2](../edge-cases.md)); a send whose hop count reaches 10 is refused with `loop_detected` ([N13](../edge-cases.md)); tools the key lacks permission for are not listed and refused if called | `it::send::e2_require_known_recipient`, `it::security::mcp_tools_follow_key` |
 | I | Tool results leaking across scope | Each tool dispatches to the same handler and router entry as its REST equivalent; there is no MCP-only data path | `it::security::cross_tenant_matrix` (MCP column) |
 | D | Long polls tying up the endpoint | `mail_wait` timeout ≤ 60 s; requests count against `RL_API` | `it::wait::e4_*` |
 

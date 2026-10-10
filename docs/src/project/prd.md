@@ -326,6 +326,14 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
   and text formats, and for images when the tenant enables it.
 - **FR-IN-9** Hidden text (zero-width characters, CSS-hidden content, white-on-white) **must** be removed
   from agent-facing text and raised as a risk flag.
+- **FR-IN-10** Messages and threads **must** be listable and readable through the API, MCP and console.
+  Thread lists and their counts show only visible mail (never quarantined, hidden or throttled
+  messages). Labels, read state and archiving **must** be settable per message and per thread, and
+  `is:unread` **must** follow the read state.
+- **FR-IN-11** An agent **must** be able to wait for new mail (`wait`, a long poll with filters), and
+  verification codes and links in received mail **must** be extracted into a structured field.
+- **FR-IN-12** Unsolicited inbound mail **must** be capped per identity and per tenant by source, so that
+  mail nobody asked for cannot exhaust storage, triage or model spend.
 
 ### 6.5 Outbound
 
@@ -360,8 +368,18 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
 - **FR-OUT-12** Test tenants **must** use the simulator transport:
   - mail to `*@simulator.invalid` produces a scripted outcome (`delivered`, `bounce`, `softbounce`,
     `complaint`, `deferred`, `reject`, `timeout`);
-  - mail to addresses on this deployment is delivered internally;
+  - mail to identities of the same tenant, or of a tenant with the same partner, is delivered internally;
   - all other recipients are refused with `test_mode_recipient`.
+- **FR-OUT-13** By default an identity **must** send only to recipients it has written to before, to
+  addresses on the tenant's send-allow list, or to the authenticated sender of mail it is answering.
+  Other recipients are suppressed unless the identity's `require_known_recipient` is turned off.
+- **FR-OUT-14** Any send whose computed hop count reaches the loop limit **must** be refused with
+  `loop_detected`, whatever its `kind`.
+- **FR-OUT-15** Marketing mail **must** leave through the SES or SMTP transport, never through Cloudflare
+  Email Service (transactional only). A marketing send that would use Cloudflare is refused with
+  `marketing_needs_ses`, at submit and again before transport.
+- **FR-OUT-16** Tenants **must** be able to manage allow and block lists for sending and receiving, by
+  address or by domain.
 
 ### 6.6 Delivery
 
@@ -376,6 +394,10 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
 - **FR-DLV-4** Uncertain sends **should** be reconciled from provider events by matching sender,
   recipient and subject within 30 minutes. A match moves the send to its real status with `reconciled: true`.
 - **FR-DLV-5** DSNs that do not match a message we sent (backscatter) **must** be dropped and counted.
+- **FR-DLV-6** A tenant or a tenant sending domain whose complaint or bounce rate reaches the provider's
+  review rate **must** be paused automatically, and a paused tenant or domain **must never** fall back to
+  the platform domain.
+- **FR-DLV-7** A person **must** be able to resolve an `uncertain` send as `sent` or `not_sent`.
 
 ### 6.7 Threading
 
@@ -422,6 +444,10 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
 - **FR-SRCH-10** Tenant scope (all of a tenant's identities) **must** require a tenant-level key.
 - **FR-SRCH-11** Erasure **must** remove keyword rows, references and vectors together. A probe query
   after erasure **must** return nothing.
+- **FR-SRCH-12** Search **should** offer a contacts lookup and a find-related lookup for a message.
+- **FR-SRCH-13** An agentic answer **must** be marked as untrusted, model-written text. Each citation
+  **must** carry the trust of its source, and a sentence that cites only unauthenticated or
+  steering-suspected mail **must** be removed.
 
 ### 6.9 Triage
 
@@ -437,6 +463,8 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
 - **FR-TRI-3** Triage is advisory. It **must never** send, delete or release a message.
 - **FR-TRI-4** The triage model **must** receive mail content as fenced, untrusted data. Its output
   **must** be validated against a schema, and invalid output is recorded as `failed`, never guessed.
+- **FR-TRI-5** Triage **may** be re-run on a stored, visible message. A re-run on a quarantined, hidden,
+  throttled or delivery-report message **must** be refused with `triage_not_eligible`.
 
 ### 6.10 Events and webhooks
 

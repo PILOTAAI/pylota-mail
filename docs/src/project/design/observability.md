@@ -176,7 +176,7 @@ GROUP BY domain_id
 | `ses_object_lost_total` | counter | – | `pm-inbound`: an S3 object was missing while its `ses_ingest` row was still `queued` ([N4](../edge-cases.md)) |
 | `scanner_error_total`, `auth_dns_cache_miss_total` | counter | – | `pm-inbound` ([Inbound](inbound.md)) |
 | `backscatter_total` | counter | – | `pm-inbound` ([D4](../edge-cases.md)) |
-| `inbound_throttled_total` | counter | – | mailbox ([D5](../edge-cases.md)) |
+| `inbound_throttled_total` | counter | cap (`per_sender`, `unauthenticated`, `per_tenant`) | mailbox ([D5](../edge-cases.md), [D13](../edge-cases.md)) |
 | `thread_token_invalid_total`, `thread_token_previous_key_total` | counter | – | mailbox ([Threading](threading.md)) |
 | `quarantine_total` | counter | reason | mailbox |
 | `send_api_requests_total` | counter | operation, result (`accepted`, `deduplicated`, or the error code) | `fetch` |
@@ -235,6 +235,11 @@ GROUP BY domain_id
 | `rpc_owner_mismatch_total` | counter | class | Durable Objects |
 | `alert_fired` | counter | alert, severity | Alert evaluator |
 | `panics_total`, `config_invalid_total`, `metrics_dropped_total` | counter | – | any |
+| `inbound_dictionary_guard_total`, `role_mail_failed_total` | counter | `role_mail_failed_total`: reason | `email()`: misses refused by the dictionary guard ([A16](../edge-cases.md)); role mail that could not be relayed ([D14](../edge-cases.md)) |
+| `dsn_untrusted_total` | counter | reason (`provider_events`, `verdict`, `alignment`, `original_from`) | `pm-inbound`: DSN entries that changed nothing ([D11](../edge-cases.md)) |
+| `r2_orphans_deleted_total` | counter | – | the mailbox's daily orphan sweep ([I9](../edge-cases.md)) |
+| `loopback_refused_total`, `stale_claim_outcome_total` | counter | – | `pm-inbound` (a loopback pointer across tenants), `pm-outbound` (a transport outcome with a stale claim token, [G2](../edge-cases.md)) |
+| `index_job_unimplemented_total`, `ai_deferred_total`, `ai_rate_limited_total`, `triage_model_cap_total` | counter | kind or task | `pm-index`: job kinds before their milestone; jobs deferred by `RL_AI` or `RL_EMBED`; Workers AI rate-limit answers; triage runs made rules-only by the daily model cap ([F16](../edge-cases.md), [D13](../edge-cases.md)) |
 
 ## 4. Service-level objectives
 
@@ -306,7 +311,7 @@ the window (the Custom Alert "minimum event count").
 | `inbound_tempfail` | A | `inbound_received_total{result=tempfail_storage}` > 0 over 5 minutes | page | [DLQ growth](#dlq-growth) (storage path) |
 | `inbound_lost` | B | `inbound_lost_total` or `inbound_raw_missing_total` > 0 | page | [Restore from PITR](#restore-from-pitr) (re-ingest step) |
 | `ses_object_lost` | B | `ses_object_lost_total` > 0: an S3 object was deleted before every recipient was ingested ([N4](../edge-cases.md)) | page | [SES account and receiving](#ses-account-and-receiving) |
-| `ses_sending_paused` | B | The 15-minute SES platform check finds account sending paused. Every SES domain uses the fallback address meanwhile ([N10](../edge-cases.md)) | page | [SES account and receiving](#ses-account-and-receiving) |
+| `ses_sending_paused` | B | The 15-minute SES platform check finds account sending paused. SES sends are held meanwhile, never moved to the platform domain, and end `failed` after 24 hours ([N10](../edge-cases.md)) | page | [SES account and receiving](#ses-account-and-receiving) |
 | `ses_rule_missing` | B | The 15-minute SES platform check finds the receipt rule set `PM_SES_RULE_SET` inactive or without the rule `pm-deliver` (only when SES receiving is configured) | page | [SES account and receiving](#ses-account-and-receiving) |
 | `ses_identities_90pct` | B | SES identities in the region reach 9,000, 90% of the 10,000 per Region ([quotas](https://docs.aws.amazon.com/ses/latest/dg/quotas.html), read 2026-10-09). Counted as `domains` rows with `ses_region` set and not `removed`, plus the platform identity. There is no `quota.warning` event for this | ticket | [SES account and receiving](#ses-account-and-receiving) |
 | `webhook_failing:{webhook_id}` | B | `consecutive_failures` ≥ 10 on an enabled endpoint | ticket | [Integrator API down](#integrator-api-down) |
@@ -327,6 +332,9 @@ the window (the Custom Alert "minimum event count").
 | `erasure_overdue:{erasure_id}` | B | Erasure still `running` 20 h after creation | page | [Erasure failure](#erasure-failure) |
 | `rpc_owner_mismatch` | B | `rpc_owner_mismatch_total` ≥ 1 | page | [Compromised key](#compromised-key) (treat as a security incident) |
 | `uncertain_spike` | A | `transport_outcomes_total{outcome=uncertain}` > 5 over 15 minutes | page | [Email Sending outage](#email-sending-outage) |
+| `transport_breaker_open:{scope}` | B | A transport's circuit breaker opened after 3 unknown outcomes in a row; queued messages wait unclaimed ([Outbound › Transport circuit breaker](outbound.md#transport-circuit-breaker-j20), [J20](../edge-cases.md)) | page | [Email Sending outage](#email-sending-outage) |
+| `sending_pause:{tenant_id or domain_id}` | B | A tenant or a tenant domain was sending-paused for its complaint or bounce rate ([Outbound › Tenant and domain auto-pause](outbound.md#tenant-and-domain-auto-pause-g12), [G12](../edge-cases.md)) | page | [Abusive identity](#abusive-identity) (review the workspace's recent sends; resume with a platform key only when the cause is fixed) |
+| `ai_backlog` | B | `ai_deferred_total` > 1,000 over 15 minutes, or `ai_rate_limited_total` > 20 over 5 minutes ([F16](../edge-cases.md)) | ticket | Compare the deferrals per tenant with the Workers AI limits; lower a tenant's `triage.daily_model_cap`, or ask Cloudflare for higher limits |
 | `delivery_orphaned` | A | `delivery_orphaned_total` > 10 over 1 h | ticket | [Email Sending outage](#email-sending-outage) |
 | `panics` | A | `panics_total` > 0 over 5 minutes | ticket | [Parser bug](#parser-bug) |
 | `config_invalid` | A | `config_invalid_total` > 0 | page | `pmail doctor` |
@@ -360,6 +368,9 @@ The `* * * * *` cron runs `ops::alerts::evaluate`:
      |---|---|
      | `mailbox_size` | The identity's mailbox, from its size check ([Data model › Mailbox notes](data-model.md#mailbox-notes)) |
      | `abuse_pause` | The delivery-event consumer (`consumers/delivery.rs`), when its auto-pause update changed a row ([Outbound › Abuse auto-pause](outbound.md#abuse-auto-pause-fr-dlv-3)) |
+     | `sending_pause` | The delivery-event consumer, when its tenant or domain pause update changed a row |
+     | `transport_breaker_open` | The outbound consumer, when it opens a breaker |
+     | `ai_backlog` | The `pm-index` consumer, from its deferral and rate-limit counts |
      | `rpc_owner_mismatch` | The Durable Object whose owner check failed ([Design conventions](index.md#5-internal-durable-object-rpc)) |
      | `inbound_lost` | The global retention `staging` step (`inbound_lost_total`) and the `pm-inbound` consumer (`inbound_raw_missing_total`) |
      | `ses_object_lost` | The `pm-inbound` consumer's SES source |
@@ -490,14 +501,14 @@ wraps it as `pmail dlq list` and `pmail dlq redrive` ([CLI and setup](cli.md)).
 | [Bounce spike](#bounce-spike) | `bounce_rate:{domain_id}` |
 | [Complaint spike](#complaint-spike) | `complaint_rate:{domain_id}` |
 | [Quota exhausted](#quota-exhausted) | `provider_quota`, `provider_quota_80`, `quota_warning` |
-| [Email Sending outage](#email-sending-outage) | `uncertain_spike`, `delivery_orphaned`, outbound burn rules, `notification_send_failures` |
+| [Email Sending outage](#email-sending-outage) | `uncertain_spike`, `transport_breaker_open`, `delivery_orphaned`, outbound burn rules, `notification_send_failures` |
 | [Domain failing](#domain-failing) | `domain_failing:{domain_id}`, `inbound_reject_spike`, `notification_send_failures` |
 | [SES account and receiving](#ses-account-and-receiving) | `ses_object_lost`, `ses_sending_paused`, `ses_rule_missing`, `ses_identities_90pct` |
 | [DLQ growth](#dlq-growth) | `dlq:{queue}`, `inbound_tempfail` |
 | [Integrator API down](#integrator-api-down) | `webhook_failing`, `webhook_disabled` |
 | [Parser bug](#parser-bug) | `panics`, reports of mis-parsed mail |
 | [Compromised key](#compromised-key) | Report, unusual usage, `rpc_owner_mismatch` |
-| [Abusive identity](#abusive-identity) | `abuse_pause`, `mailbox_size` |
+| [Abusive identity](#abusive-identity) | `abuse_pause`, `sending_pause`, `mailbox_size` |
 | [Erasure failure](#erasure-failure) | `erasure_failed`, `erasure_overdue` |
 | [Restore from PITR](#restore-from-pitr) | Data corruption, a bad migration, `inbound_lost` |
 
@@ -590,9 +601,11 @@ Every runbook ends by recording what was done in the incident log and checking t
    before the 14-day lifecycle rule deleted it. Look for `pm-inbound` dead-letter items and backstop
    cron errors in that period.
 2. **Mitigate.**
-   - `ses_sending_paused`: every SES domain already sends through its identities' platform addresses
-     (FR-DOM-6). Follow AWS's instructions in the SES console to have sending resumed (the steps are AWS's;
-     verify them at the time).
+   - `ses_sending_paused`: SES sends are already held (they never fall back to the platform domain), and
+     end `failed` (`quota_exhausted`) 24 hours after submit. Follow AWS's instructions in the SES console
+     to have sending resumed (the steps are AWS's; verify them at the time). For a domain that must keep
+     sending meanwhile, the transport runbook's failover to Cloudflare is a decision for the owner
+     ([J5](../edge-cases.md)).
    - `ses_rule_missing`: run `pmail setup ses` again. It is idempotent, adds `pm-deliver` to the active
      rule set and never deactivates another set. Until then, mail to SES domains does not reach the
      Worker.
@@ -736,7 +749,11 @@ optional backup bucket ([Privacy › R2 backup copy](privacy.md#54-optional-r2-b
      `reprocessed`, plus an `idempotency` row from the object's `idem_key_sha256`, `fingerprint` and
      `operation` metadata, with `response_json` built from the re-inserted row. A retry with the same
      Idempotency-Key then replays instead of sending again, and a person resolves each `uncertain`
-     message as usual;
+     message as usual. A refused send leaves no such object: the sent copy is written only after policy,
+     quota and the thread lock succeeded, and deleted if the accept transaction then fails
+     ([Outbound › Reservation](outbound.md#reservation-inside-the-mailbox-fr-out-1-g1)). Only that failure
+     followed by a failed delete could leave one; the person resolving the re-inserted `uncertain`
+     messages checks each against the provider's events and resolves such a message `not_sent`;
    - re-apply the saved key revocations, then re-submit the saved erasure requests with reason
      `reapply_after_restore:{era_id}` ([Privacy](privacy.md#11-what-remains-after-deletion)).
 7. **Resume** the tenants and run `pmail doctor --mail-test`.

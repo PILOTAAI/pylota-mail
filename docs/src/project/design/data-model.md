@@ -76,7 +76,13 @@ CREATE TABLE tenants (
   suspended_by     TEXT CHECK (suspended_by IN ('platform','partner')),  -- who suspended it; NULL while not
                                                            -- suspended. A partner key cannot lift 'platform'
   address_suffix   TEXT NOT NULL,                          -- '' (default tenant) or '.' || slug
+  suffix_fold      TEXT NOT NULL,                          -- fold (Identities › Confusable detection) of the suffix
+                                                           -- without its dot; '' for the default tenant. Unique, so
+                                                           -- no tenant gets a look-alike of another's suffix (D12)
   timezone         TEXT NOT NULL DEFAULT 'UTC',            -- IANA name
+  sending_paused_at    INTEGER,                            -- tenant send pause (Outbound › Tenant and domain
+  sending_pause_reason TEXT                                -- auto-pause, G12): set by the delivery consumer, cleared
+                       CHECK (sending_pause_reason IN ('abuse_threshold')),  -- only by a platform key
   policy_json      TEXT NOT NULL,                          -- TenantPolicy (see configuration.md)
   policy_ceilings_json TEXT NOT NULL DEFAULT '{}',         -- lower-only policy fields a platform key set, with
                                                            -- the value it set: a ceiling for partner keys
@@ -101,6 +107,7 @@ CREATE TABLE tenants (
   updated_at       INTEGER NOT NULL
 );
 CREATE UNIQUE INDEX tenants_suffix ON tenants(address_suffix) WHERE address_suffix <> '';
+CREATE UNIQUE INDEX tenants_suffix_fold ON tenants(suffix_fold) WHERE suffix_fold <> '';
 CREATE INDEX tenants_partner ON tenants(partner_id) WHERE partner_id IS NOT NULL;
 
 CREATE TABLE domains (
@@ -150,6 +157,9 @@ CREATE TABLE domains (
                                                            -- registrable domain), purpose and required
   monitor_do_id         TEXT NOT NULL,                     -- DomainMonitor Durable Object id; '' until the
                                                            -- every-minute cron mints it (rows written by the CLI)
+  sending_paused_at     INTEGER,                           -- domain send pause at provider-level abuse rates (G12);
+                                                           -- set by the delivery consumer, cleared only by a
+                                                           -- platform key; a paused domain never falls back
   created_at            INTEGER NOT NULL,
   updated_at            INTEGER NOT NULL
 );
@@ -210,7 +220,8 @@ CREATE TABLE addresses (
   ses_bounce_rule TEXT,                                    -- pm-retired-{n} holding this retired address (inbound = ses)
   forwarding      TEXT                                     -- NULL unless the domain's inbound = forward
                   CHECK (forwarding IN ('unverified','ok','failed')),
-  forwarding_checked_at INTEGER,                           -- last forwarding test result or forwarded message
+  forwarding_checked_at INTEGER,                           -- last forwarding-check token result (ordinary mail never
+                                                           -- changes forwarding, Inbound › Multiple identities)
   created_at      INTEGER NOT NULL,
   updated_at      INTEGER NOT NULL
 );
@@ -263,7 +274,8 @@ CREATE TABLE webhook_endpoints (
   identity_ids_json      TEXT,                             -- optional filter
   enabled                INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
   disabled_reason        TEXT                              -- manual | failing (a 410 is 'failing'; the event says gone)
-                         CHECK (disabled_reason IN ('manual','failing')),
+                         CHECK (disabled_reason IN ('manual','failing','url_changed')),  -- | url_changed: a PATCH
+                                                           -- changed the URL; a passing test re-enables (J21)
   secret_enc             TEXT NOT NULL,                    -- AES-256-GCM(PM_MASTER_KEY), base64
   prev_secret_enc        TEXT,
   prev_secret_expires_at INTEGER,
@@ -291,6 +303,32 @@ CREATE TABLE webhook_deliveries (
 );
 CREATE UNIQUE INDEX webhook_deliveries_attempt ON webhook_deliveries(endpoint_id, event_id, attempt);
 CREATE INDEX webhook_deliveries_endpoint ON webhook_deliveries(endpoint_id, created_at DESC);
+
+-- Deliveries parked while their partner is suspended (J13), instead of re-queuing every 15 minutes.
+-- Written by the Deliver consumer; the every-minute cron re-queues the rows of partners that are active
+-- again, and records rows past the replay window as dead (event_unavailable). Webhooks › Delivering.
+CREATE TABLE webhook_held (
+  endpoint_id   TEXT NOT NULL REFERENCES webhook_endpoints(id) ON DELETE CASCADE,
+  event_id      TEXT NOT NULL,
+  partner_id    TEXT NOT NULL,                             -- the suspended partner (the endpoint's, or its tenant's)
+  job_json      TEXT NOT NULL,                             -- the Deliver message, re-sent unchanged
+  occurred_at   INTEGER NOT NULL,                          -- the event's, for the replay window
+  held_at       INTEGER NOT NULL,
+  PRIMARY KEY (endpoint_id, event_id)
+);
+CREATE INDEX webhook_held_partner ON webhook_held(partner_id, held_at);
+
+-- Transport circuit breakers (Outbound › Transport circuit breaker, J20). One row per transport scope:
+-- 'cloudflare' (the account), 'ses:{region}', 'smtp:{domain_id}'.
+CREATE TABLE transport_breakers (
+  scope               TEXT PRIMARY KEY,
+  consecutive_unknown INTEGER NOT NULL DEFAULT 0,          -- Unknown outcomes in a row; reset by a definitive one
+  state               TEXT NOT NULL DEFAULT 'closed' CHECK (state IN ('closed','open','half_open')),
+  open_until          INTEGER,                             -- while open: no claims before this time
+  open_count          INTEGER NOT NULL DEFAULT 0,          -- consecutive openings; doubles the open period
+  probe_message_id    TEXT,                                -- half_open: the one message allowed through
+  updated_at          INTEGER NOT NULL
+);
 
 -- Where each event's payload lives (owner object), for replay. Payloads stay in the owner.
 CREATE TABLE event_index (
@@ -394,6 +432,10 @@ CREATE TABLE idempotency_records (
   tenant_id       TEXT,                                    -- the tenant the stored response belongs to (the scope
                                                            -- tenant, or the tenant a POST /v1/tenants created);
                                                            -- tenant erasure deletes by it (Privacy § 6.6)
+  identity_id     TEXT,                                    -- the identity the stored response belongs to (an
+                                                           -- identity create, its addresses and keys, and the
+                                                           -- mail routes of the content rule below); identity
+                                                           -- erasure deletes by it (Privacy § 6.5)
   idem_key        TEXT NOT NULL,                           -- ≤ 255 printable ASCII
   method          TEXT NOT NULL,
   path            TEXT NOT NULL,
@@ -406,6 +448,7 @@ CREATE TABLE idempotency_records (
   PRIMARY KEY (scope, key_id, idem_key)
 );
 CREATE INDEX idempotency_records_tenant ON idempotency_records(tenant_id) WHERE tenant_id IS NOT NULL;
+CREATE INDEX idempotency_records_identity ON idempotency_records(identity_id) WHERE identity_id IS NOT NULL;
 -- Every non-mail POST with an Idempotency-Key (metered ones as in Billing › What the Worker meters):
 --   1. SELECT by (scope, key_id, idem_key). completed: same method, path and fingerprint → replay
 --      response_status and response_body with Idempotent-Replayed: true; different → 409 idempotency_conflict.
@@ -418,6 +461,12 @@ CREATE INDEX idempotency_records_tenant ON idempotency_records(tenant_id) WHERE 
 --      POST /v1/tenants/{t}/webhooks, POST /v1/webhooks/{id}/rotate-secret) is stored with `secret`
 --      removed and "secret_replayed": false added, so a replay returns that body and the secret is kept
 --      nowhere (FR-KEY-2).
+--      Content rule: no record ever holds mail content. A response that carries a Message or a thread
+--      summary (POST …/release, …/cancel, …/resolve, …/threads/{t}/hold) is stored as a reference only,
+--      response_body = {"$ref":{"kind":"message"|"thread","identity_id":…,"id":…}} with identity_id set,
+--      and a replay re-reads the resource through the same handler with the calling key's visibility (a
+--      resource erased since replays its 404). Endpoints that return mail and change nothing (POST …/search
+--      at both scopes) are x-idempotency: none and are never recorded.
 --   A 4xx or 5xx before the action changed anything deletes the row, so the same key can be retried.
 
 -- Agent signing keys (Agent signing keys § 2 and § 8). Generated, sealed and used only inside the Worker.
@@ -874,6 +923,13 @@ CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 --       wait:{domain}   time until which a wait for that sender domain counts (RegisterWait: now + timeout
 --                       + 10 s, refreshed every 10 s; Inbound › The wait handler, E4; read by the
 --                       unsolicited-code check, E5)
+--       is_system       '1' in the system identity's mailbox (written by Init): redacted bodies, no index,
+--                       no tenant fan-out (Inbound › The system identity's mailbox, A15)
+--       parse:{msg}     parse attempts of an inbound pointer (NoteParseAttempt); deleted by ingest, or
+--                       by the daily maintenance after a day (Inbound › consumer step 4)
+--       compose:{msg}   time an outbound sent copy was about to be written; deleted by the accept
+--                       transaction or the refusal path; a stale one names an orphan (Inbound › Orphan objects)
+--       orphan_sweep_cursor  the last R2 key the rolling orphan sweep listed (I9)
 --       outbox_backoff  consecutive failed outbox dispatches; the retry delay is 30 s doubled per failure,
 --                       at most 5 minutes; cleared by a successful dispatch (Webhooks › Dispatching)
 --       alarm:{purpose} pending wake-ups: outbox, claim, dispatch, maintenance (Design § 4). Thread locks
@@ -881,16 +937,19 @@ CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 -- parser_version is a column of messages (and a core constant), not a meta key.
 
 CREATE TABLE threads (
-  seq                INTEGER PRIMARY KEY,                  -- per mailbox; used in thread tokens
+  seq                INTEGER PRIMARY KEY AUTOINCREMENT,    -- per mailbox; used in thread tokens; never reused,
+                                                           -- even after the newest thread is erased (C1)
   id                 TEXT NOT NULL UNIQUE,                 -- thr_
-  subject            TEXT NOT NULL,                        -- normalised subject of the first message
+  -- The summary columns below count VISIBLE messages only (not quarantined, hidden or throttled),
+  -- recomputed by Threading § 3.4; message_count = 0 means the thread is never listed
+  subject            TEXT NOT NULL,                        -- normalised subject of the first visible message ('' none yet)
   first_at           INTEGER NOT NULL,
-  last_at            INTEGER NOT NULL,
-  last_inbound_at    INTEGER,
+  last_at            INTEGER NOT NULL,                     -- latest visible message, else first_at
+  last_inbound_at    INTEGER,                              -- latest visible inbound message
   last_outbound_at   INTEGER,
-  message_count      INTEGER NOT NULL DEFAULT 0,
-  unread_count       INTEGER NOT NULL DEFAULT 0,
-  participants_json  TEXT NOT NULL DEFAULT '[]',           -- [{address,name}], capped at 50
+  message_count      INTEGER NOT NULL DEFAULT 0,           -- visible messages
+  unread_count       INTEGER NOT NULL DEFAULT 0,           -- visible inbound messages with read = 0
+  participants_json  TEXT NOT NULL DEFAULT '[]',           -- [{address,name}] of visible messages, capped at 50
   reply_from_address TEXT,                                 -- address the counterparty last wrote to
   fallback_pinned    INTEGER NOT NULL DEFAULT 0,           -- stays on platform address until quiet
   hold_json          TEXT,                                 -- legal hold {reason, until, set_by, set_at}
@@ -948,15 +1007,20 @@ CREATE TABLE messages (
   known_sender        INTEGER,
   quarantine_reason   TEXT                                 -- NULL unless status is quarantined or hidden
                       CHECK (quarantine_reason IN ('auth_failed','auth_unverified','spam','risky_attachment',
-                                                   'blocked_sender','otp_unsolicited')),
+                                                   'blocked_sender','otp_unsolicited')),  -- blocked_sender: a
+                                                           -- receive-block entry only (D7)
   flags_json          TEXT NOT NULL DEFAULT '[]',          -- parse_degraded, message_id_conflict, encrypted,
                                                            -- hidden_text, sent_via_fallback, reprocessed, bcc,
                                                            -- thread_join_unverified, reconciled, loopback,
                                                            -- body_truncated, display_name_spoof,
-                                                           -- lookalike_domain, reply_to_mismatch. The API
+                                                           -- lookalike_domain, reply_to_mismatch,
+                                                           -- shared_domain_sender, sender_suppressed,
+                                                           -- body_redacted, dsn_untrusted. The API
                                                            -- returns the trust ones (hidden_text, display_name_spoof,
                                                            -- lookalike_domain, reply_to_mismatch,
-                                                           -- thread_join_unverified) in trust.flags, the rest in flags
+                                                           -- thread_join_unverified, shared_domain_sender) in
+                                                           -- trust.flags, the rest in flags. Every row stays within
+                                                           -- the 1,900,000-byte budget of Inbound › Storage caps
   read                INTEGER NOT NULL DEFAULT 0,
   triage_status       TEXT CHECK (triage_status IN ('pending','done','skipped','failed')),
   triage_json         TEXT,
@@ -1056,10 +1120,17 @@ CREATE TABLE idempotency (
   fingerprint   TEXT NOT NULL,                             -- sha256(operation, target, canonical body)
   operation     TEXT NOT NULL,
   message_id    TEXT,
-  response_json TEXT NOT NULL,
+  response_json TEXT NOT NULL,                             -- the 202 Message with extracted_text, text and html
+                                                           -- set to null; a replay fills them from the row
+                                                           -- (Outbound › Reservation), so it stays a few KB
   created_at    INTEGER NOT NULL,
   expires_at    INTEGER NOT NULL                           -- created_at + 30 days
 );
+
+CREATE TABLE erased_ids (                                  -- message IDs an erasure deleted (I10): writers that
+  message_id TEXT PRIMARY KEY,                             -- finish after the erasure see them and delete what they
+  erased_at  INTEGER NOT NULL                              -- wrote; ingest refuses them. Rows older than 7 days are
+);                                                         -- deleted by the daily maintenance
 
 CREATE TABLE outbox (                                      -- transactional event outbox
   seq          INTEGER PRIMARY KEY,                        -- per-identity event sequence
@@ -1094,7 +1165,9 @@ CREATE TABLE verifications (                               -- codes and links fo
   consumed_at   INTEGER                                    -- first released by wait; purged 1 h later
 );
 
-CREATE TABLE rate_windows (                                -- inbound per-sender throttle (D5)
+CREATE TABLE rate_windows (                                -- inbound volume caps (D5, D13) and token
+                                                           -- brute-force limits (D10); keys in Inbound › Inbound
+                                                           -- volume caps and Threading § 2.5
   sender      TEXT NOT NULL,
   window_start INTEGER NOT NULL,
   count       INTEGER NOT NULL,
@@ -1106,8 +1179,15 @@ CREATE TABLE rate_windows (                                -- inbound per-sender
 
 - **Erasure** deletes the message row (cascading to deliveries, attachments, labels, refs, chunks and
   verifications). It also deletes the FTS rows (`DELETE FROM fts WHERE rowid = ?`), and the R2 objects
-  and vectors listed before the delete. An identity-scope erasure ends with `delete_all()` on the
-  object. See [Privacy and erasure](privacy.md).
+  and vectors listed before the delete, and inserts each message ID into `erased_ids` in the same
+  transaction, so an index job or post-commit step that finishes later deletes what it wrote
+  ([Search § 6.7](search.md#67-deletion-on-erasure), [I10](../edge-cases.md)). An identity-scope erasure
+  ends with `delete_all()` on the object. See [Privacy and erasure](privacy.md).
+- **Limits.** Durable Object SQLite allows 2 MB per string, BLOB or row, 100 bound parameters per query,
+  100 KB per statement and 100 columns per table (read 2026-10-10). Every message row has a 1,900,000-byte
+  budget ([Inbound › Storage caps](inbound.md#storage-caps)), and every list of values is bound as one
+  JSON array expanded with `json_each`, so no statement binds more than 100 parameters. The widest table,
+  `messages`, has 45 columns.
 - **Size watch.** After a write transaction, when `meta.size_checked_at` is more than an hour old, and in
   the daily maintenance, the mailbox computes `pragma page_count * page_size`, writes `meta.size_bytes`
   and `size_checked_at`, and writes one `mailbox_size_bytes` point. When the previous `size_bytes` was at
@@ -1137,6 +1217,8 @@ CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 --                    least an hour later (alarm:ownership is set to seen_at + 1 hour), cleared otherwise
 --   probe:{token}    pending alignment probe {probe_id, sent_at}; dropped after 15 minutes (smtp_probe_timeout)
 --   forward:{token}  pending forwarding test {address_id, sent_at}; dropped after 10 minutes (forwarding = failed)
+--   role:{hour}, role:{hour}:{sender_hash}  role-mail relay counts per UTC hour (AdmitRoleMail: 30 per domain,
+--                    5 per sender; Inbound › Role mail relay); keys older than 48 hours are deleted on write
 --   alarm:check, alarm:ownership, alarm:ses_check, alarm:probe, alarm:outbox  pending wake-ups (Design § 4,
 --                    rule 5); alarm:probe only for transport = smtp (Domains on any DNS host § 5.3)
 -- The NS and RDAP checks compare with D1 (domains.expected_ns_json, domains.rdap_fingerprint), so the
@@ -1194,21 +1276,35 @@ CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 --                           NotifierRequest::UsageThreshold is sent; read before sending the next one
 --   alarm:holds             earliest holds.expires_at (Billing › Settle, extend and expiry)
 --   alarm:reset             earliest allowances.resets_at (Billing › Monthly reset)
+--   tm:{msg}                the day (YYYY-MM-DD) on which CountTriageModel counted this message, so a
+--                           redelivered triage job is counted once; deleted after 2 days by the daily alarm
+--   tz                      the time zone the daily caps use now (IANA); tz_next {zone, from}: a changed
+--                           tenants.timezone, applied from `from` = the next local midnight of tz
 CREATE TABLE counters (
   metric TEXT NOT NULL,                                    -- daily caps: sends, sends:idn_..., agentic,
+                                                           --   triage_model (the AI cap of Triage § 12),
                                                            --   warned:{metric}:{80|100} (sends caps only);
                                                            -- usage: usage:{inbound|outbound|sends|triage|
                                                            --   search|agentic|ai_neurons|assertions|
-                                                           --   http_signatures};
+                                                           --   http_signatures|cf_recipients};
                                                            -- tenant outcomes: outcomes, bounced, complained
                                                            --   (RecordOutcome; summed by OutcomeRates; never
-                                                           --   pruned, ForgetIdentity leaves them)
-  window TEXT NOT NULL,                                    -- YYYY-MM-DD: the tenant's time zone for daily caps,
-                                                           -- UTC for usage:* (flushed to usage_daily) and for
-                                                           -- the tenant outcome counters
+                                                           --   pruned, ForgetIdentity leaves them), and the same
+                                                           --   three per sending domain: outcomes:dom:{domain_id}, …
+                                                           --   (G12; pruned after 8 days);
+                                                           -- inbound volume: inbound_hour (AdmitInbound, D13;
+                                                           --   pruned after 48 hours)
+  window TEXT NOT NULL,                                    -- YYYY-MM-DD: the tenant's time zone (tz above) for
+                                                           -- daily caps, UTC for usage:* (flushed to usage_daily)
+                                                           -- and for the outcome counters; YYYY-MM-DDTHH (UTC)
+                                                           -- for inbound_hour
   value  INTEGER NOT NULL,
   PRIMARY KEY (metric, window)
 );
+CREATE TABLE outcome_events (                              -- RecordOutcome is idempotent by event ID: a retried
+  event_id TEXT PRIMARY KEY,                               -- delivery event is counted once (Outbound › Abuse
+  at       INTEGER NOT NULL                                -- auto-pause); rows older than 7 days are deleted by
+);                                                         -- the daily alarm
 CREATE TABLE allowances (                                  -- plan + top-ups for the current period
   feature    TEXT PRIMARY KEY CHECK (feature IN ('inboxes','sends','triage','custom_domains','storage_gb','seats')),
   granted    INTEGER,                                      -- NULL = unlimited (exempt / disabled)
@@ -1295,10 +1391,11 @@ CREATE TABLE sent (                                        -- per-day counters f
 |---|---|---|---|
 | `inbound-staging/{yyyy}/{mm}/{dd}/{ulid}.eml` | Raw message before routing resolves | `envelope_to_hash` | The inbound consumer after the move, or the lifecycle rule (1 day) |
 | `inbound-staging/ses/{key}` | Raw message received through SES, copied from S3 (`in/{key}`) before its recipients are resolved | – | The lifecycle rule (1 day); a held message whose copy is gone is fetched from S3 again |
+| `inbound-staging/role/{yyyy}/{mm}/{dd}/{ulid}.eml` | Role mail (`postmaster@`, `abuse@`, …) waiting to be relayed through the system identity ([Inbound › Role mail relay](inbound.md#role-mail-relay)) | – | The inbound consumer after the relay, or the lifecycle rule (1 day) |
 | `t/{ten}/i/{idn}/m/{msg}/raw.eml` | Raw inbound MIME | `tenant`, `identity`, `message` | Retention (`raw_days`), erasure |
 | `t/{ten}/i/{idn}/m/{msg}/a/{att}` | Attachment bytes | same, plus `sha256` | Erasure, message retention |
 | `t/{ten}/i/{idn}/m/{msg}/a/{att}.md` | Extracted text (Markdown, with page markers) | same | as above |
-| `t/{ten}/i/{idn}/out/{msg}.eml` | Composed outbound MIME (sent copy) | same, plus `idem_key_sha256` (hex SHA-256 of the Idempotency-Key), `fingerprint` and `operation` | Retention, erasure |
+| `t/{ten}/i/{idn}/out/{msg}.eml` | Composed outbound MIME (sent copy) | same, plus `idem_key_sha256` (hex SHA-256 of the Idempotency-Key), `fingerprint` and `operation` | Retention, erasure; the submit path when the send is refused after it was written; for the system identity, as soon as the message leaves `queued` |
 | `t/{ten}/i/{idn}/out/{msg}/a/{att}` | Outbound attachment bytes (linked attachments, and copies for `GET …/attachments/{id}`) | `tenant`, `identity`, `message`, `sha256` | Retention, erasure |
 | `t/{ten}/exports/{exp}.zip` | Subject-access export | `tenant`, `export` | 7 days after creation |
 
@@ -1310,6 +1407,10 @@ to each recipient's final key ([Inbound › The SES source](inbound.md#the-ses-s
 
 The metadata on `out/{msg}.eml` lets a point-in-time restore of a mailbox rebuild the idempotency
 ledger for sends made after the restore point ([Observability › Restore from PITR](observability.md#restore-from-pitr)).
+
+Every object under `t/` is named by a row; one that is not (an orphan) is deleted at its source, or by the
+mailbox's rolling orphan sweep once it is 15 days old ([Inbound › Orphan objects](inbound.md#orphan-objects),
+[I9](../edge-cases.md)).
 
 **Optional backup bucket.** When `PM_BACKUP_BUCKET` is set, the nightly `backup` job copies every `t/`
 object created since its last run to the same key in that bucket (binding `BACKUP`, same jurisdiction).

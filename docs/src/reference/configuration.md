@@ -20,9 +20,9 @@ There are three layers:
 | `QUOTA` | Durable Object namespace | class `TenantQuota` | SQLite-backed |
 | `SES_CONTROL` | Durable Object namespace | class `SesControl` | SQLite-backed. One object per deployment, used only when SES is configured: the SES control-plane token bucket |
 | `NOTIFY` | Durable Object namespace | class `Notifier` | SQLite-backed. One object per tenant: coalescing, schedules and caps of notification email ([Notifications](../project/design/notifications.md#8-notifier-object)) |
-| `Q_INBOUND` | Queue producer and consumer | `pm-inbound` (DLQ `pm-inbound-dlq`) | Batch 10, max retries 10 |
+| `Q_INBOUND` | Queue producer and consumer | `pm-inbound` (DLQ `pm-inbound-dlq`) | Batch 10, max retries 10, `retry_delay` 120 s, so ten deliveries of a message that keeps failing span about 18 minutes and its third attempt runs headers-only ([Inbound › Degraded mode](../project/design/inbound.md#the-pm-inbound-consumer)) |
 | `Q_OUTBOUND` | Queue producer and consumer | `pm-outbound` (DLQ `pm-outbound-dlq`) | Batch 10, max retries 100. They count only unexpected errors: provider rate-limit, quota and relay back-offs re-enqueue a new message with a delay, so they never use them up; every back-off ends `failed` (`quota_exhausted`) 24 hours after submit |
-| `Q_DELIVERY` | Queue consumer and producer | `pm-delivery-events` (DLQ `pm-delivery-events-dlq`) | Batch 10, max retries 20 (the G8 retry schedule needs at least 11). Fed by Email Sending event subscriptions; the producer is used only to redrive dead-lettered items |
+| `Q_DELIVERY` | Queue consumer and producer | `pm-delivery-events` (DLQ `pm-delivery-events-dlq`) | Batch 10, max retries 20 (the G8 retry schedule, every 60 s for 15 minutes, needs at least 16). Fed by Email Sending event subscriptions; the producer is used only to redrive dead-lettered items |
 | `Q_WEBHOOKS` | Queue producer and consumer | `pm-webhooks` (DLQ `pm-webhooks-dlq`) | Batch 20, max retries 13 |
 | `Q_INDEX` | Queue producer and consumer | `pm-index` (DLQ `pm-index-dlq`) | Batch 10, max retries 10 |
 | `VECTORS` | Vectorize | `pm-mail-chunks` | 1024 dimensions, cosine, 8 metadata indexes |
@@ -33,6 +33,8 @@ There are three layers:
 | `RL_SEARCH` | Rate limiting | – | 120 per 60 s, keyed by API key ID |
 | `RL_AGENTIC` | Rate limiting | – | 20 per 60 s, keyed by API key ID |
 | `RL_SEND` | Rate limiting | – | 120 per 60 s, keyed by identity ID |
+| `RL_AI` | Rate limiting | – | 60 per 60 s, keyed by tenant ID. Asked before every Workers AI text-generation call (triage model, agentic planning and answer calls), so one tenant takes at most a fifth of the account's 300 a minute ([Search › Indexing pipeline](../project/design/search.md#6-indexing-pipeline-pm-index), [F16](../project/edge-cases.md)) |
+| `RL_EMBED` | Rate limiting | – | 600 per 60 s, keyed by tenant ID. Asked before every embedding request (an `Embed` batch of up to 16 texts, or a query embedding); the account limit is 3,000 a minute ([F16](../project/edge-cases.md)) |
 | `RL_SIGNIN` | Rate limiting | – | 10 per 60 s, keyed by client IP (`CF-Connecting-IP`). Applies to `POST /console/sign-in`, `/console/sign-in/link`, `/console/sign-in/code`, `/console/sign-up` and `/console/waitlist` ([Cloud sign-up](../project/design/cloud-signup.md#10-abuse-and-safety-on-cloud)) |
 | `RL_SIGN` | Rate limiting | – | 600 per 60 s, keyed by identity ID. Agent assertions and signed HTTP requests together ([Agent signing keys](../project/design/agent-keys.md#6-permissions-limits-and-plans)) |
 | `RL_PARTNER` | Rate limiting | – | 10 per 60 s, keyed by partner ID. `POST /v1/tenants` and `POST /v1/tenants/{tenant_id}/invitations` called with a partner key, across all of the partner's keys ([Security § 10](../project/design/security.md#10-rate-limiting-and-abuse)) |
@@ -188,6 +190,8 @@ reputation or the AI budget of a Cloud deployment. This is the full document wit
   },
   "inbound": {
     "per_sender_per_hour": 60,
+    "unauthenticated_per_hour": 120,
+    "per_tenant_per_hour": 2000,
     "extract_attachment_text": ["pdf", "office", "text", "html"],
     "extract_image_text": false,
     "ses_bounce_retired": true
@@ -199,6 +203,7 @@ reputation or the AI budget of a Cloud deployment. This is the full document wit
   },
   "triage": {
     "enabled": true,
+    "daily_model_cap": 2000,
     "categories": null,
     "rules": []
   },
@@ -213,7 +218,9 @@ reputation or the AI budget of a Cloud deployment. This is the full document wit
   "webhook_text_bytes": 16384,
   "abuse": {
     "complaint_rate_pause": 0.003,
-    "bounce_rate_pause": 0.05
+    "bounce_rate_pause": 0.05,
+    "tenant_complaint_rate_pause": 0.001,
+    "tenant_bounce_rate_pause": 0.05
   },
   "domains": {
     "allow_create_zone": false,
@@ -233,11 +240,13 @@ reputation or the AI budget of a Cloud deployment. This is the full document wit
 | `large_attachments` | `refuse`, or `link` (expiring signed links, `link_ttl_hours` 1–168) |
 | `ai_disclosure.mode` | `none`, `footer` (appended to text and HTML) or `header` (`X-AI-Generated: true`) |
 | `auto_reply.max_automatic_exchanges` | Automatic replies allowed per thread before a human must act ([D6](../project/edge-cases.md)) |
+| `inbound.per_sender_per_hour`, `inbound.unauthenticated_per_hour`, `inbound.per_tenant_per_hour` | Inbound volume caps; the excess is stored `throttled`, never triaged, embedded or evented, and not counted in `storage_gb`. The per-sender cap counts mail that fails authentication under `unauth:` + the address, so a forged `From` cannot use a real sender's allowance; the other two count only senders who are not known correspondents ([Inbound › Inbound volume caps](../project/design/inbound.md#inbound-volume-caps-d5-d13), [D5](../project/edge-cases.md), [D13](../project/edge-cases.md)) |
 | `inbound.ses_bounce_retired` | `true` bounces mail to retired addresses on SES-receiving domains with `550 5.1.6`, through SES receipt rules; `false` drops it without a bounce ([Domains on any DNS host › Retired and unknown recipients](../project/design/domain-connections.md#46-retired-and-unknown-recipients)) |
 | `quarantine.unsolicited_otp` | Quarantine password-reset and OTP mail that no `wait` asked for ([E5](../project/edge-cases.md)) |
 | `quarantine.key_release` | `true` lets keys with `quarantine:review` that reach this tenant, its partner key included, release its quarantined mail even when `PM_QUARANTINE_KEY_RELEASE` is `off`. `false` by default. Only a platform key, or the partner key of the tenant's own partner, can set it (a tenant key cannot call `PATCH /v1/tenants/{tenant_id}`: `403 permission_denied`). With `PM_QUARANTINE_KEY_RELEASE=on` it changes nothing. On Pylota Mail Cloud, Pylota's partner key sets it to `true` on each operator's tenant ([J14](../project/edge-cases.md), [J16](../project/edge-cases.md)) |
 | `retention.message_days` | `null` keeps parsed messages indefinitely. A number deletes messages, attachments, index rows and vectors after that age, except held threads |
 | `retention.events_days` | 1–365, default 30. Webhook delivery rows, the event index and the event payloads kept for replay are deleted after this many days. Webhook replay reaches back 30 days from an event's `occurred_at`, or this many days if fewer ([Privacy design › Retention](../project/design/privacy.md#52-steps-of-a-tenant-retention-job)) |
+| `triage.daily_model_cap` | Model-backed triage runs per day in the tenant's time zone; past it, triage is rules-only until local midnight. It applies whatever the billing mode, so an `exempt` workspace still has a ceiling on model spend ([Triage § 12](../project/design/triage.md#12-cost-controls)) |
 | `triage.categories` | `null` uses the built-in list. Otherwise an array of up to 20 `{ "name": "pcn", "description": "Penalty charge notices from councils" }`, which replaces it |
 | `triage.rules` | Deterministic rules. See [Triage](../guides/triage.md#rules) |
 | `search.refs_packs` | `core` (amounts, phones, emails, domains, dates, invoice and order numbers) and optional `uk_vehicle` (plates, PCNs). There is no built-in pack for booking references: add them with `custom_refs` |
@@ -245,7 +254,8 @@ reputation or the AI budget of a Cloud deployment. This is the full document wit
 | `domains.allow_create_zone` | Lets the tenant's own keys, and its partner key, use the `nameservers` method, which creates a Cloudflare zone. `false` by default; Pylota Mail Cloud sets it to `true` in `PM_DEFAULT_POLICY`. Without it, the request gets `422 transport_unavailable` (`zone_creation_not_allowed`). Platform keys may always use it. Only a platform key can set it |
 | `domains.cloudflare_zones` | Zones of the deployment's Cloudflare account, by name (A-label apex, lower case, up to 50), that the tenant's own keys and its partner key may use with the `cloudflare_zone` method and with `replace_mx`, besides the zones this deployment created for the tenant (`nameservers`, `delegated_subdomain`). A listed zone grants names strictly under it; its apex and `replace_mx` there stay platform-only. `[]` by default. A zone created for another tenant, or one under the zones of `PM_PLATFORM_DOMAIN`, `PM_API_HOST` or `PM_CONSOLE_HOST`, is refused even when listed (`403 scope_denied`, `details.reason = "zone_not_allowed"`). Platform keys may use any zone. Only a platform key can set it ([Identities and domains › Zone permission](../project/design/identity-domains.md#zone-permission)) |
 | `web_bot_auth.allowed` | Lets the tenant's identities obtain signed HTTP requests (Web Bot Auth). `false` by default, and until it is `true` those requests get `403 policy_denied`. Only a platform key can set it: a tenant or partner key cannot turn it on. It has no effect while `PM_WEB_BOT_AUTH` is `off` ([Agent signing keys](../project/design/agent-keys.md#5-signed-http-requests-web-bot-auth)) |
-| `domain_fallback` | `false` fails sends on a failing domain instead of using the platform address |
+| `domain_fallback` | `false` fails sends on a failing domain instead of using the platform address. A domain or tenant paused for its complaint or bounce rate never falls back ([G12](../project/edge-cases.md)) |
+| `abuse.tenant_complaint_rate_pause`, `abuse.tenant_bounce_rate_pause` | Rates over the last 7 UTC days, with at least 500 outcomes, at which the tenant's sending, or one of its sending domains, is paused (`sending_paused_at`). The complaint default, 0.001, is Amazon SES's review rate ([Outbound › Tenant and domain auto-pause](../project/design/outbound.md#tenant-and-domain-auto-pause-g12)) |
 
 ### Who may change a field
 
@@ -259,7 +269,7 @@ keys and the console cannot write the policy at all (`PATCH /v1/tenants/{tenant_
 |---|---|---|
 | Platform-only | `web_bot_auth.allowed`, `domains.allow_create_zone`, `domains.cloudflare_zones` | `403 scope_denied` with `details.field` |
 | Platform or own partner | `quarantine.key_release` | May set it on the tenants of its own partner, at creation and later |
-| Lower-only | `identity_daily_send_cap`, `tenant_daily_send_cap`, `max_recipients`, `auto_reply.allowed`, `auto_reply.max_automatic_exchanges`, `inbound.per_sender_per_hour`, `inbound.extract_image_text`, `retention.raw_days`, `retention.events_days`, `triage.enabled`, `search.agentic_enabled`, `search.agentic_daily_cap`, `search.agentic_max_steps`, `search.agentic_max_seconds`, `abuse.complaint_rate_pause`, `abuse.bounce_rate_pause` | May set a value at or below the field's ceiling; above it, `403 scope_denied` with `details.field` |
+| Lower-only | `identity_daily_send_cap`, `tenant_daily_send_cap`, `max_recipients`, `auto_reply.allowed`, `auto_reply.max_automatic_exchanges`, `inbound.per_sender_per_hour`, `inbound.unauthenticated_per_hour`, `inbound.per_tenant_per_hour`, `inbound.extract_image_text`, `retention.raw_days`, `retention.events_days`, `triage.enabled`, `triage.daily_model_cap`, `search.agentic_enabled`, `search.agentic_daily_cap`, `search.agentic_max_steps`, `search.agentic_max_seconds`, `abuse.complaint_rate_pause`, `abuse.bounce_rate_pause`, `abuse.tenant_complaint_rate_pause`, `abuse.tenant_bounce_rate_pause` | May set a value at or below the field's ceiling; above it, `403 scope_denied` with `details.field` |
 | Free | Every other field: `send_allowlist_only`, `large_attachments`, `link_ttl_hours`, `ai_disclosure`, `quarantine.on_auth_fail`, `quarantine.spam_threshold`, `quarantine.unsolicited_otp`, `inbound.extract_attachment_text`, `inbound.ses_bounce_retired`, `retention.message_days`, `triage.categories`, `triage.rules`, `search.refs_packs`, `search.custom_refs`, `webhook_text_bytes`, `domain_fallback` | May set any valid value |
 
 - **Ceiling.** A lower-only field's ceiling is the more restrictive of the deployment default (the

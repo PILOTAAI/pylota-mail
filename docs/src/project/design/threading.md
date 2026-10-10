@@ -6,7 +6,7 @@ carried in `Reply-To`, subject normalisation, participants, and the address a re
 | | |
 |---|---|
 | Requirements | FR-THR-1, FR-THR-2, FR-OUT-5, FR-OUT-6, FR-ADR-2, FR-DOM-6 |
-| Edge cases | [A2](../edge-cases.md), [A10](../edge-cases.md), [B6](../edge-cases.md), [C1–C8](../edge-cases.md), [D10](../edge-cases.md) |
+| Edge cases | [A2](../edge-cases.md), [A10](../edge-cases.md), [B6](../edge-cases.md), [C1–C9](../edge-cases.md), [D10](../edge-cases.md) |
 | Code | `crates/core/src/thread_token.rs`, `crates/core/src/thread.rs` (pure), `crates/worker/src/mailbox/threads.rs` (SQL) |
 | Tables | `threads`, `messages`, `rate_windows` in [Data model](data-model.md#2-identitymailbox-durable-object-sqlite); the keyring in D1 `signing_keys` ([Data model](data-model.md#1-d1-control-plane)) |
 
@@ -39,7 +39,8 @@ whose sending domain has `reply_token = 'subaddress'` (FR-OUT-6):
 local   the From address's local part, e.g. bookings.acme
 K       kid of the thread key that minted the token: one Crockford base32 character, lower case
         (signing_keys.kid, purpose 'thread')
-S       thread seq (threads.seq), Crockford base32, lower case, no leading zeros, 1–12 chars
+S       thread seq (threads.seq, AUTOINCREMENT: never reused), Crockford base32, lower case, no leading
+        zeros, 1–12 chars
 M       first 40 bits of the HMAC, Crockford base32, lower case, exactly 8 chars
 
 example bookings.acme+t03k.9f2mq7xa@agents.example     (kid "0", seq "3k" = 3 × 32 + 19 = 115)
@@ -190,22 +191,30 @@ pub fn resolve_inbound(inp: &InboundThreadInputs, db: &impl ThreadLookup) -> Thr
 
 1. **Token.** If `token` is `Valid { seq }` and `db.thread_exists(seq)`, the decision is
    `Join { seq, via: Token }`. A valid token for a seq that no longer exists (the thread was erased)
-   is ignored, and resolution continues at step 2.
+   is ignored, and resolution continues at step 2. Because `threads.seq` is `INTEGER PRIMARY KEY
+   AUTOINCREMENT`, SQLite never hands out a seq again, not even after the newest thread is erased, so an
+   old valid token can never join a new, unrelated thread ([C1](../edge-cases.md)).
 2. **In-Reply-To.** If present and `db.thread_of_message_id(in_reply_to)` returns a seq, join it
    (`via: InReplyTo`).
 3. **References.** Walk `references` from the **last** entry to the first (most recent first), at most
    50 lookups. The first hit is joined (`via: References`).
 4. **New.** Otherwise `New`. The subject is never consulted ([C1](../edge-cases.md)).
 
-`join_unverified` is set when either:
+`join_unverified` is set when any of these holds:
 
-- `token` is `Invalid` (a token-shaped tag failed, or was not checked because of the rate limit); or
+- `token` is `Invalid` (a token-shaped tag failed, or was not checked because of the rate limit);
 - the decision is `Join { via: Token }`, the sender is not already a participant
   (`!db.is_participant(seq, sender)`), and neither `In-Reply-To` nor any `References` entry resolved
-  to the same seq.
+  to the same seq;
+- the decision is `Join { via: InReplyTo }` or `Join { via: References }` and the sender is not already a
+  participant of that thread. A `Message-ID` is in every copy of a message, so anyone who saw one (a
+  recipient, a forwardee, a list) can write a header join into the thread ([C9](../edge-cases.md)).
 
-The flag is stored in `messages.flags_json` and exposed in `trust.flags`. It is advisory: integrators
-show it to the agent and to humans; nothing in the service changes behaviour because of it.
+The flag is stored in `messages.flags_json` and exposed in `trust.flags`. It is advisory for the message
+itself: integrators show it to the agent and to humans, and the message still joins the thread. One
+behaviour depends on it: a message with the flag never satisfies `wait` with `kind=reply`
+([Inbound › The `wait` handler](inbound.md#the-wait-handler-e4)), so an agent waiting for a reply is not
+woken by a stranger's header join.
 
 ### 3.2 Message-ID normalisation and matching
 
@@ -250,32 +259,48 @@ cannot see them.
 
 ### 3.4 Effects on the thread row
 
+A thread's summary columns describe **visible** mail only: a message counts when its status is not
+`quarantined`, `hidden` or `throttled` (every outbound message counts). So a thread list never shows a
+count, a date, a subject or a participant that comes from mail an agent cannot see, and a thread whose
+messages are all invisible has `message_count = 0` and is never listed
+([Inbound › Read path and release](inbound.md#read-path-and-release)).
+
 When the decision is `New`, the mailbox inserts:
 
 ```sql
 INSERT INTO threads (id, subject, first_at, last_at, last_inbound_at, message_count, unread_count,
                      participants_json, reply_from_address)
-VALUES (?1, ?2, ?3, ?3, ?3, 0, 0, '[]', ?4)
+VALUES (?1, ?2, ?3, ?3, NULL, 0, 0, '[]', ?4)
 RETURNING seq;
--- ?1 thr_ id from the platform ID generator, ?2 normalise_subject(subject), ?3 received_at,
--- ?4 the delivered-to address without its tag (NULL for a BCC copy)
+-- ?1 thr_ id from the platform ID generator, ?2 normalise_subject(subject) when the message is visible,
+-- else '' (filled by the first visible message), ?3 received_at, ?4 the delivered-to address without its
+-- tag (NULL for a BCC copy, and for a message that is not visible)
 ```
 
-Then, for both new and joined threads, after the message row is inserted:
+Then, for both new and joined threads, after the message row is inserted, and only when the new message
+is visible, the visible columns are recomputed by one statement (the same one runs when a message is
+released, and when an erasure or retention purge deletes a message of the thread):
 
 ```sql
 UPDATE threads SET
-  last_at         = MAX(last_at, ?2),
-  last_inbound_at = MAX(COALESCE(last_inbound_at, 0), ?2),
-  message_count   = message_count + 1,
-  unread_count    = unread_count + CASE WHEN ?3 THEN 1 ELSE 0 END,   -- visible to agents
-  participants_json  = ?4,                                           -- recomputed in Rust (section 6)
-  reply_from_address = COALESCE(?5, reply_from_address)              -- section 5
+  message_count   = (SELECT COUNT(*) FROM messages
+                     WHERE thread_seq = ?1 AND status NOT IN ('quarantined','hidden','throttled')),
+  unread_count    = (SELECT COUNT(*) FROM messages
+                     WHERE thread_seq = ?1 AND direction = 'inbound' AND status = 'received' AND read = 0),
+  last_at         = COALESCE((SELECT MAX(received_at) FROM messages
+                     WHERE thread_seq = ?1 AND status NOT IN ('quarantined','hidden','throttled')), first_at),
+  last_inbound_at = (SELECT MAX(received_at) FROM messages
+                     WHERE thread_seq = ?1 AND direction = 'inbound' AND status = 'received'),
+  subject         = CASE WHEN subject = '' THEN ?2 ELSE subject END,
+  participants_json  = ?3,                                           -- recomputed in Rust (section 6)
+  reply_from_address = COALESCE(?4, reply_from_address)              -- section 5
 WHERE seq = ?1;
+-- ?2 normalise_subject of the earliest visible message, ?3 the participants list of section 6
 ```
 
-`?3` is true only for status `received` (quarantined, hidden and throttled messages do not count as
-unread). Releasing a quarantined message increments `unread_count` at release time.
+The subqueries use `messages_thread (thread_seq, received_at)`. A quarantined, hidden or throttled
+message changes none of the columns (its `thread_seq` still records where it belongs, so a later release
+recomputes them).
 
 ## 4. Outbound threading
 
@@ -320,9 +345,10 @@ Cloudflare's 100-entry `reply()` limit never applies.
 
 ### 4.2 The outbound message row
 
-The outbound message is inserted with `thread_seq` of its thread, and the thread row is updated with
-`last_at`, `last_outbound_at`, `message_count + 1` and, for a new thread, `reply_from_address` set to the
-From address used. Recipients are added to `participants_json` (section 6). The Reply-To token is minted
+The outbound message is inserted with `thread_seq` of its thread, the thread's visible columns are
+recomputed as in 3.4 (an outbound message is always visible), `last_outbound_at` is set and, for a new
+thread, `subject` and `reply_from_address` are set from it. Recipients are added to `participants_json`
+(section 6). The Reply-To token is minted
 from the thread's `seq` at composition time (see [Outbound](outbound.md#reply-to-and-the-thread-token)).
 
 ## 5. Which address a reply is sent from ([C3](../edge-cases.md), FR-OUT-5)
@@ -367,7 +393,10 @@ is needed when a domain recovers.
 ## 6. Participants
 
 `threads.participants_json` is `[{ "address": "...", "name": "..." }]`, at most 50 entries, ordered by
-first appearance. It is recomputed in Rust on each message insert:
+first appearance, built from visible messages only. When a visible message is inserted or released, its
+addresses are added to the stored list in Rust; after an erasure or retention purge deletes a message of
+the thread, the list is rebuilt from the thread's 1,000 most recent visible messages, so an erased
+counterparty leaves it. The rules for each message:
 
 - **Inbound:** add `From`, then every `To` and `Cc` entry.
 - **Outbound:** add every `To` and `Cc` recipient.
@@ -434,6 +463,7 @@ truncated at a character boundary.
 | [C6](../edge-cases.md) | Forward stays in the thread and keeps `References` | 4 |
 | [C7](../edge-cases.md) | Replies to our mail match by token first, then by learned header ID or provider ID | 3.1, 3.2 |
 | [C8](../edge-cases.md) | Localised prefixes are stripped for display only | 7 |
+| [C9](../edge-cases.md) | A header join by a sender who is not a participant is flagged `thread_join_unverified` and never satisfies `wait` with `kind=reply` | 3.1 |
 | [A2](../edge-cases.md) | Forged or unrelated sub-address tags never change the identity; a token-shaped tag that fails is ignored | 2.3 |
 | [B6](../edge-cases.md) | Forwarded `message/rfc822` parsed as nested content | 3.3 |
 | [D10](../edge-cases.md) | Failed verifications rate-limited and flagged | 2.5, 3.1 |
@@ -451,6 +481,9 @@ truncated at a character boundary.
 | `it::inbound::a2_forged_token_ignored` | A forged token files by headers, flags `thread_join_unverified`, identity unchanged (A2) |
 | `it::inbound::d10_token_bruteforce` | Eleventh failure in an hour from one sender is not verified; the 101st failure across senders suspends verification; mail still accepted (D10) |
 | `core::thread::c1_token_only` / `core::thread::c1_no_headers_new_thread` / `core::thread::c1_subject_never_joins` | C1; the resolution order of FR-THR-1 (token, then headers, then a new thread; the subject never joins) |
+| `it::thread::seq_never_reused` | Erase the newest thread of a mailbox, create a new one: its `seq` is higher than the erased one's, and a reply carrying the erased thread's valid token starts a new thread instead of joining the new one (C1; an integration test because the guarantee is SQLite's `AUTOINCREMENT`) |
+| `core::thread::c9_header_join_non_participant` / `it::inbound::c9_header_join_flagged` | `resolve_inbound` sets `join_unverified` for an `In-Reply-To` or `References` join by a sender who is not a participant, and not for a participant; through `email()`, such a message joins the thread with `thread_join_unverified` in `trust.flags` and does not end a `wait` with `kind=reply` (C9) |
+| `it::messages::thread_counts_visible_only` | A quarantined first message leaves the thread unlisted with `message_count = 0`; a throttled reply changes neither `last_at` nor `participants`; after release the counts, subject and participants include the released message; after a counterparty erasure the counterparty leaves `participants` |
 | `core::thread::c2_trim_references` | 150 references → first + 19 most recent, order kept, duplicates removed (C2) |
 | `core::thread::c2_rfc5322_parent_rules` | Parent without References uses its In-Reply-To |
 | `it::addresses::c3_reply_from_retiring` | After a promote, replies go from the retiring address the counterparty used; after retirement, from the primary (C3) |
