@@ -352,7 +352,9 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
 - **FR-DLV-2** A hard bounce **must** create a suppression. A complaint **must** create a permanent
   suppression and count towards the identity's complaint rate.
 - **FR-DLV-3** An identity whose complaint rate exceeds 0.3% over its last 1,000 sends, or whose bounce
-  rate exceeds 5% over its last 200, **must** be paused automatically with reason `abuse_threshold`.
+  rate exceeds 5% over its last 200, **must** be paused automatically with reason `abuse_threshold`. This
+  applies to every identity except the deployment's system identity, whose outcomes are recorded but
+  never pause it (its bounces and complaints pause the affected person's notifications instead).
 - **FR-DLV-4** Uncertain sends **should** be reconciled from provider events by matching sender,
   recipient and subject within 30 minutes. A match moves the send to its real status with `reconciled: true`.
 - **FR-DLV-5** DSNs that do not match a message we sent (backscatter) **must** be dropped and counted.

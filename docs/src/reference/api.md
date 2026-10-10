@@ -561,8 +561,9 @@ The token's header is `{"alg":"EdDSA","typ":"agent-assertion+jwt","kid":"<thumbp
   signature, `aud`, `nbf` and `exp` with 60 seconds of skew, and `jti` against replays
   ([Agent signing keys § 4.3](../project/design/agent-keys.md#43-how-a-verifier-checks-it)).
 
-Errors: `400 invalid_request` ([O4–O6](../project/edge-cases.md)), `403 permission_denied`,
-`403 scope_denied`, `404 identity_not_found`, `409 identity_paused` and `429 rate_limited`.
+Errors: `403 tenant_suspended` (checked first, before `409 identity_paused`), `400 invalid_request`
+([O4–O6](../project/edge-cases.md)), `403 permission_denied`, `403 scope_denied`, `404 identity_not_found`,
+`409 identity_paused` and `429 rate_limited`.
 
 ### `POST /v1/identities/{identity_id}/http-signatures` — tenant or identity key, `identities:sign`
 
@@ -606,7 +607,8 @@ Signed HTTP requests are off unless the operator sets `PM_WEB_BOT_AUTH=on` (allo
 passed) and the tenant opts in. While `PM_WEB_BOT_AUTH=off`, this returns `422 web_bot_auth_disabled`
 ([O9](../project/edge-cases.md)); while tenant policy `web_bot_auth.allowed` is `false`, the default,
 `403 policy_denied` ([O13](../project/edge-cases.md);
-[Configuration › Tenant policy](configuration.md#tenant-policy)). Other errors as for assertions. The
+[Configuration › Tenant policy](configuration.md#tenant-policy)). Other errors as for assertions,
+`403 tenant_suspended` first among them. The
 operator side is in [Self-hosting › Signed HTTP requests](../self-hosting.md#signed-http-requests-web-bot-auth).
 
 ---
@@ -827,7 +829,7 @@ must call SES first waits up to 5 seconds for the deployment's SES control-plane
 | `transport` | `cloudflare`, `ses` or `smtp` |
 | `routing_mode` | `catch_all`, `literal` (one routing rule per address, on a zone subdomain) or `forward` |
 | `ses_region` | The region of the domain's SES identity: set when `inbound` or `transport` is `ses`, and on a `cloudflare_zone`, `nameservers` or `delegated_subdomain` domain that got an SES identity for the Email Sending failover ([J5](../project/edge-cases.md)) during onboarding; otherwise `null` |
-| `mail_from_domain` | `pm-bounce.{name}` when SES sends for the domain, otherwise `null`. The local part `pm-bounce` is reserved on such domains |
+| `mail_from_domain` | `pm-bounce.{name}` on a `dns_records` or `send_only` domain, whose mail SES sends; the local part `pm-bounce` is reserved on such domains. Otherwise `null`, including a Cloudflare-method domain sending through its J5 failover identity after a `PATCH` to `ses`: that identity has no custom MAIL FROM |
 | `smtp` | `smtp_relay` only, otherwise `null`: `{ "host", "port", "username", "probe_from" }`. Never the password |
 | `probe` | `smtp` transport only, otherwise `null`: `{ "last_at", "result" }`. `result` is `pass` or the issue code of the failure (`smtp_unaligned`, `smtp_from_rewritten`, `smtp_probe_timeout`, `smtp_auth_failed`, `smtp_tls_required`); both are `null` before the first probe |
 | `state_reason` | The first issue code, or `zone_expired` on a `nameservers` domain whose zone Cloudflare deleted |
@@ -1078,8 +1080,11 @@ which only a dry run returns. A `200` always has `would_send: true`; each recipi
   already uses it (G7; with `thread_id`). Otherwise `400 invalid_request` with
   `details.errors[0].path = "from_address"`. The default is the primary.
 - `headers` accepts only `X-` names matching `^X-[A-Za-z0-9_-]+$` (at most 100 bytes), plus the
-  allow-listed `Importance`, `Priority`, `Sensitivity`, `Keywords`, `Comments` and `Organization`, spelled
-  exactly so; any other name gets `400 header_not_allowed`. `Importance` takes `high`, `normal` or `low`,
+  allow-listed `Importance`, `Priority`, `Sensitivity`, `Keywords`, `Comments` and `Organization`. Names
+  are matched case-insensitively, as Cloudflare matches them: `importance` is accepted and sent as
+  `Importance`, `x-booking-ref` as given, and the reserved `X-Pylota-*` and `X-AI-Generated` are refused in
+  any case. Any other name gets `400 header_not_allowed`; two names that differ only in case get
+  `400 invalid_request`. `Importance` takes `high`, `normal` or `low`,
   `Priority` `normal`, `non-urgent` or `urgent`, and `Sensitivity` `personal`, `private` or
   `company-confidential`; another value gets `400 invalid_request`. These checks run when the request
   arrives, so a bad header never becomes a later `rejected`. Everything else is set by the service.

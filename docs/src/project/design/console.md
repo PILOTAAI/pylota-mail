@@ -485,7 +485,7 @@ not people.
 
 ### Unsubscribe links
 
-Every `usage`, `new_mail` and `needs_person` email carries
+Every `usage`, `new_mail`, `needs_person` and `digest` email carries
 `List-Unsubscribe: <https://{PM_CONSOLE_HOST}/console/notifications/unsubscribe?t={token}>` and
 `List-Unsubscribe-Post: List-Unsubscribe=One-Click` (RFC 8058). The token (a MAC under the current `link`
 key with its kid, binding the person, the workspace and the kind, valid 90 days) is defined in
@@ -494,7 +494,7 @@ key with its kid, binding the person, the workspace and the kind, valid 90 days)
 | Route | Does |
 |---|---|
 | `GET /console/notifications/unsubscribe?t=…` | Changes nothing. With a valid token it shows the workspace and the kind with one **Unsubscribe** button, a form that `POST`s to the same URL. A mail scanner that opens the link unsubscribes no one |
-| `POST /console/notifications/unsubscribe?t=…` | Verifies the token and sets that kind to `off` for that person and workspace (an upsert of the `notification_prefs` row), then shows a confirmation page with a link to the settings page. This is the request a mail provider sends for a one-click unsubscribe |
+| `POST /console/notifications/unsubscribe?t=…` | Verifies the token and sets that kind to `off` for that person and workspace (an upsert of the `notification_prefs` row), then shows a confirmation page with a link to the settings page. A `digest` token performs three upserts, setting `usage`, `new_mail` and `needs_person` to `off`, because the digest has no row of its own: the `notification_prefs` kind `CHECK` stays those three kinds. This is the request a mail provider sends for a one-click unsubscribe |
 
 - No session is needed and none is created. Both routes are exempt from the CSRF token and `Origin`
   check ([CSRF](#csrf)), and both are served even with `PM_CONSOLE=off`.

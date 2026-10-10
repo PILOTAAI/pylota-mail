@@ -57,8 +57,10 @@ CREATE TABLE tenants (
                                                            -- then QuotaRequest::Init { tenant_id }
   notify_do_id     TEXT NOT NULL,                          -- Notifier Durable Object id; minted with the row,
                                                            -- then NotifierRequest::Init { tenant_id } (Notifications § 8);
-                                                           -- '' until M26 builds the Notifier, as mailbox_do_id
-                                                           -- is '' until the cron mints it
+                                                           -- '' on rows written before M26 builds the Notifier;
+                                                           -- from M26 the every-minute cron mints a Notifier and
+                                                           -- sends Init for each row still at '', as it mints
+                                                           -- mailbox_do_id
   require_two_factor      INTEGER NOT NULL DEFAULT 0       -- members need two-step verification (console)
                           CHECK (require_two_factor IN (0,1)),
   onboarding_dismissed_at INTEGER,                         -- first-run checklist dismissed: written by the dismiss
@@ -104,7 +106,8 @@ CREATE TABLE domains (
                                                            -- or the J5 failover identity of a cloudflare_zone,
                                                            -- nameservers or delegated_subdomain domain
   ses_region            TEXT,                              -- set whenever ses_identity is
-  mail_from_domain      TEXT,                              -- pm-bounce.{domain}, the custom MAIL FROM (SES transport)
+  mail_from_domain      TEXT,                              -- pm-bounce.{domain}, the custom MAIL FROM of dns_records
+                                                           -- and send_only; NULL for a J5 failover identity
   smtp_sealed           BLOB,                              -- smtp_relay: pm1 envelope of {host, port, username,
                                                            -- password, probe_from}
   smtp_pending_sealed   BLOB,                              -- values from PATCH waiting for a passing probe
@@ -702,8 +705,9 @@ CREATE TABLE platform_objects (
   `pm1|{table}|{column}|{row id}` (for example `pm1|domains|smtp_sealed|{domain_id}`):
   `webhook_endpoints.secret_enc` and `prev_secret_enc`, `identity_keys.private_enc`,
   `signing_keys.ciphertext`, `domains.smtp_sealed` and `smtp_pending_sealed`, `users.totp_sealed`,
-  `users.recovery_codes_sealed` and `oauth_states.pkce_sealed`. The re-seal sweep of `pmail secrets rotate-master` covers every one of
-  them. Recovery codes are sealed, not hashed under a `link` key, because link keys are deleted 7 days
+  `users.recovery_codes_sealed` and `oauth_states.pkce_sealed`. Each is an entry of the sealed-column
+  registry (`crates/core/src/sealed.rs`), which the re-seal sweep and the count query of
+  `pmail secrets rotate-master` read, so the rotation covers every one of them. Recovery codes are sealed, not hashed under a `link` key, because link keys are deleted 7 days
   after a rotation and recovery codes live for months.
 - **Notification preferences.** `notification_prefs` rows exist only where a person changed a default.
   Removing a member deletes their rows for that workspace ([O19](../edge-cases.md)); erasing a person
@@ -1097,12 +1101,16 @@ CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 --   alarm:reset             earliest allowances.resets_at (Billing › Monthly reset)
 CREATE TABLE counters (
   metric TEXT NOT NULL,                                    -- daily caps: sends, sends:idn_..., agentic,
-                                                           --   warned:{metric}:{80|100};
+                                                           --   warned:{metric}:{80|100} (sends caps only);
                                                            -- usage: usage:{inbound|outbound|sends|triage|
                                                            --   search|agentic|ai_neurons|assertions|
-                                                           --   http_signatures}
+                                                           --   http_signatures};
+                                                           -- tenant outcomes: outcomes, bounced, complained
+                                                           --   (RecordOutcome; summed by OutcomeRates; never
+                                                           --   pruned, ForgetIdentity leaves them)
   window TEXT NOT NULL,                                    -- YYYY-MM-DD: the tenant's time zone for daily caps,
-                                                           -- UTC for usage:* (flushed to usage_daily)
+                                                           -- UTC for usage:* (flushed to usage_daily) and for
+                                                           -- the tenant outcome counters
   value  INTEGER NOT NULL,
   PRIMARY KEY (metric, window)
 );

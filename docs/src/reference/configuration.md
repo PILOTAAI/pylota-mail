@@ -53,7 +53,8 @@ Cron triggers:
   state-alert evaluator, the SES inbound backstop (draining `PM_SES_INBOUND_QUEUE_URL`, when set), and
   minting the Durable Object IDs that only the Worker can mint for rows written outside it: the system
   identity's mailbox, the `DomainMonitor` of a domain row with `monitor_do_id = ''` (the platform domain,
-  and domains added with `pmail domains add --local-token`), and the `SesControl` object when SES is
+  and domains added with `pmail domains add --local-token`), the `Notifier` of a tenant row with
+  `notify_do_id = ''` (then `NotifierRequest::Init`), and the `SesControl` object when SES is
   configured.
   Retrying stuck sends, transport claims and uncertain-send bookkeeping run in each mailbox's own alarms,
   not in the cron.

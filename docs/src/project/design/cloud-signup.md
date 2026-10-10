@@ -317,7 +317,7 @@ Stripe redirects to `/console/plan/return?session_id={CHECKOUT_SESSION_ID}`.
 | Open redirects through `next` | [§7](#7-where-people-land) |
 | Lost access to the sign-in address | No self-service recovery. Pylota support verifies the requester against the workspace's Stripe billing details and a recent invoice number, then moves ownership to a new verified address. The audit log records it with `via: support` |
 | Lost authenticator | Recovery codes; otherwise the support route above |
-| Leaving | A person can delete their account at `/console/settings` when they own no workspace (otherwise `409 owner_required`) ([W34](../edge-cases.md)). An owner can delete a workspace after re-authentication and typing its name. That starts tenant erasure, whose `cancel_billing` step cancels the plan subscription and every top-up subscription at once, with no proration and no refund, before any D1 row is deleted ([Privacy › Tenant scope](privacy.md#66-tenant-scope)). Deleting an account deletes the person's sessions, `oauth_identities` and `waitlist` row, and scrubs the `users` row ([Privacy › People](privacy.md#69-people-console-accounts)) |
+| Leaving | A person can delete their account at `/console/settings` when they own no workspace (otherwise `409 owner_required`) ([W34](../edge-cases.md)). An owner can delete a workspace after re-authentication and typing its name. That starts tenant erasure, whose second step, `cancel_billing`, runs right after routing stops and cancels the plan subscription and every top-up subscription at once, with no proration and no refund, before any domain, mailbox or D1 row is removed ([Privacy › Tenant scope](privacy.md#66-tenant-scope)). Deleting an account deletes the person's sessions, `oauth_identities` and `waitlist` row, and scrubs the `users` row ([Privacy › People](privacy.md#69-people-console-accounts)) |
 
 ### 10.1 New-workspace send ramp
 
@@ -334,7 +334,9 @@ The ramp limits what a new Free workspace can send before it has a sending histo
 - **Daily evaluation.** The `*/15` cron runs `crons/signup_ramp.rs` once per UTC day (the run whose UTC
   hour is 03 and minute is below 15). It selects the ramped workspaces created at least 7 days ago and
   asks each one's `TenantQuota` for `OutcomeRates { since: created_at }`: the number of delivery
-  outcomes recorded for its identities, and how many were `bounced` and `complained`
+  outcomes recorded for its identities since then, and how many were `bounced` and `complained`. They
+  come from the tenant's per-day outcome counters, which `RecordOutcome` increments with every outcome
+  and identity deletion leaves in place, so an identity deleted during the ramp still counts
   ([Outbound › Abuse auto-pause](outbound.md#abuse-auto-pause-fr-dlv-3)). When neither
   `complained / outcomes` nor `bounced / outcomes` is above the tenant's `policy.abuse` thresholds (both
   are 0 with no outcomes), it sets `ramp_lifted_at = now` and writes the audit row `tenant.ramp_lifted`.
@@ -455,5 +457,5 @@ The global retention job deletes `oauth_states` rows 24 hours after `expires_at`
 | `it::checkout::return_before_webhook` | Waits, then "within a minute"; the plan is applied by the webhook only ([W25](../edge-cases.md), FR-CON-13) |
 | `it::onboarding::derived_steps` | Each checklist step turns done from real data alone; each Overview banner condition shows its banner and hides it once resolved (FR-CON-12) |
 | `it::abuse::free_ramp` | 51st send on day 1 of a Free workspace → `429 daily_cap_reached` (effective cap min(policy, 50)); lifted at once on upgrade, and not ramped again after a downgrade ([W30](../edge-cases.md)) |
-| `it::abuse::ramp_evaluator` | On day 7 the daily evaluation lifts the ramp when the rates are under the thresholds; with a complaint rate above them the ramp stays and is evaluated again daily, and the third failure fires `signup_ramp_review` without suspending the tenant ([W30](../edge-cases.md)) |
+| `it::abuse::ramp_evaluator` | On day 7 the daily evaluation lifts the ramp when the rates are under the thresholds; outcomes of an identity deleted before the evaluation still count (the tenant's per-day counters, not the identity's `outcomes` rows); with a complaint rate above them the ramp stays and is evaluated again daily, and the third failure fires `signup_ramp_review` without suspending the tenant ([W30](../edge-cases.md)) |
 | `it::hosts::console_api_split` | With two hosts, console paths 404 on the API host and API paths 404 on the console host; no `Set-Cookie` on the API host |

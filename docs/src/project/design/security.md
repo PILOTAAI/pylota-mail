@@ -9,7 +9,7 @@ the thread token in [Threading](threading.md)), this page states the security pr
 |---|---|
 | Requirements | FR-KEY-1, FR-KEY-2, FR-KEY-3, FR-TEN-1, FR-TEN-2, FR-TEN-3, FR-IN-4, FR-IN-5, FR-IN-9, FR-IDN-6, FR-IDN-7, FR-IDN-8, FR-IDN-9, FR-WH-2, FR-WH-5, FR-TRI-3, FR-TRI-4, FR-SRCH-3, FR-SRCH-8, FR-SRCH-10, FR-MCP-1, FR-PRV-6, FR-DOM-9, FR-DOM-11, FR-CON-3, FR-CON-9, FR-CON-10, FR-CON-13, FR-CON-14, NFR-SEC-1, NFR-SEC-2 |
 | Edge cases | [A2](../edge-cases.md), [A4](../edge-cases.md), [A6](../edge-cases.md), [B7](../edge-cases.md), [B10](../edge-cases.md), [B11](../edge-cases.md), [D2](../edge-cases.md), [D5](../edge-cases.md), [D9](../edge-cases.md), [D10](../edge-cases.md), [E1](../edge-cases.md), [E2](../edge-cases.md), [F1](../edge-cases.md), [F3](../edge-cases.md), [F7](../edge-cases.md), [F10](../edge-cases.md), [I5](../edge-cases.md), [J6](../edge-cases.md), [L4](../edge-cases.md), [W15](../edge-cases.md)–[W18](../edge-cases.md), [W20](../edge-cases.md)–[W22](../edge-cases.md), [W27](../edge-cases.md), [W28](../edge-cases.md), [W31](../edge-cases.md), [N1](../edge-cases.md)–[N3](../edge-cases.md), [N14](../edge-cases.md), [N16](../edge-cases.md), [N18](../edge-cases.md), [N28](../edge-cases.md), [O1](../edge-cases.md), [O3](../edge-cases.md), [O7](../edge-cases.md), [O8](../edge-cases.md), [O12](../edge-cases.md), [O13](../edge-cases.md), [O15](../edge-cases.md), [O18](../edge-cases.md), [O24](../edge-cases.md) |
-| Code | `crates/worker/src/auth/` (keys, router table, scope), `crates/core/src/ssrf.rs`, `crates/core/src/injection.rs`, `crates/core/src/sanitize.rs`, `crates/core/src/crypto.rs` (sealing, pure; nonces passed in), `crates/core/src/{jwk.rs, jwt.rs, httpsig.rs}` (agent signing, pure), `crates/worker/src/net.rs` (guarded HTTP), `crates/worker/src/log.rs` |
+| Code | `crates/worker/src/auth/` (keys, router table, scope), `crates/core/src/ssrf.rs`, `crates/core/src/injection.rs`, `crates/core/src/sanitize.rs`, `crates/core/src/crypto.rs` (sealing, pure; nonces passed in), `crates/core/src/sealed.rs` (the sealed-column registry, pure), `crates/worker/src/ops/reseal.rs` (the master-key re-seal sweep), `crates/core/src/{jwk.rs, jwt.rs, httpsig.rs}` (agent signing, pure), `crates/worker/src/net.rs` (guarded HTTP), `crates/worker/src/log.rs` |
 | Reporting | [SECURITY.md](https://github.com/PILOTAAI/pylota-mail/blob/main/SECURITY.md) |
 
 ## 1. Assets and invariants
@@ -186,7 +186,7 @@ section 4.9 states the security properties.
 | E | A viewer acting beyond its role, or an ID from another workspace | The console route table registers each route with its permission, like the API's ([W18](../edge-cases.md)) | `it::console::w18_role_and_scope` |
 | S/T | A forged unsubscribe token, or a real one replayed for another person, workspace or kind | The token is a MAC under a `link` key, with that key's kid, over the person, the workspace and the kind (section 4.9); it is compared in constant time, lives 90 days and verifies only while its link key is current or inside the 7-day window after a rotation. It can only set that one kind to `off` for that person in that workspace: it reads nothing and never touches `account`. An altered, foreign or expired token changes nothing and gets the same page linking to settings ([O18](../edge-cases.md)) | `it::notify::one_click_unsubscribe` |
 | I | Notification content read on a lock screen, or by the person's mail provider | Notifications carry counts, inbox addresses, the workspace name and links only: never a subject, sender, snippet or attachment name from any message, and only mail visible in the inbox is counted ([Notifications §1](notifications.md#1-kinds), [O15](../edge-cases.md)) | `core::notify::no_content_in_body`, `it::notify::invisible_mail_never_notifies` |
-| D | Notification mail used to flood a person | At most 50 notification emails per person and 200 per workspace a day, `account` excepted, the rest going into the next daily digest ([O24](../edge-cases.md)); a hard bounce or complaint pauses that person's preferences ([O17](../edge-cases.md)) | `it::notify::daily_caps`, `it::notify::bounce_pauses_prefs` |
+| D | Notification mail used to flood a person | At most 50 notification emails per person and 200 per workspace a day, `account` and `digest` excepted, the rest going into the next daily digest (one `digest` email per person a day at most) ([O24](../edge-cases.md)); a hard bounce or complaint pauses that person's preferences ([O17](../edge-cases.md)) | `it::notify::daily_caps`, `it::notify::bounce_pauses_prefs` |
 | D | Free workspaces created to send spam | New-workspace send ramp, disposable-domain block, `RL_SIGNIN` ([W29](../edge-cases.md), [W30](../edge-cases.md), [Cloud sign-up §10](cloud-signup.md#10-abuse-and-safety-on-cloud)) | `it::abuse::free_ramp` |
 
 ### 3.8 TB8: agent proofs → third parties
@@ -561,10 +561,13 @@ value:
 2. The CLI generates a new key `K2` and uploads it as the secret `PM_MASTER_KEY_NEXT`.
 3. While `PM_MASTER_KEY_NEXT` is set, the Worker decrypts with whichever of `PM_MASTER_KEY` and
    `PM_MASTER_KEY_NEXT` matches the ciphertext's key ID, and seals every new value with
-   `PM_MASTER_KEY_NEXT`. The `*/15` cron re-seals up to 500 values per run in
+   `PM_MASTER_KEY_NEXT`. The `*/15` cron re-seals up to 500 values per run whose key ID is not `kid(K2)`,
+   in every column of the sealed-column registry (`crates/core/src/sealed.rs`, pure): for v1.0,
    `webhook_endpoints.secret_enc`, `webhook_endpoints.prev_secret_enc`, `identity_keys.private_enc`,
    `signing_keys.ciphertext`, `domains.smtp_sealed`, `domains.smtp_pending_sealed`, `users.totp_sealed`,
-   `users.recovery_codes_sealed` and `oauth_states.pkce_sealed` whose key ID is not `kid(K2)`.
+   `users.recovery_codes_sealed` and `oauth_states.pkce_sealed` (section 7.2). The CLI's count query
+   (step 4) is built from the same registry, so a column added to it is swept and counted with no other
+   change.
 4. The CLI polls D1 through the Cloudflare D1 query API until no value has a different key ID, then
    uploads `PM_MASTER_KEY = K2` and deletes `PM_MASTER_KEY_NEXT`.
 5. The Worker logs `secrets_reseal_progress` counts; the CLI prints them.
@@ -635,8 +638,10 @@ aad         "pm1|{table}|{column}|{row id}", e.g. "pm1|webhook_endpoints|secret_
 
 Sealed columns: `webhook_endpoints.secret_enc` and `prev_secret_enc`, `identity_keys.private_enc` (the
 32-byte Ed25519 seed), `signing_keys.ciphertext` (the `web_bot_auth` seed included), `domains.smtp_sealed` (aad `pm1|domains|smtp_sealed|{domain_id}`) and
-`domains.smtp_pending_sealed`, `users.totp_sealed`, `users.recovery_codes_sealed` and `oauth_states.pkce_sealed`. The master-key
-rotation re-seals every one of them (section 6.2).
+`domains.smtp_pending_sealed`, `users.totp_sealed`, `users.recovery_codes_sealed` and `oauth_states.pkce_sealed`. Each is an
+entry of the sealed-column registry `crates/core/src/sealed.rs` (table, column, row-ID expression), which
+the master-key rotation reads to re-seal and count them (section 6.2); code that adds a sealed column adds
+its entry.
 
 The associated data stops a ciphertext copied into another row or column from decrypting. With random
 nonces a key must seal fewer than 2^32 values; the volume here is endpoint secrets, signing keys, relay
@@ -829,7 +834,7 @@ fails. At delivery time a failure is recorded as a failed attempt with error `ss
 | Agentic search | 20 / 60 s per key; tenant daily cap (default 500) | `RL_AGENTIC`; exact count in `TenantQuota` | `429 rate_limited`, `429 agentic_budget_exhausted` |
 | Sends per identity | 120 / 60 s; daily caps from policy | `RL_SEND`; exact daily counters in `TenantQuota` | `429 rate_limited`, `429 daily_cap_reached` |
 | Signing per identity (agent assertions and HTTP signatures together) | 600 / 60 s | `RL_SIGN`, keyed by identity ID. Signing is not metered against any plan allowance | `429 rate_limited` |
-| Notification emails | 50 per person and 200 per workspace a day, every kind except `account` | The tenant's `Notifier` (`sent` counters, [Notifications §3](notifications.md#3-how-notifications-are-produced)) | Not an error: the overflow goes into the next daily digest ([O24](../edge-cases.md)) |
+| Notification emails | 50 per person and 200 per workspace a day, every kind except `account` and `digest` (the `digest` is one email per person a day at most) | The tenant's `Notifier` (`sent` counters, [Notifications §3](notifications.md#3-how-notifications-are-produced)) | Not an error: the overflow goes into the next daily digest ([O24](../edge-cases.md)) |
 | Inbound per sender per identity | `inbound.per_sender_per_hour` (default 60) | Mailbox `rate_windows` ([D5](../edge-cases.md)) | Excess stored `throttled` |
 | Failed thread-token verifications | 10 per sender per hour, 100 per mailbox per hour | Mailbox `rate_windows` ([Threading](threading.md), [D10](../edge-cases.md)) | Tokens not verified for the rest of the window |
 | Domain verification | 1 per minute per domain | `DomainMonitor` | `429 rate_limited` |
@@ -851,7 +856,10 @@ fails. At delivery time a failure is recorded as a failed attempt with error `ss
 - **Abuse auto-pause** (FR-DLV-3): `TenantQuota.outcomes` keeps the last 1,000 outcomes per identity.
   When the complaint rate over the last 1,000 exceeds `abuse.complaint_rate_pause` (default 0.003), or
   the bounce rate over the last 200 exceeds `abuse.bounce_rate_pause` (default 0.05), the identity is
-  paused with reason `abuse_threshold` and `identity.paused` is emitted with the metrics.
+  paused with reason `abuse_threshold` and `identity.paused` is emitted with the metrics. This applies to
+  every identity except the system identity (`is_system = 1`), whose outcomes are recorded but never
+  pause it: pausing it would stop every sign-in, invitation and notification email
+  ([Outbound › Abuse auto-pause](outbound.md#abuse-auto-pause-fr-dlv-3)).
 - **Kill switches.** Revoke a key (`DELETE /v1/keys/{id}`, immediate). Pause an identity
   (`PATCH … {"status": "paused"}`): besides stopping its sends, this stops it signing at once
   (`409 identity_paused`) and withdraws its JWKS (`404 identity_not_found`), so verifiers stop accepting
@@ -947,7 +955,7 @@ address used by the integration suite, captures all Worker output, and fails if 
 | `it::attachments::serving_headers` | Section 8.5 headers on attachments and raw MIME; `text/html` and SVG served as `application/octet-stream` | [B10](../edge-cases.md) |
 | `it::security::response_headers` | Global headers present; no CORS headers; no `Set-Cookie` | section 8.5 |
 | `core::crypto::envelope_round_trip` | Seal/open round trip; wrong AAD, wrong key or flipped bit fails | SEC-3 |
-| `it::secrets::master_key_rotation` | With `PM_MASTER_KEY_NEXT` set, old and new ciphertexts open, new ones use the new kid, the sweep re-seals every sealed column of section 7.2, including `signing_keys` (the `web_bot_auth` seed too), `identity_keys`, `domains.smtp_sealed` and the `users` second factors | section 6.2 |
+| `it::secrets::master_key_rotation` | With `PM_MASTER_KEY_NEXT` set, old and new ciphertexts open, new ones use the new kid, and the sweep re-seals every column of the sealed-column registry, with one case per registered column: `signing_keys` (the `web_bot_auth` seed too), the webhook secrets, `identity_keys`, the `domains` SMTP credentials, the `users` second factors and `oauth_states.pkce_sealed`; the registry names exactly the sealed columns of `0001_init.sql` (those ending `_enc` or `_sealed`, and `signing_keys.ciphertext`) | section 6.2 |
 | `it::secrets::rotate_master_reseals_identity_keys` | Assertions signed before and after a master-key rotation verify with the same public key and kid | [O8](../edge-cases.md) |
 | `core::jwk::thumbprint_rfc8037_vector`, `core::jwt::eddsa_rfc8037_vector`, `core::httpsig::signature_base_rfc9421` | The RFC 8037 thumbprint and signing vectors; RFC 9421 signature bases, an IDN host as its A-label, non-ASCII components refused | section 7.1, [O10](../edge-cases.md) |
 | `it::assertions::sdk_verifies` | The SDK verifier accepts a fresh assertion and rejects a wrong audience, an expired token, an unknown kid and `alg: none` | section 3.8 |

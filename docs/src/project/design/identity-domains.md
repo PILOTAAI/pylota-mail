@@ -52,7 +52,10 @@ normal outbound pipeline.
   cron mints the mailbox and sends `MailboxRequest::Init`, as the [monitor hook](#create) does for
   domains. At most one row has `is_system = 1` (a partial unique index).
 - **Exempt from username validation.** Its local part may be a reserved name (`no-reply` is), because
-  only setup writes it. It must still be ASCII, at most 64 octets, with a valid address syntax.
+  only setup writes its addresses, at creation and when `PM_SYSTEM_FROM` changes, and setup writes them
+  through its internal path (the D1 query API), never the public routes, so the reserved-name and
+  role-name steps of [Username validation](#username-validation) never run for it. Setup still checks
+  that the local part is ASCII, at most 64 octets, with a valid address syntax.
 - **Not listed to tenants.** List endpoints (`GET /v1/identities`, `GET /v1/tenants/{t}/identities`,
   `mail_list_identities`, the console) never return it, and a tenant or identity key that names it gets
   `404 identity_not_found`. Only a platform key reads or changes it, by ID. It is not counted against
@@ -71,13 +74,16 @@ normal outbound pipeline.
   tenant's `retention` policy says: the tenant retention job uses these cutoffs for the identity with
   `is_system = 1` ([Privacy §5.2](privacy.md#52-steps-of-a-tenant-retention-job)). Deleting a person also
   erases the system mail sent to them ([Privacy §6.9](privacy.md#69-people-console-accounts)).
-- **Changing `PM_SYSTEM_FROM`.** A re-run of setup adds the new address to the system identity and
-  promotes it through the API with the bootstrap platform key; the old address retires as usual. This is
-  the one exception to the rule that every identity keeps exactly one platform-domain address for life
-  ([Format](#format)): for the system identity only, `POST …/addresses` accepts a second address on the
-  platform domain, and promoting it makes the previous primary `retiring` with the usual grace, as on any
-  other domain, instead of an `active` alias. The promoted address is the system identity's platform
-  address from then on. Every other identity's platform address still cannot be retired or deleted.
+- **Changing `PM_SYSTEM_FROM`.** A re-run of setup inserts the new address as an `active` alias on the
+  platform domain through its internal path, in one D1 query API batch as at creation (no reserved-name
+  or role-name check, so `noreply` is accepted), then promotes it through the API with the bootstrap
+  platform key; the old address retires as usual. This is the one exception to the rule that every
+  identity keeps exactly one platform-domain address for life ([Format](#format)): only setup's internal
+  write creates a second platform-domain address, for the system identity only, while the public
+  `POST …/addresses` never does (and would refuse a reserved name with `400 address_reserved`).
+  Promoting it makes the previous primary `retiring` with the usual grace, as on any other domain,
+  instead of an `active` alias. The promoted address is the system identity's platform address from then
+  on. Every other identity's platform address still cannot be retired or deleted.
 - **Without the console** (`PM_CONSOLE=off`) it still exists and still sends invitations, because
   `PM_SYSTEM_FROM` and `PM_CONSOLE_HOST` are top-level settings, not console settings
   ([Rust workspace §6.1](rust-workspace.md#61-errors-and-configuration)).
@@ -162,7 +168,10 @@ Display names are Unicode and never refused for script reasons (FR-ADR-7).
 Request validation of `username` and `local_part` runs through this function, never through a schema
 pattern: `openapi.yaml` leaves both request fields unconstrained and documents the stored form, so a
 non-ASCII or confusable input gets `address_unsupported` or `address_reserved` from steps 1–3, not a
-generic `400 invalid_request`.
+generic `400 invalid_request`. Every route that writes a username or an address runs it, for every
+identity. The only writes that skip it are setup's writes of the system identity's username and
+addresses, through the D1 query API rather than a route ([The system identity](#the-system-identity)),
+which check ASCII, length and address syntax only.
 
 **Reserved names** (FR-ADR-6):
 
@@ -597,7 +606,12 @@ record the result is `ok`, `missing`, `mismatch` or `unexpected`, and its issue 
 `ses_identity` (the optional step of [Kind `zone`](#kind-zone)) and still sends through Cloudflare, the
 three SES DKIM CNAMEs and the daily `GetEmailIdentity` check run, but only for information: each record's
 result is shown in `GET …/records` and `GET …/health`, and they add no issue to the outcome, so they never
-change the domain's state. After a `PATCH` to `ses` they are checked as above, with their levels.
+change the domain's state. After a `PATCH` to `ses`, the rows for `transport = ses` replace those for
+`transport = cloudflare` (return path and sending DKIM): the SES DKIM CNAMEs and the SES identity check
+count with their levels; the receiving, DMARC, ownership, NS and RDAP rows are unchanged; and the MAIL FROM
+row of [Domains on any DNS host § 6](domain-connections.md#6-health-checks-per-method) does not apply,
+because the failover identity has no custom MAIL FROM (`mail_from_domain` stays `null`), so failing over
+never makes the domain `degraded`.
 
 The checks that depend on the connection method (SES inbound MX, SES identity, MAIL FROM, the SES
 account, the alignment probe, SMTP login, parent delegation and doubled names) are in
@@ -800,6 +814,7 @@ forwarded).
 | `it::addresses::a14_platform_address_kept` | Promoting away keeps the platform address `active`; retiring or deleting it is refused with `409 address_in_use`; promoting it again rolls back: it is `primary` and the custom address is an `active` alias with `retire_at = NULL` ([A14](../edge-cases.md), FR-ADR-2, FR-DOM-6) |
 | `core::address::a4_role_names_by_domain` | `support`, `sales`, `info`, `marketing` are refused on the platform domain and allowed on a tenant domain; `postmaster` and `abuse` are refused on both ([A4](../edge-cases.md), FR-ADR-6) |
 | `it::domains::transport_patch` | With SES configured, a `cloudflare_zone` domain is onboarded with `ses_identity`, `ses_region` and its three DKIM CNAMEs (created through the Cloudflare API fake, `required: false`); while it sends through Cloudflare, a missing CNAME or a `FAILED` SES DKIM status changes no state; a platform key switches it to `ses` and back; a tenant key gets `403 scope_denied`; a domain without an SES identity gives `422 transport_unavailable` ([J5](../edge-cases.md)) |
+| `it::domains::remove_deletes_ses_identity` | Removing a `cloudflare_zone` domain that onboarding gave a failover SES identity runs `delete_ses_identity`: the SES fake no longer has the identity and the Cloudflare DNS fake no longer has its three DKIM CNAMEs; a provider `404` with its own not-found code counts as done, any other `404` is retried; tenant erasure's `remove_domains` does the same for every such domain of the tenant ([Domain removal](#domain-removal), [Privacy §6.6](privacy.md#66-tenant-scope)) |
 | `it::addresses::retirement_cron` | `retire_at` reached → `retired`, `identity.address_retired`, inbound `550 5.1.6` (FR-ADR-3) |
 | `it::addresses::c3_reply_from_retiring` | Replies from the retiring address the counterparty used ([C3](../edge-cases.md)) |
 | `it::domains::h1_failing_fallback` | DNS fake removes DKIM; after two agreeing checks `failing`; sends fall back with thread continuity; restore → `recovered`; pinned threads stay ([H1](../edge-cases.md), FR-DOM-5, FR-DOM-6) |

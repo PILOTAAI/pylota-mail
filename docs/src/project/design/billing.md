@@ -165,7 +165,9 @@ design adds the `allowances` and `holds` tables from the
 [data model](data-model.md#3-other-durable-objects) and these requests:
 
 ```rust
-// crates/worker/src/billing/quota.rs (QuotaRequest variants declared by the M5 stub, implemented here in M22)
+// Declared in crates/worker/src/quota/mod.rs by the M5 stub, with the types they carry (Feature,
+// BillingMode, Allowances, and the Held and Denied answers), so the stub compiles and answers every
+// variant; crates/worker/src/billing/quota.rs implements their behaviour in M22 without changing them.
 pub enum Feature { Inboxes, Sends, Triage, CustomDomains, StorageGb, Seats }
 
 Hold     { feature: Feature, units: u32, r#ref: String, gates: Vec<Feature> },
@@ -228,7 +230,8 @@ a `Settle` that consumes units, the settle of a count feature's hold when its cr
   `SetMeasured`.
 - `granted` `NULL` (exempt, or billing `disabled`) sends nothing. With `PM_BILLING=off` no usage alert is
   ever sent: no feature has a limit to reach, and tenant policy has no quota for the six allowances
-  ([O23](../edge-cases.md)). The daily caps are not allowances; they keep their `quota.warning` events.
+  ([O23](../edge-cases.md)). The daily caps are not allowances; the identity and tenant send caps keep their `quota.warning` events
+  (the agentic-search cap has none).
 
 The call is fire-and-forget after commit: a lost call loses one email, never a hold or a count, and the
 `quota.warning` and `billing.limit_reached` webhook events are unchanged.
@@ -370,7 +373,7 @@ Stripe is called for five things only ([Architecture › Console and billing](..
 | Retrieve a Checkout Session (`GET /v1/checkout/sessions/{id}`) | The return page ([Cloud sign-up › Coming back from Checkout](cloud-signup.md#9-coming-back-from-checkout)) |
 | Create a Customer Portal session | [Customer Portal](#customer-portal) |
 | Read subscriptions (`GET /v1/subscriptions?customer=…`) | When a webhook arrives ([Applying state](#applying-state)), and before cancelling |
-| Cancel subscriptions (`DELETE /v1/subscriptions/{id}`, at once, with no proration and no refund) | Workspace deletion only ([Privacy › Tenant scope](privacy.md#66-tenant-scope), step `cancel_billing`) |
+| Cancel subscriptions (`DELETE /v1/subscriptions/{id}`, at once, with no proration and no refund) | Workspace deletion ([Privacy › Tenant scope](privacy.md#66-tenant-scope), step `cancel_billing`), and the webhook handler when a live subscription appears for an erasing or erased workspace (`cancelled_after_erasure`, [Webhook endpoint](#webhook-endpoint)) |
 
 Its signed webhooks are the only writer of subscription state in D1 (FR-BILL-10). `PM_STRIPE_SECRET_KEY` is a
 restricted key with exactly these permissions: create and retrieve Checkout Sessions, create Customer

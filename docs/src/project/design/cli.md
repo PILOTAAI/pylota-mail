@@ -3,7 +3,7 @@
 Binding design for `pmail`, the command-line client: configuration, output and exit codes, `setup`,
 `setup ses`, `deploy`, `upgrade`, `doctor`, `destroy`, secret and signing-key rotation, dead-letter
 handling and the client-side behaviour of the mail and admin commands. It implements FR-CLI-1, FR-OPS-1
-to FR-OPS-3, FR-CON-7 and FR-BILL-12, build plan milestone M16, the CLI half of M17 (`dlq`), the
+to FR-OPS-3, FR-CON-7 and FR-BILL-12, build plan milestone M16, the CLI half of M17 (`dlq`, and `secrets rotate-master` in M17 Foundation), the
 `deploy --version` acceptance of M19, the CLI parts of FR-DOM-7 to FR-DOM-12 (M23: `domains add
 --method`, `domains update`, `domains probe`, `addresses test-forwarding`, `setup ses`), of FR-CON-8
 (M24: `waitlist invite`) and of FR-IDN-6 to FR-IDN-8 (M25: `identity-keys`, `assertions`, `http-sign`,
@@ -439,7 +439,7 @@ Each step prints `created`, `exists`, `updated` or `skipped` with the resource a
 | 19 | Bootstrap key | D1 query API ([§6.5](#65-the-bootstrap-key)) | Skipped when the profile already holds a working platform key |
 | 20 | Platform domain row | D1 query API ([§6.6](#66-the-platform-domain-row)) | Upsert by `name` |
 | 21 | Default tenant | `GET /v1/tenants` (bootstrap key) and look for `address_suffix == ""`; if absent `POST /v1/tenants` with `Idempotency-Key: pmail-setup-default-tenant` and `{"slug":"default","name":"{tenant_name}","address_suffix":"","owner":{"email":"{owner_email}","name":"{owner_name}"}}` (`owner` omitted with `--no-console` and no `--owner-email`) | Found by suffix. The owner receives a sign-in link from the Worker ([Console design](console.md)) |
-| 22 | System identity | D1 query API: insert the `identities` row (`is_system = 1`, the default tenant, `username` and `display_name` from `PM_SYSTEM_FROM`, `owner_name = 'Operator'`, `owner_email` = `--owner-email` or `postmaster@{mail_domain}`, `send_policy_json = '{"daily_cap":50000}'`, `mailbox_do_id = ''`) and its `active` primary address on the platform domain, in one batch. The every-minute cron mints the mailbox and sends `Init` ([Identities, addresses and domains › The system identity](identity-domains.md#the-system-identity)) | Found by `is_system = 1`. A changed `PM_SYSTEM_FROM` adds the new address and promotes it through the API (bootstrap key); the old one retires as usual |
+| 22 | System identity | D1 query API: insert the `identities` row (`is_system = 1`, the default tenant, `username` and `display_name` from `PM_SYSTEM_FROM`, `owner_name = 'Operator'`, `owner_email` = `--owner-email` or `postmaster@{mail_domain}`, `send_policy_json = '{"daily_cap":50000}'`, `mailbox_do_id = ''`) and its `active` primary address on the platform domain, in one batch. The every-minute cron mints the mailbox and sends `Init` ([Identities, addresses and domains › The system identity](identity-domains.md#the-system-identity)) | Found by `is_system = 1`. A changed `PM_SYSTEM_FROM` inserts the new address as an `active` platform-domain alias in a D1 query API batch (setup's internal path: no reserved-name or role-name check, which the public `POST …/addresses` would apply to a name such as `noreply`), then promotes it through the API (bootstrap key); the old one retires as usual |
 | 23 | Mail test and `PM_TRUSTED_AUTHSERV_ID` | Run the `--mail-test` check of `doctor` ([§10](#10-doctor)) with the bootstrap key. Write the observed `Authentication-Results` authserv-id to `PM_TRUSTED_AUTHSERV_ID` in `deploy/wrangler.toml` and deploy once more (a variable change only) | Skipped when the rendered file already holds the observed value. A failed mail test is a warning: setup finishes, `PM_TRUSTED_AUTHSERV_ID` stays empty, and SPF-only alignment is treated as `unverified` until a re-run sets it ([Inbound › Authentication verdict](inbound.md#authentication-verdict)) |
 | 24 | Summary | `doctor` checks `dns.platform`, `routing.catch_all`, `sending.domains`, `sending.event_subscriptions`, `secrets`, `health` | Pure read |
 
@@ -1075,7 +1075,9 @@ The procedure is [Security §6.2](security.md#62-rotation-procedures). The CLI's
 2. Generate `K2` (32 bytes, OS CSPRNG) and compute `kid(K2)` = first 8 bytes of `SHA-256(K2)`, lower-case
    hex ([Security §7.2](security.md#72-encryption-envelope)). Upload it with
    `wrangler secret put PM_MASTER_KEY_NEXT` (value on stdin).
-3. Poll every 60 s through the D1 query API until the count is 0:
+3. Poll every 60 s through the D1 query API until the count is 0. The query is built from the
+   sealed-column registry (`core::sealed`, [Security §7.2](security.md#72-encryption-envelope)), one term per
+   column; for v1.0 it reads:
 
    ```sql
    SELECT
@@ -1095,8 +1097,8 @@ The procedure is [Security §6.2](security.md#62-rotation-procedures). The CLI's
    + (SELECT COUNT(*) FROM oauth_states WHERE pkce_sealed NOT LIKE 'pm1.' || ?1 || '.%') AS remaining;
    ```
 
-   The columns are every value sealed under `PM_MASTER_KEY` ([Security §7.2](security.md#72-encryption-envelope)),
-   the same set the Worker's re-seal sweep covers.
+   The columns are every value sealed under `PM_MASTER_KEY`, the same registry the Worker's re-seal sweep
+   reads.
 
    printing the count each time. With `--resume`, `K2` is not known; the CLI reads the target `kid`
    from the most common `kid` among rows already re-sealed and asks for confirmation.
@@ -1543,7 +1545,8 @@ verdict. JSON: `{ "valid": true, "kid", "claims": { … } }` or `{ "valid": fals
   `From`, `Signature-Input`, `Signature`, ready for `curl -H @file`; `--json` prints the response
   unchanged (`headers`, `expires_at`). The signature expires after `--expires-in` seconds, so it is made
   right before the request it signs.
-- Errors keep their API meaning: `422 web_bot_auth_disabled` (exit 7) while `PM_WEB_BOT_AUTH` is `off`;
+- Errors keep their API meaning: `403 tenant_suspended` (exit 4), checked first, for an identity of a
+  suspended tenant; `422 web_bot_auth_disabled` (exit 7) while `PM_WEB_BOT_AUTH` is `off`;
   `403 policy_denied` (exit 4) while the tenant policy `web_bot_auth.allowed` is `false`;
   `400 invalid_request` (exit 7) for a URL that is not `https`, an expiry outside 30–300 s or a non-ASCII
   component value; `409 identity_paused` (exit 6).

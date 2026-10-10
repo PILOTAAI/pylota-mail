@@ -165,8 +165,9 @@ recovery codes are stored encrypted.
 - Removing a member from a workspace deletes their notification preferences there and drops any
   notifications still waiting for them.
 - Deleting a workspace erases it like any tenant, and also removes its members, invitations and sessions.
-  People left with no workspace are deleted too. With billing on, it first cancels the workspace's plan
-  and top-up subscriptions at once, with no proration and no refund.
+  People left with no workspace are deleted too. With billing on, the step right after the workspace's
+  mail stops cancels its plan and top-up subscriptions at once, with no proration and no refund, before
+  anything is deleted.
 - Invitations that expired or were revoked are deleted 30 days after their expiry date.
 - A waitlist entry is written only when its confirmation link is used; an unused confirmation link
   expires after 10 minutes. Entries are deleted 30 days after the person was invited.

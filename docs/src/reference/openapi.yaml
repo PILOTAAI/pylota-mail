@@ -2534,7 +2534,8 @@ paths:
           that already uses it ([G7]; with `thread_id`). Otherwise `400 invalid_request` with
           `details.errors[0].path = "from_address"`. The default is the primary.
         - **`headers`** accepts only `X-` names matching `^X-[A-Za-z0-9_-]+$` plus `Importance`, `Priority`,
-          `Sensitivity`, `Keywords`, `Comments` and `Organization`, spelled exactly so (`400 header_not_allowed`).
+          `Sensitivity`, `Keywords`, `Comments` and `Organization`, matched case-insensitively
+          (`400 header_not_allowed`).
           `Importance` must be `high`, `normal` or `low`, `Priority` `normal`, `non-urgent` or `urgent`, and
           `Sensitivity` `personal`, `private` or `company-confidential` (`400 invalid_request`). Everything
           else is set by the service.
@@ -9427,7 +9428,11 @@ components:
           examples: [eu-west-2]
         mail_from_domain:
           type: [string, 'null']
-          description: The custom MAIL FROM domain, `pm-bounce.{name}`, when SES sends for the domain. The local part `pm-bounce` is reserved on such domains.
+          description: >-
+            The custom MAIL FROM domain, `pm-bounce.{name}`, of a `dns_records` or `send_only` domain, whose
+            mail SES sends. The local part `pm-bounce` is reserved on such domains. Otherwise `null`, including
+            a Cloudflare-method domain sending through its [J5] failover identity after a `PATCH` to `ses`:
+            that identity has no custom MAIL FROM.
           examples: [pm-bounce.agents.brightwell.example]
         smtp:
           description: '`smtp_relay` only, otherwise `null`. Never the password.'
@@ -10297,11 +10302,14 @@ components:
     SendHeaders:
       type: object
       description: >-
-        Custom headers, checked when the request arrives, never later at the transport. A name must be an
-        `X-` name matching `^X-[A-Za-z0-9_-]+$` (at most 100 bytes; `X-Pylota-*` and `X-AI-Generated` are
-        reserved) or one of `Importance`, `Priority`, `Sensitivity`, `Keywords`, `Comments` and
-        `Organization`, spelled exactly so; any other name is `400 header_not_allowed` (the schema leaves
-        names unconstrained, so that this code and not a generic `invalid_request` is returned). `Importance` takes
+        Custom headers, checked when the request arrives, never later at the transport. Names are matched
+        case-insensitively, as Cloudflare matches them. A name must be an `X-` name matching
+        `^X-[A-Za-z0-9_-]+$`, the prefix in either case (at most 100 bytes, sent as given; `X-Pylota-*` and
+        `X-AI-Generated` are reserved in any case), or one of `Importance`, `Priority`, `Sensitivity`,
+        `Keywords`, `Comments` and `Organization` in any case, which is sent in that casing; any other name
+        is `400 header_not_allowed` (the schema leaves names unconstrained, so that this code and not a
+        generic `invalid_request` is returned). Two names that differ only in case are `400 invalid_request`.
+        The enums below are listed under the canonical names and apply to every casing. `Importance` takes
         only `high`, `normal` or `low`, `Priority` only `normal`, `non-urgent` or `urgent`, and
         `Sensitivity` only `personal`, `private` or `company-confidential`; another value, an empty value or
         one with CR or LF is `400 invalid_request`. Everything else is set by the service. At most 16 KB in
@@ -10448,7 +10456,8 @@ components:
           description: Attach the original's attachments (never those with a `risk`).
         attachments:
           type: array
-          description: Extra attachments.
+          maxItems: 32
+          description: Extra attachments, at most 32 as on a send.
           items: {$ref: '#/components/schemas/AttachmentInput'}
         labels:
           type: array

@@ -1081,7 +1081,7 @@ pmail send --identity <identity> --to <recipient>… --subject <text>
 | `--attach` | Attach a file (repeatable). `pmail` refuses before sending when the message would exceed 5 MiB, unless `--allow-large` (for tenants that turn large attachments into links) |
 | `--kind` | `marketing` needs `--unsubscribe-url` or `--unsubscribe-mailto` and the consent flags |
 | `--thread` | Continue an existing thread |
-| `--header` | Only `X-` names matching `^X-[A-Za-z0-9_-]+$`, and `Importance` (`high`, `normal`, `low`), `Priority` (`normal`, `non-urgent`, `urgent`), `Sensitivity` (`personal`, `private`, `company-confidential`), `Keywords`, `Comments`, `Organization`, spelled exactly so; checked by the API (`400 header_not_allowed` for a name, `400 invalid_request` for a value) |
+| `--header` | Only `X-` names matching `^X-[A-Za-z0-9_-]+$`, and `Importance` (`high`, `normal`, `low`), `Priority` (`normal`, `non-urgent`, `urgent`), `Sensitivity` (`personal`, `private`, `company-confidential`), `Keywords`, `Comments`, `Organization`, names matched case-insensitively; checked by the API (`400 header_not_allowed` for a name, `400 invalid_request` for a value) |
 | `--idempotency-key` | 1–255 printable ASCII characters. Generated and printed when omitted |
 
 ```bash

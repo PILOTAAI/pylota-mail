@@ -122,7 +122,8 @@ settings page says so.
 - **Features:** every allowance in the plan catalog (`inboxes`, `sends`, `triage`, `custom_domains`,
   `storage_gb`, `seats`). On a deployment with `PM_BILLING=off`, usage alerts are not sent at all: no
   feature has a limit ([O23](../edge-cases.md)). The daily caps in tenant policy are not allowances; they
-  still return `429` and emit `quota.warning` to webhooks.
+  still return `429`, and the identity and tenant daily send caps emit `quota.warning` to webhooks (the
+  agentic-search cap does not).
 - **Thresholds:** 80% and 100% of `granted`, including top-ups.
 - **Once per threshold per period ([O20](../edge-cases.md)).** For allowances that reset (`sends`,
   `triage`), each threshold alerts at most once per billing period, even if holds are released and the
@@ -208,7 +209,9 @@ A suspended tenant gets `account` emails only ([O26](../edge-cases.md)).
 | `meta` | `tenant_id` (the owner, written by `NotifierRequest::Init`), `schema_version`, `alarm:send` (the earliest `due_at`), `alarm:held` (the earliest `held.until`), `alarm:daily` (the next 09:00 in the tenant's time zone), `prefs_cache_at` |
 
 The object's ID is minted with the tenant row and stored in `tenants.notify_do_id`, like `quota_do_id`
-for `TenantQuota`, and the object takes `NotifierRequest::Init` before anything else ([Design § 5](index.md#5-internal-durable-object-rpc)).
+for `TenantQuota` (a row still at `notify_do_id = ''` gets one from the every-minute cron,
+[Configuration › Bindings](../../reference/configuration.md#bindings)), and the object takes
+`NotifierRequest::Init` before anything else ([Design § 5](index.md#5-internal-durable-object-rpc)).
 Its single alarm is set to the earliest of `alarm:send`, `alarm:held` and `alarm:daily` ([Design § 4](index.md#4-durable-object-transactions),
 rule 5) and drives sending. Each send is idempotent: the
 outbound request uses an `Idempotency-Key` of `notify:{user_id}:{kind}:{ref}:{window start}`, so a
@@ -235,7 +238,7 @@ would be refused as `409 idempotency_conflict`).
 | `it::notify::usage_once_per_threshold_per_period` | Crossing 80% three times in a period → one email ([O20](../edge-cases.md)) |
 | `it::notify::count_feature_cooldown` | Seats 9→10→9→10 within a day → one email ([O21](../edge-cases.md)) |
 | `it::notify::timezone_change` | No day sent twice or skipped ([O22](../edge-cases.md)) |
-| `it::notify::billing_off_no_usage_alerts` | `PM_BILLING=off`: sends past every amount that would cross 80% or 100% on a plan send no `usage` email and no `UsageThreshold`; a daily cap still returns `429` and emits `quota.warning` ([O23](../edge-cases.md)) |
+| `it::notify::billing_off_no_usage_alerts` | `PM_BILLING=off`: sends past every amount that would cross 80% or 100% on a plan send no `usage` email and no `UsageThreshold`; a daily send cap still returns `429` and emits `quota.warning` ([O23](../edge-cases.md)) |
 | `it::notify::daily_caps` | 51st email for a person, or the workspace's 201st, → folded into the person's `digest`; the next 09:00 sends one `digest` email with counts and no mail content, not counted against the caps; its one-click unsubscribe turns `usage`, `new_mail` and `needs_person` off ([O24](../edge-cases.md)) |
 | `it::notify::platform_domain_failing_retries` | Platform domain `failing`: items kept and retried hourly for 24 hours; the platform domain alert fires ([O25](../edge-cases.md)) |
 | `it::notify::system_mail_blocked_retries` | A notification submit refused with `429 daily_cap_reached` (system identity's cap lowered), `409 identity_paused` (paused by a platform key) or `409 domain_not_ready`: the item is kept and retried hourly for 24 hours, then dropped; `system_mail_blocked` fires with the code; the default tenant's `tenant_daily_send_cap` never refuses it |

@@ -1250,8 +1250,9 @@ UNTRUSTED CONTENT
 
 HOW TO SEARCH
 1. When the question gives a concrete fact, use an operator for it:
-   from: to: participant: (people and domains), ref: (plates, invoice, order, claim, PCN and booking
-   numbers, amounts, phone numbers), label:, category:, has:attachment, filename:, type:pdf,
+   from: to: participant: (people and domains), ref: (plates, invoice, order, claim and PCN numbers,
+   amounts, phone numbers, and booking references when the organisation defines a custom: pattern for
+   them), label:, category:, has:attachment, filename:, type:pdf,
    after:YYYY-MM-DD, before:YYYY-MM-DD, newer_than:30d, older_than:1y, in:inbound, in:outbound,
    is:unread, is:needs_reply. Quote exact phrases: "change of dates". Use OR between alternatives
    and a leading - to exclude.

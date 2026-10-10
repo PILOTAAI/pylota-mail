@@ -250,8 +250,8 @@ and `kid` (`identity.key_rotated` also carries `previous_kid`). They are identit
 the D1 change through the identity's mailbox like the other `identity.*` events. Errors: the new
 `web_bot_auth_disabled` (422) and `policy_denied` (403); `key_not_found` (404), the existing code for a
 missing key, also covers an unknown `kid` and the directory while it is off; plus the existing
-`identity_not_found`, `identity_paused`, `invalid_request`, `permission_denied`, `scope_denied` and
-`rate_limited`.
+`tenant_suspended` (checked first, before `identity_paused`), `identity_not_found`, `identity_paused`,
+`invalid_request`, `permission_denied`, `scope_denied` and `rate_limited`.
 
 ## 8. Data model
 

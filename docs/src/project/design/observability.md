@@ -299,7 +299,7 @@ the window (the Custom Alert "minimum event count").
 | Alert | Class | Condition | Severity | Runbook |
 |---|---|---|---|---|
 | `dlq:{queue}` | B | The oldest open `dlq_items` row of a queue is older than 15 minutes ([J8](../edge-cases.md)) | page | [DLQ growth](#dlq-growth) |
-| `vector_drift` | B | Tonight's and the previous night's reconciliation both put `drift_pct` more than 1 away from zero ([Search › Nightly reconciliation](search.md#66-nightly-reconciliation)) | ticket | Re-run the reconciliation; if the drift persists, start a `reindex` job for the affected identities (`POST /v1/jobs`) |
+| `vector_drift` | B | Tonight's and the previous night's reconciliation both put `drift_pct` more than 1 away from zero ([Search › Nightly reconciliation](search.md#66-nightly-reconciliation)) | ticket | Re-run the reconciliation; if the drift persists, start a `reembed` job for each affected tenant (`POST /v1/platform/jobs` with `{ "kind": "reembed", "tenant_id": … }`, and `identity_ids` to limit it to the identities whose `index_reconcile` rows show the gap; `platform:ops`). A `reindex` job rebuilds only the keyword index and does not touch Vectorize |
 | `bounce_rate:{domain_id}` | A | `bounces_total / recipients_submitted_total` > 2% over 1 h for a domain with ≥ 50 recipients | page | [Bounce spike](#bounce-spike) |
 | `complaint_rate:{domain_id}` | A | `complaints_total / recipients_submitted_total` > 0.1% over 24 h for a domain with ≥ 200 recipients | page | [Complaint spike](#complaint-spike) |
 | `inbound_reject_spike` | A | Anomaly detection on `inbound_received_total{result=rejected_unknown}`: spike, 15-minute evaluation window, 24 h baseline, minimum 50 events | ticket | [Domain failing](#domain-failing) (routing checks) |
@@ -313,7 +313,7 @@ the window (the Custom Alert "minimum event count").
 | `webhook_disabled:{webhook_id}` | B + C | Endpoint disabled with `failing` (`webhook.disabled` event) | ticket | [Integrator API down](#integrator-api-down) |
 | `provider_quota` | A | `provider_quota_errors_total` > 0 over 15 minutes: the first quota error ([G3](../edge-cases.md)) | page | [Quota exhausted](#quota-exhausted) |
 | `provider_quota_80` | B | Only when `PM_DAILY_SEND_QUOTA` is set: today's (UTC) `sends` in `usage_daily`, summed over live tenants, reach 80% of it ([G3](../edge-cases.md)) | ticket | [Quota exhausted](#quota-exhausted) |
-| `quota_warning` | C | `quota.warning` at 80% and 100% of a tenant or identity cap | – (tenant-facing) | [Quota exhausted](#quota-exhausted) |
+| `quota_warning` | C | `quota.warning` at 80% and 100% of a tenant or identity daily send cap | – (tenant-facing) | [Quota exhausted](#quota-exhausted) |
 | `domain_failing:{domain_id}` | B + C | Domain enters `failing` or `suspended` (`domain.failing`, `domain.suspended`) | ticket | [Domain failing](#domain-failing) |
 | `inbound_throttled` | A | `inbound_throttled_total` > 100 over 1 h: one or more senders exceed `inbound.per_sender_per_hour` and their excess is stored `throttled` ([D5](../edge-cases.md)) | ticket | [Abusive identity](#abusive-identity) (the affected mailbox's `rate_windows` rows name the sender; add a receive-block if it is abuse) |
 | `stripe_webhook_errors` | B | Only with `PM_BILLING=stripe`: at least one `billing_events` row with `outcome` starting `error:` received in the last hour (the detail lists each `type` and code) | ticket | [Billing design › Stripe webhook](billing.md#stripe-integration) (fix the endpoint's event list, or the customer mismatch) |
@@ -353,12 +353,22 @@ The `* * * * *` cron runs `ops::alerts::evaluate`:
      are counted too, which only makes it fire earlier;
    - when SES is configured: `SELECT COUNT(*) FROM domains WHERE ses_region IS NOT NULL AND state <>
      'removed'`, plus one for the platform identity, against 9,000 (`ses_identities_90pct`);
-   - conditions reported by objects and crons since the last run (`mailbox_size`, `abuse_pause`,
-     `rpc_owner_mismatch`, `inbound_lost`, `ses_object_lost` from the inbound consumer,
-     `system_mail_blocked` from the Notifier, `billing_cancel_failed` from the erasure job,
-     `signup_ramp_review` from the daily ramp evaluation, and
-     `ses_sending_paused` and `ses_rule_missing` from the 15-minute SES platform check, which reads
-     `GetAccount` and the receipt rule set): the reporting code writes an `alert.fired` audit row itself.
+   - conditions reported by objects and crons since the last run. The reporting code writes the
+     `alert.fired` audit row itself:
+
+     | Condition | Reported by, and writer of its `alert.fired` row |
+     |---|---|
+     | `mailbox_size` | The identity's mailbox, from its size check ([Data model › Mailbox notes](data-model.md#mailbox-notes)) |
+     | `abuse_pause` | The delivery-event consumer (`consumers/delivery.rs`), when its auto-pause update changed a row ([Outbound › Abuse auto-pause](outbound.md#abuse-auto-pause-fr-dlv-3)) |
+     | `rpc_owner_mismatch` | The Durable Object whose owner check failed ([Design conventions](index.md#5-internal-durable-object-rpc)) |
+     | `inbound_lost` | The global retention `staging` step (`inbound_lost_total`) and the `pm-inbound` consumer (`inbound_raw_missing_total`) |
+     | `ses_object_lost` | The `pm-inbound` consumer's SES source |
+     | `system_mail_blocked` | The Notifier |
+     | `billing_cancel_failed` | The tenant erasure job, on the third failed `cancel_billing` attempt |
+     | `billing_cancelled_after_erasure` | The Stripe webhook handler, when it cancels a live subscription of an erasing or erased workspace ([Billing › Webhook endpoint](billing.md#webhook-endpoint)) |
+     | `vector_drift` | The `*/15` cron's reconciliation drift evaluation, when this run's and the previous run's `drift_pct` are both more than 1 from zero ([Search › Nightly reconciliation](search.md#66-nightly-reconciliation)) |
+     | `signup_ramp_review` | The daily ramp evaluation (`crons/signup_ramp.rs`) |
+     | `ses_sending_paused`, `ses_rule_missing` | The 15-minute SES platform check, which reads `GetAccount` and the receipt rule set |
 2. Read the current state: for each alert key, the latest `audit_log` row with
    `action IN ('alert.fired', 'alert.resolved') AND target_id = <alert key>`.
 3. Transition, with pure rules in `core::slo`: a true condition on a key that is not firing writes

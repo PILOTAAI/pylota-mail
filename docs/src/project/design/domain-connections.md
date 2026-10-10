@@ -530,7 +530,7 @@ These rows add to [What each check verifies](identity-domains.md#what-each-check
 | SES inbound MX at the domain | `inbound = ses` | The MX set contains `inbound-smtp.{ses_region}.amazonaws.com` | `mx_missing` (fail); `mx_unexpected`: another MX host too (degraded) ([N9](../edge-cases.md)); `mx_wrong_region`: an SES inbound host for another region (fail) ([N8](../edge-cases.md)) |
 | SES identity | `transport = ses` or `inbound = ses`; on a Cloudflare-transport domain with `ses_identity` (the [J5](../edge-cases.md) failover identity), informational only: shown, never an issue that changes the state ([Identities and domains › What each check verifies](identity-domains.md#what-each-check-verifies)) | `GetEmailIdentity` (once a day, at the domain's hash offset, through the SES token bucket, §4.8): `VerifiedForSendingStatus = true` and `DkimAttributes.Status = SUCCESS` | `ses_dkim_failed` (fail) ([N10](../edge-cases.md)) |
 | SES DKIM CNAMEs | as above | Each CNAME points at `{token}.{SigningHostedZone}` | `dkim_missing` (fail) |
-| MAIL FROM | `transport = ses` | `MailFromAttributes.MailFromDomainStatus = SUCCESS`, and the MX and SPF at `pm-bounce.{domain}` match | `mail_from_failed` (degraded) ([N11](../edge-cases.md)) |
+| MAIL FROM | `transport = ses` with `mail_from_domain` set (`dns_records`, `send_only`). Not a Cloudflare-method domain sent through its J5 failover identity: that identity has no custom MAIL FROM (SES uses its default), so a failed-over domain never turns `degraded` for it | `MailFromAttributes.MailFromDomainStatus = SUCCESS`, and the MX and SPF at `pm-bounce.{domain}` match | `mail_from_failed` (degraded) ([N11](../edge-cases.md)) |
 | SES account | deployment, in `pmail doctor` and the 15-minute platform check | Production access enabled, sending not paused, the receipt rule set active and containing `pm-deliver` | `ses_sending_paused`, `ses_rule_missing` (platform alerts; every SES domain uses fallback while sending is paused) ([N10](../edge-cases.md)) |
 | Alignment probe | `transport = smtp` | Last probe (with the live values) passed within 26 hours | `smtp_unaligned`, `smtp_from_rewritten` (degraded for the first in a row, fail from the second; [§5.3](#53-proving-alignment-the-probe)); `smtp_probe_timeout` (fail before the first pass; after it degraded, then fail after three in a row) |
 | SMTP login | `transport = smtp` | The last send or probe authenticated | `smtp_auth_failed`, `smtp_tls_required` (fail) |
@@ -551,7 +551,7 @@ inbound     TEXT NOT NULL CHECK (inbound IN ('routing','ses','forward','none')),
 transport   TEXT NOT NULL CHECK (transport IN ('cloudflare','ses','smtp')),
 ses_region        TEXT,          -- set when the domain has an SES identity: inbound or transport is ses, or the
                                  -- J5 failover identity of a Cloudflare-method domain
-mail_from_domain  TEXT,          -- pm-bounce.{domain}
+mail_from_domain  TEXT,          -- pm-bounce.{domain} (dns_records, send_only); NULL for a J5 failover identity
 smtp_sealed       BLOB,          -- pm1 envelope of {host, port, username, password, probe_from}
 smtp_pending_sealed BLOB,        -- values from PATCH waiting for a passing probe (pm1, aad column smtp_pending_sealed)
 probe_last_at     INTEGER,

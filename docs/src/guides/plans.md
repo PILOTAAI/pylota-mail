@@ -20,8 +20,9 @@ Self-hosting is free under FSL-1.1-ALv2. You pay only your own Cloudflare usage
   ([Configuration › Tenant policy](../reference/configuration.md#tenant-policy)).
 - `GET /v1/usage` still reports what each workspace uses, with `"billing": "disabled"` and no plan
   limits (every feature `granted: null`, `unlimited: true`).
-- No [usage alerts](#usage-alerts) are sent: with no plan there is no limit to reach. The daily caps
-  above still emit `quota.warning` to webhooks.
+- No [usage alerts](#usage-alerts) are sent: with no plan there is no limit to reach. The identity and
+  tenant daily send caps above still emit `quota.warning` to webhooks at 80% and 100%; the agentic-search
+  cap emits none, only its `429`.
 
 Turning billing on (`PM_BILLING=stripe`, with a plan catalog and Stripe keys) is an operator choice,
 described in the [billing design](../project/design/billing.md#self-host-mode). FSL-1.1-ALv2 does not
@@ -183,8 +184,8 @@ they last signed in more than 10 minutes ago.
 - **Change plan, change top-ups, update the card, see invoices, cancel.** **Manage billing** opens the
   Stripe Customer Portal. A change applies when Stripe confirms it; Stripe prorates the price.
 - **Cancel.** The plan stays until the end of the period you paid for, then the workspace moves to Free.
-- **Delete the workspace.** Deleting a workspace (owner only, at **Settings**) cancels its plan and every
-  top-up at once, with no proration and no refund, then erases the workspace
+- **Delete the workspace.** Deleting a workspace (owner only, at **Settings**) stops its mail, then cancels
+  its plan and every top-up at once, with no proration and no refund, before anything else is erased
   ([Privacy](privacy.md#console-accounts)).
 
 **A downgrade never deletes data.** If you have more identities, custom domains or members than the new

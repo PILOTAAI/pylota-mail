@@ -84,14 +84,14 @@ M0 skeleton ─▶ M1 spikes ─▶ M2 core ─▶ M3 api-types ─▶ M4 platfo
      └──────┬───────┴───────┬───────┘                                                   │
             ▼               ▼                                                           │
      M14 privacy      M15 MCP ◀─────────────────────────────────────────────────────────┘
-            │               │
+            │               │      (M15 also waits for M22 and M25, second graph)
             └───────┬───────┘
                     ▼
             M18 quality gates ─▶ M20 staging + live proof ─▶ v1.0
 ```
 
-The console, billing, domain-method, agent-key and notification milestones join the graph like this.
-Each also feeds M20:
+The console, billing, domain-method, agent-key and notification milestones, and the two halves of M17,
+join the graph like this. Each also feeds M20:
 
 ```text
 M7, M8, M9, M10, M11, M12, M13, M14 ─▶ M21 console ─▶ M22 billing ─▶ M24 cloud sign-up and sign-in
@@ -100,7 +100,10 @@ M9 outbound ─▶ M13 domains ─▶ M23 domains on any DNS host   (S10, S11, S
 M5, M6 ─▶ M25 agent signing keys, assertions and signed requests ─▶ M15 MCP (two signing tools)
                                                                   ─▶ M21 console (keys on the identity page)
    (S13 gates signed HTTP requests only)
-M9, M10, M21, M22 (and M6's system identity) ─▶ M26 notifications and usage alerts
+M22 billing ─▶ M15 MCP (mail_get_usage calls M22's GET /v1/usage)
+M9, M10, M21, M22, M24 (and M6's system identity) ─▶ M26 notifications and usage alerts
+M5 ─▶ M17 Foundation (metrics writer, alert evaluator, alert table, re-seal sweep) ─▶ M7, M8, M9
+   (M17 Completion, the checks that measure later milestones, is accepted at M20)
 ```
 
 After M5, these tracks can run in parallel, each in its own branch and worktree:
@@ -109,30 +112,52 @@ After M5, these tracks can run in parallel, each in its own branch and worktree:
   M7 also waits for M8, whose `webhooks/payloads.rs` builds the `message.*` events that inbound mail emits;
 - **Track 2:** M8, once M6 lands (M8 imports M6's `webhooks/envelope.rs`: the event envelope, the
   `WebhookJob` queue message and the identity payload builders that M6's outbox already needs);
-- **Track 3:** M16 + M17;
+- **Track 3:** M17 Foundation first (it must merge before M7, M8 and M9), then M16 and M17 Completion;
 - **Track 4:** M19;
 - **Track 5:** M25, once M6 lands (it needs only M5 and M6).
 
 Once M7 lands, M10 and M12 also run in parallel with M9. M23 follows M13 on the domains track. M21
 starts only after M7–M14 and M25, because its screens (inboxes, search, quarantine, triage, domains,
 webhooks, erasure, identity keys) call their services; M22 starts after M9, M12 and M21, M24 after M21 and
-M22, and M26 after M9, M10, M21 and M22 (it sends through M6's system identity and is fed by M8's
-webhook dispatcher and M12's triage, which come before M21). M15 also waits for M25, whose two signing
-tools it registers. No milestone depends on one that comes later in this graph. Tracks never edit the same files. Shared files
-(`router.rs`, `wrangler.toml` template, `0001_init.sql`) are changed only by the track that owns them, as
-listed per milestone.
+M22, and M26 after M9, M10, M21, M22 and M24 (it sends through M6's system identity, is fed by M8's
+webhook dispatcher and M12's triage, which come before M21, and adds hooks to M24's sign-in files).
+M15 also waits for M22, whose `GET /v1/usage` its `mail_get_usage` tool calls, and for M25, whose two
+signing tools it registers. M17 is accepted in two halves, without renumbering: **M17 Foundation** (the
+metrics writer, the alert evaluator, the alert table and the master-key re-seal sweep) is Track 3's first
+pull request and merges before M7, M8 and M9, because M7 and M8 emit their SLI metrics through its writer
+and M9's G3 (`it::ops::provider_quota_80`) and M23's N26 (`ses_identities_90pct`) fire through its
+evaluator; **M17 Completion** (J3, every metric emitted, the SLOs) is accepted at M20, because it
+measures what later milestones build. No milestone depends on one that comes later in this graph.
+Tracks never edit the same files. Shared files (`router.rs`, `wrangler.toml` template, `0001_init.sql`)
+are changed only by the track that owns them, as listed per milestone.
 
-**Shared files.** Two files are changed by milestones that can run at the same time, so they have a
+**Shared files.** These files are changed by milestones that can run at the same time, so they have a
 rule of their own:
 
 - `quota/mod.rs`, the `TenantQuota` object. M5 creates it with every `QuotaRequest` variant already
-  answered by a stub (below), so later milestones replace the behaviour of the variants they own and
-  never change a signature: M9 (`Reserve`, `Release`, `RecordOutcome`), M11 (`CountAgentic`), M22 (the
-  allowance variants, through `billing/quota.rs`) and M26 (the `NotifierRequest::UsageThreshold` hook).
+  answered by a stub (below), and declares the billing types the stub needs to compile (`Feature`,
+  `BillingMode`, `Allowances`, the `Hold` and `SetPlan` payloads and the `Held` and `Denied` answers), so
+  later milestones replace the behaviour of the variants they own and never change a signature: M9
+  (`Reserve`, `Release`, `RecordOutcome`), M11 (`CountAgentic`), M22 (the allowance variants, through
+  `billing/quota.rs`), M24 (`OutcomeRates`) and M26 (the `NotifierRequest::UsageThreshold` hook).
 - `consumers/index.rs`, the `pm-index` consumer. M7 creates it for attachment text, M10 adds chunking,
   embedding and reconciliation, and M12 the triage job. M7 writes the whole `IndexJob` enum
   ([Search § 6](design/search.md#6-indexing-pipeline-pm-index)), so each later milestone fills in only the
   arm of its own job kind.
+- `billing/webhook.rs`, the Stripe webhook handler. M22 creates it; M24 adds the `ramp_lifted_at` update
+  when a workspace moves to a paid plan, and M26 the `Account { event: payment_failed }` hook.
+- `jobs/erasure.rs`, tenant and person erasure. M14 creates it with every step and the named stubs of its
+  table (below); M21 (console rows), M22 (`cancel_billing` and the billing rows), M23 (the
+  `pm-retired-{n}` entries), M24 (person deletion) and M26 (the Notifier rows) each fill in their own stub.
+- `jobs/retention.rs`, the global retention job. M14 creates it with the job framework and the steps whose
+  tables have writers by then; M21 (`console`), M22 (`billing_events`), M23 (`ses_ingest`), M24
+  (`signup`) and M25 (`identity_keys`) each add their own step and its test. If M23 or M25 lands before
+  M14, M14 writes that step, and the milestone's test runs once M14 has landed.
+- `crates/core/src/sealed.rs`, the registry of columns sealed under `PM_MASTER_KEY`. M17 Foundation
+  creates it with the columns written by then (`signing_keys.ciphertext`); each milestone that writes a
+  sealed column adds its entry and its case in `it::secrets::master_key_rotation`: M8 (webhook secrets),
+  M23 (SMTP credentials), M24 (second factors and PKCE verifiers) and M25 (identity keys). M25 is the only
+  one that can land before M17 Foundation; if it does, M17 Foundation adds its entry.
 
 Each change to one of these files has one owner, the milestone that needs it. When two tracks change the
 same file at once, the one that merges second rebases onto the other and re-runs the gate; neither edits
@@ -296,7 +321,8 @@ idempotency for non-mail POSTs, and the thread and link keyring (`signing_keys`,
 `members` rows and the `billing_accounts` row. Nothing acts on them yet. The owner's sign-in link is sent
 once M21 lands, and plan checks run once M22 lands; until then holds always succeed, as in billing mode
 `disabled`. Each tenant gets its `TenantQuota` object (`quota_do_id`, then `QuotaRequest::Init`).
-`notify_do_id` is written as `''` until M26 mints a `Notifier` with the tenant row
+`notify_do_id` is written as `''` until M26 mints a `Notifier` with the tenant row; from M26 the
+every-minute cron also mints one for each row still at `''`
 ([Data model](design/data-model.md#1-d1-control-plane)).
 
 **The `TenantQuota` stub.** `quota/mod.rs` declares the whole `QuotaRequest` enum of
@@ -308,8 +334,9 @@ well-formed answer. Later milestones replace behaviour, never a signature:
 | Variants | Stub behaviour from M5 | Replaced by |
 |---|---|---|
 | `Init` | Stores the owner in `meta`; every other request checks it | final |
-| `Reserve`, `Release` | `Reserve` takes its `sends` hold as `Hold` does and counts the day's `sends:{identity_id}` and `sends` counters, without enforcing a cap; `Release` decrements them | M9: daily caps (`CapReached`) and `quota.warning` thresholds |
-| `RecordOutcome` | Records the outcome in `outcomes`; never pauses an identity | M9: abuse auto-pause (FR-DLV-3) |
+| `Reserve`, `Release` | `Reserve` takes its `sends` hold as `Hold` does and counts the day's `sends:{identity_id}` counter, and the tenant `sends` counter unless `tenant_cap` is `None` (the system identity), without enforcing a cap; `Release` decrements the same counters (`sends` only when `tenant_counted`) | M9: daily caps (`CapReached`) and `quota.warning` thresholds |
+| `RecordOutcome` | Records the outcome in `outcomes` and the tenant's per-day outcome counters; never pauses an identity | M9: abuse auto-pause (FR-DLV-3) |
+| `OutcomeRates` | Zero counts (`{ outcomes: 0, bounced: 0, complained: 0 }`) | M24: sums the tenant's outcome counters for the send ramp |
 | `CountAgentic` | Counts `agentic` for the day and `usage:agentic`; always `Ok { used }` | M11: the tenant daily cap (`CapReached`) |
 | `RecordUsage` | Adds to `usage:{metric}` for the current UTC day | final |
 | `ForgetIdentity` | Deletes the identity's `outcomes` rows and `sends:{identity_id}` counters | final |
@@ -367,11 +394,13 @@ stub that accepts `JobRequest::Start` and runs no step, so the job stays `queued
 `deleting`. M14 replaces the stub with the real `JobRunner`, whose every-minute restart of jobs left
 `queued` picks these up.
 
-**Acceptance:** A5, A7 (pause part), A12, J9, plus `identity.created`, `identity.updated`,
+**Acceptance:** A5, A12, J9, plus `identity.created`, `identity.updated`,
 `identity.paused` and `identity.resumed` events that reach the outbox, `event_index` and a `pm-webhooks`
 message (consumed once M8 lands); a crash between commit and dispatch repeats the dispatch, never loses
-it. The system identity is never listed and refuses tenant keys. Rows that need a later milestone are
-accepted there: A13 in M7 (it needs `email()`), A8 in M9 (`it::send::a8_owner_required`), and A11, A14
+it. The system identity is never listed and refuses tenant keys. The pause itself
+(`PATCH /v1/identities/{identity_id}` with `status: "paused"` or `"active"`) ships here. Rows that need a
+later milestone are accepted there: A7 in M9 (its only test, `it::send::a7_paused_refuses_send`, needs
+the send path), A13 in M7 (it needs `email()`), A8 in M9 (`it::send::a8_owner_required`), and A11, A14
 and the promote, retire and rollback flows in M13 (they need a tenant domain).
 
 ---
@@ -387,7 +416,7 @@ fill in their arms).
 ([Inbound › The `wait` handler](design/inbound.md#the-wait-handler-e4)), which is P0 because quarantine
 rule 5 (E5) depends on its registrations.
 
-**Acceptance:** A2, A6, A9, A10 (inbound part), A13, B1 (documented), B3, B12, B14, C1, D4, D5, D9, D10,
+**Acceptance:** A2, A6 (`it::inbound::a6_reject_codes`; its SES part in M23), A9, A10 (inbound part), A13, B1 (documented), B3, B12, B14, C1, D4, D5, D9, D10,
 E4 (`it::wait::e4_*`), E5, J1, J2, J7, and every `conf::` corpus case ingested end to end through workerd.
 Rows whose inbound side needs a later milestone are accepted there: C7 (it matches replies to outbound
 mail), D7 (suppressions and lists) and loopback L3 in M9, and C3 (a retiring address) and A4's role-mail
@@ -421,6 +450,8 @@ temporarily failed mail.
 - Auto-disable on `410` and on 100 consecutive failures.
 - NFR-REL-4: the retry schedule reaches 24 hours within its 13 attempts, and `webhook_delivery_latency_ms`
   and `webhook_dead_total` are emitted for the SLI.
+- `webhook_endpoints.secret_enc` and `prev_secret_enc` are registered in `crates/core/src/sealed.rs`
+  (M17 Foundation's registry), with their case in `it::secrets::master_key_rotation`.
 
 ---
 
@@ -440,7 +471,8 @@ lazily and reconciliation is event-driven, so neither has an alarm; no cron is i
 **Implements:** FR-OUT-1–12, FR-DLV-1–5, NFR-PERF-1/2.
 
 **Acceptance:** A7, A8, A10, C2, C4, C6, C7, D6 (exchange cap), D7, E2, E3, E8, G1–G6, G8–G11 (G5 with
-signed links), K3, L1–L4. G7 needs domain states and is accepted in M13. Also: the allow and block lists
+signed links), K3, L1–L4. G3's `it::ops::provider_quota_80` fires through M17 Foundation's evaluator,
+which merges first. G7 needs domain states and is accepted in M13. Also: the allow and block lists
 (`it::lists::entries_crud`) and their effect on sends and on inbound mail (`it::send::list_filters`,
 `it::inbound::receive_allow_skips_spam`; D7 covers receive-block), the custom-header rules checked at the
 API (`it::send::header_rules`), the simulator matrix drives every status, an uncertain send is reconciled by a
@@ -518,7 +550,9 @@ CLI `pmail domains subscribe`. The other connection methods, `nameservers` inclu
 
 **Acceptance:**
 
-- H1–H7, G7, C3, A11, A14, A4's role-mail routing (`it::inbound::a4_role_mail_routing`), the promote,
+- H1, H2 (`core::dns::h2_spf_lookup_count`; its MAIL FROM part, `it::ses::h2_mail_from_spf_preflight`,
+  is for `dns_records` and `send_only` domains and is accepted in M23), H3–H7, G7, C3, A11, A14, A4's
+  role-mail routing (`it::inbound::a4_role_mail_routing`), the promote,
   retire and rollback flows
   (`it::addresses::promote_retire_rollback`, `it::addresses::retirement_cron`), and the API part of J5
   (`it::domains::transport_patch`, including the SES identity that `cloudflare_zone` onboarding creates
@@ -535,6 +569,11 @@ CLI `pmail domains subscribe`. The other connection methods, `nameservers` inclu
   in M23.
 - The fallback send carries `sent_via_fallback` and keeps the thread token.
 - Recovery leaves fallback threads pinned.
+- The `domain_remove` job's steps for `cloudflare_zone`
+  ([Identities and domains › Domain removal](design/identity-domains.md#domain-removal)), including
+  `delete_ses_identity`, which deletes the failover SES identity that onboarding created and its three
+  DKIM CNAMEs. `DELETE /v1/domains/{domain_id}` queues the job behind M6's `JobRunner` stub; M14 runs it,
+  inline in tenant erasure's `remove_domains` too, and accepts `it::domains::remove_deletes_ses_identity`.
 
 ---
 
@@ -566,11 +605,19 @@ migration (the `domains` method columns, `ses_ingest`, `addresses.ses_bounce_rul
 - `pmail setup ses` is idempotent: it runs twice against a recorded AWS API fake with no duplicate
   resources, never deactivates an existing active rule set, and prints the IAM policy before applying it.
 - Every new error code and `transport_unavailable` reason in the design is returned by at least one test.
+- The SES parts of rows that M7 and M13 accept: A6's suspended-tenant hold (`it::ses::suspended_tenant_held`)
+  and H2's MAIL FROM preflight (`it::ses::h2_mail_from_spf_preflight`).
+- The SES operator alerts, which fire through M17 Foundation's evaluator: `it::ops::ses_alerts`
+  (`ses_identities_90pct` for N26, `ses_sending_paused` and `ses_rule_missing` for N10).
 - The cross-tenant suite covers `/hooks/ses/inbound` (no key) and the new routes.
 - Erasure extension, once M14 has landed (if M14 lands later, it writes this substep instead of a stub):
-  tenant erasure's `remove_domains` deletes each SES domain's identity and its addresses in the
-  `pm-retired-{n}` receipt rules ([Privacy §6.6](design/privacy.md#66-tenant-scope)).
-  `it::erasure::tenant_console_rows` gains its SES-fake assertions.
+  tenant erasure's `remove_domains` removes each SES domain's addresses from the `pm-retired-{n}`
+  receipt rules (the `prune_retired_rules` step of domain removal;
+  [Privacy §6.6](design/privacy.md#66-tenant-scope)). The SES identity itself is deleted by M13's
+  `delete_ses_identity` step. `it::erasure::tenant_ses_rows` lands here.
+- The global retention job's `ses_ingest` step (`it::retention::global_ses_ingest`).
+- `domains.smtp_sealed` and `domains.smtp_pending_sealed` are registered in `crates/core/src/sealed.rs`,
+  with their case in `it::secrets::master_key_rotation`.
 
 **Gate:** each method ships only when its spike passed: S11 for `dns_records`, S12 for `smtp_relay`, S10
 for `delegated_subdomain` (which also stays behind `PM_CF_SUBDOMAIN_SETUP`). `smtp_relay` with `inbound: ses`
@@ -587,15 +634,22 @@ also needs S11; without it, `smtp_relay` ships with `inbound: forward` only. `cl
 
 **Implements:** FR-PRV-1–6, FR-IDN-4, NFR-PRV-1.
 
-**Acceptance:** F6, I1–I7, J3, plus every erasure scope with receipt counts and empty probes (identity and
-tenant scope also delete `identity_keys` and write `key_tombstones`; with M25 this is O7), the
-optional backup copy (`it::retention::backup_copy`), and `it::logs::i5_no_content_in_logs`, which greps
-captured Worker logs for any test-message body string and any test address. NFR-PRV-1: in a
-time-controlled harness every erasure scope completes within 24 hours, and a step that keeps failing
-still produces a receipt (`it::erasure::step_retry_and_fail`). Tenant scope runs its steps in order
-(`it::erasure::tenant_scope_order`), and the global retention job runs every step of
-[Privacy §5.3](design/privacy.md#53-global-retention-job), including `identity_keys` and `billing_events`
-(`it::retention::global_job_steps`).
+**Acceptance:** F6, I1–I7, the `reparse` job that J3 starts (J3 itself is accepted with M17 Completion,
+which adds its start through `POST /v1/platform/jobs`), plus every erasure scope with receipt counts and
+empty probes (identity and tenant scope also delete `identity_keys` and write `key_tombstones`; with M25
+this is O7), the optional backup copy (`it::retention::backup_copy`), and
+`it::logs::i5_no_content_in_logs`, which greps captured Worker logs for any test-message body string and
+any test address. NFR-PRV-1: in a time-controlled harness every erasure scope completes within 24 hours,
+and a step that keeps failing still produces a receipt (`it::erasure::step_retry_and_fail`). Tenant scope
+runs its steps in order, `cancel_billing` second (`it::erasure::tenant_scope_order`). `remove_domains`
+runs M13's `domain_remove` steps inline, including `delete_ses_identity` (the failover SES identity and
+its three DKIM CNAMEs), and a domain removal that M13 queued behind the stub now runs
+(`it::domains::remove_deletes_ses_identity`). The global retention job ([Privacy
+§5.3](design/privacy.md#53-global-retention-job)) lands with its framework and the steps whose tables
+have writers by now: `idempotency`, `platform_events`, `jobs`, `usage`, `dlq`, `signing_keys`, `staging`
+and `audit` (`it::retention::global_job_steps`). Its other steps are added by the milestones that write
+their tables, each with its own test: `console` in M21, `billing_events` in M22, `ses_ingest` in M23,
+`signup` in M24 and `identity_keys` in M25.
 
 **Stubs completed by later milestones.** Tenant erasure ([Privacy §6.6](design/privacy.md#66-tenant-scope))
 reaches tables and services that later milestones build. M14 writes every step, and leaves these substeps
@@ -605,8 +659,8 @@ test it names:
 | Substep | Completed by | Test |
 |---|---|---|
 | Console rows: `members`, `invitations` and `sessions` in `delete_d1_rows` | M21 | `it::erasure::tenant_console_rows` (lands in M21) |
-| Billing: the `cancel_billing` step, and `billing_events` and `billing_accounts` in `delete_d1_rows` | M22 | `it::erasure::tenant_cancels_billing`; billing assertions in `it::erasure::tenant_console_rows` |
-| SES: the SES identity and the `pm-retired-{n}` entries in `remove_domains` | M23 | SES-fake assertions in `it::erasure::tenant_console_rows` |
+| Billing: the `cancel_billing` step (step 2), and `billing_events` and `billing_accounts` in `delete_d1_rows` | M22 | `it::erasure::tenant_cancels_billing`; billing assertions in `it::erasure::tenant_console_rows` |
+| SES: the domain's addresses in the `pm-retired-{n}` receipt rules (`prune_retired_rules`, run by `remove_domains`) | M23 | `it::erasure::tenant_ses_rows` (lands in M23) |
 | Person rows: deleting every person left with no workspace ([Privacy §6.9](design/privacy.md#69-people-console-accounts)) | M24 | `it::erasure::person_scope`; assertions on people left with no workspace in `it::erasure::tenant_console_rows` |
 | Notifier: `notification_prefs` in `delete_d1_rows`, and `Notifier` `delete_all` | M26 | Notifier assertions in `it::erasure::tenant_console_rows` and `it::erasure::person_scope` |
 
@@ -656,18 +710,38 @@ signing tools of M25 (`mail_sign_assertion`, `mail_sign_http_request`).
 (alert rules, pure), `handlers/platform.rs`
 (the platform API: `GET /v1/platform/dlq`, `POST /v1/platform/dlq/{dlq_id}/redrive`,
 `POST /v1/platform/jobs`, `GET /v1/platform/jobs/{job_id}`, `POST /v1/platform/keys/{purpose}/rotate`, all
-`platform:ops`), CLI
-`dlq list|redrive`. There is no internal-only handler: the CLI uses the public platform API.
+`platform:ops`), `crates/core/src/sealed.rs` (the registry of sealed columns, pure), `ops/reseal.rs` (the
+re-seal sweep that the `*/15` cron runs), CLI `dlq list|redrive` and `secrets rotate-master`. There is no
+internal-only handler: the CLI uses the public platform API.
 
 **Implements:** FR-OPS-4, NFR-OPS-2, NFR-COST-1 and [Observability](design/observability.md).
 
-**Acceptance:**
+M17 is accepted in two halves, without renumbering ([Dependency graph](#dependency-graph)).
 
-- J8, J3 (job start through the API), `it::secrets::signing_key_rotation`, `it::ops::provider_quota_80`.
-- Log scrubbing (part of I5).
-- Every metric in the design is emitted by at least one test path.
+**Acceptance, M17 Foundation** (Track 3's first pull request; it merges before M7, M8 and M9):
+
+- The log and metrics writer (`log.rs`, `metrics.rs`): `event = "metric"` lines with the catalogued
+  labels, and log scrubbing (part of I5).
+- The alert table (the [alert list](design/observability.md#53-alert-list) as data in `ops/alerts.rs`:
+  each alert's key, class, severity and runbook) and the state alert evaluator
+  ([Observability §5.4](design/observability.md#54-the-state-alert-evaluator)): `core::slo::alert_state_machine`
+  and `it::ops::alert_evaluator_transitions`. M9's G3 (`it::ops::provider_quota_80`) and M23's N26
+  (`ses_identities_90pct`, checked by `it::ops::ses_alerts`) fire through them and are accepted there.
+- The master-key rotation ([Security §6.2](design/security.md#62-rotation-procedures)):
+  `PM_MASTER_KEY_NEXT`, the re-seal sweep over the registry in `crates/core/src/sealed.rs`, and
+  `pmail secrets rotate-master`, whose count query is built from the same registry:
+  `it::secrets::master_key_rotation` and `cli::secrets::rotate_master` for the columns registered so far.
+  Each milestone that writes a sealed column registers it and extends the test
+  ([Shared files](#dependency-graph)).
+
+**Acceptance, M17 Completion** (accepted at M20, once what it measures has landed):
+
+- J8, J3 (job start through `POST /v1/platform/jobs`; it needs M14's `reparse` job),
+  `it::secrets::signing_key_rotation`.
+- Every metric in the design is emitted by at least one test path (`it::ops::metrics_emitted`).
 - Every SLO of [Observability §4](design/observability.md#4-service-level-objectives) is computed from emitted metrics
-  (`it::ops::slo_from_metrics`): NFR-REL-1–4, NFR-PERF-1–6 and NFR-PRV-1.
+  (`it::ops::slo_from_metrics`): NFR-REL-1–4, NFR-PERF-1–6 and NFR-PRV-1, including those that need
+  later milestones (NFR-PRV-1 needs M14's erasure, NFR-PERF-6 M11's agentic search).
 - NFR-OPS-2: `it::ops::restore_rebuilds_ledger`, and the restore runbook that `live::ops::restore_drill`
   runs in M20.
 - NFR-COST-1: the generated `wrangler.toml` declares no always-on compute (no Containers, no binding
@@ -728,9 +802,10 @@ including identity-key management on the identity page ([Agent signing keys §6]
   tenant daily cap and from abuse auto-pause (`it::send::system_identity_exemptions`).
 - Erasure extension: the console-rows stub of tenant erasure (`members`, `invitations` and `sessions` in
   `delete_d1_rows`, [Privacy §6.6](design/privacy.md#66-tenant-scope)) is filled in, and
-  `it::erasure::tenant_console_rows` lands here, asserting those rows; M22, M23, M24 and M26 add their
-  assertions to it. The global retention job's `console` step deletes expired and revoked invitations
-  30 days after `expires_at`.
+  `it::erasure::tenant_console_rows` lands here, asserting those rows; M22, M24 and M26 add their
+  assertions to it (M23's SES rows have their own test, `it::erasure::tenant_ses_rows`).
+- The global retention job's `console` step (`login_tokens`, `sessions`, and invitations expired or
+  revoked more than 30 days ago) is added here: `it::retention::global_console_rows`.
 
 ---
 
@@ -753,12 +828,13 @@ console pages `plan.rs`. No migration: `billing_accounts` and `billing_events` a
 - NFR-BILL-1: `it::billing::w1_last_unit_race` and the hold property tests allow 0 actions beyond a
   granted allowance. NFR-BILL-2: `it::billing::w2_stripe_down_sends_ok` fails no metered action while
   Stripe is unreachable.
-- Erasure extension: the billing stub of tenant erasure, that is the `cancel_billing` step (the plan and
-  every top-up subscription cancelled at once, no proration, no refund) and `billing_events` and
+- Erasure extension: the billing stub of tenant erasure, that is the `cancel_billing` step (step 2, right
+  after routing stops: the plan and every top-up subscription cancelled at once, no proration, no refund) and `billing_events` and
   `billing_accounts` in `delete_d1_rows` ([Privacy §6.6](design/privacy.md#66-tenant-scope)), with
   `it::erasure::tenant_cancels_billing`; webhooks for an erased tenant are answered `200` and recorded
   `ignored_erased`, except that a live subscription created after the deletion is cancelled
   (`it::billing::late_subscription_after_erasure`). `it::erasure::tenant_console_rows` gains the billing assertions.
+- The global retention job's `billing_events` step: `it::retention::global_billing_events`.
 
 **Gate:** every request pins `Stripe-Version: 2025-03-31.basil`, and each Stripe call matches the
 `Verified` line of [Billing](design/billing.md#tests) (read 2026-10-10; re-read and update it if it is more
@@ -796,7 +872,10 @@ deletion (`console/pages/settings.rs` and the person step of `jobs/erasure.rs`).
   `it::onboarding::derived_steps` and `it::hosts::console_api_split`.
 - The new pages pass the M21 checks: they join `browser::console::no_js` and `browser::console::axe_scan`
   (no JavaScript needed, no axe violation of impact `serious` or `critical`).
-- `pmail secrets rotate-master` re-seals `users.totp_sealed` and `users.recovery_codes_sealed`.
+- `users.totp_sealed`, `users.recovery_codes_sealed` and `oauth_states.pkce_sealed` are registered in
+  `crates/core/src/sealed.rs`, so M17 Foundation's re-seal sweep covers them, with their cases in
+  `it::secrets::master_key_rotation`.
+- The global retention job's `signup` step (`oauth_states`, `waitlist`): `it::retention::global_signup_rows`.
 
 **Gate:** Google's and GitHub's endpoints and claim names are re-read from their current documentation
 and recorded in the design before the OAuth code is written ([Cloud sign-up §4](design/cloud-signup.md#4-google-and-github)).
@@ -836,11 +915,17 @@ and the cross-tenant suite's new routes (NFR-SEC-1).
 - Edge rows O1–O13, with the tests named in the register: `core::httpsig::signature_base_rfc9421` (O10),
   `it::identity_keys::{lazy_create_and_rotate, revoke_removes_from_jwks, paused_withdraws_jwks}` (O2, O3,
   O1), `it::assertions::claims_and_limits` (O4–O6), `it::secrets::rotate_master_reseals_identity_keys`
-  (O8: the existing re-seal sweep already covers `identity_keys.private_enc` and `signing_keys.ciphertext`),
+  (O8: M25 registers `identity_keys.private_enc` in `crates/core/src/sealed.rs`, so M17 Foundation's
+  re-seal sweep covers it alongside `signing_keys.ciphertext`, and adds its case to
+  `it::secrets::master_key_rotation`; if M25 lands before M17 Foundation, M17 Foundation does both and
+  this test runs once it has landed),
   `it::http_signatures::{disabled_and_policy, expiry_bounds}` (O9, O13, O11) and
   `it::well_known::directory_signed_per_key` (O12). O7 (`it::assertions::erasure_tombstones_kid`) runs
   once M14 has landed too: M14's identity- and tenant-scope erasure deletes the keys and writes
   `key_tombstones`.
+- The global retention job's `identity_keys` step, which retires `retiring` keys past `verify_until`:
+  `it::retention::global_identity_keys` (it runs once M14 has landed; if M14 lands later, M14 writes the
+  step).
 - `core::jwk::thumbprint_rfc8037_vector`, `core::jwt::eddsa_rfc8037_vector` and
   `it::assertions::sdk_verifies` (the SDK verifier accepts a fresh token and rejects a wrong audience, an
   expired token, an unknown kid and `alg: none`).
@@ -857,20 +942,22 @@ assertion half of the milestone ships unchanged.
 
 ---
 
-## M26 · Notifications and usage alerts (after M9, M10, M21 and M22; the system identity from M6)
+## M26 · Notifications and usage alerts (after M9, M10, M21, M22 and M24; the system identity from M6)
 
 **Files:** `crates/worker/src/notify/{mod.rs, notifier.rs (the Notifier Durable Object), compose.rs,
 prefs.rs, unsubscribe.rs}`, `crates/core/src/notify.rs` (windows, caps, schedules across time zones, and
 rendering that takes no mail content, pure), `crates/worker/src/console/pages/notifications.rs`
 (`/console/settings/notifications` and the unsubscribe pair), the `NOTIFY` binding and the `Notifier`
 class in the `wrangler.toml` template and `export_worker!`, and `tenants.notify_do_id` minted with the
-tenant row; no migration (`notification_prefs` and the column are in `0001_init.sql`). Hooks in other
-milestones' files, each reviewed by that file's owner. M26 does not wait for M24: if M24 lands later, it
-adds its two hooks when it creates those files.
+tenant row, plus a `Notifier` minted by the every-minute cron for each tenant still at
+`notify_do_id = ''` (those created before M26, setup's default tenant included;
+[Configuration › Bindings](../reference/configuration.md#bindings)); no migration (`notification_prefs` and the
+column are in `0001_init.sql`). Hooks in other milestones' files, each reviewed by that file's owner:
 
 | File | Hook |
 |---|---|
 | `consumers/webhooks.rs` (M8's dispatcher) | `NotifierRequest::Event` for `message.received`, `message.released` and `message.triaged` |
+| `consumers/delivery.rs` (M9's delivery-event consumer, which SES events also reach) | After a hard bounce or complaint on a system-identity message carrying `metadata.notify_user_id`, set `paused_reason` on every `notification_prefs` row of that person ([O17](edge-cases.md); [Outbound › Applying an event](design/outbound.md#applying-an-event-to-a-message)) |
 | `quota/mod.rs` (M22's `TenantQuota`) | `NotifierRequest::UsageThreshold` |
 | `members/mod.rs` and `handlers/members.rs` (M21) | `NotifierRequest::MemberRemoved` on removal and leaving; `Account { event: ownership_transferred }` on a transfer |
 | `console/totp.rs` (M24) | `Account { event: two_factor_disabled }` |
@@ -922,7 +1009,8 @@ adds its two hooks when it creates those files.
 ## M20 · Staging deploy and live proof
 
 **Implements:** NFR-OPS-1 (the timed rehearsal, step 12) and the live measurements of NFR-REL-3,
-NFR-PERF-4, NFR-OPS-2 and NFR-COST-1 (step 13).
+NFR-PERF-4, NFR-OPS-2 and NFR-COST-1 (step 13). M17 Completion is accepted here too: its checks run in the
+gate once every milestone it measures has landed.
 
 Deploy to staging with `pmail setup` and `pmail deploy` from the docs alone, as if you were a new
 self-hoster. Then run `live::*`. Each step names its tests in [Testing §10](design/testing.md#10-live-end-to-end-suite-live);

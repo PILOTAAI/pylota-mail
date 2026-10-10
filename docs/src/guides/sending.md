@@ -187,8 +187,10 @@ mode at `none`.
 ## Custom headers
 
 `headers` accepts `X-` headers whose name uses only letters, digits, `-` and `_` (`X-Booking-Ref`), plus
-`Importance`, `Priority`, `Sensitivity`, `Keywords`, `Comments` and `Organization`, spelled exactly so.
-Anything else fails with `400 header_not_allowed`. `Importance` takes `high`, `normal` or `low`,
+`Importance`, `Priority`, `Sensitivity`, `Keywords`, `Comments` and `Organization`. Names are matched
+case-insensitively, as Cloudflare matches them, so `importance` works and is sent as `Importance`.
+Anything else fails with `400 header_not_allowed`, and so do the reserved `X-Pylota-*` and
+`X-AI-Generated` in any case. `Importance` takes `high`, `normal` or `low`,
 `Priority` `normal`, `non-urgent` or `urgent`, and `Sensitivity` `personal`, `private` or
 `company-confidential`; another value fails with `400 invalid_request`. Both are checked when you send, so
 a bad header never turns into a rejected message later. The service sets threading,
@@ -403,8 +405,8 @@ not, because you made them.
 | Sends per tenant per day | `tenant_daily_send_cap` 5,000 | `429 daily_cap_reached` |
 | Cloudflare's daily sending quota for the account | Set by Cloudflare | Not your error: the queue backs off and retries for up to 24 hours, then `failed` with `quota_exhausted` ([G3](../project/edge-cases.md)) |
 
-Daily caps count in the tenant's time zone. A `quota.warning` event is sent at 80% and at 100% of a
-cap.
+Daily caps count in the tenant's time zone. A `quota.warning` event is sent at 80% and at 100% of the
+identity or tenant daily send cap.
 
 An identity is **paused automatically** with reason `abuse_threshold` when its complaint rate exceeds
 0.3% over its last 1,000 sends, or its bounce rate exceeds 5% over its last 200
