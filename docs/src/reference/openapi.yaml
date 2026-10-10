@@ -7712,7 +7712,9 @@ components:
           schema: {$ref: '#/components/schemas/Error'}
     SendUnprocessable:
       description: >-
-        The sending domain's transport is not configured (for example SES for an `external` domain). Only a
+        The sending domain's transport is not configured (for example SES for an `external` domain), or a
+        `kind: marketing` message comes from a domain whose transport is `cloudflare` (`details.reason =
+        "marketing_needs_ses"`: Cloudflare Email Service is for transactional mail only). Only a
         dry run (`dry_run=true`) returns `all_recipients_suppressed` (a real send whose every recipient is
         suppressed is accepted and ends `suppressed`) and `recipient_blocked` (a recipient is on the
         send-block list).
@@ -8241,7 +8243,8 @@ components:
         | `subdomain_setup_disabled` | `delegated_subdomain` while `PM_CF_SUBDOMAIN_SETUP` is not `on` |
         | `zone_creation_not_allowed` | `nameservers` by a tenant key whose policy lacks `domains.allow_create_zone: true` |
         | `method_not_supported` | The domain's method does not support the operation: `PATCH` with a transport it cannot use, `probe` on a domain whose transport is not `smtp`, `test-forwarding` on an address whose domain does not use `inbound: forward` |
-      enum: [ses_not_configured, ses_receiving_not_configured, ses_identity_limit, subdomain_setup_disabled, zone_creation_not_allowed, method_not_supported]
+        | `marketing_needs_ses` | A `kind: marketing` send or reply from a domain whose transport is `cloudflare`, the platform domain included: Cloudflare Email Service is for transactional mail only. Use a domain with the `ses` or `smtp` transport |
+      enum: [ses_not_configured, ses_receiving_not_configured, ses_identity_limit, subdomain_setup_disabled, zone_creation_not_allowed, method_not_supported, marketing_needs_ses]
 
     # ── Keys and access ──────────────────────────────────────────────────────────────────────────
 

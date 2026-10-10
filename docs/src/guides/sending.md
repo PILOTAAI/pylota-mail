@@ -154,7 +154,7 @@ Every message has a `kind` ([G9](../project/edge-cases.md)):
 | Kind | Use | Requirements |
 |---|---|---|
 | `transactional` | The default. Booking confirmations, answers, invoices, anything the recipient expects | None |
-| `marketing` | Promotional mail, one message at a time | An `unsubscribe` object (`{ "url": "https://…", "mailto": "…" }`) and the tenant's consent attestation (`"consent": { "basis": "opt_in", "recorded_at": "…" }`). Without them: `400 marketing_requirements_missing` |
+| `marketing` | Promotional mail, one message at a time | An `unsubscribe` object (`{ "url": "https://…", "mailto": "…" }`) and the tenant's consent attestation (`"consent": { "basis": "opt_in", "recorded_at": "…" }`). Without them: `400 marketing_requirements_missing`. The sending domain must use the `ses` or `smtp` transport: Cloudflare Email Service is for transactional mail only, so marketing from the platform domain or a `cloudflare`-transport domain gets `422 transport_unavailable` |
 | `auto_reply` | An automatic answer the agent sends without a human | Allowed only in reply to a non-automated message. Sets `Auto-Submitted: auto-replied` |
 
 Marketing mail gets RFC 8058 one-click unsubscribe headers (`List-Unsubscribe` and

@@ -22,7 +22,7 @@ a CLI. It reports what happened through signed webhooks.
 It is source available under the Functional Source License (FSL-1.1-ALv2), written entirely in Rust, and
 runs as one Cloudflare Worker on the deployer's own Cloudflare account. Pylota also operates it as a hosted
 service, **Pylota Mail Cloud**, with Free, Developer and Team plans (section 13). Pylota (a platform for independent car-rental operators) is the first
-user. Pylota gives each operator four agent identities (bookings, inquiry, compliance, maintenance), and
+user, on its own self-hosted deployment. Pylota gives each operator four agent identities (bookings, inquiry, compliance, maintenance), and
 operators move those identities from a shared platform domain to their own domain over time.
 
 ## 2. Problem

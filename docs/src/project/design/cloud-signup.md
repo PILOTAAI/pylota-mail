@@ -19,7 +19,7 @@ open point 6 of [Console and workspaces](console.md#open-points) and extends tha
 | **Cloud customer** (a developer or a team buying Pylota Mail) | Self-serve sign-up, this page | The console on Pylota Mail Cloud |
 | **Teammate** of a Cloud customer | An invitation ([Invitations](console.md#invitations)) | The same console, in the inviter's workspace |
 | **Self-hoster** | `pmail setup --owner-email` creates the first owner ([Console](console.md#workspaces)) | The console on their own deployment |
-| **Pylota car-rental operator** | Never signs in here. Pylota's backend creates their workspace with a platform key | Inside the Pylota app, which reads and acts on mail through the API |
+| **Pylota car-rental operator** | Not on Cloud. Pylota runs its own self-hosted deployment of Pylota Mail for its operators, and Pylota's backend creates their workspaces there with that deployment's platform key | Inside the Pylota app, which reads and acts on mail through the API |
 
 Self-serve sign-up exists only where `PM_SIGNUP` is `waitlist` or `open` (Cloud). It is `closed` by
 default, so a self-hosted deployment has no public sign-up unless its operator turns it on.
@@ -36,8 +36,10 @@ Using `pylota.io` would mix agent mail with Pylota's own sign-in mail and its bo
 | `app.pylotamail.com` | The console, `PM_CONSOLE_HOST` | Same Worker as the API. Only console routes answer on this host |
 | `api.pylotamail.com` | REST API, MCP, signed links (`/v1/links/*`), `/hooks/*`, the Stripe webhook (`/billing/stripe/webhook`), `/health`, `PM_API_HOST` | No cookies are ever set or read on this host |
 
-Pylota's own car-rental operators are tenants of the same deployment with `billing.mode = exempt`, so there is
-one service to run. Amazon SES for this deployment runs in `eu-west-2` (London), also decided on 2026-10-09.
+Pylota's own car-rental operators are not tenants of Cloud (decided 2026-10-10). Pylota runs a separate
+self-hosted deployment for them, so the platform key its backend uses never reaches a Cloud customer's mail, and
+Cloud keeps `PM_QUARANTINE_KEY_RELEASE=off`. Amazon SES for Cloud runs in `eu-west-2` (London), decided on
+2026-10-09.
 
 `PM_CONSOLE_HOST` defaults to `PM_API_HOST`, so a self-hosted deployment keeps one hostname. When the two
 differ, the router answers console paths only on the console host and API paths only on the API host;

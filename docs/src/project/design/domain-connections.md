@@ -615,6 +615,7 @@ New error codes:
 | `subdomain_setup_disabled` | `delegated_subdomain` while `PM_CF_SUBDOMAIN_SETUP` is not `on` |
 | `zone_creation_not_allowed` | `nameservers` by a tenant key whose policy lacks `domains.allow_create_zone: true` |
 | `method_not_supported` | The method does not support the operation: `PATCH transport` to a transport the method cannot use; `probe` when the transport is not `smtp`; `test-forwarding` without `inbound: forward` |
+| `marketing_needs_ses` | A `kind: marketing` send from a domain whose transport is `cloudflare`, the platform domain included ([Outbound › Pipeline](outbound.md), step 9): Cloudflare Email Service is for transactional mail only |
 
 ## 9. Configuration
 

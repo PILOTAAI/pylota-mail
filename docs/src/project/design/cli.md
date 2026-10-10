@@ -1344,7 +1344,8 @@ is not set up for the method" to exit 3 (`config`) instead of the API's exit 7:
   CLI prints `details.reason` with its fix (`ses_not_configured` and `ses_receiving_not_configured`:
   `pmail setup ses`; `subdomain_setup_disabled`: `PM_CF_SUBDOMAIN_SETUP = "on"`;
   `zone_creation_not_allowed`: the tenant policy `domains.allow_create_zone`; `ses_identity_limit`:
-  raise the SES limit; `method_not_supported`: another method).
+  raise the SES limit; `method_not_supported`: another method; `marketing_needs_ses`: send marketing from a
+  domain with the `ses` or `smtp` transport).
 - `422 cf_token_required`: the deployment has no `PM_CF_API_TOKEN`. The fix is "set `PM_CF_API_TOKEN` on
   the deployment (`wrangler secret put PM_CF_API_TOKEN`), or, for a zone apex, run again with
   `--local-token`".
