@@ -43,13 +43,20 @@ of truth for both.
 PRAGMA foreign_keys = ON;
 
 -- An integrator whose partner keys create tenants and act only on those tenants (Security § 4.6).
+-- Never deleted: DELETE /v1/partners/{id} sets status 'deleted' and scrubs name (Privacy § 6.10), so
+-- tenants.partner_id always points at a row.
 CREATE TABLE partners (
   id                   TEXT PRIMARY KEY,                   -- ptn_
-  name                 TEXT NOT NULL,                      -- the only data a partner holds (Privacy § 6.10)
+  name                 TEXT NOT NULL,                      -- the only data a partner holds; '' once deleted
   status               TEXT NOT NULL DEFAULT 'active'
-                       CHECK (status IN ('active','suspended')),
+                       CHECK (status IN ('active','suspended','deleted')),
   default_billing_mode TEXT NOT NULL DEFAULT 'metered'     -- copied to billing_accounts.mode of each tenant
                        CHECK (default_billing_mode IN ('exempt','metered')),  -- a partner key creates
+  max_tenants          INTEGER NOT NULL DEFAULT 25         -- tenants not erased, at most (platform-set)
+                       CHECK (max_tenants >= 0),
+  ramp_exempt          INTEGER NOT NULL DEFAULT 0          -- 1: its tenants skip the new-workspace send ramp
+                       CHECK (ramp_exempt IN (0,1)),       -- (platform-set; Cloud sign-up § 10.1)
+  deleted_at           INTEGER,
   created_at           INTEGER NOT NULL,
   updated_at           INTEGER NOT NULL
 );
@@ -58,18 +65,22 @@ CREATE TABLE tenants (
   id               TEXT PRIMARY KEY,                       -- ten_
   slug             TEXT NOT NULL UNIQUE,                   -- ^[a-z0-9][a-z0-9-]{1,31}$
   name             TEXT NOT NULL,
-  partner_id       TEXT REFERENCES partners(id) ON DELETE SET NULL,
-                                                           -- the partner whose key created the tenant; NULL
-                                                           -- otherwise. Written at insert and never updated;
-                                                           -- only deleting the partner, which needs every one
-                                                           -- of its tenants erased, clears it
+  partner_id       TEXT REFERENCES partners(id),           -- the partner whose key created the tenant; NULL
+                                                           -- otherwise. Written at insert and never updated,
+                                                           -- also after erasure and partner deletion (partners
+                                                           -- are soft-deleted), so provenance is kept
   mode             TEXT NOT NULL CHECK (mode IN ('live','test')),
   status           TEXT NOT NULL DEFAULT 'active'
                    CHECK (status IN ('active','suspended','erasing','erased')),
   suspended_at     INTEGER,
+  suspended_by     TEXT CHECK (suspended_by IN ('platform','partner')),  -- who suspended it; NULL while not
+                                                           -- suspended. A partner key cannot lift 'platform'
   address_suffix   TEXT NOT NULL,                          -- '' (default tenant) or '.' || slug
   timezone         TEXT NOT NULL DEFAULT 'UTC',            -- IANA name
   policy_json      TEXT NOT NULL,                          -- TenantPolicy (see configuration.md)
+  policy_ceilings_json TEXT NOT NULL DEFAULT '{}',         -- lower-only policy fields a platform key set, with
+                                                           -- the value it set: a ceiling for partner keys
+                                                           -- (Configuration › Who may change a field)
   quota_do_id      TEXT NOT NULL,                          -- TenantQuota Durable Object id; minted with the row,
                                                            -- then QuotaRequest::Init { tenant_id }
   notify_do_id     TEXT NOT NULL,                          -- Notifier Durable Object id; minted with the row,
@@ -143,6 +154,16 @@ CREATE TABLE domains (
   updated_at            INTEGER NOT NULL
 );
 CREATE INDEX domains_tenant ON domains(tenant_id, state);
+
+-- Cloudflare zones this deployment created for a tenant (nameservers, delegated_subdomain), so no other
+-- tenant's key can use them through cloudflare_zone (Identities and domains › Zone permission).
+CREATE TABLE zone_claims (
+  zone_id    TEXT PRIMARY KEY,                             -- Cloudflare zone ID
+  zone_name  TEXT NOT NULL UNIQUE,                         -- A-label apex of the zone
+  tenant_id  TEXT NOT NULL REFERENCES tenants(id),         -- the tenant it was created for
+  domain_id  TEXT NOT NULL,                                -- the domain whose onboarding created it
+  created_at INTEGER NOT NULL
+);
 
 CREATE TABLE identities (
   id                 TEXT PRIMARY KEY,                     -- idn_
@@ -279,12 +300,17 @@ CREATE TABLE event_index (
   type         TEXT NOT NULL,
   owner_kind   TEXT NOT NULL CHECK (owner_kind IN ('mailbox','domain','job','platform')),
   owner_id     TEXT NOT NULL,                              -- Durable Object id, or 'platform'
+  partner_id   TEXT,                                       -- the event tenant's partner (tenants.partner_id, which
+                                                           -- never changes), or for webhook.disabled the disabled
+                                                           -- endpoint's partner; NULL otherwise. Read by replay
+                                                           -- to a partner endpoint (Webhooks § Replay)
   payload_json TEXT,                                       -- only for owner_kind = 'platform'
   occurred_at  INTEGER NOT NULL,
   fanned_out_at INTEGER                                    -- platform events only: set by the Fanout consumer,
                                                            -- read by the outbox sweep (Webhooks § Platform events)
 );
 CREATE INDEX event_index_tenant_time ON event_index(tenant_id, occurred_at);
+CREATE INDEX event_index_partner_time ON event_index(partner_id, occurred_at) WHERE partner_id IS NOT NULL;
 
 CREATE TABLE suppressions (
   tenant_id         TEXT NOT NULL REFERENCES tenants(id),
@@ -363,25 +389,35 @@ CREATE TABLE idempotency_records (
   scope           TEXT NOT NULL,                           -- tenant_id; the partner_id for a partner key's POST
                                                            -- that names no tenant (POST /v1/tenants,
                                                            -- POST /v1/webhooks); or 'platform'
+  key_id          TEXT NOT NULL,                           -- the calling API key: another key in the same scope
+                                                           -- never receives this record's replay
+  tenant_id       TEXT,                                    -- the tenant the stored response belongs to (the scope
+                                                           -- tenant, or the tenant a POST /v1/tenants created);
+                                                           -- tenant erasure deletes by it (Privacy § 6.6)
   idem_key        TEXT NOT NULL,                           -- ≤ 255 printable ASCII
   method          TEXT NOT NULL,
   path            TEXT NOT NULL,
   fingerprint     TEXT NOT NULL,                           -- sha256(method, path, canonical JSON body)
   status          TEXT NOT NULL CHECK (status IN ('in_progress','completed')),
   response_status INTEGER,
-  response_body   TEXT,
+  response_body   TEXT,                                    -- never a one-time secret (below)
   created_at      INTEGER NOT NULL,
   expires_at      INTEGER NOT NULL,                        -- created_at + 30 days
-  PRIMARY KEY (scope, idem_key)
+  PRIMARY KEY (scope, key_id, idem_key)
 );
+CREATE INDEX idempotency_records_tenant ON idempotency_records(tenant_id) WHERE tenant_id IS NOT NULL;
 -- Every non-mail POST with an Idempotency-Key (metered ones as in Billing › What the Worker meters):
---   1. SELECT by (scope, idem_key). completed: same method, path and fingerprint → replay
+--   1. SELECT by (scope, key_id, idem_key). completed: same method, path and fingerprint → replay
 --      response_status and response_body with Idempotent-Replayed: true; different → 409 idempotency_conflict.
 --      in_progress and created_at within 60 s → 409 request_in_progress; older (the first request died)
 --      → take it over: UPDATE … SET created_at = now WHERE status = 'in_progress' AND created_at = ?old.
 --   2. Otherwise INSERT (status 'in_progress'); a primary-key conflict → 409 request_in_progress.
 --   3. Run the action, then UPDATE status = 'completed', response_status, response_body (≤ 64 KB; a
---      larger body stores the resource ID and the replay re-reads it).
+--      larger body stores the resource ID and the replay re-reads it), and tenant_id. A response that
+--      carries a one-time secret (POST /v1/keys, POST /v1/keys/{id}/rotate, POST /v1/webhooks,
+--      POST /v1/tenants/{t}/webhooks, POST /v1/webhooks/{id}/rotate-secret) is stored with `secret`
+--      removed and "secret_replayed": false added, so a replay returns that body and the secret is kept
+--      nowhere (FR-KEY-2).
 --   A 4xx or 5xx before the action changed anything deletes the row, so the same key can be retried.
 
 -- Agent signing keys (Agent signing keys § 2 and § 8). Generated, sealed and used only inside the Worker.
@@ -758,23 +794,37 @@ CREATE TABLE platform_objects (
   `released_by_user_id` for a console release).
 - **Partners.** `partners` rows are written by `POST /v1/partners` and changed by
   `PATCH /v1/partners/{partner_id}` (platform keys with `partners:manage`,
-  [REST API › Partners](../../reference/api.md#partners)). `status` is read by authentication for every
-  partner key ([Security § 4.2](security.md#42-verification), step 9), and `default_billing_mode` by
-  `POST /v1/tenants` with a partner key, which writes it to the new tenant's `billing_accounts.mode` and
-  the key's `partner_id` to `tenants.partner_id`. `tenants.partner_id` is read by the owner check of every
-  partner-key request ([Security § 5.2](security.md#52-order-of-checks), step 4), by the `partner_id`
-  filter of `GET /v1/tenants`, and by the webhook fan-out to find a tenant's partner endpoints
-  ([Webhooks › Endpoint resolution](webhooks.md#endpoint-resolution-and-filters)).
+  [REST API › Partners](../../reference/api.md#partners)); they are never deleted. `status` is read by
+  authentication for every partner key and for every tenant and identity key of a partner's tenant
+  ([Security § 4.2](security.md#42-verification), step 9), and by the `Deliver` consumer, which holds
+  deliveries while the partner is `suspended` ([Webhooks › Delivering an attempt](webhooks.md#delivering-an-attempt)).
+  `default_billing_mode` and `max_tenants` are read by `POST /v1/tenants` with a partner key, which writes
+  the first to the new tenant's `billing_accounts.mode` and the key's `partner_id` to `tenants.partner_id`.
+  `ramp_exempt` is read by the send-ramp evaluation and outbound policy step 18
+  ([Cloud sign-up § 10.1](cloud-signup.md#101-new-workspace-send-ramp)). `tenants.partner_id` is read by
+  the owner check of every partner-key request ([Security § 5.2](security.md#52-order-of-checks), step 4),
+  by the `partner_id` filter of `GET /v1/tenants`, by the webhook fan-out to find a tenant's partner
+  endpoints ([Webhooks › Endpoint resolution](webhooks.md#endpoint-resolution-and-filters)), and by the
+  outbox dispatch, which copies it to `event_index.partner_id` (read by replay). `tenants.suspended_by` is
+  written with `status` by `PATCH /v1/tenants/{tenant_id}` and read by the next status change (a partner
+  key cannot lift `platform`). `tenants.policy_ceilings_json` is written when a platform key sets a
+  lower-only policy field and read when a partner key writes one
+  ([Configuration › Who may change a field](../../reference/configuration.md#who-may-change-a-field)).
   `api_keys.partner_id` is written by `POST /v1/keys` for `level: "partner"` and read by authentication
   (step 9). `webhook_endpoints.partner_id` is written by `POST /v1/webhooks` with a partner key and read
-  by the fan-out, the replay selection and the owner check. `DELETE /v1/partners/{partner_id}` runs one
-  D1 batch: it deletes the partner's `webhook_endpoints` (their deliveries cascade), its `api_keys`, its
-  `idempotency_records` (`scope` = the partner ID) and then the `partners` row. Every statement of the
-  batch carries the guard `AND NOT EXISTS (SELECT 1 FROM tenants WHERE partner_id = ?1 AND status <> 'erased')`,
-  so while any of its tenants is not erased the batch changes nothing and the route answers
-  `409 partner_has_tenants`; a tenant created concurrently is either seen by the guard or fails its own
-  insert on the foreign key. Deleting the row sets `partner_id` to `NULL` on the partner's erased tenants
-  (`ON DELETE SET NULL`) ([Privacy § 6.10](privacy.md#610-partners)).
+  by the fan-out, the replay selection and the owner check. `zone_claims` rows are written by the
+  `nameservers` and `delegated_subdomain` onboarding in the batch that records the new zone, read by the
+  zone-permission check of `cloudflare_zone` ([Identities and domains › Zone permission](identity-domains.md#zone-permission)),
+  and deleted by the `delete_zone` step of domain removal or when the zone expires.
+  `DELETE /v1/partners/{partner_id}` runs one D1 batch: it deletes the partner's `webhook_endpoints`
+  (their deliveries cascade), revokes and deletes its `api_keys` and deletes its `idempotency_records`
+  (`scope` = the partner ID), then sets `status = 'deleted'`, `name = ''` and `deleted_at`. Every statement
+  of the batch carries the guard
+  `AND NOT EXISTS (SELECT 1 FROM tenants WHERE partner_id = ?1 AND status <> 'erased')`, so while any of
+  its tenants is not erased the batch changes nothing and the route answers `409 partner_has_tenants`; a
+  tenant created concurrently is either seen by the guard or refused, because tenant creation requires the
+  partner to be `active` in its own insert. `tenants.partner_id` keeps pointing at the deleted row
+  ([Privacy § 6.10](privacy.md#610-partners)).
 - **Console token hashes** (`invitations.token_hash`, `login_tokens.token_hash` and `code_hash`,
   `sessions.id_hash`, `oauth_states.state_hash` and `cookie_hash`) use the current `link` key and record
   its kid in `key_kid`. A lookup computes the HMAC under each `link` key still inside its verify window,

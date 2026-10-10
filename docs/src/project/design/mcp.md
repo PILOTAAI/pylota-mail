@@ -269,8 +269,11 @@ Field names are serialised in camelCase as in `schema.ts` (`protocolVersion`, `s
 
 ## 3. Authentication and tool filtering
 
-The bearer key resolves to `(level, tenant_id?, identity_id?, permissions, mode)` exactly as for REST
-(FR-KEY-3). `tools/list` returns only the tools the key may use: it holds the tool's permission and
+The bearer key resolves to `(level, partner_id?, tenant_id?, identity_id?, permissions, mode)` exactly as
+for REST (FR-KEY-3, FR-KEY-4). For a partner key, `partner_id` is its partner, and every tool reaches only
+the tenants whose `partner_id` equals it, through the same owner check as REST (a tenant with a `NULL`
+`partner_id` never matches, [Security › Partner keys](security.md#partner-keys)); a suspended partner's
+keys, and its tenants' keys, get `403 partner_suspended` at authentication, before any tool runs. `tools/list` returns only the tools the key may use: it holds the tool's permission and
 meets any key-level condition in the table below (FR-MCP-1). A call to any other tool returns
 `-32602 Unknown tool`, the same answer as for a tool that does not exist. A missing permission is
 therefore never a tool error.

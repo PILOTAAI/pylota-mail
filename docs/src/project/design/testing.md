@@ -351,7 +351,9 @@ a held thread, an erasure request, an export, an identity signing key on each id
 `retiring` key exists too) and `policy.web_bot_auth.allowed = true`. Tenant A's mail contains a unique
 canary term. A third tenant C is a test tenant. Two partners, P and Q, each have a partner key holding
 every permission valid at the partner level and a partner webhook endpoint: P's key created A, Q's key
-created B, and C was created by a platform key, so it has no partner.
+created B, and C was created by a platform key, so it has no partner. A's domain was added with
+`nameservers`, so the Cloudflare fake holds A's zone and its `zone_claims` row; the fake also holds the
+zone of `PM_PLATFORM_DOMAIN`.
 
 "Every permission valid at that level" follows [Security §4.6](security.md#46-creating-keys-fr-key-1):
 a tenant key holds every permission except `tenants:manage`, `partners:manage` and `platform:ops`, so it holds
@@ -387,6 +389,14 @@ ID of the same type. It asserts:
    webhook receiver are unchanged, and no `audit_log` row names A.
 4. The same matrix runs over MCP: every tool, with the same attacker keys, returns an error and no data.
 
+**Zone case `foreign_zone`** ([H8](../edge-cases.md)). B's tenant key and Q's partner key call
+`POST /v1/tenants/{B}/domains` with `method: "cloudflare_zone"` (once with `replace_mx: true`) for A's
+zone, for a name under it, and for a name under the platform domain's zone, also after a platform key
+lists A's zone in B's `domains.cloudflare_zones`; and with `nameservers` and `delegated_subdomain` for a
+name under either zone. Each gets `403 scope_denied` with `details.reason = "zone_not_allowed"`, the same
+body as for a zone that does not exist, before any call reaches the Cloudflare fake; no D1 row is written,
+no MX record of A's zone is deleted, and A's routing is unchanged.
+
 **Additional suites.**
 
 | Test | Attack |
@@ -400,7 +410,7 @@ ID of the same type. It asserts:
 | `it::security::webhook_filter_scope` | B creating a webhook with `identity_ids` of A gets `404 identity_not_found` |
 | `it::partners::j10_foreign_partner_not_found` | P's partner key against every route with the resource IDs of B (Q's tenant) and of C (no partner), and against Q's partner endpoint and Q's partner key by ID: the same `404` as a missing ID and no side effect; `GET /v1/tenants`, `GET /v1/keys` and `GET /v1/webhooks` with P's key list only A's rows and P's endpoint ([J10](../edge-cases.md)) |
 | `it::webhooks::j15_partner_scope_filter` | Events of B and C never reach P's partner endpoint, and events of A never reach Q's ([J15](../edge-cases.md)) |
-| `it::security::mcp_tools_follow_key` | Tools listed and callable only with their permission; `mail_sign_assertion` and `mail_sign_http_request` are never listed to a platform key |
+| `it::security::mcp_tools_follow_key` | Tools listed and callable only with their permission; `mail_sign_assertion` and `mail_sign_http_request` are never listed to a platform or partner key; with P's partner key every tool reaches A and answers for B and C as for a missing ID (C's `NULL` `partner_id` never matches); with P suspended, every tool call with P's key or A's tenant key gets `partner_suspended` |
 | `it::identity_keys::paused_withdraws_jwks`, `it::assertions::erasure_tombstones_kid` | Without a key: a paused identity's JWKS answers the same `404 identity_not_found` as an unknown ID; an erased identity's kid is never published again ([O1](../edge-cases.md), [O7](../edge-cases.md)) |
 | `it::notify::one_click_unsubscribe` | An unsubscribe token for a person of B, altered to name A's workspace or another kind, changes nothing and gets the same page as an expired token ([O18](../edge-cases.md)) |
 
@@ -589,13 +599,14 @@ It prints the traceability matrix as Markdown into the CI summary.
 | G2, G3, G4, G10 | Mail sender fake outcomes; queue-delay log; simulator `timeout@` for test tenants |
 | G6, G8 | `/__test/delivery-event`; recorded retry delays |
 | H1, H4, H6, H7 | DNS fake per resolver; RDAP fake; Cloudflare API fake errors; `/__test/alarm` for checks |
-| I1–I7, F6 | Stateful Vectorize fake; local R2; JobRunner alarms; probe failure mode |
+| H8 | Cloudflare API fake holding a zone claimed by another tenant, a listed zone, an unlisted zone and the platform domain's zone; a call counter on the fake to prove no call was made before the refusal |
+| I1–I8, F6 | Stateful Vectorize fake; local R2; JobRunner alarms; probe failure mode |
 | J2 | `restart_runtime()` |
 | J4 | Webhook receiver fake failing; recorded delays against the 72-hour schedule |
 | J7 | `d1.query` fault on the directory lookup |
 | J8 | Forced dead-letter delivery (a consumer fault beyond `max_retries`); fake clock for the 15-minute alert |
 | J9 | `/__test/mailbox-schema` |
-| J10–J16 | The two partners of the attack-suite fixture (section 7), each with a partner key and a partner endpoint, and the webhook receiver fake; `restart_runtime_with` setting `PM_QUARANTINE_KEY_RELEASE=off` for J16 |
+| J10–J19 | The two partners of the attack-suite fixture (section 7), each with a partner key and a partner endpoint, and the webhook receiver fake; `restart_runtime_with` setting `PM_QUARANTINE_KEY_RELEASE=off` for J16; fake clock for the 15-minute delivery hold of J13 and the `RL_PARTNER` minute of J18; concurrent tenant creations for J18; the abuse auto-pause driven by simulator complaints for J17 |
 | L1–L4 | Test tenants with the real simulator and loopback paths |
 | B1, C7, J5 | Live (B1 and J5 also need real providers). C7 has an `it::` part too, and J5's API part is `it::domains::transport_patch` |
 | N1–N7, N10, N11, N26–N29 | SNS push and SQS fakes; S3 fake with `NoSuchKey`; SES fake identity, account and receipt-rule state; a generated 39 MB message for N5; seeded domain rows for the identity count |

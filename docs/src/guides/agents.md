@@ -273,8 +273,8 @@ It is off unless both of these hold:
 - the operator turned it on with `PM_WEB_BOT_AUTH=on`
   ([Deploy to Cloudflare › Signed HTTP requests](../self-hosting.md#signed-http-requests-web-bot-auth)).
   Otherwise every request gets `422 web_bot_auth_disabled`;
-- the workspace opted in: tenant policy `web_bot_auth.allowed: true`, set with a platform key (or the
-  workspace's partner key) that holds `tenants:manage` ([Configuration › Tenant policy](../reference/configuration.md#tenant-policy)).
+- the workspace opted in: tenant policy `web_bot_auth.allowed: true`, set with a platform key that holds
+  `tenants:manage`; a partner key cannot set it ([Configuration › Who may change a field](../reference/configuration.md#who-may-change-a-field)).
   Otherwise `403 policy_denied`.
 
 Signed HTTP requests are a P1 feature. The operator can turn them on only once the Web Bot Auth format

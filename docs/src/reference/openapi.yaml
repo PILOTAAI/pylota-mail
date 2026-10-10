@@ -42,8 +42,10 @@ info:
       `POST` except four (`x-idempotency: none`), which ignore it and never record it: the two signing
       endpoints (`…/assertions` and `…/http-signatures`) and the two SNS endpoints (`/hooks/ses` and
       `/hooks/ses/inbound`). Keys are kept for 30 days, scoped per
-      identity for mail and per tenant for everything else. A replay returns the original response with the header `Idempotent-Replayed: true`
-      (and `"deduplicated": true` in mail responses).
+      identity for mail, and per calling API key and tenant (or partner, or deployment, when the request
+      names no tenant) for everything else. A replay returns the original response with the header
+      `Idempotent-Replayed: true` (and `"deduplicated": true` in mail responses); a response that carried
+      a one-time secret is replayed without it and with `"secret_replayed": false`.
     - **Rate limits.** Every authenticated response carries `RateLimit-Limit`: the limit of the bucket that
       applied, per period. A `429` also carries `Retry-After` and `RateLimit-Reset`, the seconds to the end
       of the bucket's current period; for `rate_limited` the two are equal, and the other `429` codes set
@@ -64,7 +66,7 @@ info:
     | `x-required-permission` | operation | Array of permissions the key must hold, all of them. `[]` means any valid key |
     | `x-key-levels` | operation | Key levels (`platform`, `partner`, `tenant`, `identity`) that can call the operation at all. A `partner` key acts only on the tenants its partner's keys created |
     | `x-permission-notes` | operation | Conditional permission or scope rules that the two fields above cannot express |
-    | `x-rate-limit-buckets` | operation | Rate-limit buckets the request counts against (`api`, `search`, `agentic`, `send`, `sign`) |
+    | `x-rate-limit-buckets` | operation | Rate-limit buckets the request counts against (`api`, `search`, `agentic`, `send`, `sign`, `partner`; `partner` only for a partner key's calls) |
     | `x-idempotency` | operation | `required`, `optional` or `none` for the `Idempotency-Key` header. `required` means a request without it fails with `400 idempotency_key_required`, except a dry run (`dry_run=true`). `none` means the header is ignored and never recorded |
     | `x-error-codes` | response | The `error.code` values this operation can return with that status |
 
@@ -269,12 +271,19 @@ paths:
         and an ownership transfer in the console. `billing.mode` defaults to `metered` (plan `free`) on a
         deployment with billing on, and to `disabled` otherwise. With a partner key, the tenant's
         `partner_id` is the key's partner, for good, and its billing mode is the partner's
-        `default_billing_mode`; `billing` is platform-only. The audit row `tenant.create` records the
-        `partner_id`.
+        `default_billing_mode`; `billing` is platform-only. A partner key's `policy` is checked field by
+        field (platform-only, lower-only and free fields, see `TenantPolicy`); it may set
+        `quarantine.key_release`. A partner has at most `max_tenants` tenants that are not `erased`
+        (`403 partner_tenant_limit`), and a partner key's creations count in the `partner` bucket
+        (`RL_PARTNER`, 10 a minute per partner, shared with invitations). The audit row `tenant.create`
+        records the `partner_id`.
       x-required-permission: ['tenants:manage']
       x-key-levels: [platform, partner]
-      x-permission-notes: A partner key that sends `billing` gets `403 scope_denied`.
-      x-rate-limit-buckets: [api]
+      x-permission-notes: >-
+        A partner key that sends `billing`, a platform-only policy field, or a lower-only policy field above
+        its ceiling gets `403 scope_denied` (`details.field`); beyond the partner's `max_tenants`,
+        `403 partner_tenant_limit`.
+      x-rate-limit-buckets: [api, partner]
       x-idempotency: optional
       parameters:
         - $ref: '#/components/parameters/IdempotencyKeyOptional'
@@ -308,7 +317,25 @@ paths:
               schema: {$ref: '#/components/schemas/Tenant'}
         '400': {$ref: '#/components/responses/BadRequest'}
         '401': {$ref: '#/components/responses/Unauthorized'}
-        '403': {$ref: '#/components/responses/Forbidden'}
+        '403':
+          description: >-
+            As `Forbidden`, plus `partner_tenant_limit` when the partner already has `max_tenants` tenants
+            that are not erased (`details.max_tenants`).
+          x-error-codes: [permission_denied, scope_denied, partner_suspended, partner_tenant_limit]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+              example:
+                error:
+                  code: partner_tenant_limit
+                  message: This partner already has 25 tenants that are not erased.
+                  retryable: false
+                  fix: Erase a tenant you no longer need, or ask the platform operator to raise max_tenants.
+                  request_id: req_01J9Z4K8V4QW7X2M5N6P8R0T1Y
+                  details:
+                    max_tenants: 25
         '409':
           description: The slug or address suffix is taken, or the idempotency key is in use.
           x-error-codes: [slug_taken, suffix_taken, idempotency_conflict, request_in_progress]
@@ -374,7 +401,8 @@ paths:
       summary: Get a tenant
       description: >-
         Platform keys with `tenants:manage` can read any tenant, and partner keys with `tenants:manage` the
-        tenants their partner's keys created. A tenant key can read its own tenant.
+        tenants their partner's keys created, also while the tenant is `erasing` and after it is `erased`
+        (its name is then `''`). A tenant key can read its own tenant.
       x-required-permission: ['tenants:manage']
       x-key-levels: [platform, partner, tenant]
       x-permission-notes: A tenant key can read its own tenant without `tenants:manage`.
@@ -403,16 +431,21 @@ paths:
         Updatable: `name`, `timezone`, `policy` (deep merge; `null` resets a field to its default) and
         `status` (`active` or `suspended`). While a tenant is suspended, inbound mail gets a temporary
         failure for up to five days and then a permanent one, and every send is refused (FR-TEN-3).
-        Tenants are deleted through an erasure request with `scope: "tenant"`. `partner_id` and `mode` never
-        change. Only a platform key, or the partner key of the tenant's own partner, can set
+        `suspended_by` records which level suspended it; a partner key cannot lift a suspension a platform
+        key made. Tenants are deleted through an erasure request with `scope: "tenant"`; once a tenant is
+        `erasing` or `erased`, only the erasure job changes its status (`409 tenant_erased` for a platform
+        key, `404 tenant_not_found` for any other key). `partner_id` and `mode` never change. Only a
+        platform key, or the partner key of the tenant's own partner, can set
         `policy.quarantine.key_release` (a tenant key cannot call this operation: it can never hold
-        `tenants:manage`).
+        `tenants:manage`). A value a platform key sets on a lower-only policy field becomes that field's
+        ceiling for partner keys.
       x-required-permission: ['tenants:manage']
       x-key-levels: [platform, partner]
       x-permission-notes: >-
-        A partner key updates only the tenants its partner's keys created. It may lower their send caps,
-        `max_recipients`, `search.agentic_daily_cap` and `abuse` thresholds but not raise them above the
-        deployment's defaults (`403 scope_denied`, `details.field`).
+        A partner key updates only the tenants its partner's keys created. Each policy field present is
+        checked by its class (see `TenantPolicy`): a platform-only field, or a lower-only field above
+        min(deployment default, platform ceiling), gets `403 scope_denied` with `details.field`, and so does
+        `status: "active"` on a tenant a platform key suspended (`details.field = "status"`).
       x-rate-limit-buckets: [api]
       x-idempotency: none
       requestBody:
@@ -438,6 +471,14 @@ paths:
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
+        '409':
+          description: A platform key changed the `status` of a tenant that is `erasing` or `erased`.
+          x-error-codes: [tenant_erased]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
         '413': {$ref: '#/components/responses/PayloadTooLarge'}
         '429': {$ref: '#/components/responses/TooManyRequests'}
         '500': {$ref: '#/components/responses/InternalError'}
@@ -454,7 +495,8 @@ paths:
         Platform keys with `partners:manage`. A partner is an integrator that creates tenants for its own
         customers and manages them with partner keys (FR-KEY-4), which a platform key then mints with
         `POST /v1/keys` (`level: partner`). Every tenant a partner key creates gets the partner's
-        `partner_id` and `default_billing_mode`. Audit-logged (`partner.create`).
+        `partner_id` and `default_billing_mode`. `max_tenants` (default 25) and `ramp_exempt` (default
+        `false`) bound what the partner's keys can create and send. Audit-logged (`partner.create`).
       x-required-permission: ['partners:manage']
       x-key-levels: [platform]
       x-rate-limit-buckets: [api]
@@ -484,6 +526,8 @@ paths:
                 name: Pylota
                 status: active
                 default_billing_mode: exempt
+                max_tenants: 25
+                ramp_exempt: false
                 created_at: '2026-10-10T09:00:00Z'
                 updated_at: '2026-10-10T09:00:00Z'
         '400': {$ref: '#/components/responses/BadRequest'}
@@ -533,6 +577,8 @@ paths:
       operationId: getPartner
       tags: [Partners]
       summary: Get a partner
+      description: >-
+        A deleted partner is returned with `status: "deleted"` and an empty `name`.
       x-required-permission: ['partners:manage']
       x-key-levels: [platform]
       x-rate-limit-buckets: [api]
@@ -557,12 +603,14 @@ paths:
       tags: [Partners]
       summary: Update or suspend a partner
       description: >-
-        Updatable: `name`, `status` and `default_billing_mode`. `suspended` refuses every key of the partner
-        at once with `403 partner_suspended`, on every route; its tenants are not suspended, so their mail
-        keeps arriving and their own tenant and identity keys keep working ([J13]). `active` restores the
-        partner keys. A new `default_billing_mode` applies to tenants created afterwards; existing tenants
-        keep theirs, which only a platform key changes (`PATCH /v1/tenants/{tenant_id}/billing`).
-        Audit-logged (`partner.update`).
+        Updatable: `name`, `status` (`active` or `suspended`), `default_billing_mode`, `max_tenants` and
+        `ramp_exempt`. `suspended` refuses at once, with `403 partner_suspended` on every route, every key
+        of the partner and every API key of its tenants, so nothing can send for them; the tenants' status
+        does not change and their inbound mail is still stored. Deliveries to the partner's endpoints and
+        to its tenants' endpoints are held and resume when the partner is `active` again ([J13]). A new
+        `default_billing_mode` applies to tenants created afterwards; existing tenants keep theirs, which
+        only a platform key changes (`PATCH /v1/tenants/{tenant_id}/billing`). A deleted partner gets
+        `404 partner_not_found`. Audit-logged (`partner.update`).
       x-required-permission: ['partners:manage']
       x-key-levels: [platform]
       x-rate-limit-buckets: [api]
@@ -596,10 +644,12 @@ paths:
       tags: [Partners]
       summary: Delete a partner
       description: >-
-        Deletes the partner's name, its partner keys and its partner webhook endpoints with their
-        deliveries. Refused with `409 partner_has_tenants` while any tenant with this `partner_id` is not
-        `erased` (`active`, `suspended` or `erasing`); erase them first with an erasure request of scope
-        `tenant` ([J12]). Audit-logged (`partner.delete`).
+        A soft delete: the partner stays with `status: "deleted"` and an empty `name`; its partner keys are
+        revoked and deleted, and its partner webhook endpoints deleted with their deliveries. The erased
+        tenants keep their `partner_id`. Refused with `409 partner_has_tenants` while any tenant with this
+        `partner_id` is not `erased` (`active`, `suspended` or `erasing`); erase them first with an erasure
+        request of scope `tenant` ([J12]). A deleted partner gets `404 partner_not_found`. Audit-logged
+        (`partner.delete`).
       x-required-permission: ['partners:manage']
       x-key-levels: [platform]
       x-rate-limit-buckets: [api]
@@ -652,6 +702,9 @@ paths:
         `owner` is required before the identity can send (`identity_owner_required`).
       x-required-permission: ['identities:write']
       x-key-levels: [platform, partner, tenant]
+      x-permission-notes: >-
+        A `send_policy.daily_cap` above the tenant's effective `identity_daily_send_cap` needs a platform
+        key (`403 scope_denied`, `details.field = "send_policy.daily_cap"`).
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -886,10 +939,16 @@ paths:
         Updatable: `display_name`, `purpose`, `owner`, `signature`, `metadata`, `send_policy` and `status`
         (`active` or `paused`). A paused identity still receives and stores mail and refuses every send with
         `identity_paused` (FR-IDN-3). Setting `status: "active"` on an identity paused for
-        `abuse_threshold` needs a platform, partner or tenant key and is audit-logged.
+        `abuse_threshold` needs a platform, partner or tenant key and is audit-logged; on a tenant a
+        partner's key created it needs a platform key. A `send_policy.daily_cap` above the tenant's
+        effective `identity_daily_send_cap` needs a platform key.
       x-required-permission: ['identities:write']
       x-key-levels: [platform, partner, tenant, identity]
-      x-permission-notes: Resuming an identity paused for `abuse_threshold` needs a platform, partner or tenant key, and is audit-logged.
+      x-permission-notes: >-
+        Resuming an identity paused for `abuse_threshold` needs a platform, partner or tenant key, and is
+        audit-logged; on a tenant a partner's key created, only a platform key (`403 scope_denied`
+        otherwise). `send_policy.daily_cap` above the tenant's `identity_daily_send_cap` from any other key
+        gets `403 scope_denied` (`details.field = "send_policy.daily_cap"`).
       x-rate-limit-buckets: [api]
       x-idempotency: none
       requestBody:
@@ -1781,6 +1840,13 @@ paths:
         - **`cloudflare_zone`, `nameservers`, `delegated_subdomain`** need `PM_CF_API_TOKEN`
           (`422 cf_token_required`). For an apex `cloudflare_zone`, `pmail domains add --local-token` with the
           operator's own Cloudflare token works instead (catch-all, no literal rules).
+        - **Zone permission** (tenant and partner keys, before any Cloudflare call): `cloudflare_zone` and
+          `replace_mx` work only on a zone this deployment created for the tenant (`nameservers`,
+          `delegated_subdomain`) or one listed in its platform-only policy `domains.cloudflare_zones`. A zone
+          created for another tenant, and any name under the zones of the platform domain, the API host or
+          the console host, is refused, as is a `nameservers` or `delegated_subdomain` name inside such a
+          zone: `403 scope_denied` with `details.reason = "zone_not_allowed"` ([H8]). Platform keys may use
+          any zone.
         - **`nameservers`** creates the zone. Tenant keys need the policy `domains.allow_create_zone: true`
           (`422 transport_unavailable`, `zone_creation_not_allowed`). A name with A, AAAA or MX records, or a
           `www` CNAME, A or AAAA record, needs `confirm_dedicated: true` (`409 domain_not_dedicated`, with
@@ -1808,7 +1874,10 @@ paths:
           includes to flatten ([H2]).
       x-required-permission: ['domains:write']
       x-key-levels: [platform, partner, tenant]
-      x-permission-notes: '`nameservers` (or the old `create_zone: true`) needs a platform key, or a tenant key whose policy has `domains.allow_create_zone: true`.'
+      x-permission-notes: >-
+        `nameservers` (or the old `create_zone: true`) needs a platform key, or a tenant or partner key whose
+        tenant's policy has `domains.allow_create_zone: true`. For a tenant or partner key, the zone must be
+        one the tenant may use (`403 scope_denied`, `details.reason = "zone_not_allowed"`).
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -1878,7 +1947,25 @@ paths:
         '402':
           $ref: '#/components/responses/BillingLimit'
           description: 'The plan''s `custom_domains` allowance is spent (`details.feature: "custom_domains"`). Nothing was stored.'
-        '403': {$ref: '#/components/responses/Forbidden'}
+        '403':
+          description: >-
+            As `Forbidden`. `scope_denied` with `details.reason = "zone_not_allowed"`: a tenant or partner key
+            named a Cloudflare zone its tenant may not use ([H8]).
+          x-error-codes: [permission_denied, scope_denied, tenant_suspended, partner_suspended]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+              example:
+                error:
+                  code: scope_denied
+                  message: This key cannot use the Cloudflare zone brightwell.example.
+                  retryable: false
+                  fix: Use a zone created for this tenant, or ask the platform operator to add it to domains.cloudflare_zones.
+                  request_id: req_01J9Z4K8V4QW7X2M5N6P8R0T1Y
+                  details:
+                    reason: zone_not_allowed
         '404': {$ref: '#/components/responses/NotFound'}
         '409':
           description: >-
@@ -4933,6 +5020,11 @@ paths:
         | `counterparty` | `counterparty_address` | Every message to or from that address, in every identity of the tenant |
         | `identity` | `identity_id` | The whole mailbox. Its addresses are tombstoned |
         | `tenant` | none | Everything in the tenant. Then the tenant is marked `erased` |
+
+        A `tenant` request for a tenant that is already `erasing` returns the existing request with `200`
+        (the same `era_` ID) and starts nothing; for an `erased` tenant it returns `409 tenant_erased`. Any
+        other erasure request naming an `erasing` or `erased` tenant, like every write to such a tenant,
+        gets `404 tenant_not_found` from a non-platform key.
       x-required-permission: ['erasure:manage']
       x-key-levels: [platform, partner, tenant, identity]
       x-permission-notes: An identity key can only erase within its own identity (`message`, `thread` and `identity` scopes). `counterparty` needs a tenant, partner or platform key; `tenant` needs a platform key, the partner key of the tenant's own partner, or the tenant's own key.
@@ -4960,11 +5052,29 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ErasureRequest'}
+        '200':
+          description: >-
+            A `tenant` request for a tenant already being erased: the existing tenant-scope request, unchanged.
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErasureRequest'}
         '400': {$ref: '#/components/responses/BadRequest'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
-        '409': {$ref: '#/components/responses/IdempotencyConflict'}
+        '409':
+          description: >-
+            The tenant is already `erased` (`tenant_erased`, for a `tenant` request), or the idempotency key
+            is in use.
+          x-error-codes: [tenant_erased, idempotency_conflict, request_in_progress]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
         '413': {$ref: '#/components/responses/PayloadTooLarge'}
         '429': {$ref: '#/components/responses/TooManyRequests'}
         '500': {$ref: '#/components/responses/InternalError'}
@@ -5011,7 +5121,8 @@ paths:
       summary: Get an erasure request
       description: >-
         The request and its status. `completed_with_holds` means the erasure finished but skipped held
-        threads, which the receipt lists in `held`.
+        threads, which the receipt lists in `held`. The partner key of an erased tenant's partner can still
+        read the tenant's erasure requests and receipts.
       x-required-permission: ['erasure:manage']
       x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
@@ -5532,10 +5643,11 @@ paths:
         Sends an invitation email from the deployment's platform identity. A pending invitation uses a seat;
         with no seat left the request fails with `402 billing_limit` (`details.feature: "seats"`). Roles:
         `admin`, `member`, `viewer`. The owner is set at workspace creation (`owner` in `createTenant`) or by
-        an ownership transfer in the console.
+        an ownership transfer in the console. A partner key's invitations count in the `partner` bucket
+        (`RL_PARTNER`, 10 a minute per partner, shared with tenant creation).
       x-required-permission: ['members:manage']
       x-key-levels: [platform, partner, tenant]
-      x-rate-limit-buckets: [api]
+      x-rate-limit-buckets: [api, partner]
       x-idempotency: optional
       parameters:
         - $ref: '#/components/parameters/IdempotencyKeyOptional'
@@ -7247,7 +7359,7 @@ webhooks:
       operationId: onWebhookDisabled
       tags: [Events]
       summary: 'webhook.disabled'
-      description: 'A webhook endpoint was disabled. Sent to platform endpoints and, when the disabled endpoint belongs to a partner, to that partner''s other endpoints.'
+      description: 'A webhook endpoint was disabled. Sent to platform endpoints and, when the disabled endpoint belongs to a partner (a partner endpoint, or an endpoint of a tenant a partner''s key created), to that partner''s other endpoints; never to tenant endpoints or to the endpoint itself.'
       security: []
       parameters:
         - $ref: '#/components/parameters/WebhookIdHeader'
@@ -7547,9 +7659,13 @@ components:
       in: header
       required: false
       description: >-
-        Optional. 1–255 printable ASCII characters. Kept for 30 days, scoped to the tenant (or, for a request
-        that names no tenant, to the partner for a partner key and to the platform for a platform key). The same key with the same request returns the original response with
-        `Idempotent-Replayed: true`; with a different request, `409 idempotency_conflict`.
+        Optional. 1–255 printable ASCII characters. Kept for 30 days, scoped to the calling API key and the
+        tenant (or, for a request that names no tenant, to the partner for a partner key and to the platform
+        for a platform key), so another key never receives this key's replay. The same key with the same
+        request returns the original response with `Idempotent-Replayed: true`; with a different request,
+        `409 idempotency_conflict`. A response that carried a one-time secret (`createKey`, `rotateKey`,
+        `createWebhook`, `createTenantWebhook`, `rotateWebhookSecret`) is replayed without it and with
+        `"secret_replayed": false`.
       schema:
         type: string
         minLength: 1
@@ -7859,8 +7975,9 @@ components:
     Forbidden:
       description: >-
         The key lacks the permission (`details.required` names it), the resource is outside the key's
-        tenant or identity, the tenant is suspended, or the key is a partner key whose partner is suspended
-        (`partner_suspended`, on every route).
+        tenant or identity, the tenant is suspended, or the key's partner is suspended
+        (`partner_suspended`, on every route: a partner key, or a tenant or identity key of one of the
+        partner's tenants).
       x-error-codes: [permission_denied, scope_denied, tenant_suspended, partner_suspended]
       headers:
         Request-Id: {$ref: '#/components/headers/Request-Id'}
@@ -8339,11 +8456,27 @@ components:
             `identity_paused`: why the identity is paused. `transport_unavailable`: why the deployment or
             the domain's method cannot do what was asked. `invalid_request` on `POST /v1/keys`:
             `permission_not_allowed_for_level` when `permissions` lists one the new key's level cannot hold.
+            `scope_denied` on a domain create: `zone_not_allowed` when a non-platform key names a Cloudflare
+            zone its tenant may not use (`cloudflare_zone`, `replace_mx`; see `TenantPolicy.domains`).
           anyOf:
             - $ref: '#/components/schemas/PauseReason'
             - $ref: '#/components/schemas/TransportUnavailableReason'
             - type: string
               const: permission_not_allowed_for_level
+            - type: string
+              const: zone_not_allowed
+        field:
+          type: string
+          description: >-
+            `scope_denied`: the request field the key may not set to that value, as a dotted path: a
+            platform-only or lower-only policy field written by a partner key (`policy.tenant_daily_send_cap`
+            is reported as `tenant_daily_send_cap`), `send_policy.daily_cap` above the tenant's identity cap,
+            or `status` when a partner key tries to lift a platform suspension.
+          examples: [tenant_daily_send_cap, send_policy.daily_cap, status]
+        max_tenants:
+          type: integer
+          minimum: 0
+          description: '`partner_tenant_limit`: the partner''s `max_tenants`.'
         records:
           type: array
           description: >-
@@ -8412,6 +8545,7 @@ components:
         - key_scope_exceeded
         - tenant_suspended
         - partner_suspended
+        - partner_tenant_limit
         - test_mode_recipient
         - invalid_signature
         - policy_denied
@@ -8464,6 +8598,7 @@ components:
         - zone_hold
         - owner_required
         - partner_has_tenants
+        - tenant_erased
         - plan_managed_by_stripe
         - address_taken
         - address_is_primary
@@ -8668,7 +8803,7 @@ components:
       examples: [.acme]
     Tenant:
       type: object
-      required: [id, slug, name, mode, status, partner_id, address_suffix, timezone, policy, created_at, updated_at]
+      required: [id, slug, name, mode, status, suspended_by, partner_id, address_suffix, timezone, policy, created_at, updated_at]
       properties:
         id: {$ref: '#/components/schemas/TenantId'}
         slug: {$ref: '#/components/schemas/TenantSlug'}
@@ -8677,10 +8812,17 @@ components:
           examples: [Acme Car Hire]
         mode: {$ref: '#/components/schemas/Mode'}
         status: {$ref: '#/components/schemas/TenantStatus'}
+        suspended_by:
+          type: [string, 'null']
+          description: >-
+            Who suspended the tenant while `status` is `suspended`: `platform` (a platform key; a partner key
+            cannot lift it) or `partner` (the tenant's partner key). `null` otherwise.
+          enum: [platform, partner, null]
         partner_id:
           description: >-
             The partner whose key created the tenant, or `null` (created by a platform key, by `pmail setup` or
-            by self-serve sign-up). Set at creation and never changed.
+            by self-serve sign-up). Set at creation and never changed, also after the tenant is erased and
+            the partner deleted.
           oneOf:
             - $ref: '#/components/schemas/PartnerId'
             - type: 'null'
@@ -8716,8 +8858,8 @@ components:
         owner:
           type: object
           description: >-
-            Creates the workspace's console owner and emails them a sign-in link. Without it, a platform key
-            can add an owner later with an invitation and an ownership transfer in the console.
+            Creates the workspace's console owner and emails them a sign-in link. Without it, a platform or
+            partner key can add an owner later with an invitation and an ownership transfer in the console.
           required: [email]
           properties:
             email: {$ref: '#/components/schemas/EmailAddress'}
@@ -8748,14 +8890,26 @@ components:
           $ref: '#/components/schemas/TenantPolicyPatch'
         status:
           type: string
-          description: '`suspended` suspends the tenant (FR-TEN-3); `active` resumes it.'
+          description: >-
+            `suspended` suspends the tenant (FR-TEN-3) and records `suspended_by`; `active` resumes it, except
+            that a partner key cannot resume a tenant a platform key suspended (`403 scope_denied`).
           enum: [active, suspended]
 
     TenantPolicy:
       type: object
       description: >-
         The full effective policy of a tenant: the built-in defaults shown here, then `PM_DEFAULT_POLICY`,
-        then the tenant's own values, deep-merged.
+        then the tenant's own values, deep-merged. Who may write each field (docs › Configuration › Who may
+        change a field): platform keys write every field. For a partner key, `web_bot_auth.allowed`,
+        `domains.allow_create_zone` and `domains.cloudflare_zones` are platform-only;
+        `quarantine.key_release` is allowed on its own tenants; the lower-only fields
+        (`identity_daily_send_cap`, `tenant_daily_send_cap`, `max_recipients`, `auto_reply.allowed`,
+        `auto_reply.max_automatic_exchanges`, `inbound.per_sender_per_hour`, `inbound.extract_image_text`,
+        `retention.raw_days`, `retention.events_days`, `triage.enabled`, `search.agentic_enabled`,
+        `search.agentic_daily_cap`, `search.agentic_max_steps`, `search.agentic_max_seconds` and the `abuse`
+        thresholds) may be set at most to min(deployment default, platform ceiling), a switch to `true`
+        only when both allow it; every other field is free. A refused field gets `403 scope_denied` with
+        `details.field` and nothing is stored. Tenant and identity keys cannot write the policy.
       required: [identity_daily_send_cap, tenant_daily_send_cap, max_recipients, send_allowlist_only, large_attachments, link_ttl_hours, ai_disclosure, auto_reply, quarantine, inbound, retention, triage, search, webhook_text_bytes, abuse, domains, domain_fallback, web_bot_auth]
       properties:
         identity_daily_send_cap:
@@ -8848,7 +9002,7 @@ components:
               description: >-
                 Lets keys with `quarantine:review` that reach this tenant (its partner key included) release
                 quarantined mail even when `PM_QUARANTINE_KEY_RELEASE` is `off`. Only a platform key, or the
-                partner key of the tenant's own partner, can set it ([J14], [J16]).
+                partner key of the tenant's own partner, can set it, at creation or later ([J14], [J16]).
           default:
             on_auth_fail: true
             spam_threshold: 0.8
@@ -9010,7 +9164,7 @@ components:
             bounce_rate_pause: 0.05
         domains:
           type: object
-          required: [allow_create_zone]
+          required: [allow_create_zone, cloudflare_zones]
           properties:
             allow_create_zone:
               type: boolean
@@ -9018,9 +9172,26 @@ components:
               description: >-
                 Lets the tenant's own keys, and its partner key, use the `nameservers` method, which creates a
                 Cloudflare zone. Without it, they get `422 transport_unavailable` (`zone_creation_not_allowed`).
-                Platform keys may always use it. Pylota Mail Cloud sets it to `true`.
+                Platform keys may always use it. Pylota Mail Cloud sets it to `true` in `PM_DEFAULT_POLICY`.
+                Platform-only.
+            cloudflare_zones:
+              type: array
+              maxItems: 50
+              uniqueItems: true
+              default: []
+              items:
+                type: string
+                pattern: '^[a-z0-9.-]{1,253}$'
+              description: >-
+                Zones of the deployment's Cloudflare account, by A-label name, that the tenant's own keys and
+                its partner key may use with `cloudflare_zone` and `replace_mx`, besides the zones this
+                deployment created for the tenant (`nameservers`, `delegated_subdomain`). A zone created for
+                another tenant, or under the zones of the deployment's platform domain, API host or console
+                host, is refused even when listed (`403 scope_denied`, `details.reason = "zone_not_allowed"`).
+                Platform keys may use any zone. Platform-only.
           default:
             allow_create_zone: false
+            cloudflare_zones: []
         domain_fallback:
           type: boolean
           default: true
@@ -9035,7 +9206,7 @@ components:
               description: >-
                 Lets the tenant's identities sign HTTP requests (Web Bot Auth). While it is `false`,
                 `POST …/http-signatures` returns `403 policy_denied` ([O13]). It has no effect while the
-                deployment has `PM_WEB_BOT_AUTH=off`. Agent assertions do not depend on it.
+                deployment has `PM_WEB_BOT_AUTH=off`. Agent assertions do not depend on it. Platform-only.
           default:
             allowed: false
 
@@ -9183,6 +9354,13 @@ components:
           properties:
             allow_create_zone:
               type: [boolean, 'null']
+            cloudflare_zones:
+              type: [array, 'null']
+              maxItems: 50
+              uniqueItems: true
+              items:
+                type: string
+                pattern: '^[a-z0-9.-]{1,253}$'
         domain_fallback:
           type: [boolean, 'null']
         web_bot_auth:
@@ -9360,8 +9538,11 @@ components:
 
     PartnerStatus:
       type: string
-      description: '`suspended` refuses every key of the partner with `403 partner_suspended`; its tenants are not suspended.'
-      enum: [active, suspended]
+      description: >-
+        `suspended` refuses every key of the partner, and every API key of its tenants, with
+        `403 partner_suspended`, and holds deliveries to its and its tenants' endpoints; the tenants' status
+        does not change. `deleted` is set by `DELETE /v1/partners/{partner_id}` and is final.
+      enum: [active, suspended, deleted]
     PartnerBillingMode:
       type: string
       description: >-
@@ -9372,15 +9553,19 @@ components:
       type: object
       description: >-
         An integrator whose partner keys create tenants and act only on those tenants (FR-KEY-4). A partner
-        holds nothing but its name and these settings.
-      required: [id, name, status, default_billing_mode, created_at, updated_at]
+        holds nothing but its name and these settings. A deleted partner stays, with `status: "deleted"`
+        and an empty `name`.
+      required: [id, name, status, default_billing_mode, max_tenants, ramp_exempt, created_at, updated_at]
       properties:
         id: {$ref: '#/components/schemas/PartnerId'}
         name:
           type: string
+          description: '`""` once the partner is deleted.'
           examples: [Pylota]
         status: {$ref: '#/components/schemas/PartnerStatus'}
         default_billing_mode: {$ref: '#/components/schemas/PartnerBillingMode'}
+        max_tenants: {$ref: '#/components/schemas/PartnerMaxTenants'}
+        ramp_exempt: {$ref: '#/components/schemas/PartnerRampExempt'}
         created_at:
           type: string
           format: date-time
@@ -9399,6 +9584,8 @@ components:
           allOf:
             - $ref: '#/components/schemas/PartnerBillingMode'
           default: metered
+        max_tenants: {$ref: '#/components/schemas/PartnerMaxTenants'}
+        ramp_exempt: {$ref: '#/components/schemas/PartnerRampExempt'}
     PartnerUpdateRequest:
       type: object
       minProperties: 1
@@ -9406,8 +9593,28 @@ components:
         name:
           type: string
           minLength: 1
-        status: {$ref: '#/components/schemas/PartnerStatus'}
+        status:
+          type: string
+          description: '`deleted` cannot be set here: use `DELETE /v1/partners/{partner_id}`.'
+          enum: [active, suspended]
         default_billing_mode: {$ref: '#/components/schemas/PartnerBillingMode'}
+        max_tenants: {$ref: '#/components/schemas/PartnerMaxTenants'}
+        ramp_exempt: {$ref: '#/components/schemas/PartnerRampExempt'}
+    PartnerMaxTenants:
+      type: integer
+      minimum: 0
+      default: 25
+      description: >-
+        The most tenants that are not `erased` the partner may have; the next `POST /v1/tenants` by a partner
+        key gets `403 partner_tenant_limit`. Default 25: with the default `tenant_daily_send_cap` of 5,000,
+        one partner can send at most 125,000 messages a day (1,250 while its new tenants are on the send
+        ramp). Lowering it below the current count refuses new tenants and changes no existing one.
+    PartnerRampExempt:
+      type: boolean
+      default: false
+      description: >-
+        `true` lets the partner's new tenants skip the new-workspace send ramp (a tenant daily cap of 50 for
+        at least 7 days). `false`, the default: they follow it whatever their billing mode.
 
     # ── Identities ───────────────────────────────────────────────────────────────────────────────
 
@@ -9468,7 +9675,9 @@ components:
         daily_cap:
           type: integer
           minimum: 0
-          description: Sends per day for this identity. Defaults to the tenant's `identity_daily_send_cap`.
+          description: >-
+            Sends per day for this identity. Defaults to the tenant's `identity_daily_send_cap`. Only a
+            platform key may set it above that cap (`403 scope_denied` with `details.field`).
         auto_reply:
           type: string
           enum: [allowed, denied]
@@ -9554,7 +9763,9 @@ components:
         send_policy: {$ref: '#/components/schemas/IdentitySendPolicy'}
         status:
           type: string
-          description: '`paused` pauses with reason `manual`; `active` resumes.'
+          description: >-
+            `paused` pauses with reason `manual`; `active` resumes (an `abuse_threshold` pause on a tenant a
+            partner's key created needs a platform key).
           enum: [active, paused]
 
     # ── Addresses ────────────────────────────────────────────────────────────────────────────────
@@ -11396,16 +11607,25 @@ components:
           type: string
           format: date-time
     WebhookCreated:
-      description: An endpoint with its signing secret. The secret is shown only in this response.
+      description: >-
+        An endpoint with its signing secret. The secret is shown only in this response: an idempotent replay
+        (`Idempotent-Replayed: true`) returns the same body without `secret` and with
+        `"secret_replayed": false`, because the stored response never holds it.
       allOf:
         - $ref: '#/components/schemas/Webhook'
         - type: object
-          required: [secret]
           properties:
             secret:
               type: string
               pattern: '^whsec_[A-Za-z0-9+/]+={0,2}$'
               description: '`whsec_` followed by the base64-encoded signing key.'
+            secret_replayed:
+              type: boolean
+              const: false
+              description: Present only on an idempotent replay, which carries no secret. Rotate the secret if it was lost.
+          oneOf:
+            - required: [secret]
+            - required: [secret_replayed]
     WebhookCreateRequest:
       type: object
       required: [url, events]
@@ -11636,16 +11856,25 @@ components:
           type: string
           format: date-time
     ApiKeyCreated:
-      description: A key with its secret. The secret is shown only in this response.
+      description: >-
+        A key with its secret. The secret is shown only in this response: an idempotent replay
+        (`Idempotent-Replayed: true`) returns the same body without `secret` and with
+        `"secret_replayed": false`, because the stored response never holds it (FR-KEY-2).
       allOf:
         - $ref: '#/components/schemas/ApiKey'
         - type: object
-          required: [secret]
           properties:
             secret:
               type: string
               pattern: '^pmk_(live|test)_.{12}_.+$'
               description: '`pmk_live_<lookup12>_<secret>` or `pmk_test_<lookup12>_<secret>`.'
+            secret_replayed:
+              type: boolean
+              const: false
+              description: Present only on an idempotent replay, which carries no secret. Rotate or revoke the key if the secret was lost.
+          oneOf:
+            - required: [secret]
+            - required: [secret_replayed]
     ApiKeyCreateRequest:
       type: object
       description: >-
@@ -13601,7 +13830,8 @@ components:
         | `transport_connection_lost` | `uncertain` | The connection dropped after the request was written |
         | `resolved_not_sent` | `failed` | A human resolved an uncertain send as not sent |
         | `domain_failing_no_fallback` | `failed` | The domain failed and fallback was disabled by policy |
-      enum: [provider_validation, sender_domain_unavailable, recipient_suppressed_by_provider, quota_exhausted, transport_timeout, transport_connection_lost, resolved_not_sent, domain_failing_no_fallback]
+        | `marketing_needs_ses` | `rejected` | A `kind: marketing` message whose sending domain uses the `cloudflare` transport when it reached the transport (the domain's transport changed, or fallback moved it to the platform domain, after it was accepted). Cloudflare Email Service is for transactional mail only |
+      enum: [provider_validation, sender_domain_unavailable, recipient_suppressed_by_provider, quota_exhausted, transport_timeout, transport_connection_lost, resolved_not_sent, domain_failing_no_fallback, marketing_needs_ses]
     EventAttachment:
       type: object
       required: [id, filename, content_type, size]

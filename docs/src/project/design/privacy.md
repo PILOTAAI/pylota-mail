@@ -311,7 +311,13 @@ reason `identity_deleted`), or `DELETE …/messages/{id}` (message scope, reason
   passed only to the JobRunner, which keeps it in `meta.target_address` until the `finalise` step.
 - The response is `202` with the erasure request object (`status: "queued"`). Repeating a request
   creates a new request and job; erasure is idempotent, so a second run deletes nothing and reports
-  zero counts.
+  zero counts. Tenant scope is the exception, because its job is the only writer of the tenant's status
+  from `erasing` on ([I8](../edge-cases.md)): on a tenant already `erasing`, the request returns the
+  existing tenant-scope request (`200`, the same `era_` ID) and starts nothing; on an `erased` tenant it
+  returns `409 tenant_erased`. For a non-platform key, any other write to an `erasing` or `erased`
+  tenant (or to anything in it) is refused as `*_not_found`
+  ([Security § 5.2](security.md#52-order-of-checks), step 4); reading the tenant and its erasure
+  requests keeps working for its partner key (section 6.10).
 - An erasure request never returns `423 legal_hold`: held items are skipped and listed (FR-PRV-4,
   api.md). Only the single-message `DELETE …/messages/{message_id}` checks the thread's hold first and
   answers `423 legal_hold` without creating a request.
@@ -396,11 +402,11 @@ Order: stop routing, then billing (money stops before anything else is removed),
 
 | # | Step | Does |
 |---|---|---|
-| 1 | `stop_routing` | `tenants.status = 'erasing'` (inbound for every tenant address now gets `550 5.1.1`; outbound consumers drop messages for the tenant); revoke every tenant and identity key; disable the tenant's webhook endpoints (`enabled = 0`, `disabled_reason = 'manual'`); cancel the tenant's other running jobs |
+| 1 | `stop_routing` | `tenants.status = 'erasing'`, which only this job changes afterwards (a `PATCH` with `status` gets `409 tenant_erased`, and non-platform keys can no longer write to the tenant) (inbound for every tenant address now gets `550 5.1.1`; outbound consumers drop messages for the tenant); revoke every tenant and identity key; disable the tenant's webhook endpoints (`enabled = 0`, `disabled_reason = 'manual'`); cancel the tenant's other running jobs |
 | 2 | `cancel_billing` | Skipped when `PM_BILLING=off`, or when the tenant has no `billing_accounts.stripe_customer_id`. Otherwise read the customer's subscriptions (`GET /v1/subscriptions?customer=…`, every status except canceled) and cancel each one, the plan subscription and every top-up subscription, at once: immediate cancellation, with no proration credit and no refund ([Billing › Stripe integration](billing.md#stripe-integration)). The step is done when the read returns none, so a re-run after a partial failure cancels only what is left; a customer Stripe no longer knows counts as done. Failures retry under the job's backoff (section 4). The third failed attempt fires `billing_cancel_failed:{tenant_id}` (page; [Observability › Alert list](observability.md#53-alert-list)), so an operator can cancel in the Stripe Dashboard before the tenth attempt fails the job like any step. Webhooks for this tenant afterwards are answered `200` and recorded `ignored_erased`, except that a live subscription created after the deletion is cancelled (`cancelled_after_erasure`; [Billing › Webhook endpoint](billing.md#webhook-endpoint)) |
 | 3 | `remove_domains` | For each tenant domain, run the `domain_remove` steps of [Identities and domains › Domain removal](identity-domains.md#domain-removal) inline (literal rules, catch-all, routing, sending onboarding, event subscription, the SES identity with `DeleteEmailIdentity` and its DKIM CNAMEs, including a failover identity, the domain's addresses in `pm-retired-{n}` receipt rules, ownership record, zone); then `DomainMonitor` `delete_all` |
 | 4 | `erase_identities` | For each identity: identity steps 2 and 3 (tombstone every address, including retired ones; erase the mailbox) |
-| 5 | `delete_d1_rows` | In this order, all `WHERE tenant_id = ?1`: `webhook_deliveries`, `webhook_endpoints`, `event_index`, `suppressions`, `sender_lists`, `idempotency_records` (`scope = tenant_id`), `usage_daily`, `identity_keys` (after `INSERT OR IGNORE INTO key_tombstones` of every row's `id`, as in identity scope), `notification_prefs`, `api_keys`, `identities`, `domains`, `exports`, non-erasure `jobs`, `invitations`, `sessions` (active workspace = this tenant), `members`, `billing_events`, `billing_accounts`, `audit_log` rows whose `action` does not start with `erasure.`; then `tenants` set `status = 'erased'`, `name = ''`, `policy_json = '{}'` (the row, slug and suffix stay, so neither is reused); `TenantQuota` `delete_all` and `Notifier` `delete_all`, so no pending notification survives. Every person the `members` delete left with no workspace is then deleted as in section 6.9, which also removes their `oauth_identities`, `login_tokens` and `waitlist` row |
+| 5 | `delete_d1_rows` | In this order, all `WHERE tenant_id = ?1`: `webhook_deliveries`, `webhook_endpoints`, `event_index`, `suppressions`, `sender_lists`, `idempotency_records` (`scope = ?1 OR tenant_id = ?1`: the tenant's own records, and the records of platform and partner keys whose stored response belongs to the tenant, such as the `POST /v1/tenants` that created it), `usage_daily`, `identity_keys` (after `INSERT OR IGNORE INTO key_tombstones` of every row's `id`, as in identity scope), `notification_prefs`, `api_keys`, `identities`, `domains`, `exports`, non-erasure `jobs`, `invitations`, `sessions` (active workspace = this tenant), `members`, `billing_events`, `billing_accounts`, `audit_log` rows whose `action` does not start with `erasure.`; then `tenants` set `status = 'erased'`, `name = ''`, `policy_json = '{}'` (the row, slug and suffix stay, so neither is reused); `TenantQuota` `delete_all` and `Notifier` `delete_all`, so no pending notification survives. Every person the `members` delete left with no workspace is then deleted as in section 6.9, which also removes their `oauth_identities`, `login_tokens` and `waitlist` row |
 | 6 | `sweep_vectors` | Vectorize has no method to delete a namespace (Vectorize client API, read 2026-10-09: only `deleteByIds`). Query the tenant namespace with a fixed probe vector (`topK = 100`, `returnMetadata: "none"`), `deleteByIds` the IDs returned, wait 10 seconds, and repeat until two consecutive queries return nothing (at most 100 rounds per alarm slice; section 6.8) |
 | 7 | `sweep_r2` | List and delete every object under `t/{tenant_id}/`, in `BLOBS` and, when configured, `BACKUP` |
 | 8 | `probe` | Section 6.7, plus: `t/{tenant_id}/` lists empty; a namespace query returns nothing; D1 counts for the tenant are zero except the kept rows |
@@ -464,20 +470,32 @@ expires after 7 days, and the global retention job deletes expired and revoked r
 
 ### 6.10 Partners
 
-A partner holds only its name, its status and its default billing mode; its customers' data lives in its
-tenants, which tenant erasure covers (section 6.6). A partner key with `erasure:manage` can start that
-erasure for each of its own tenants (`POST /v1/erasure-requests` with `scope: "tenant"`).
+A partner holds only its name, its status, its limits and its default billing mode; its customers' data
+lives in its tenants, which tenant erasure covers (section 6.6). A partner key with `erasure:manage` can
+start that erasure for each of its own tenants (`POST /v1/erasure-requests` with `scope: "tenant"`).
+While the tenant is `erasing` and after it is `erased`, the partner key can still read
+`GET /v1/tenants/{tenant_id}` (status, slug and `partner_id`; the name is `''` once erased) and the
+tenant's erasure requests (`GET /v1/erasure-requests?tenant_id=…` and `GET /v1/erasure-requests/{id}`,
+with the receipt), so it can show its customer the outcome. Every write to that tenant from a
+non-platform key gets `404 tenant_not_found` ([I8](../edge-cases.md)).
 
 `DELETE /v1/partners/{partner_id}` (platform key, `partners:manage`) deletes a partner only when every
 tenant with its `partner_id` is `erased` ([J12](../edge-cases.md)); otherwise `409 partner_has_tenants`
-and nothing changes. In one D1 batch, guarded by that condition on every statement
-([Data model › Notes](data-model.md#notes)), it deletes:
+and nothing changes. It is a soft delete. In one D1 batch, guarded by that condition on every statement
+([Data model › Notes](data-model.md#notes)), it:
 
-1. the partner's webhook endpoints (`webhook_endpoints.partner_id`), and with them their delivery rows
-   (`ON DELETE CASCADE`);
-2. its partner keys (`api_keys.partner_id`), so their next request is `401 unauthenticated`;
-3. its `idempotency_records` (`scope` = the partner ID);
-4. the `partners` row, which clears `partner_id` on its erased tenants (`ON DELETE SET NULL`).
+1. deletes the partner's webhook endpoints (`webhook_endpoints.partner_id`), and with them their delivery
+   rows (`ON DELETE CASCADE`);
+2. revokes and deletes its partner keys (`api_keys.partner_id`), so their next request is
+   `401 unauthenticated`;
+3. deletes its `idempotency_records` (`scope` = the partner ID);
+4. sets the `partners` row to `status = 'deleted'`, `name = ''` and `deleted_at = now`.
+
+The row stays, so `tenants.partner_id` of its erased tenants keeps pointing at it and is never changed:
+the provenance of an erased tenant (which partner created it) survives, and no `NULL` can appear where a
+partner was. A deleted partner keeps only its ID, status, limits, billing mode and timestamps, none of
+which is personal data. `GET /v1/partners/{partner_id}` shows it with `status: "deleted"`; `PATCH`, a
+second `DELETE` and minting a key for it get `404 partner_not_found`.
 
 It writes the audit row `partner.delete` with `tenant_id = NULL` and only the `ptn_` ID as its target.
 The `audit_log` rows about the partner (`partner.*`, and `key.create`/`key.revoke` of its keys) keep only
@@ -734,7 +752,8 @@ canaries.
 | `it::assertions::erasure_tombstones_kid` | Identity erasure deletes the identity's keys; their kids are in `key_tombstones` and are never published again, and key generation refuses a tombstoned thumbprint | FR-IDN-9, [O7](../edge-cases.md) |
 | `it::erasure::identity_with_hold_continues` | An identity with a held thread ends `completed_with_holds`; removing the hold leads to a continuation request that completes the deletion | section 6.5 |
 | `it::erasure::tenant_scope_order` | Routing stops first (inbound rejected while mailboxes still exist), then the `cancel_billing` step runs before any domain or mailbox is removed, then domains, mailboxes, D1 rows and the vector sweep; the tenant ends `erased`; platform endpoints, and for a partner's tenant the partner's endpoints, receive `erasure.completed` | section 6.6 |
-| `it::partners::j12_delete_with_tenants` | A partner with a tenant that is not erased cannot be deleted (`409 partner_has_tenants`); after the tenant's erasure, deleting the partner removes its name, keys, endpoints, their deliveries and its idempotency records, clears `partner_id` on the erased tenant, and writes `partner.delete` | section 6.10, [J12](../edge-cases.md) |
+| `it::partners::j12_delete_with_tenants` | A partner with a tenant that is not erased cannot be deleted (`409 partner_has_tenants`); after the tenant's erasure, deleting the partner keeps the row with `status: "deleted"` and an empty name, revokes and deletes its keys, deletes its endpoints, their deliveries and its idempotency records, leaves `partner_id` unchanged on the erased tenant, and writes `partner.delete`; `PATCH`, a second `DELETE` and a key mint for it get `404 partner_not_found` | section 6.10, [J12](../edge-cases.md) |
+| `it::erasure::i8_erasing_tenant_frozen` | While a tenant is `erasing` and after it is `erased`, every write from its partner key (identity create, send, domain add, key mint, webhook create, `PATCH` of the tenant) gets `404 tenant_not_found` or the resource's `*_not_found`, and the tenant's own keys get `401 key_revoked`; the partner key still reads the tenant and its erasure requests with the receipt; a second tenant-scope erasure returns `200` with the same `era_` while `erasing` and `409 tenant_erased` once `erased`; a platform key's `PATCH` with `status` gets `409 tenant_erased`; the tenant's idempotency records, those of the platform and partner keys whose response belongs to the tenant included, are gone after the job | sections 6.1, 6.6, 6.10, [I8](../edge-cases.md) |
 | `it::erasure::tenant_cancels_billing` | With the Stripe fake holding a plan subscription and two top-up subscriptions, tenant erasure cancels all three at once, with no proration, as its second step, right after routing stops and before any domain, mailbox or D1 row is removed; a failing Stripe call is retried with backoff and the third failure fires `billing_cancel_failed`; with `PM_BILLING=off`, or no Stripe customer, the step is skipped; a `customer.subscription.deleted` webhook after the erasure is answered `200` and recorded `ignored_erased`, while a live subscription created after the deletion is cancelled (`cancelled_after_erasure`, [Billing › Tests](billing.md#tests)) | section 6.6 |
 | `it::erasure::tenant_console_rows` | After tenant erasure no `members`, `invitations`, `sessions`, `notification_prefs`, `identity_keys` or billing rows remain for the tenant, every deleted kid is in `key_tombstones`, and the tenant's `Notifier` holds nothing; a member of another workspace keeps their account; a person left with no workspace is scrubbed and loses `oauth_identities`, `login_tokens` and `waitlist` rows | section 6.6 |
 | `it::erasure::tenant_ses_rows` | With the SES fake, tenant erasure of a workspace with an SES domain (`dns_records` or `send_only`) removes every address of that domain from the `pm-retired-{n}` receipt rules, so later mail to them is dropped like unknown mail, and leaves no SES identity for the domain | section 6.6 |

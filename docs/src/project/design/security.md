@@ -119,6 +119,11 @@ reused; the others are defined in section 13.
 | E | Minting a wider key | Section 4.6 subset rule, `403 key_scope_exceeded` | `it::keys::scope_exceeded` |
 | E | An API key releasing quarantined mail where only a person should | With `PM_QUARANTINE_KEY_RELEASE=off` (Pylota Mail Cloud) every key gets `403 permission_denied`, unless the tenant's `policy.quarantine.key_release` is `true`, which only a platform key or the tenant's own partner key can set (section 5.3); every release is audit-logged with its key | `it::quarantine::j14_key_release_policy`, `it::quarantine::j16_key_release_override` |
 | E | Test key acting on a live tenant, or the reverse | A key's mode follows its tenant; platform keys act on both, and partner keys on both modes of their own tenants, and every state-changing action they take is audit-logged except sends, which are recorded as messages ([L4](../edge-cases.md)) | `it::testmode::l4_mode_binding` |
+| E | A partner raising its tenants' limits or reversing operator enforcement (a cap above the default, a platform suspension lifted, an abuse pause resumed, a cap raised one identity at a time) | Lower-only and platform-only policy fields, platform ceilings in `tenants.policy_ceilings_json`, `tenants.suspended_by`, platform-only abuse resume on partnered tenants, and the identity `send_policy.daily_cap` bound (section 4.6, [J17](../edge-cases.md)) | `it::partners::policy_caps_lower_only`, `it::partners::j17_operator_enforcement` |
+| D | A partner key creating tenants or invitations without bound | `partners.max_tenants` checked in the insert (`403 partner_tenant_limit`) and `RL_PARTNER` per partner (section 10, [J18](../edge-cases.md)) | `it::partners::j18_partner_limits` |
+| E | A tenant or partner key taking over a Cloudflare zone it does not own (another tenant's zone, or the zone of the deployment's own hosts) through `cloudflare_zone` | Zone permission before any Cloudflare call: the zone must be claimed for the tenant in `zone_claims` or listed in its platform-only `domains.cloudflare_zones`, and is never under the zones of `PM_PLATFORM_DOMAIN`, `PM_API_HOST` or `PM_CONSOLE_HOST` (`403 scope_denied`, `details.reason = "zone_not_allowed"`, [Identities and domains › Zone permission](identity-domains.md#zone-permission), [H8](../edge-cases.md)) | `it::domains::h8_zone_permission`, `it::security::cross_tenant_matrix` (`foreign_zone`) |
+| I | A one-time secret recovered from an idempotent replay, or a replay crossing keys | Idempotency records are keyed by the calling key, and a response carrying a secret is stored without it (`"secret_replayed": false`, [J19](../edge-cases.md)) | `it::idempotency::j19_per_key_no_secret` |
+| T | Changing a tenant while its erasure runs | Non-platform writes to an `erasing` or `erased` tenant are `*_not_found`, and only the erasure job changes its status (section 5.2, [I8](../edge-cases.md)) | `it::erasure::i8_erasing_tenant_frozen` |
 
 ### 3.3 TB3: agent → MCP
 
@@ -166,7 +171,7 @@ reused; the others are defined in section 13.
 | Threat | Mitigation |
 |---|---|
 | A Cloudflare account member reads D1, R2 or Durable Object data | Out of scope for the software (SECURITY.md). Deployers keep account membership minimal and use Cloudflare's own audit logs. Secrets are Worker secrets and are never written to disk unless `pmail setup --print-secrets` is used |
-| A partner key is misused | A partner key reaches only the tenants its partner's keys created, never another Cloud customer's ([FR-KEY-4](../prd.md#61-tenancy-and-access)). A platform key suspends the partner (`PATCH /v1/partners/{partner_id}` with `status: suspended`), which refuses every partner key of it at once (`403 partner_suspended`) without stopping its tenants' mail or their own keys ([J13](../edge-cases.md)); every state-changing partner-key action is audit-logged like a platform key's |
+| A partner key is misused | A partner key reaches only the tenants its partner's keys created, never another Cloud customer's ([FR-KEY-4](../prd.md#61-tenancy-and-access)). A platform key suspends the partner (`PATCH /v1/partners/{partner_id}` with `status: suspended`), which at once refuses every partner key of it and every API key of its tenants (`403 partner_suspended`) and holds deliveries to its and its tenants' endpoints, while inbound mail is still stored ([J13](../edge-cases.md)); the partner cannot raise limits past the operator's or undo the operator's enforcement (section 4.6, [J17](../edge-cases.md)), and its reach is bounded by `max_tenants` ([J18](../edge-cases.md)); every state-changing partner-key action is audit-logged like a platform key's |
 | A platform key is misused | Platform keys reach every tenant: issue few, set `expires_at`, store them in a secrets manager (`key_command` in the CLI profile). Every state-changing platform-key action on a tenant is audit-logged; sends are not audit rows: each is a stored message, and the request's structured log carries `key_id` ([Observability §2.1](observability.md#21-schema)). A platform key cannot sign as an identity: `identities:sign` is not allowed at that level (section 4.6) |
 | The CLI machine leaks a key | `~/.config/pylota-mail/config.toml` is created `0600` and refused when group- or world-readable ([Configuration](../../reference/configuration.md#cli-configuration)) |
 | The release pipeline is compromised | Section 11: pinned dependencies and actions, signed `SHA256SUMS`, build provenance attestations, protected tags and environments |
@@ -205,7 +210,7 @@ security properties.
 | S | A mirrored key directory: someone serves a copy of `/.well-known/http-message-signatures-directory` and registers it as theirs | The response is signed once per listed key with `("@authority";req)`, `tag="http-message-signatures-directory"`, a fresh nonce, `created` and `expires` = `created` + 300 s, so a copy served from another authority fails verification. At most three keys are listed ([O12](../edge-cases.md)) | `it::well_known::directory_signed_per_key` |
 | I | Probing the JWKS for which identities exist, are paused or were deleted | An unknown, deleted, paused or suspended identity gets the same `404 identity_not_found`; identity IDs are ULIDs, never derived from addresses ([Agent signing keys §3.1](agent-keys.md#31-identity-jwks)) | `it::identity_keys::paused_withdraws_jwks` |
 | E | A misbehaving agent keeps proving who it is after it was stopped | The kill switch (FR-IDN-9): pausing an identity, or suspending its tenant (which pauses every identity), stops signing at once (suspended tenant → `403 tenant_suspended`; paused identity → `409 identity_paused`) and withdraws its JWKS (`404`), so a verifier that refetches stops accepting it within the 5-minute cache ([O1](../edge-cases.md)). Erasure deletes the keys and writes each kid to `key_tombstones`, so a deleted kid is never published again ([O7](../edge-cases.md)) | `it::identity_keys::paused_withdraws_jwks`, `it::assertions::erasure_tombstones_kid` |
-| E | Signed HTTP requests from a tenant that never chose them | `PM_WEB_BOT_AUTH` is `off` by default and stays off until spike S13 passes (`422 web_bot_auth_disabled`, [O9](../edge-cases.md)); a tenant must opt in with `policy.web_bot_auth.allowed` (`403 policy_denied`, [O13](../edge-cases.md)) | `it::http_signatures::disabled_and_policy` |
+| E | Signed HTTP requests from a tenant that never chose them | `PM_WEB_BOT_AUTH` is `off` by default and stays off until spike S13 passes (`422 web_bot_auth_disabled`, [O9](../edge-cases.md)); a tenant must be opted in with `policy.web_bot_auth.allowed`, which only a platform key can set (`403 policy_denied`, [O13](../edge-cases.md)) | `it::http_signatures::disabled_and_policy` |
 | D | Signing calls used to exhaust the Worker | `RL_SIGN`: 600 signing calls per 60 s per identity, assertions and HTTP signatures together (section 10) | `it::auth::rate_limited` |
 
 ## 4. Authentication
@@ -248,15 +253,16 @@ Every authenticated request (REST and MCP) runs `auth::authenticate` once, befor
 8. The `mode` in the token must equal the row's `mode`; otherwise `401 unauthenticated`.
 9. Resolve `Scope { key_id, level, partner_id, tenant_id, identity_id, mode, permissions }`. For tenant and
    identity keys, `permissions` is the key's list plus the implicit `usage:read` (section 4.6), and the
-   tenant row is loaded; a tenant in status `erasing` or `erased` gives
-   `401 key_revoked` (its keys were revoked by the erasure job; this covers the window before that
-   step commits). A `suspended` tenant still authenticates: suspension is enforced by policy
-   (`403 tenant_suspended` on sends, FR-TEN-3). For a partner key the `partners` row is loaded in the
-   same D1 read (a join on `api_keys.partner_id`): `status = 'suspended'` gives `403 partner_suspended`
-   on every route, `GET /v1/me` included, and nothing else runs ([J13](../edge-cases.md)). This comes after
-   the secret matched, so it tells a guesser nothing. Suspending a partner never suspends its tenants:
-   their mail and their own tenant and identity keys keep working. A partner key gets no implicit
-   permission.
+   tenant row is loaded with its partner's `status` (a join on `tenants.partner_id`); a tenant in status
+   `erasing` or `erased` gives `401 key_revoked` (its keys were revoked by the erasure job; this covers
+   the window before that step commits). A `suspended` tenant still authenticates: suspension is enforced
+   by policy (`403 tenant_suspended` on sends, FR-TEN-3). For a partner key the `partners` row is loaded
+   in the same D1 read (a join on `api_keys.partner_id`). When the partner is `suspended`, its partner
+   keys **and every tenant and identity key of its tenants** get `403 partner_suspended` on every route,
+   `GET /v1/me` included, and nothing else runs ([J13](../edge-cases.md)); inbound mail is still accepted
+   and stored, and the tenants' status does not change. This comes after the secret matched, so it tells
+   a guesser nothing. A partner key gets no implicit permission. A `deleted` partner has no keys left
+   (deletion deletes them), so no request reaches this step for it.
 
 ### 4.3 `last_used_at`
 
@@ -315,14 +321,14 @@ partner's keys, [Partner keys](#partner-keys)), `tenant` (one tenant) and `ident
 
    | Caller level | New key's level | Partner | Tenant | Identity |
    |---|---|---|---|---|
-   | platform | any | an existing partner (partner level) | any existing tenant (tenant, identity levels) | any identity of that tenant (identity level) |
+   | platform | any | an existing partner that is not `deleted` (partner level) | any existing tenant (tenant, identity levels) | any identity of that tenant (identity level) |
    | partner | tenant or identity | – | a tenant whose `partner_id` is the caller's | any identity of that tenant (identity level) |
    | tenant | tenant or identity | – | must equal the caller's tenant | any identity of the caller's tenant |
    | identity | identity | – | must equal the caller's tenant | must equal the caller's identity |
 
    and `permissions` is a subset of the caller's permissions. A partner key that asks for a `partner` or
    `platform` key, or names a tenant outside its own, gets `403 key_scope_exceeded` ([J11](../edge-cases.md)).
-   A platform key naming a partner that does not exist gets `404 partner_not_found`.
+   A platform key naming a partner that does not exist or is `deleted` gets `404 partner_not_found`.
 
 - **Implicit `usage:read`.** Every tenant and identity key holds `usage:read` for its own workspace
   without listing it: authentication adds it to the resolved permissions (section 4.2, step 9). A key
@@ -351,24 +357,85 @@ only a platform key rotates or revokes one.
   another partner created, a tenant no partner created, the platform's endpoints, any partner or platform
   key (its own included: `GET /v1/me` describes it), or a deployment-wide route (`/v1/platform/*`,
   `/v1/partners/*`).
+- **A `NULL` partner never matches.** Owner checks and the fan-out compare a tenant's or endpoint's
+  `partner_id` only with a partner key's own `Some(partner_id)`. A `NULL` `partner_id` (a tenant no
+  partner created, a platform or tenant endpoint) matches nothing. Implementers must not compare two
+  optional values directly: in Rust `None == None` is `true`, so `key.partner_id == tenant.partner_id`
+  would hand every unpartnered tenant to any key without a partner. Branch on the key's level first, and
+  for a partner key compare `tenant.partner_id == Some(key_partner_id)`; in SQL, `partner_id = ?` is never
+  true for `NULL`. `it::partners::j10_foreign_partner_not_found` includes the unpartnered case.
 - **Tenants it creates.** `POST /v1/tenants` with a partner key writes the key's `partner_id` to
   `tenants.partner_id` and the partner's `default_billing_mode` to the tenant's billing mode. Neither can
   be changed by a partner key: `partner_id` is never updated, and the `billing` field of
   `POST /v1/tenants` and `PATCH /v1/tenants/{tenant_id}/billing` are platform-only (`403 scope_denied`).
-- **Abuse controls.** A partner key may lower its tenants' `identity_daily_send_cap`,
-  `tenant_daily_send_cap`, `max_recipients`, `search.agentic_daily_cap` and `abuse` thresholds, but not raise
-  them above the deployment's defaults: raising one is platform-only (`403 scope_denied`, `details.field`),
-  so one partner cannot spend a shared deployment's sending reputation
-  ([Configuration › Tenant policy](../../reference/configuration.md#tenant-policy)).
+  A partner has at most `partners.max_tenants` tenants that are not `erased` (default 25, set by a platform
+  key); the next creation gets `403 partner_tenant_limit`. The insert itself checks that the partner is
+  `active` and below its limit (`INSERT … SELECT … WHERE` in one statement), so concurrent creations
+  cannot overshoot. Each creation also counts in `RL_PARTNER` (section 10). A partner key may set
+  `quarantine.key_release` in the `policy` of the creation.
+- **Policy writes** ([Configuration › Who may change a field](../../reference/configuration.md#who-may-change-a-field)).
+  Every policy write by a partner key, the `policy` of `POST /v1/tenants` as well as of
+  `PATCH /v1/tenants/{tenant_id}`, is checked field by field, for the fields present only:
+  - a **platform-only** field (`web_bot_auth.allowed`, `domains.allow_create_zone`,
+    `domains.cloudflare_zones`) gets `403 scope_denied` with `details.field`;
+  - a **lower-only** field may be set at most to its ceiling, otherwise `403 scope_denied` with
+    `details.field`. The ceiling is the more restrictive of the deployment default (the built-in defaults
+    merged with `PM_DEFAULT_POLICY`) and the tenant's platform ceiling, the value a platform key last set on
+    that field (`tenants.policy_ceilings_json`): min(deployment default, platform ceiling) for numbers, and
+    for a switch whose `true` costs or loosens, `true` only when both allow it;
+  - `quarantine.key_release` is accepted from the tenant's own partner key;
+  - every other field is **free**.
+
+  One failing field refuses the whole write and nothing is stored. For every non-platform key, an
+  identity's `send_policy.daily_cap` (`POST …/identities`, `PATCH /v1/identities/{identity_id}`) may not
+  exceed the tenant's effective `identity_daily_send_cap` (`403 scope_denied`,
+  `details.field = "send_policy.daily_cap"`), so a lower-only cap cannot be raised one identity at a time.
+- **Operator enforcement stays** ([J17](../edge-cases.md)). A partner cannot undo what a platform key
+  enforced on its tenants:
+  - `tenants.suspended_by` records who suspended a tenant (`platform` or `partner`); a partner key that
+    sets `status: "active"` on a tenant a platform key suspended gets `403 scope_denied`
+    (`details.field = "status"`). A platform key's suspension replaces a partner's;
+  - a value a platform key sets on a lower-only field is stored in `tenants.policy_ceilings_json` and
+    becomes that field's ceiling for partner keys; a platform key's `null` for the field (reset to the
+    default) removes it;
+  - resuming an identity paused for `abuse_threshold` on a tenant a partner created needs a platform key;
+    a partner or tenant key gets `403 scope_denied`.
+- **Erasing and erased tenants** ([I8](../edge-cases.md)). For every non-platform key, a write to a tenant
+  in status `erasing` or `erased`, or to anything in it, gets `404 tenant_not_found` (or the resource's own
+  `*_not_found` on a route by resource ID), except a repeated tenant-scope erasure request (`200` with
+  the existing request, or `409 tenant_erased`); in practice this is the partner key, because the tenant's own
+  tenant and identity keys are revoked by the erasure and get `401 key_revoked` (section 4.2, step 9). `GET /v1/tenants/{tenant_id}` and the tenant's erasure
+  requests (`GET /v1/erasure-requests` filtered on it, and by ID) keep answering its partner key, so a
+  partner can follow an erasure to its receipt after the tenant is gone
+  ([Privacy § 6.10](privacy.md#610-partners)). Only the erasure job changes the status of an `erasing` or
+  `erased` tenant: a platform key's `PATCH` with `status` gets `409 tenant_erased`.
 - **What it may hold.** `tenants:manage` (create, update, suspend and read its own tenants),
   `keys:manage` (tenant and identity keys of its own tenants), `webhooks:manage` and `webhooks:read`
   (its partner endpoints, and its tenants' endpoints), `quarantine:review`, `usage:read`, and every other
   tenant-level permission. Never `platform:ops`, `partners:manage` or `identities:sign` (step 2).
-- **Suspension.** A suspended partner's keys get `403 partner_suspended` (section 4.2, step 9); its
-  tenants keep receiving and sending mail ([J13](../edge-cases.md)).
+- **Suspension contains the partner** ([J13](../edge-cases.md)). While a partner is `suspended`, its keys
+  and every API key of its tenants get `403 partner_suspended` (section 4.2, step 9), so nothing can send
+  for those tenants. Their status does not change and their inbound mail is still accepted and stored.
+  Deliveries to the partner's endpoints and to its tenants' endpoints are held, not dropped, and resume
+  when the partner is `active` again ([Webhooks › Delivering an attempt](webhooks.md#delivering-an-attempt)).
+  Console sessions of the tenants' members are not API keys and keep working; the console sends no mail
+  for them.
+- **Deletion.** `DELETE /v1/partners/{partner_id}` needs every tenant of the partner `erased`
+  (`409 partner_has_tenants`). It is a soft delete: the row stays with `status: "deleted"` and an empty
+  `name`, its keys are revoked and deleted and its endpoints deleted, and `tenants.partner_id` never
+  changes ([Privacy § 6.10](privacy.md#610-partners)).
 - **Mode and limits.** Partner keys are `live` and act on the `live` and `test` tenants of their partner.
-  They count against the same rate-limit buckets as platform keys, keyed by their own key ID
-  (section 10).
+  They count against the same rate-limit buckets as platform keys, keyed by their own key ID, and against
+  `RL_PARTNER`, keyed by the partner, for tenant creation and invitations (section 10).
+- **Aggregate bound.** Whatever the number of its keys, one partner can at most: keep `max_tenants`
+  tenants that are not erased (25 by default); send, across them, `max_tenants` × the ceiling of
+  `tenant_daily_send_cap` messages a day (25 × 5,000 = 125,000 with the defaults, and 25 × 50 = 1,250 while
+  its new tenants are on the send ramp, [Cloud sign-up § 10.1](cloud-signup.md#101-new-workspace-send-ramp));
+  run `max_tenants` × `search.agentic_daily_cap` agentic searches a day (12,500); create tenants and send
+  invitations 10 times a minute together (`RL_PARTNER`), which bounds the owner and invitation mail it
+  can make the system identity send to 10 a minute (14,400 a day), under that identity's own caps; and make
+  600 requests a minute per key (`RL_API`). Raising `max_tenants`, a ceiling or `ramp_exempt` is an
+  operator decision, made with a platform key.
 
 ### 4.7 Unauthenticated routes
 
@@ -488,7 +555,8 @@ For each request, before any Durable Object or R2 call:
 4. **Resolve the target's owner** from D1 with the key's scope as a mandatory parameter of the data-access
    function (`tenant_id` is a required argument of every tenant-data query):
    - `TenantPath`: the tenant ID must equal the key's tenant (platform keys: the tenant must exist;
-     partner keys: the tenant's `partner_id` must equal the key's `partner_id`).
+     partner keys: the tenant's `partner_id` must equal the key's `partner_id`, compared as
+     `Some(key_partner_id)`, so a tenant with a `NULL` `partner_id` never matches, [Partner keys](#partner-keys)).
    - `IdentityPath`: `SELECT i.tenant_id, i.status, i.mailbox_do_id, t.partner_id FROM identities i JOIN tenants t ON t.id = i.tenant_id WHERE i.id = ?1`, then
      compare with the key; identity keys must match their own identity, and partner keys need
      `t.partner_id` equal to their own.
@@ -501,6 +569,17 @@ For each request, before any Durable Object or R2 call:
      `404 key_not_found` to it.
    - Any mismatch returns the resource's own `*_not_found` code with the same body as for a
      non-existent ID. The check runs whether or not the ID exists, so both paths do one D1 read.
+   - **Erasing and erased tenants.** For a non-platform key, a write (any method but `GET`) whose
+     resolved tenant is `erasing` or `erased` gets the same `*_not_found` (`404 tenant_not_found` on a
+     tenant path), so nothing is created, changed or sent in a tenant being erased ([I8](../edge-cases.md)).
+     The one exception is a tenant-scope erasure request for that tenant, which returns the existing
+     request (`200`) while it is `erasing` and `409 tenant_erased` once it is `erased`, for every key that
+     may request it.
+     Reads still resolve; for a partner key `GET /v1/tenants/{tenant_id}` and its tenant's erasure
+     requests are the reads that remain useful, because the erasure deleted the rest. A platform key's
+     write to such a tenant follows the route (a `PATCH` with `status` gets `409 tenant_erased`, a new
+     tenant-scope erasure request returns the existing one or `409 tenant_erased`,
+     [Privacy § 6.6](privacy.md#66-tenant-scope)).
 5. **Body and query parameters naming a tenant or identity** (`tenant_id` in `POST /v1/keys`,
    `POST /v1/erasure-requests`, `POST /v1/exports`, `identity_ids` filters, `tenant_id` filters):
    for non-platform keys, a value outside the key's scope returns `404 tenant_not_found` or
@@ -545,7 +624,9 @@ For each request, before any Durable Object or R2 call:
   `quarantine:review` the flag is ignored, never refused ([Search § 2](search.md#2-request-handling)).
 - Attachments with a `risk` require `quarantine:review` (api.md).
 - Resuming an identity paused for `abuse_threshold` requires a tenant, partner or platform key and is
-  audit-logged (api.md).
+  audit-logged (api.md). On a tenant a partner created it requires a platform key: a partner or tenant
+  key gets `403 scope_denied` ([J17](../edge-cases.md)), so a partner cannot reverse the platform's
+  abuse controls on its own tenants.
 - **Quarantine release by API keys** (FR-CON-6). `POST …/messages/{message_id}/release` with
   `quarantine:review` is allowed when `PM_QUARANTINE_KEY_RELEASE` is `on` (or `PM_CONSOLE=off`), or when
   the message's tenant has `policy.quarantine.key_release: true`; otherwise `403 permission_denied` and
@@ -927,12 +1008,21 @@ fails. At delivery time a failure is recorded as a failed attempt with error `ss
 | Console sign-in, sign-up and waitlist requests per client IP | 10 / 60 s on `POST /console/sign-in`, `/console/sign-in/link`, `/console/sign-in/code`, `/console/sign-up` and `/console/waitlist` | `RL_SIGNIN`, keyed by `CF-Connecting-IP`; the IP is never logged | `429` page |
 | Two-step verification codes | 5 attempts a minute per person; 10 failures in a row lock two-step sign-in for 15 minutes | A per-person failure counter ([Cloud sign-up §5](cloud-signup.md#5-two-step-verification)) | Code refused; lock page |
 | Sends from a new Free workspace | `tenant_daily_send_cap` 50 for the first 7 days; lifts on day 7 if bounce and complaint rates are under the auto-pause thresholds, or at once on a paid plan | `TenantQuota` ([W30](../edge-cases.md)) | `429 daily_cap_reached` |
+| Sends from a new tenant of a partner | The same ramp, whatever `PM_BILLING` and the tenant's billing mode (`exempt` included), unless a platform key set the partner's `ramp_exempt`; an `exempt` tenant has no plan, so only the daily evaluation lifts it | `TenantQuota` ([W30](../edge-cases.md), [Cloud sign-up § 10.1](cloud-signup.md#101-new-workspace-send-ramp)) | `429 daily_cap_reached` |
+| Tenant creation and invitations per partner | 10 / 60 s together, across every key of the partner: `POST /v1/tenants` and `POST /v1/tenants/{tenant_id}/invitations` called with a partner key | `RL_PARTNER`, keyed by the partner ID ([J18](../edge-cases.md)) | `429 rate_limited` |
+| Tenants per partner | `partners.max_tenants` tenants not `erased` (default 25, set by a platform key) | Checked in the tenant insert ([J18](../edge-cases.md)) | `403 partner_tenant_limit` |
 
 - **Partner keys** use the same buckets as platform keys: `RL_API`, `RL_SEARCH` and `RL_AGENTIC` keyed by
   the partner key's own ID, so one partner key's 600 requests a minute cover all of its tenants. The
   per-identity buckets (`RL_SEND`, `RL_SIGN`) and each tenant's exact daily caps in `TenantQuota` apply
   as for every key. A partner that needs more throughput mints tenant keys for its tenants (section 4.6),
-  each with its own bucket.
+  each with its own bucket. `RL_PARTNER` is keyed by the partner, not the key, so minting more partner
+  keys does not raise it. Cloudflare's rate-limiting binding accepts only a 10- or 60-second period
+  (`simple.period` is `enum [10, 60]` in wrangler's `config-schema.json`, wrangler 4.87.0, read
+  2026-10-10), so the daily bound comes from `max_tenants` and the minute bound from `RL_PARTNER`: at most
+  10 owner and invitation emails a minute per partner (14,400 a day), which the system identity's own
+  daily caps bound again. The aggregate bound for one partner is stated in section 4.6
+  ([Partner keys](#partner-keys)).
 - The rate-limiting bindings are approximate and per location. Anything that must be exact (daily send
   caps, the agentic budget, abuse windows) is counted in `TenantQuota`.
 - **Headers.** A binding's `limit()` answers only allow or deny, so the Worker cannot report what is left.
@@ -955,7 +1045,9 @@ fails. At delivery time a failure is recorded as a failed attempt with error `ss
   key (`POST /v1/identities/{identity_id}/keys/{kid}/revoke`) to withdraw that key alone. Suspend a
   tenant (`PATCH /v1/tenants/{id} {"status": "suspended"}`): every send is refused at once, inbound gets
   a temporary failure, and every identity of the tenant is paused, so the same signing stop applies.
-  Stop signed HTTP requests for the whole deployment with `PM_WEB_BOT_AUTH=off`. For a platform-wide
+  Suspend a partner (`PATCH /v1/partners/{partner_id} {"status": "suspended"}`): its keys and every API
+  key of its tenants get `403 partner_suspended`, and deliveries to its and its tenants' endpoints are
+  held ([J13](../edge-cases.md)). Stop signed HTTP requests for the whole deployment with `PM_WEB_BOT_AUTH=off`. For a platform-wide
   stop, suspend every tenant or roll back the Worker version with `npx --yes wrangler@4.139.0 rollback`.
 - **Platform domain reputation.** Per-identity caps, complaint and bounce auto-pause, a DMARC policy
   ramped from `p=none` to `p=reject` on the platform domain, and custom domains encouraged (PRD risk
@@ -1021,11 +1113,14 @@ address used by the integration suite, captures all Worker output, and fails if 
 | `it::messages::list_hides_review_statuses` | A message list never shows `quarantined`, `hidden` or `throttled` mail without a `status` filter, also to a key holding `quarantine:review`; with the filter, only a key holding `quarantine:review` sees them, and any other key gets `200` without them; a thread list never shows them | section 5.3, FR-IN-5 |
 | `it::keys::j6_revoke_rotate` | Revocation is immediate; rotation overlaps; audit rows name the actor | [J6](../edge-cases.md) |
 | `it::keys::j11_partner_key_limits` | A partner key asking for a `partner` or `platform` key, or for a tenant or identity key of a tenant outside its partner, gets `403 key_scope_exceeded`; `platform:ops`, `partners:manage` or `identities:sign` on a partner key gets `400 invalid_request` (`permission_not_allowed_for_level`) from any caller; a tenant or identity key cannot list `partner_id` or ask for `level: partner`; a platform key mints a partner key with `partner_id` (`404 partner_not_found` for an unknown one), and `key.create` and `key.revoke` rows record `level` and `partner_id` | FR-KEY-1, FR-KEY-4, [J11](../edge-cases.md) |
-| `it::partners::routes_and_audit` | The five partner routes need a platform key with `partners:manage` (a partner key gets `403 permission_denied`); create, update and delete write `partner.create`, `partner.update` and `partner.delete`; a tenant created by a partner key has `partner_id` and the partner's `default_billing_mode`, and writes `tenant.create` with that `partner_id`; a partner key sending `billing` in `POST /v1/tenants`, or calling `PATCH /v1/tenants/{own}/billing`, gets `403 scope_denied`; `GET /v1/tenants` with a partner key lists only its tenants; changing `default_billing_mode` leaves existing tenants' billing modes unchanged; idempotency records of a partner key's `POST /v1/tenants` are scoped to its partner, so another partner's identical key and body create a separate tenant | FR-KEY-4 |
-| `it::partners::policy_caps_lower_only` | A partner key lowers its tenant's `tenant_daily_send_cap` and an `abuse` threshold; raising either above the deployment default gets `403 scope_denied` with `details.field`, and a platform key can raise them |
+| `it::partners::routes_and_audit` | The five partner routes need a platform key with `partners:manage` (a partner key gets `403 permission_denied`); create, update and delete write `partner.create`, `partner.update` and `partner.delete`; a tenant created by a partner key has `partner_id` and the partner's `default_billing_mode`, and writes `tenant.create` with that `partner_id`; a partner key sending `billing` in `POST /v1/tenants`, or calling `PATCH /v1/tenants/{own}/billing`, gets `403 scope_denied`; a partner key may set `quarantine.key_release` in the `policy` of `POST /v1/tenants`; `GET /v1/tenants` with a partner key lists only its tenants; changing `default_billing_mode` leaves existing tenants' billing modes unchanged; idempotency records of a partner key's `POST /v1/tenants` are scoped to its partner and its key, so another partner's key, or another key of the same partner, sending the same `Idempotency-Key` and body gets no replay: its request runs and gets `409 slug_taken`, because slugs are unique across the deployment | FR-KEY-4 |
+| `it::partners::policy_caps_lower_only` | For every field of each class of [Configuration › Who may change a field](../../reference/configuration.md#who-may-change-a-field), in the `policy` of `POST /v1/tenants` and of `PATCH /v1/tenants/{tenant_id}`: a partner key lowers a lower-only field (`tenant_daily_send_cap`, an `abuse` threshold, `retention.raw_days`, `auto_reply.max_automatic_exchanges`) and turns off a cost switch (`inbound.extract_image_text`, `triage.enabled`, `search.agentic_enabled`); raising one above the deployment default (the built-in defaults merged with `PM_DEFAULT_POLICY`), or turning a switch on that the default has off, gets `403 scope_denied` with `details.field` and stores nothing, also when other fields of the write are valid; a field absent from the write is not compared; a platform-only field (`web_bot_auth.allowed`, `domains.allow_create_zone`, `domains.cloudflare_zones`) gets `403 scope_denied` with `details.field`; a free field is accepted; a platform key raises a lower-only field; an identity's `send_policy.daily_cap` above the tenant's effective `identity_daily_send_cap` gets `403 scope_denied` with `details.field = "send_policy.daily_cap"` from a partner, tenant or identity key, on `POST …/identities` and `PATCH /v1/identities/{identity_id}`, and is accepted from a platform key | FR-KEY-4, FR-TEN-2 |
 | `it::partners::j10_foreign_partner_not_found` | A partner key against another partner's tenant, a tenant no partner created, the identities, messages, domains, keys and endpoints inside them, and another partner's endpoints and keys, gets the same `404 …_not_found` as for a missing ID, with no side effect | FR-KEY-4, NFR-SEC-1, [J10](../edge-cases.md) |
-| `it::partners::j12_delete_with_tenants` | `DELETE /v1/partners/{partner_id}` gets `409 partner_has_tenants` while one of its tenants is `active`, `suspended` or `erasing`, and changes nothing; once all are `erased` it deletes the partner, its keys (their next request is `401 unauthenticated`), its endpoints and their deliveries, and clears `partner_id` on the erased tenants | FR-KEY-4, [J12](../edge-cases.md) |
-| `it::partners::j13_suspended_partner` | With the partner `suspended`, each of its keys gets `403 partner_suspended` on every route, `GET /v1/me` included; its tenants keep receiving mail and their tenant and identity keys keep sending; `active` again restores the partner keys | FR-KEY-4, [J13](../edge-cases.md) |
+| `it::partners::j12_delete_with_tenants` | `DELETE /v1/partners/{partner_id}` gets `409 partner_has_tenants` while one of its tenants is `active`, `suspended` or `erasing`, and changes nothing; once all are `erased` it soft-deletes the partner (`status: "deleted"`, empty `name`), revokes and deletes its keys (their next request is `401 unauthenticated`), deletes its endpoints and their deliveries, and leaves `partner_id` unchanged on the erased tenants; `GET /v1/partners/{partner_id}` shows it `deleted`, and `PATCH`, a second `DELETE` and a key mint for it get `404 partner_not_found` | FR-KEY-4, [J12](../edge-cases.md) |
+| `it::partners::j13_suspended_partner` | With the partner `suspended`, each of its keys and every tenant and identity key of its tenants gets `403 partner_suspended` on every route, `GET /v1/me` included, and no send is accepted for those tenants; their status does not change and inbound mail to them is stored; deliveries to the partner's endpoints and to its tenants' endpoints are held with no attempt recorded; `active` again restores every key and the held deliveries are sent | FR-KEY-4, [J13](../edge-cases.md) |
+| `it::partners::j17_operator_enforcement` | A partner key setting `status: "active"` on a tenant a platform key suspended gets `403 scope_denied` with `details.field = "status"`, and lifts its own suspension; after a platform key sets `tenant_daily_send_cap` to 200 on a partner's tenant, the partner key may set at most 200 (`403 scope_denied` at 201) even though the deployment default is 5,000; a platform `null` removes the ceiling; resuming an identity paused for `abuse_threshold` on a partner's tenant gets `403 scope_denied` from the partner key and from a tenant key, and works with a platform key | FR-KEY-4, [J17](../edge-cases.md) |
+| `it::partners::j18_partner_limits` | With `max_tenants` 2, a partner's third tenant gets `403 partner_tenant_limit`, also when two creations race for the last place (exactly one succeeds); an `erased` tenant frees its place; the eleventh tenant creation or invitation in a minute across two keys of one partner gets `429 rate_limited` (`RL_PARTNER`, keyed by the partner); only a platform key sets `max_tenants` and `ramp_exempt` (a partner key cannot reach `/v1/partners`) | FR-KEY-4, [J18](../edge-cases.md) |
+| `it::idempotency::j19_per_key_no_secret` | A replay needs the same key: a second key of the same tenant or partner sending the same `Idempotency-Key` gets no replay; a replay of `POST /v1/keys`, `POST /v1/keys/{key_id}/rotate`, `POST /v1/webhooks`, `POST /v1/tenants/{tenant_id}/webhooks` and `POST /v1/webhooks/{webhook_id}/rotate-secret` returns the stored body without `secret` and with `"secret_replayed": false`; no `idempotency_records.response_body` contains a secret | FR-KEY-2, FR-WH-2, [J19](../edge-cases.md) |
 | `it::quarantine::j14_key_release_policy` | Only a platform key or the tenant's own partner key sets `quarantine.key_release`; a tenant key gets `403 permission_denied` and the policy is unchanged; another partner's key gets `404 tenant_not_found` | FR-CON-6, [J14](../edge-cases.md) |
 | `it::quarantine::j16_key_release_override` | With `PM_QUARANTINE_KEY_RELEASE=off`, a key with `quarantine:review` (a tenant key, an identity key and the partner key) releases mail of a tenant whose policy has `quarantine.key_release: true`, writing `quarantine.release` with the key; on a tenant without it every key gets `403 permission_denied`; with `on`, the policy changes nothing | FR-CON-6, [J16](../edge-cases.md) |
 | `it::security::cross_tenant_matrix` | Section 5 matrix: every route × every foreign key class, the `foreign_partner` class included → `*_not_found` or `scope_denied`, identical to a missing ID, no side effects; REST and MCP | NFR-SEC-1, FR-KEY-3, FR-KEY-4, FR-TEN-1 |
@@ -1035,7 +1130,7 @@ address used by the integration suite, captures all Worker output, and fails if 
 | `it::search::f3_tenant_scope_denied` | Identity key on tenant search → `403 scope_denied` | [F3](../edge-cases.md) |
 | `it::security::search_canary_isolation` | A canary term in tenant B's mail is never returned to tenant A in keyword, semantic, hybrid or agentic mode | NFR-SEC-1 |
 | `it::security::vector_foreign_id_dropped` | A fake Vectorize result containing another tenant's vector ID is dropped by the mailbox read-back | NFR-SEC-1 |
-| `it::security::mcp_requires_key`, `it::security::mcp_tools_follow_key` | No key, no MCP; tools listed and callable only with their permission | FR-MCP-1 |
+| `it::security::mcp_requires_key`, `it::security::mcp_tools_follow_key` | No key, no MCP; tools listed and callable only with their permission; with a partner key, tools act only on its own tenants and a `NULL`-partner tenant is unreachable | FR-MCP-1, FR-KEY-4 |
 | `core::ssrf::refuses_private_ranges` (with a property test over each range) | Every address in each blocked range (including mapped and embedded IPv4) is refused; public addresses pass | FR-WH-5 |
 | `core::ssrf::url_rules` | Section 9.1 rules 1 to 4, including integer, hexadecimal and octal IPv4 literals and `hooks.example.com` allowed | FR-WH-5 |
 | `it::webhooks::ssrf_refused`, `it::webhooks::no_redirects_and_caps` | Guard at create and at delivery; `3xx` is a failure and is not followed; 15 s deadline; bodies over 4 KB are cut | FR-WH-5 |

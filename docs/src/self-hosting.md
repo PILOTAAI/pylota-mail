@@ -111,7 +111,11 @@ recommended setting, because the CLI writes to several zones: the platform mail 
 of the API host and the console host, and the zone of every tenant domain you add with
 `pmail domains add --local-token`. The Worker's token likewise needs every zone that tenants add with
 `cloudflare_zone`, and a zone it creates for `nameservers` or `delegated_subdomain` exists in no list of
-specific zones. For least privilege, give your own token **specific zones** instead: the mail domain's
+specific zones. A tenant or partner key can use a zone through `cloudflare_zone` only when this
+deployment created it for that tenant or a platform key listed it in the tenant's policy
+`domains.cloudflare_zones`; the zones of your mail domain, API host and console host are refused to every
+key but a platform key ([Identities and domains › Zone permission](project/design/identity-domains.md#zone-permission)).
+For least privilege, give your own token **specific zones** instead: the mail domain's
 zone, the API host's zone, the console host's zone, and each tenant zone you will add with
 `--local-token` (add a zone to the token before you add its domain).
 
@@ -185,7 +189,7 @@ and run the same command again. It finds what already exists and creates only wh
 | Ownership record | TXT `_pylota-mail.agents.example` | `pm-verify=…`, the proof that this deployment controls the domain |
 | Email Sending | On the platform domain | Onboarded. Cloudflare adds MX and SPF records on `cf-bounce.agents.example`, DKIM at `cf-bounce._domainkey.agents.example` and DMARC at `_dmarc.agents.example` |
 | Event subscription | Platform domain → `pm-delivery-events` | Delivery, bounce, complaint and other Email Sending events |
-| Rate-limit namespaces | `RL_API`, `RL_SEARCH`, `RL_AGENTIC`, `RL_SEND`, `RL_SIGNIN`, `RL_SIGN` | Six bindings, with namespace IDs from 1001 that no other Worker in the account uses |
+| Rate-limit namespaces | `RL_API`, `RL_SEARCH`, `RL_AGENTIC`, `RL_SEND`, `RL_SIGNIN`, `RL_SIGN`, `RL_PARTNER` | Seven bindings, with namespace IDs from 1001 that no other Worker in the account uses |
 | Worker secrets | `PM_MASTER_KEY`, `PM_KEY_PEPPER`, `PM_HASH_KEY` | 32 random bytes each, one purpose each. The keys that sign thread tokens, links, search cursors and Web Bot Auth requests, and each identity's signing keys, are generated later by the Worker itself and kept sealed in D1. See [Configuration › Secrets](reference/configuration.md#secrets) |
 | Worker | `pylota-mail` | Its six Durable Object classes (`IdentityMailbox`, `DomainMonitor`, `JobRunner`, `TenantQuota`, `SesControl`, `Notifier`), its cron triggers and the API host's Custom Domain (two, with `--console-host`) |
 | Temporary platform key | `setup-bootstrap`, in your CLI profile | Expires after 24 hours. Replace it in [step 5](#5-create-the-first-api-key) |

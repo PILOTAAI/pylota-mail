@@ -47,7 +47,9 @@ partner and gives it a **partner key**. With it the partner creates tenants and 
 identities, domains, keys, webhooks and mail. It reaches only the tenants its own keys created, never
 another customer's ([FR-KEY-4](project/prd.md#61-tenancy-and-access)). Its tenants get the partner's
 billing mode, which only the operator can change. A partner's own webhook endpoints receive the events
-of its tenants and nobody else's.
+of its tenants and nobody else's. The operator bounds a partner: at most `max_tenants` tenants (25 by
+default), limits it can lower but not raise, and suspension, which stops the partner's keys and its
+tenants' keys at once while their mail keeps arriving.
 
 Reference: [REST API › Partners](reference/api.md#partners).
 

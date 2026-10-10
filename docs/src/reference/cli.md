@@ -703,6 +703,9 @@ pmail tenants update <tenant> [--name <name>] [--timezone <iana>] [--policy-file
 
 `--policy-file` and `--policy` deep-merge into the tenant's policy; `null` resets a field to its default.
 `quarantine.key_release` can be set only with a platform key or the partner key of the tenant's partner.
+With a partner key, each policy field is checked by its class: a platform-only field, or a lower-only field
+above its ceiling, is refused with `403 scope_denied` (exit 4) and the field named in `details.field`
+([Configuration › Who may change a field](configuration.md#who-may-change-a-field)).
 
 ```bash
 pmail tenants update acme --policy '{"search":{"agentic_daily_cap":200}}'
@@ -711,7 +714,8 @@ pmail tenants update acme --policy '{"quarantine":{"key_release":true}}'
 
 ### `tenants suspend` and `tenants resume`
 
-Suspends a tenant (sends are refused with `tenant_suspended`; inbound mail is deferred) or resumes it.
+Suspends a tenant (sends are refused with `tenant_suspended`; inbound mail is deferred) or resumes it. A
+partner key cannot resume a tenant that a platform key suspended (`403 scope_denied`, exit 4).
 
 ```bash
 pmail tenants suspend acme
@@ -728,11 +732,15 @@ only on them ([API › Partners](api.md#partners)). A partner key cannot run the
 ### `partners create`
 
 ```text
-pmail partners create --name <name> [--default-billing-mode exempt|metered]
+pmail partners create --name <name> [--default-billing-mode exempt|metered] [--max-tenants <n>]
+                      [--ramp-exempt true|false]
 ```
 
-`--default-billing-mode` (default `metered`) is the billing mode of every tenant the partner's keys
-create.
+| Flag | Meaning |
+|---|---|
+| `--default-billing-mode` | Default `metered`. The billing mode of every tenant the partner's keys create |
+| `--max-tenants` | Default 25. The most tenants that are not erased the partner may have; the next `tenants create` with its key gets `403 partner_tenant_limit` (exit 4) |
+| `--ramp-exempt` | Default `false`. `true` lets the partner's new tenants skip the new-workspace send ramp, which they otherwise follow whatever their billing mode |
 
 ```bash
 pmail partners create --name Pylota --default-billing-mode exempt
@@ -741,7 +749,7 @@ pmail partners create --name Pylota --default-billing-mode exempt
 ### `partners list`
 
 ```text
-pmail partners list [--status active|suspended] [--limit <n>] [--all]
+pmail partners list [--status active|suspended|deleted] [--limit <n>] [--all]
 ```
 
 ### `partners get`
@@ -754,11 +762,14 @@ pmail partners get ptn_01JA2B3C4D5E6F7G8H9J0K1M2N
 
 ```text
 pmail partners update <partner_id> [--name <name>] [--status active|suspended]
-                      [--default-billing-mode exempt|metered]
+                      [--default-billing-mode exempt|metered] [--max-tenants <n>] [--ramp-exempt true|false]
 ```
 
-`--status suspended` refuses every key of the partner at once (`403 partner_suspended`); its tenants keep
-working. A new `--default-billing-mode` applies only to tenants created afterwards.
+`--status suspended` contains the partner at once: every key of the partner and every API key of its
+tenants gets `403 partner_suspended`, and deliveries to its and its tenants' webhook endpoints are held
+until `--status active`; the tenants' inbound mail is still stored. A new `--default-billing-mode`
+applies only to tenants created afterwards. Lowering `--max-tenants` below the current count refuses new
+tenants and changes no existing one.
 
 ```bash
 pmail partners update ptn_01JA2B3C4D5E6F7G8H9J0K1M2N --status suspended
@@ -766,8 +777,9 @@ pmail partners update ptn_01JA2B3C4D5E6F7G8H9J0K1M2N --status suspended
 
 ### `partners delete`
 
-Deletes the partner, its partner keys and its partner webhook endpoints. Asks for confirmation unless
-`--yes`. While any of its tenants is not erased the API answers `409 partner_has_tenants` (exit 6): erase
+Soft-deletes the partner: it stays, with status `deleted` and an empty name, and its partner keys and
+partner webhook endpoints are deleted. Its erased tenants keep their `partner_id`. Asks for confirmation
+unless `--yes`. While any of its tenants is not erased the API answers `409 partner_has_tenants` (exit 6): erase
 those tenants first with [`erasure create`](#erasure-create) and `--scope tenant`.
 
 ```bash
@@ -839,7 +851,8 @@ pmail identities update bookings.acme@agents.example \
 
 ### `identities pause` and `identities resume`
 
-A paused identity cannot send. Resuming an identity paused for abuse needs a tenant, partner or platform key.
+A paused identity cannot send. Resuming an identity paused for abuse needs a tenant, partner or platform key,
+and only a platform key on a tenant a partner's key created (`403 scope_denied`, exit 4).
 
 ```bash
 pmail identities pause bookings@acme.example.com

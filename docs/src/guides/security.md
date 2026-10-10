@@ -57,6 +57,22 @@ Never give `quarantine:review`, `erasure:manage`, `keys:manage`, `suppressions:m
 `tenants:manage` to an agent. Never give any mailbox permission to a public or customer-facing agent
 ([F2](../project/edge-cases.md)).
 
+### What a partner key cannot change
+
+A partner key manages its own tenants, but the deployment's operator keeps the last word
+([Security › Partner keys](../project/design/security.md#partner-keys)):
+
+- it can lower its tenants' send caps, abuse thresholds, retention and AI switches but never raise them
+  above the deployment default or a value the operator set, and it cannot set `web_bot_auth.allowed`,
+  `domains.allow_create_zone` or `domains.cloudflare_zones`
+  ([Configuration › Who may change a field](../reference/configuration.md#who-may-change-a-field));
+- it cannot lift a suspension the operator made, or resume an identity paused for abuse;
+- it has at most `max_tenants` tenants (25 by default), creates tenants and invitations at most 10 a
+  minute, and its new tenants follow the send ramp unless the operator exempts the partner;
+- when the operator suspends the partner, its keys and every key of its tenants stop at once, and webhook
+  deliveries to it and its tenants are held until it is reactivated;
+- it cannot write to a tenant that is being erased; it can still read the tenant and its erasure receipt.
+
 ### How keys are stored and checked
 
 - A key looks like `pmk_live_<lookup>_<secret>`. The 12-character lookup finds the key record, and

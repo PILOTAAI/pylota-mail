@@ -52,8 +52,9 @@ pm-delivery-events ─▶ delivery consumer ─▶ ApplyDeliveryEvent ─▶ per
 5. **Fingerprint** (section below).
 6. **D1 context** in one `batch` (5-second deadline; `503 unavailable` on failure): the identity row
    (`status`, `pause_reason`, `owner_*`, `display_name`, `signature_*`, `send_policy_json`, `is_system`),
-   the tenant (`status`, `mode`, `policy_json`, `timezone`, `created_at`, `ramp_lifted_at`) with its
-   `billing_accounts` `mode` and `plan_id` (for the send ramp of step 18), all of the identity's addresses
+   the tenant (`status`, `mode`, `policy_json`, `timezone`, `created_at`, `ramp_lifted_at`,
+   `partner_id`) with its `billing_accounts` `mode` and `plan_id` and its partner's `ramp_exempt` (for the
+   send ramp of step 18), all of the identity's addresses
    with their domains (`state`, `kind`, `transport`, `reply_token`, `sending`), the platform domain, suppressions for every
    requested recipient (`address_hash IN (…)`), send-list entries for each recipient address and
    `@domain`, and, for a test tenant, the directory rows of the recipients (policy step 8).
@@ -124,16 +125,16 @@ alarm; an expired key behaves as new.
 | 6 | Recipients ([Recipients](#recipients)): each is a valid RFC 5321 address with an ASCII local part; duplicates removed case-insensitively; at least one | `400 address_invalid`; `400 address_unsupported` for a non-ASCII (SMTPUTF8) local part ([A3](../edge-cases.md)); `400 invalid_request` when there is no recipient |
 | 7 | Count across `to`, `cc`, `bcc` ≤ `policy.max_recipients` (default 10, at most 49: Cloudflare's limit is 50 and strategy B's journal copy takes one, so the limit is 49 on every transport) ([E3](../edge-cases.md)) | `400 too_many_recipients` |
 | 8 | Test tenant: every recipient is `*@simulator.invalid` or an `active`/`retiring` address on this deployment (FR-OUT-12, [L1](../edge-cases.md)) | `403 test_mode_recipient` |
-| 9 | `kind: marketing` has `unsubscribe.url` (HTTPS) and `consent` ([G9](../edge-cases.md), FR-OUT-8); and the sending address's domain has `transport` `ses` or `smtp`, because Cloudflare Email Service is for transactional mail only ([Cloudflare Email Service FAQ](https://developers.cloudflare.com/email-service/reference/faq/), read 2026-10-10) | `400 marketing_requirements_missing`; `422 transport_unavailable`, `details.reason = "marketing_needs_ses"` (the platform domain and every `cloudflare`-transport domain) |
+| 9 | `kind: marketing` has `unsubscribe.url` (HTTPS) and `consent` ([G9](../edge-cases.md), FR-OUT-8). Its transport is checked at step 15, once step 13 has resolved the sending address | `400 marketing_requirements_missing` |
 | 10 | `kind: auto_reply` only for reply or reply-all, to a message whose `kind` is `normal` or `calendar`, with `policy.auto_reply.allowed`, identity `send_policy.auto_reply` not `"denied"` (the default is `"allowed"`), and under the exchange cap ([D6](../edge-cases.md), FR-OUT-7) | `409 auto_reply_not_allowed` |
 | 11 | Custom headers ([Headers](#headers)) | `400 header_not_allowed` / `400 invalid_request` |
 | 12 | Content: `text` or `html` present; subject ≤ 998 characters; ≤ 32 attachments, valid base64, `content_id` on inline parts; labels and metadata within limits | `400 invalid_request` |
 | 13 | From address ([From](#from-address-and-fallback)): an `active` address of the identity, or `retiring` on a thread that already uses it ([G7](../edge-cases.md)) | `400 invalid_request` (`details.errors[0].path = "from_address"`) |
 | 14 | Sending domain: `pending` or `verifying` (or the address is `pending`) | `409 domain_not_ready` (retryable) |
-| 15 | Transport configured: `ses` without the SES secrets and region | `422 transport_unavailable`, `details.reason = "ses_not_configured"` |
+| 15 | Transport: `ses` configured (the SES secrets and region); and for `kind: marketing`, the domain of the From address resolved at step 13 has `transport` `ses` or `smtp`, because Cloudflare Email Service is for transactional mail only ([Cloudflare Email Service FAQ](https://developers.cloudflare.com/email-service/reference/faq/), read 2026-10-10). The platform domain and every `cloudflare`-transport domain fail this. `BeginTransport` checks it again with the transport actually chosen ([The outbound consumer](#the-outbound-consumer)) | `422 transport_unavailable`, `details.reason = "ses_not_configured"` or `"marketing_needs_ses"` |
 | 16 | Per recipient: suppression, send-block, `send_allowlist_only`, `require_known_recipient` ([Recipient filters](#recipient-filters)) | not an error: the recipient's delivery is `suppressed` (FR-OUT-4, [G4](../edge-cases.md), [E2](../edge-cases.md)) |
 | 17 | Size after composition ([Attachments and size](#attachments-and-size)) | `413 message_too_large`, unless `large_attachments: "link"` |
-| 18 | Plan allowance and daily caps, in one `TenantQuota` request and one transaction ([TenantQuota](#tenantquota)). First the **`sends` hold** (FR-BILL-4, FR-BILL-5): `units` = recipients left after step 16, `ref` = the new `msg_` ID, gate `storage_gb` when the message has attachments; a send whose recipients are all suppressed takes no hold. Then the **daily-cap reserve** (identity cap: `send_policy.daily_cap`, else `policy.identity_daily_send_cap`; tenant cap: `policy.tenant_daily_send_cap`), counted per accepted message in the tenant's time zone ([E3](../edge-cases.md)). The tenant cap is min(`policy.tenant_daily_send_cap`, 50) while the **new-workspace send ramp** applies: `PM_BILLING=stripe`, the workspace `metered` on the catalog's `default_plan`, and `tenants.ramp_lifted_at IS NULL` ([Cloud sign-up › New-workspace send ramp](cloud-signup.md#101-new-workspace-send-ramp), [W30](../edge-cases.md)). The **system identity** (`is_system = 1`) is exempt from the tenant cap: its reserve passes `tenant_cap: None`, so the tenant `sends` counter is neither checked nor incremented, and only its own `send_policy.daily_cap` (50,000) applies ([Identities and domains › The system identity](identity-domains.md#the-system-identity)). If either check fails, neither is kept | `402 billing_limit` (`details.feature` = `sends` or `storage_gb`); `429 daily_cap_reached`, `details.resets_at` |
+| 18 | Plan allowance and daily caps, in one `TenantQuota` request and one transaction ([TenantQuota](#tenantquota)). First the **`sends` hold** (FR-BILL-4, FR-BILL-5): `units` = recipients left after step 16, `ref` = the new `msg_` ID, gate `storage_gb` when the message has attachments; a send whose recipients are all suppressed takes no hold. Then the **daily-cap reserve** (identity cap: `send_policy.daily_cap`, else `policy.identity_daily_send_cap`; tenant cap: `policy.tenant_daily_send_cap`), counted per accepted message in the tenant's time zone ([E3](../edge-cases.md)). The tenant cap is min(`policy.tenant_daily_send_cap`, 50) while the **new-workspace send ramp** applies: `tenants.ramp_lifted_at IS NULL` and either the tenant has a partner whose `ramp_exempt` is `0` (whatever `PM_BILLING` and its billing mode), or it has no partner, `PM_BILLING=stripe` and the workspace is `metered` on the catalog's `default_plan` ([Cloud sign-up › New-workspace send ramp](cloud-signup.md#101-new-workspace-send-ramp), [W30](../edge-cases.md)). The **system identity** (`is_system = 1`) is exempt from the tenant cap: its reserve passes `tenant_cap: None`, so the tenant `sends` counter is neither checked nor incremented, and only its own `send_policy.daily_cap` (50,000) applies ([Identities and domains › The system identity](identity-domains.md#the-system-identity)). If either check fails, neither is kept | `402 billing_limit` (`details.feature` = `sends` or `storage_gb`); `429 daily_cap_reached`, `details.resets_at` |
 | 19 | Thread lock ([C4](../edge-cases.md), FR-OUT-9) | `409 thread_busy`, `details.retry_after` |
 
 The allowance is checked before the daily caps, so a request that would fail both gets the `402`, which
@@ -500,7 +501,12 @@ For `Send`:
      record `uncertain` with `transport_connection_lost` and ack;
    - otherwise write `claim:{msg} = {token, claimed_at}`, refresh the lock lease, set `alarm:claim` at
      `claimed_at + 5 min`, apply the From decision (fallback or `domain_failing_no_fallback`), and return
-     the `OutgoingMessage` inputs (the `.eml` key, `queued` recipients, From, Reply-To, transport).
+     the `OutgoingMessage` inputs (the `.eml` key, `queued` recipients, From, Reply-To, transport);
+   - after the From decision, a `kind: marketing` message whose transport is now `cloudflare` (the
+     domain's transport changed after submit, or fallback chose the platform domain) is not sent: in the
+     same transaction its `queued` deliveries and the message become `rejected` with reason
+     `marketing_needs_ses`, the lock is released and no claim is written; after the commit the `sends`
+     hold is settled with nothing consumed, `message.rejected` is emitted, and the consumer acks.
 3. **Build** the `OutgoingMessage` (structured fields parsed back from the stored `.eml` with the core
    parser, overridden by the fallback decision; attachments read from R2).
 4. **Send** through the chosen transport with a 30-second deadline (SMTP: the step timeouts and the
@@ -554,6 +560,7 @@ codes are from the SES v2 `SendEmail` reference (read 2026-10-09). SMTP rows fol
 | Cloudflare `E_INTERNAL_SERVER_ERROR` ("temporarily unavailable"), any unrecognised Cloudflare code, a thrown error without a code; SES 5xx; a connection error; SMTP connection lost after the final `.` was written and before its reply ([N15](../edge-cases.md)) | `uncertain` | `uncertain` | **never** | `message.uncertain` (`transport_connection_lost`) |
 | No answer within the 30-second deadline ([G2](../edge-cases.md)); SMTP: no reply to the final `.` within 60 s, or the overall deadline reached after the final `.` | `uncertain` | `uncertain` | **never** | `message.uncertain` (`transport_timeout`) |
 | Domain failing with fallback disabled | `failed` | `failed` | never | `message.failed` (`domain_failing_no_fallback`) |
+| `kind: marketing` on the `cloudflare` transport at `BeginTransport` (decided before any transport call) | `rejected` | `rejected` | never | `message.rejected` (`marketing_needs_ses`) |
 
 An error response from the provider that the table does not classify as definitive is treated as
 unknown: the design prefers an `uncertain` that a human or a later event resolves over a retry that could
@@ -809,7 +816,9 @@ WHERE id = ?1 AND status = 'active';
 
 and only when it changed a row: `EmitEvent identity.paused` with `reason: "abuse_threshold"` and
 `metrics: { complaints, complaint_window: 1000, bounces, bounce_window: 200 }`, and an `audit_log` row
-(`identity.auto_pause`). Resuming needs a platform, partner or tenant key ([API](../../reference/api.md#patch-v1identitiesidentity_id--identitieswrite)).
+(`identity.auto_pause`). Resuming needs a platform, partner or tenant key; on a tenant a partner's key
+created it needs a platform key, so a partner cannot reverse the platform's abuse control on its own
+tenants ([J17](../edge-cases.md), [API](../../reference/api.md#patch-v1identitiesidentity_id--identitieswrite)).
 
 **Tenant outcome counters.** `RecordOutcome` also increments `counters` rows of the tenant for the UTC
 day of `at`: `outcomes` for every outcome, and `bounced` or `complained` when the outcome is one of those.
@@ -1208,7 +1217,7 @@ Agent        API handler      IdentityMailbox     pm-outbound consumer   Cloudfl
 | `it::delivery::g6_hard_soft_complaint_late` | Hard bounce suppresses; soft bounce does not; complaint suppresses permanently; late bounce after delivered ([G6](../edge-cases.md), FR-DLV-1, FR-DLV-2) |
 | `it::send::g7_domain_states` | Retiring only on threads using it; pending `domain_not_ready`; failing falls back or fails ([G7](../edge-cases.md), FR-DOM-6) |
 | `it::delivery::g8_race` | An event before the provider ID is stored is retried every 30 s, then orphaned ([G8](../edge-cases.md)) |
-| `it::send::g9_marketing_requirements` | Marketing needs `unsubscribe` and `consent`; headers and visible link added; from a `cloudflare`-transport domain (the platform domain included) it is refused with `422 transport_unavailable` (`marketing_needs_ses`), and a failing domain never falls back for it ([G9](../edge-cases.md), FR-OUT-8) |
+| `it::send::g9_marketing_requirements` | Marketing needs `unsubscribe` and `consent`; headers and visible link added; from a `cloudflare`-transport domain (the platform domain included) it is refused with `422 transport_unavailable` (`marketing_needs_ses`) by step 15, with the address resolved at step 13; a marketing message accepted on an `ses` domain whose transport is changed to `cloudflare` before transport, or whose domain fails so that fallback would use the platform domain, ends `rejected` with `marketing_needs_ses` at `BeginTransport` and is never sent ([G9](../edge-cases.md), FR-OUT-8) |
 | `it::send::notification_list_unsubscribe` | A `usage`, `new_mail`, `needs_person` or `digest` notification from the system identity is `transactional` and carries `List-Unsubscribe` and `List-Unsubscribe-Post` (the `digest` token names the kind `digest`, and its one-click `POST` sets `usage`, `new_mail` and `needs_person` to `off`); an `account` notification carries neither; a REST send naming either header gets `400 header_not_allowed`; `list_unsubscribe` on any other identity is refused |
 | `it::send::header_rules` | `X-Booking-Ref`, `x-booking-ref` and the six allowed names pass in any case (`importance: high` is sent as `Importance: high`); `X-Bad Name`, `X-`, `Importance ` and the reserved `x-pylota-trace` and `x-ai-generated` get `400 header_not_allowed`; `Importance: urgent`, `priority: high` and `Sensitivity: secret` get `400 invalid_request` with the header's path, and so do `Importance` and `importance` in one request; nothing is stored, so no send ends `rejected` for a header |
 | `it::send::idempotency_key_pattern` | An empty key, a 256-byte key and a key with a byte outside 0x20–0x7E get `400 invalid_idempotency_key`; a 255-byte key with spaces is accepted |

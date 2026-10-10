@@ -58,6 +58,12 @@ A Cloudflare zone can have at most 30 mail domains (routing and sending together
   `CLOUDFLARE_API_TOKEN` ([CLI › Commands that use your Cloudflare token](../reference/cli.md#commands-that-use-your-cloudflare-token)).
   Subdomains, `nameservers` and `delegated_subdomain` always need the token on the deployment.
   `dns_records`, `send_only` and `smtp_relay` need no Cloudflare token.
+- With a tenant or partner key, `cloudflare_zone` (and `replace_mx` with it) works only on a zone that
+  this deployment created for your workspace with `nameservers` or `delegated_subdomain`, or one the
+  operator assigned to it (tenant policy `domains.cloudflare_zones`, which only a platform key sets).
+  Another workspace's zone and the zone of the deployment's own hosts are refused with
+  `403 scope_denied` and `details.reason: "zone_not_allowed"`, for `nameservers` and
+  `delegated_subdomain` too ([Identities and domains › Zone permission](../project/design/identity-domains.md#zone-permission)).
 - The records you publish are always read from the provider when you ask for them. Never copy records
   from this page or anywhere else ([FR-DOM-3](../project/prd.md#63-domains)).
 

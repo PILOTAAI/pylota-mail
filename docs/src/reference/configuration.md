@@ -35,6 +35,7 @@ There are three layers:
 | `RL_SEND` | Rate limiting | – | 120 per 60 s, keyed by identity ID |
 | `RL_SIGNIN` | Rate limiting | – | 10 per 60 s, keyed by client IP (`CF-Connecting-IP`). Applies to `POST /console/sign-in`, `/console/sign-in/link`, `/console/sign-in/code`, `/console/sign-up` and `/console/waitlist` ([Cloud sign-up](../project/design/cloud-signup.md#10-abuse-and-safety-on-cloud)) |
 | `RL_SIGN` | Rate limiting | – | 600 per 60 s, keyed by identity ID. Agent assertions and signed HTTP requests together ([Agent signing keys](../project/design/agent-keys.md#6-permissions-limits-and-plans)) |
+| `RL_PARTNER` | Rate limiting | – | 10 per 60 s, keyed by partner ID. `POST /v1/tenants` and `POST /v1/tenants/{tenant_id}/invitations` called with a partner key, across all of the partner's keys ([Security § 10](../project/design/security.md#10-rate-limiting-and-abuse)) |
 | `METRICS` | Analytics Engine dataset | `pylota_mail_metrics` | Metrics and alerts ([Observability](../project/design/observability.md#3-metrics)). Holds IDs and counts only |
 | `BACKUP` | R2 | the value of `PM_BACKUP_BUCKET` | Only when `PM_BACKUP_BUCKET` is set. Same jurisdiction as `BLOBS` |
 
@@ -59,8 +60,9 @@ Cron triggers:
   Retrying stuck sends, transport claims and uncertain-send bookkeeping run in each mailbox's own alarms,
   not in the cron.
 - `*/15 * * * *`: domain health scheduling, retention, usage roll-up, the master-key re-seal sweep, the
-  nightly backup job once per UTC day when `PM_BACKUP_BUCKET` is set, and, with `PM_BILLING=stripe`, the
-  new-workspace send-ramp evaluation once per UTC day (`crons/signup_ramp.rs`).
+  nightly backup job once per UTC day when `PM_BACKUP_BUCKET` is set, and the new-workspace send-ramp
+  evaluation once per UTC day (`crons/signup_ramp.rs`; it finds ramped Free workspaces with
+  `PM_BILLING=stripe`, and ramped tenants of partners on any deployment).
 
 ## Variables
 
@@ -161,11 +163,9 @@ OAuth flows and cursors fail). Then rotate `PM_MASTER_KEY`.
 Stored per tenant. `PATCH /v1/tenants/{tenant_id}` with `{ "policy": { … } }` deep-merges it; it needs
 `tenants:manage`, so a platform key changes any tenant's policy and a partner key the policy of the
 tenants its partner's keys created ([REST API › Partners](api.md#partners)). Tenant keys and the console
-cannot change it. A partner key may lower the abuse controls of its tenants but not raise them above the
-deployment's defaults: `identity_daily_send_cap`, `tenant_daily_send_cap`, `max_recipients`,
-`search.agentic_daily_cap` and the `abuse` thresholds (a higher threshold makes auto-pause more lenient).
-Raising one needs a platform key; a partner key gets `403 scope_denied` with `details.field`, so one
-partner cannot spend the shared sending reputation of a Cloud deployment. This is the full document with defaults:
+cannot change it. A partner key may change only some fields, and some only downwards
+([Who may change a field](#who-may-change-a-field)), so one partner cannot spend the shared sending
+reputation or the AI budget of a Cloud deployment. This is the full document with defaults:
 
 ```json
 {
@@ -216,7 +216,8 @@ partner cannot spend the shared sending reputation of a Cloud deployment. This i
     "bounce_rate_pause": 0.05
   },
   "domains": {
-    "allow_create_zone": false
+    "allow_create_zone": false,
+    "cloudflare_zones": []
   },
   "web_bot_auth": {
     "allowed": false
@@ -227,7 +228,7 @@ partner cannot spend the shared sending reputation of a Cloud deployment. This i
 
 | Field | Notes |
 |---|---|
-| `tenant_daily_send_cap` | With `PM_BILLING=stripe`, a new workspace on the Free plan has an effective cap of min(this value, 50) until `tenants.ramp_lifted_at` is set: for its first 7 days, then until the daily evaluation (the `*/15` cron's `crons/signup_ramp.rs`) finds its bounce and complaint rates under the `abuse` thresholds. A paid plan lifts it at once. The system identity is never counted against this cap ([Cloud sign-up › New-workspace send ramp](../project/design/cloud-signup.md#101-new-workspace-send-ramp)) |
+| `tenant_daily_send_cap` | With `PM_BILLING=stripe`, a new workspace on the Free plan has an effective cap of min(this value, 50) until `tenants.ramp_lifted_at` is set: for its first 7 days, then until the daily evaluation (the `*/15` cron's `crons/signup_ramp.rs`) finds its bounce and complaint rates under the `abuse` thresholds. A paid plan lifts it at once. A tenant a partner's key created follows the same ramp whatever `PM_BILLING` and its billing mode (`exempt` included), unless a platform key set the partner's `ramp_exempt`; an `exempt` tenant has no plan, so only the daily evaluation lifts it. The system identity is never counted against this cap ([Cloud sign-up › New-workspace send ramp](../project/design/cloud-signup.md#101-new-workspace-send-ramp)) |
 | `max_recipients` | 1–49. Cloudflare allows 50 recipients per message, and one is kept for the hidden journal copy of Message-ID strategy B ([Outbound design](../project/design/outbound.md#message-id-of-outbound-mail-spike-s7)) |
 | `large_attachments` | `refuse`, or `link` (expiring signed links, `link_ttl_hours` 1–168) |
 | `ai_disclosure.mode` | `none`, `footer` (appended to text and HTML) or `header` (`X-AI-Generated: true`) |
@@ -241,9 +242,50 @@ partner cannot spend the shared sending reputation of a Cloud deployment. This i
 | `triage.rules` | Deterministic rules. See [Triage](../guides/triage.md#rules) |
 | `search.refs_packs` | `core` (amounts, phones, emails, domains, dates, invoice and order numbers) and optional `uk_vehicle` (plates, PCNs). There is no built-in pack for booking references: add them with `custom_refs` |
 | `search.custom_refs` | Up to 20 `{ "name": "booking", "pattern": "BK-\\d{4,6}", "normalise": "upper" }`. Patterns use the `regex` crate syntax: linear time, no back-references, compiled size capped at 64 KB |
-| `domains.allow_create_zone` | Lets the tenant's own keys, and its partner key, use the `nameservers` method, which creates a Cloudflare zone. `false` by default; Pylota Mail Cloud sets it to `true`. Without it, the request gets `422 transport_unavailable` (`zone_creation_not_allowed`). Platform keys may always use it |
-| `web_bot_auth.allowed` | Lets the tenant's identities obtain signed HTTP requests (Web Bot Auth). `false` by default: a tenant must opt in, and until it does those requests get `403 policy_denied`. It has no effect while `PM_WEB_BOT_AUTH` is `off` ([Agent signing keys](../project/design/agent-keys.md#5-signed-http-requests-web-bot-auth)) |
+| `domains.allow_create_zone` | Lets the tenant's own keys, and its partner key, use the `nameservers` method, which creates a Cloudflare zone. `false` by default; Pylota Mail Cloud sets it to `true` in `PM_DEFAULT_POLICY`. Without it, the request gets `422 transport_unavailable` (`zone_creation_not_allowed`). Platform keys may always use it. Only a platform key can set it |
+| `domains.cloudflare_zones` | Zones of the deployment's Cloudflare account, by name (A-label apex, lower case, up to 50), that the tenant's own keys and its partner key may use with the `cloudflare_zone` method and with `replace_mx`, besides the zones this deployment created for the tenant (`nameservers`, `delegated_subdomain`). A listed zone grants names strictly under it; its apex and `replace_mx` there stay platform-only. `[]` by default. A zone created for another tenant, or one under the zones of `PM_PLATFORM_DOMAIN`, `PM_API_HOST` or `PM_CONSOLE_HOST`, is refused even when listed (`403 scope_denied`, `details.reason = "zone_not_allowed"`). Platform keys may use any zone. Only a platform key can set it ([Identities and domains › Zone permission](../project/design/identity-domains.md#zone-permission)) |
+| `web_bot_auth.allowed` | Lets the tenant's identities obtain signed HTTP requests (Web Bot Auth). `false` by default, and until it is `true` those requests get `403 policy_denied`. Only a platform key can set it: a tenant or partner key cannot turn it on. It has no effect while `PM_WEB_BOT_AUTH` is `off` ([Agent signing keys](../project/design/agent-keys.md#5-signed-http-requests-web-bot-auth)) |
 | `domain_fallback` | `false` fails sends on a failing domain instead of using the platform address |
+
+### Who may change a field
+
+Every policy write is checked against this table: the `policy` of `POST /v1/tenants` and of
+`PATCH /v1/tenants/{tenant_id}`. Only the fields present in the write are compared; one refused field
+refuses the whole write and nothing is stored. Platform keys may set every field. Tenant keys, identity
+keys and the console cannot write the policy at all (`PATCH /v1/tenants/{tenant_id}` needs
+`tenants:manage`).
+
+| Class | Fields | A partner key |
+|---|---|---|
+| Platform-only | `web_bot_auth.allowed`, `domains.allow_create_zone`, `domains.cloudflare_zones` | `403 scope_denied` with `details.field` |
+| Platform or own partner | `quarantine.key_release` | May set it on the tenants of its own partner, at creation and later |
+| Lower-only | `identity_daily_send_cap`, `tenant_daily_send_cap`, `max_recipients`, `auto_reply.allowed`, `auto_reply.max_automatic_exchanges`, `inbound.per_sender_per_hour`, `inbound.extract_image_text`, `retention.raw_days`, `retention.events_days`, `triage.enabled`, `search.agentic_enabled`, `search.agentic_daily_cap`, `search.agentic_max_steps`, `search.agentic_max_seconds`, `abuse.complaint_rate_pause`, `abuse.bounce_rate_pause` | May set a value at or below the field's ceiling; above it, `403 scope_denied` with `details.field` |
+| Free | Every other field: `send_allowlist_only`, `large_attachments`, `link_ttl_hours`, `ai_disclosure`, `quarantine.on_auth_fail`, `quarantine.spam_threshold`, `quarantine.unsolicited_otp`, `inbound.extract_attachment_text`, `inbound.ses_bounce_retired`, `retention.message_days`, `triage.categories`, `triage.rules`, `search.refs_packs`, `search.custom_refs`, `webhook_text_bytes`, `domain_fallback` | May set any valid value |
+
+- **Ceiling.** A lower-only field's ceiling is the more restrictive of the deployment default (the
+  built-in defaults above merged with `PM_DEFAULT_POLICY`) and the tenant's platform ceiling, the value a
+  platform key last set on that field, at creation or by `PATCH` (kept in `tenants.policy_ceilings_json`):
+  min(deployment default, platform ceiling). A platform key's `null` for the field removes its platform
+  ceiling. A higher number is always the looser value, the `abuse` thresholds included (a higher rate
+  makes auto-pause more lenient), and so are longer retention, more steps or seconds, and more automatic
+  exchanges.
+- **Switches.** For `auto_reply.allowed`, `inbound.extract_image_text`, `triage.enabled` and
+  `search.agentic_enabled`, `true` is the looser value (it sends more mail or spends Workers AI). A
+  partner key may always set `false`, and `true` only when the deployment default and the platform
+  ceiling (if any) are both `true`.
+- **`null` from a partner key** on a lower-only field resets it to the deployment default, so it is
+  compared as that value: refused when a platform ceiling is lower.
+- Ceilings are checked when a value is written. Changing `PM_DEFAULT_POLICY` later does not rewrite
+  stored values; a platform key that wants a tenant lower sets the field.
+- **An identity's `send_policy.daily_cap`** (`POST …/identities`, `PATCH /v1/identities/{identity_id}`)
+  may not exceed the tenant's effective `identity_daily_send_cap` for any key but a platform key
+  (`403 scope_denied`, `details.field = "send_policy.daily_cap"`), so a lower-only cap cannot be raised
+  one identity at a time.
+- **`quarantine.on_auth_fail: false`** is free, but it removes a guarantee: mail whose authentication
+  verdict is `fail` or `unverified` is then stored as `received` and evented to agents with that verdict,
+  instead of being quarantined (rules 3 and 3a of
+  [Inbound › Quarantine decision](../project/design/inbound.md#quarantine-decision)). A partner that turns
+  it off accepts that its agents must check `verdict` themselves.
 
 ## CLI configuration
 

@@ -73,6 +73,8 @@ Applies to domains connected with `smtp_relay`.
 | Agentic search per key | 20 per minute. Tenant daily cap 500 by default |
 | Sends per identity | 120 per minute. Daily caps from policy |
 | Signing per identity (`RL_SIGN`): agent assertions and signed HTTP requests together | 600 per minute. Not counted against any plan allowance |
+| Tenant creation and invitations per partner (`RL_PARTNER`) | 10 per minute together, across all of the partner's keys |
+| Tenants per partner | `max_tenants` tenants that are not erased: 25 by default, set by the operator (`403 partner_tenant_limit`) |
 | Rate-limit headers | Every authenticated response carries `RateLimit-Limit` (the bucket's limit per period). A `429` also carries `Retry-After` and `RateLimit-Reset`, the seconds to the end of the bucket's current period (for `rate_limited` the two are equal; other `429` codes set `Retry-After` to their own wait). No `RateLimit-Remaining`: the rate-limiting binding answers only allow or deny |
 | Page size | 25 by default, 100 maximum |
 | Search `limit` | 10 by default, 50 maximum |

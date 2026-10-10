@@ -500,8 +500,9 @@ pub trait MailSender {
 }
 
 // Rate limiting (bindings RL_*) ---------------------------------------------------------
-#[derive(Clone, Copy)] pub enum RlBucket { Api, Search, Agentic, Send, SignIn, Sign }
+#[derive(Clone, Copy)] pub enum RlBucket { Api, Search, Agentic, Send, SignIn, Sign, Partner }
 // SignIn: RL_SIGNIN, keyed by client IP. Sign: RL_SIGN, keyed by identity ID (assertions and HTTP signatures)
+// Partner: RL_PARTNER, keyed by partner ID (tenant creation and invitations by partner keys)
 pub trait RateLimiter { async fn allow(&self, bucket: RlBucket, key: &str) -> PResult<bool>; }
 
 // DNS over HTTPS ------------------------------------------------------------------------
@@ -875,6 +876,10 @@ simple = { limit = 10, period = 60 }
 name = "RL_SIGN"                               # keyed by identity ID; assertions and HTTP signatures
 namespace_id = "{1006}"
 simple = { limit = 600, period = 60 }
+[[ratelimits]]
+name = "RL_PARTNER"                            # keyed by partner ID; tenant creation and invitations
+namespace_id = "{1007}"                        # by partner keys (Security § 10)
+simple = { limit = 10, period = 60 }
 
 [triggers]
 crons = ["* * * * *", "*/15 * * * *"]

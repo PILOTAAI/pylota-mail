@@ -414,7 +414,8 @@ An identity is **paused automatically** with reason `abuse_threshold` when its c
 `abuse.bounce_rate_pause`). It keeps receiving mail. An `identity.paused` event carries the metrics.
 Find out why the rates rose (a stale address list, an agent writing to strangers) before resuming:
 setting `status: "active"` on an identity paused for abuse needs a platform, partner or tenant key and is
-audit-logged.
+audit-logged. On a workspace a partner created, only the deployment's operator (a platform key) can resume
+it.
 
 ## When a domain fails
 

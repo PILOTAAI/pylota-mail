@@ -429,7 +429,7 @@ Each step prints `created`, `exists`, `updated` or `skipped` with the resource a
 | 7 | Email Routing on the mail domain | `GET /zones/{z}/email/routing`; if not enabled, delete foreign MX records when `--replace-mx` was accepted, then `POST /zones/{z}/email/routing/dns` `{"name": "{mail_domain}"}` (adds and locks the MX and SPF records); then `PATCH /zones/{z}/email/routing` `{"support_subaddress": true}` if it is not already `true` | Read first; each call only when the setting differs |
 | 8 | Ownership record | `GET /zones/{z}/dns_records?type=TXT&name.exact=_pylota-mail.{mail_domain}`; if absent, `POST /zones/{z}/dns_records` `{"type":"TXT","name":"_pylota-mail.{mail_domain}","content":"pm-verify={token}","ttl":1}` ([Identities, addresses and domains](identity-domains.md), step 4) | An existing `pm-verify=` value is reused as the token |
 | 9 | Email Sending on the mail domain | `GET /zones/{z}/email/sending/subdomains`; if no entry has `name == mail_domain`, `POST /zones/{z}/email/sending/subdomains` `{"name": "{mail_domain}"}`; then `PATCH /zones/{z}/email/sending/subdomains/{tag}` `{"drop_suppressed_recipients": false, "preview_enabled": false}` when either differs ([Outbound › G4](outbound.md#provider-suppressions-and-resending-g4), [Privacy](privacy.md#3-jurisdiction-and-residency)) | Found by name. Whether an apex is onboarded through this endpoint, and whether both fields are accepted by `PATCH`, are verified by spike S9; the fallback is the dashboard step printed by `doctor` |
-| 10 | Rate-limit namespace IDs | No call when `deploy/wrangler.toml` already holds an ID for each of the six bindings (`RL_API`, `RL_SEARCH`, `RL_AGENTIC`, `RL_SEND`, `RL_SIGNIN`, `RL_SIGN`). Otherwise list the account's scripts (`GET /accounts/{a}/workers/scripts`) and read each script's bindings (`GET /accounts/{a}/workers/scripts/{name}/settings`; verify at build time), collect every `ratelimit` binding's `namespace_id`, and pick the smallest unused integers from 1001 for the bindings that have none | Kept across re-runs through the rendered file ([Rust workspace §8](rust-workspace.md#8-generated-wranglertoml)); a file from an older release that lacks `RL_SIGNIN` or `RL_SIGN` gets one new ID for each missing binding |
+| 10 | Rate-limit namespace IDs | No call when `deploy/wrangler.toml` already holds an ID for each of the seven bindings (`RL_API`, `RL_SEARCH`, `RL_AGENTIC`, `RL_SEND`, `RL_SIGNIN`, `RL_SIGN`, `RL_PARTNER`). Otherwise list the account's scripts (`GET /accounts/{a}/workers/scripts`) and read each script's bindings (`GET /accounts/{a}/workers/scripts/{name}/settings`; verify at build time), collect every `ratelimit` binding's `namespace_id`, and pick the smallest unused integers from 1001 for the bindings that have none | Kept across re-runs through the rendered file ([Rust workspace §8](rust-workspace.md#8-generated-wranglertoml)); a file from an older release that lacks `RL_SIGNIN`, `RL_SIGN` or `RL_PARTNER` gets one new ID for each missing binding |
 | 11 | Render `deploy/wrangler.toml` | none ([§7](#7-rendering-wranglertoml)) | Deterministic; a re-run with the same inputs writes the same bytes |
 | 12 | D1 migrations | `POST /accounts/{a}/d1/database/{id}/query` per migration ([§8.5](#85-d1-migrations)) | `schema_migrations` records each applied version |
 | 13 | First deploy | `npx --yes wrangler@4.139.0 deploy --config <dir>/wrangler.toml` from the bundle directory. Creates the Worker `pylota-mail`, its Durable Object classes, queue consumers, cron triggers and the Custom Domain (two when the console host differs) | Skipped when `/health` already reports this version and the rendered file is unchanged since the last deploy ([§8.9](#89-no-op-redeploys)) |
@@ -706,9 +706,11 @@ repository's template with `--from-source`). The output is the file in
    observability come from the template. They include the `Q_DELIVERY` producer (used only by
    `POST /v1/platform/dlq/{dlq_id}/redrive` to republish dead-lettered delivery events), the six Durable
    Object bindings including `NOTIFY` (class `Notifier`, [Notifications §8](notifications.md#8-notifier-object)),
-   the six rate-limit bindings including `RL_SIGNIN` (10 requests per 60 s per client IP,
-   [Cloud sign-up §10](cloud-signup.md#10-abuse-and-safety-on-cloud)) and `RL_SIGN` (600 signing calls
-   per 60 s per identity, [Agent signing keys §6](agent-keys.md#6-permissions-limits-and-plans)), a
+   the seven rate-limit bindings including `RL_SIGNIN` (10 requests per 60 s per client IP,
+   [Cloud sign-up §10](cloud-signup.md#10-abuse-and-safety-on-cloud)), `RL_SIGN` (600 signing calls
+   per 60 s per identity, [Agent signing keys §6](agent-keys.md#6-permissions-limits-and-plans)) and
+   `RL_PARTNER` (10 tenant creations and invitations per 60 s per partner,
+   [Security § 10](security.md#10-rate-limiting-and-abuse)), a
    second Custom Domain route when
    `PM_CONSOLE_HOST` differs from `PM_API_HOST`, and, when `PM_BACKUP_BUCKET` is set, the `BACKUP` R2
    binding in the deployment's jurisdiction. Edits to them are not preserved; the renderer prints a
@@ -1328,9 +1330,11 @@ answered · confidence 0.86 · 3 steps · 2.8 s
   ([Cloud sign-up §6.1](cloud-signup.md#61-before-launch-the-waitlist)).
 - **`partners create|list|get|update|delete`** call the five `/v1/partners` routes (platform key,
   `partners:manage`; [REST API › Partners](../../reference/api.md#partners)). `create` sends `name` and,
-  with `--default-billing-mode`, `default_billing_mode`; `update` sends only the flags given (`--name`,
-  `--status active|suspended`, `--default-billing-mode`) and prints a warning that suspending refuses
-  every key of the partner at once while its tenants keep working. `delete` asks for confirmation unless
+  when given, `default_billing_mode` (`--default-billing-mode`), `max_tenants` (`--max-tenants <n>`) and
+  `ramp_exempt` (`--ramp-exempt true|false`); `update` sends only the flags given (`--name`,
+  `--status active|suspended`, `--default-billing-mode`, `--max-tenants`, `--ramp-exempt`) and prints a
+  warning that suspending refuses every key of the partner and of its tenants at once and holds their
+  webhook deliveries, while their inbound mail is still stored. `delete` asks for confirmation unless
   `--yes`; `409 partner_has_tenants` is exit 6 and prints `details.tenants` with the fix (erase those
   tenants first). A partner key gets `403 permission_denied` on all five (exit 4).
 - **`keys create --level partner --partner <ptn_…>`** sends `level: "partner"` and `partner_id`, and no
@@ -1365,8 +1369,8 @@ is not set up for the method" to exit 3 (`config`) instead of the API's exit 7:
   CLI prints `details.reason` with its fix (`ses_not_configured` and `ses_receiving_not_configured`:
   `pmail setup ses`; `subdomain_setup_disabled`: `PM_CF_SUBDOMAIN_SETUP = "on"`;
   `zone_creation_not_allowed`: the tenant policy `domains.allow_create_zone`; `ses_identity_limit`:
-  raise the SES limit; `method_not_supported`: another method; `marketing_needs_ses`: send marketing from a
-  domain with the `ses` or `smtp` transport).
+  raise the SES limit; `method_not_supported`: another method). `marketing_needs_ses` is never returned
+  by a domain create (it is a send refusal), so `domains add` does not map it.
 - `422 cf_token_required`: the deployment has no `PM_CF_API_TOKEN`. The fix is "set `PM_CF_API_TOKEN` on
   the deployment (`wrangler secret put PM_CF_API_TOKEN`), or, for a zone apex, run again with
   `--local-token`".
@@ -1658,7 +1662,7 @@ have no command: they are set only in the console ([Notifications §2](notificat
 | `cli::setup::owner_email` | The default tenant is created with the owner; `--no-console` writes `PM_CONSOLE = "off"` | FR-CON-7 |
 | `cli::setup::billing_off` | Setup writes no `PM_BILLING`; the default tenant reports `billing: disabled` | FR-BILL-12 |
 | `cli::setup::secrets_never_written` | Generated secrets reach Wrangler only on stdin and appear in no file, argument or log unless `--print-secrets` | FR-OPS-1, [I5] |
-| `cli::setup::renders_optional_settings` | The rendered file has the `Q_DELIVERY` producer, the `NOTIFY` Durable Object binding (class `Notifier`), six rate-limit bindings including `RL_SIGNIN` and `RL_SIGN` (an older file gets an ID for each missing one), `PM_WEB_BOT_AUTH = "off"`, `PM_IDENTITY_KEY_OVERLAP_DAYS` and `PM_NOTIFICATIONS`, `PM_CONSOLE_HOST` (the API host, or `--console-host` with a second Custom Domain) and `PM_SIGNUP = "closed"`; `--daily-send-quota` writes `PM_DAILY_SEND_QUOTA`; `--backup-bucket` creates the bucket in the jurisdiction and binds it as `BACKUP` | FR-OPS-1, FR-CON-8 |
+| `cli::setup::renders_optional_settings` | The rendered file has the `Q_DELIVERY` producer, the `NOTIFY` Durable Object binding (class `Notifier`), seven rate-limit bindings including `RL_SIGNIN`, `RL_SIGN` and `RL_PARTNER` (an older file gets an ID for each missing one), `PM_WEB_BOT_AUTH = "off"`, `PM_IDENTITY_KEY_OVERLAP_DAYS` and `PM_NOTIFICATIONS`, `PM_CONSOLE_HOST` (the API host, or `--console-host` with a second Custom Domain) and `PM_SIGNUP = "closed"`; `--daily-send-quota` writes `PM_DAILY_SEND_QUOTA`; `--backup-bucket` creates the bucket in the jurisdiction and binds it as `BACKUP` | FR-OPS-1, FR-CON-8 |
 | `cli::setup::ses_idempotent_rerun` | Against a recorded AWS fake, every resource of §6.9 is created once and a second run reports `exists` for all and deploys nothing; an existing active rule set is never deactivated; both SNS topics end with `SignatureVersion = 2`; the HTTPS subscriptions come after the deploy | FR-DOM-8, FR-DOM-9 |
 | `cli::setup::ses_region_check` | A region that cannot receive is exit 2; a region outside the EU and the UK under `PM_JURISDICTION = "eu"` is exit 2 without `--allow-non-eu` and accepted with it, and `eu-west-2` (London) is accepted without it; no production access is exit 14 with the console steps and nothing created; Essentials prints a warning | FR-DOM-8, [N30] |
 | `cli::setup::ses_policy_and_key` | The IAM policy JSON is printed before it is applied and needs a confirmation or `--yes`; the access key reaches Wrangler only on stdin, appears in no file, argument, output or log, and is not created again when `PM_SES_ACCESS_KEY_ID` exists | FR-DOM-8, [I5] |
@@ -1690,7 +1694,7 @@ have no command: they are set only in the console ([Notifications §2](notificat
 | `cli::billing::plans_and_billing` | `plans list` sends no key; `billing set` sends only the flags given; `409 plan_managed_by_stripe` is exit 6 | FR-BILL-1 |
 | `cli::usage::daily` | `usage` reads `GET /v1/usage`; `usage daily` passes `from`, `to` and `tenant_id` to `GET /v1/usage/daily` and prints the `assertions` and `http_signatures` columns; a platform key without `--tenant` or a profile tenant sends no `tenant_id` (never the default tenant) and `400 invalid_request` is exit 7 | FR-BILL-11 |
 | `cli::keys::create_permissions_by_level` | `--level platform` without `--permissions` is exit 2 before any request, listing the allowed permissions; `identities:sign` on a platform key and a tenant-only permission on an identity key come back as `400 invalid_request` (`permission_not_allowed_for_level`), exit 7 | FR-KEY-2, FR-IDN-6 |
-| `cli::partners::lifecycle` | `partners create\|list\|get\|update\|delete` call their routes with only the flags given; `delete` needs confirmation or `--yes`, and `409 partner_has_tenants` is exit 6 with the count; `keys create --level partner --partner ptn_…` sends `level` and `partner_id` only, `--tenant` with it (or `--partner` with another level) is exit 2 before any request, and `403 key_scope_exceeded` for a partner key is exit 4; a partner key without `--tenant` or a profile tenant is exit 2 on a tenant-scoped command, never the default tenant; `webhooks create --partner` with a platform key is exit 2 | FR-KEY-4 |
+| `cli::partners::lifecycle` | `partners create\|list\|get\|update\|delete` call their routes with only the flags given (`--max-tenants` and `--ramp-exempt` included); `delete` needs confirmation or `--yes`, and `409 partner_has_tenants` is exit 6 with the count; `keys create --level partner --partner ptn_…` sends `level` and `partner_id` only, `--tenant` with it (or `--partner` with another level) is exit 2 before any request, and `403 key_scope_exceeded` for a partner key is exit 4; a partner key without `--tenant` or a profile tenant is exit 2 on a tenant-scoped command, never the default tenant; `webhooks create --partner` with a platform key is exit 2 | FR-KEY-4 |
 | `cli::identity_keys::lifecycle` | `list`, `create` (`201` and `200` both exit 0), `rotate` (with and without a previous key) and `revoke` (confirmation or `--yes`; unknown kid exit 5; already retired exit 0) call their endpoints and never print key material | FR-IDN-6, [O2], [O3] |
 | `cli::assertions::create_and_verify` | `create` sends no `Idempotency-Key` and `--quiet` prints only the token; `verify` accepts a fresh token against the workerd harness with no API key, and exits 11 for a wrong audience, another issuer, an expired token, an unknown kid, `alg: none` and a paused identity (JWKS `404`); a JWKS network failure is exit 9; the JWKS URL is built from `--issuer`, never from the token | FR-IDN-7, [O1], [O4], [O5] |
 | `cli::http_sign::headers_and_errors` | Prints the four headers as `Name: value` lines in order, or the response with `--json`; `--component` adds only `@method`, `@path` or `@query`; `422 web_bot_auth_disabled` is exit 7 and `403 policy_denied` exit 4 | FR-IDN-8, [O9], [O13] |

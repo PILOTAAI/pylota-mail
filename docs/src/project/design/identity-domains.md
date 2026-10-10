@@ -29,7 +29,7 @@ Items the documentation does not confirm are marked "verify at build time" with 
 | `active` | `PATCH status: paused` | `identities:write` | `pause_reason = 'manual'`; `identity.paused` | `paused` |
 | `active` | Abuse threshold ([Outbound](outbound.md#abuse-auto-pause-fr-dlv-3)) | – | `pause_reason = 'abuse_threshold'`; `identity.paused` with `metrics` | `paused` |
 | `active` | Tenant suspended | – | `pause_reason = 'tenant_suspended'`; `identity.paused` | `paused` |
-| `paused` | `PATCH status: active` | reason `manual`: `identities:write`; reason `abuse_threshold`: platform, partner or tenant key, audit-logged; reason `tenant_suspended`: refused (`409 identity_paused`) | `pause_reason = NULL`; `identity.resumed` | `active` |
+| `paused` | `PATCH status: active` | reason `manual`: `identities:write`; reason `abuse_threshold`: platform, partner or tenant key, audit-logged, and only a platform key on a tenant a partner's key created ([J17](../edge-cases.md)); reason `tenant_suspended`: refused (`409 identity_paused`) | `pause_reason = NULL`; `identity.resumed` | `active` |
 | `paused` (`tenant_suspended`) | Tenant resumed | – | `identity.resumed` | `active` |
 | `active`, `paused` | `DELETE` | `identities:write` and `erasure:manage` | Tombstone and remove every address; create the identity-scope erasure ([Privacy](privacy.md)) | `deleting` |
 | `deleting` | Erasure completed with no holds left | – | `identity.deleted`, once, from the erasure job's outbox with `identity_id` set ([Privacy § 6.5](privacy.md#65-identity-scope-fr-idn-4)) | `deleted` |
@@ -94,7 +94,11 @@ normal outbound pipeline.
 
 1. Validate the body: `username` ([Username validation](#username-validation)), `display_name` (1–78
    characters, Unicode allowed, no CR or LF), `owner.email` (RFC 5321), `signature.html` (sanitised with
-   the inbound policy before storage), `metadata` (≤ 16 keys, ≤ 512 bytes per value).
+   the inbound policy before storage), `metadata` (≤ 16 keys, ≤ 512 bytes per value). For any key but a
+   platform key, `send_policy.daily_cap` may not exceed the tenant's effective
+   `identity_daily_send_cap` (`403 scope_denied`, `details.field = "send_policy.daily_cap"`); the same
+   check runs on `PATCH /v1/identities/{identity_id}`
+   ([Configuration › Who may change a field](../../reference/configuration.md#who-may-change-a-field)).
 2. **`client_id`** (FR-IDN-1): `client_fingerprint = hex(sha256(canonical_json(body)))` (canonical JSON as
    in [Outbound](outbound.md#idempotency-fingerprint)).
    `SELECT id, client_fingerprint FROM identities WHERE tenant_id = ?1 AND client_id = ?2` decides
@@ -119,8 +123,9 @@ normal outbound pipeline.
 
 `PATCH /v1/identities/{id}` updates D1, then sends `MailboxRequest::EmitEvent` with `identity.updated`
 (`changed` = field names), `identity.paused` or `identity.resumed`. Suspending a tenant
-(`PATCH /v1/tenants/{id}` with `status: suspended`) sets `tenants.suspended_at` and, in the same D1
-batch, pauses every `active` identity with `pause_reason = 'tenant_suspended'`; resuming reverses only
+(`PATCH /v1/tenants/{id}` with `status: suspended`) sets `tenants.suspended_at` and `suspended_by`
+(`platform` or `partner`, from the calling key's level; a partner key cannot resume a tenant whose
+`suspended_by` is `platform`, `403 scope_denied`) and, in the same D1 batch, pauses every `active` identity with `pause_reason = 'tenant_suspended'`; resuming reverses only
 those. Each identity then gets its event.
 
 ### Delete (FR-IDN-4, A13)
@@ -345,7 +350,7 @@ The request names a `method`. When it is absent, the old `kind` is mapped (`zone
 | `method` | Onboarding | The deployment needs (refusal without it) |
 |---|---|---|
 | `cloudflare_zone` | [Kind `zone`](#kind-zone) | `PM_CF_API_TOKEN` (`422 cf_token_required`) |
-| `nameservers` | [Creating a zone](#creating-a-zone), then [Kind `zone`](#kind-zone) at the apex | `PM_CF_API_TOKEN` that can create zones (`422 cf_token_required`); for a tenant key, the policy `domains.allow_create_zone: true` (`422 transport_unavailable`, `details.reason = "zone_creation_not_allowed"`) |
+| `nameservers` | [Creating a zone](#creating-a-zone), then [Kind `zone`](#kind-zone) at the apex | `PM_CF_API_TOKEN` that can create zones (`422 cf_token_required`); for a tenant or partner key, the policy `domains.allow_create_zone: true` (`422 transport_unavailable`, `details.reason = "zone_creation_not_allowed"`) |
 | `delegated_subdomain` | [Domains on any DNS host §3.3](domain-connections.md#33-delegated_subdomain) | `PM_CF_API_TOKEN` (`422 cf_token_required`) and `PM_CF_SUBDOMAIN_SETUP=on` (`422 transport_unavailable`, `subdomain_setup_disabled`) |
 | `dns_records` | [§4.3](domain-connections.md#43-dns_records) | SES with receiving (`422 transport_unavailable`, `ses_not_configured` or `ses_receiving_not_configured`) |
 | `send_only` | [Kind `external`](#kind-external) and [§4.4](domain-connections.md#44-send_only) | SES (`422 transport_unavailable`, `ses_not_configured`) |
@@ -376,6 +381,44 @@ records and the SES endpoint hosts of `ses_region`
 ([§4.1](domain-connections.md#41-what-each-method-asks-the-customer-to-publish)). `GET …/records`
 re-reads them; they are never copied from documentation or templates.
 
+#### Zone permission
+
+`cloudflare_zone`, `nameservers` and `delegated_subdomain` work inside the deployment's own Cloudflare
+account, which holds every tenant's zones and the zones of the deployment's own hosts. A tenant or
+partner key may therefore use only zones its tenant is entitled to ([H8](../edge-cases.md)). Platform
+keys skip this check. Two sources grant a zone to a tenant:
+
+- **Claimed zones.** `zone_claims` ([Data model](data-model.md#1-d1-control-plane)) records each zone
+  this deployment created for a tenant (`nameservers`, `delegated_subdomain`): the row is inserted in the
+  D1 batch that inserts the domain row, and `zone_name` is unique, so a zone is claimed by one tenant at
+  most. The claim is deleted by the `delete_zone` step of [Domain removal](#domain-removal) and when the
+  zone expires (`zone_expired`, [Creating a zone](#creating-a-zone) step 5), together with the zone.
+- **Listed zones.** The tenant's policy `domains.cloudflare_zones`, an array of zone names that only a
+  platform key can write ([Configuration › Who may change a field](../../reference/configuration.md#who-may-change-a-field)),
+  for zones of the account that an operator assigns to the tenant.
+
+The check runs in two places, both before anything is written, and refuses with `403 scope_denied`,
+`details.reason = "zone_not_allowed"`:
+
+1. **By name, before any Cloudflare call.** Let the *deployment zones* be the registrable domains (public
+   suffix list) of `PM_PLATFORM_DOMAIN`, `PM_API_HOST` and `PM_CONSOLE_HOST`. The name is refused when it
+   equals or is under a deployment zone, or under a zone another tenant claimed. For `cloudflare_zone`
+   (and with it `replace_mx`, which deletes MX records only inside that zone), the name must also equal or
+   be under a zone this tenant claimed or a zone in its `domains.cloudflare_zones`. A listed zone grants
+   names strictly under it: its apex, and `replace_mx` there, stay platform-only, so listing an operator's
+   zone (for example `pylota.io`, to allow `notify.pylota.io`) never hands over that zone's own mail.
+   `nameservers` and
+   `delegated_subdomain` create their own zone and need no grant, only the two refusals.
+2. **On the zone found** ([Kind `zone`](#kind-zone) step 1, which takes the most specific zone of the
+   account containing the name). The found zone must be claimed by this tenant (`zone_claims.zone_id`
+   with its `tenant_id`), or listed in its `domains.cloudflare_zones` by name and claimed by no other
+   tenant. A zone claimed by another tenant is refused even when the policy lists it, so a listed parent
+   zone never reaches a more specific zone another tenant owns.
+
+Both refusals have the same body, whether or not a zone of that name exists in the account, so the
+answer does not reveal other tenants' zones. `pmail domains add --local-token` runs with the operator's
+own Cloudflare token and inserts the row itself; it is a platform operation and not checked.
+
 #### Kind `zone`
 
 The `cloudflare_zone` method. Needs `PM_CF_API_TOKEN` (`422 cf_token_required` without it, as above) and
@@ -384,7 +427,9 @@ The `cloudflare_zone` method. Needs `PM_CF_API_TOKEN` (`422 cf_token_required` w
 1. **Find the zone.** List zones by name for the account, trying the domain and then each parent label
    up to the registrable domain (`GET /zones?name={name}`; verify the query parameters at build time).
    Not found: `404 domain_not_found`. The `nameservers` method creates the zone instead
-   ([Creating a zone](#creating-a-zone)).
+   ([Creating a zone](#creating-a-zone)). For a tenant or partner key, the found zone then passes the
+   second [zone permission](#zone-permission) check, or the request gets `403 scope_denied`
+   (`zone_not_allowed`) before anything is changed.
 2. **Existing mail at an apex ([H5](../edge-cases.md)).** Query MX at the apex on both DoH resolvers. If
    it has MX records other than the hosts Email Routing expects (taken from step 6, never hard-coded) and
    the request lacks `"replace_mx": true`, refuse with `409 existing_mx` and a fix saying that existing
@@ -489,14 +534,18 @@ may always use it; tenant and partner keys only when the tenant's policy has `do
    `details.retry_after` of 10800 seconds ([N22](../edge-cases.md)); a zone hold becomes `409 zone_hold`.
 3. The zone is created in a pending state and the response's `name_servers` are returned in `records` as
    `NS` records (`purpose: "ns"`) to set at the registrar. `expected_ns_json` is set to `name_servers`.
+   The D1 batch that inserts the domain row also inserts its `zone_claims` row (zone ID, zone name, the
+   tenant, the domain), so no other tenant can use the zone through `cloudflare_zone`
+   ([Zone permission](#zone-permission)). The first [zone permission](#zone-permission) check ran before
+   step 1.
 4. Steps 2–8 of [Kind `zone`](#kind-zone) run once the zone is active: the monitor polls the zone
    (`GET /zones/{zone_id}`, `status = "active"`; verify the field at build time) on each check while the
    domain is `pending`, and runs onboarding then, at the apex (catch-all). `confirm_dedicated` stands in
    for `replace_mx` at step 2, because the user has already accepted that existing mail stops.
 5. **Expiry ([N23](../edge-cases.md)).** Cloudflare deletes a Free-plan zone that is not activated within
    28 days. The monitor sends a final `domain.reminder` at day 21. If the zone disappears, the domain
-   moves to `removed` with `state_reason = zone_expired` and `domain.removed` carries
-   `reason: "zone_expired"`; the user can add it again.
+   moves to `removed` with `state_reason = zone_expired`, its `zone_claims` row is deleted, and
+   `domain.removed` carries `reason: "zone_expired"`; the user can add it again.
 
 #### Kind `external`
 
@@ -754,8 +803,8 @@ idempotent:
    the rule entries only use capacity.
 8. `delete_ownership_record` (zone, delegated): delete the `_pylota-mail` TXT.
 9. `delete_zone` (`nameservers`, `delegated_subdomain`): `DELETE /zones/{zone_id}`, because this
-   deployment created the zone for a domain used only for mail. A zone found through `cloudflare_zone`
-   belongs to the account owner and is never deleted.
+   deployment created the zone for a domain used only for mail, then delete its `zone_claims` row. A zone
+   found through `cloudflare_zone` belongs to the account owner and is never deleted.
 10. `finish`: `UPDATE domains SET state = 'removed', smtp_sealed = NULL, smtp_pending_sealed = NULL,
     updated_at = ?` and emit `domain.removed` (`reason: requested`).
 
@@ -822,6 +871,7 @@ forwarded).
 | `core::dns::h3_strict_alignment` | `adkim=s`/`aspf=s` against Cloudflare and SES signing domains ([H3](../edge-cases.md)) |
 | `it::domains::h4_ownership_change` | NS move, ownership TXT removed, RDAP change → `suspended`; reprove → `verifying` ([H4](../edge-cases.md)) |
 | `it::domains::h5_existing_mx` | Apex with existing MX refused without `replace_mx` ([H5](../edge-cases.md)) |
+| `it::domains::h8_zone_permission` | With the Cloudflare fake holding a zone claimed by tenant B, a zone listed in tenant A's `domains.cloudflare_zones`, an unlisted zone, and the zone of `PM_PLATFORM_DOMAIN`: a tenant key and a partner key of tenant A get `403 scope_denied` (`zone_not_allowed`, the same body for an existing and a missing zone) for `cloudflare_zone` on B's zone (also when A's policy lists it, and for a name under a listed parent zone that resolves to B's zone), on the unlisted zone, and with `replace_mx` on any of them, and for `nameservers` or `delegated_subdomain` under the platform zone or B's zone; nothing is written and no MX record is deleted; the listed zone and a zone created for A by `nameservers` are accepted; the `zone_claims` row is written with the domain and deleted by `delete_zone` and by `zone_expired`; a platform key may use every zone; a partner key cannot set `domains.cloudflare_zones` (`403 scope_denied`); with `domains.cloudflare_zones: ["pylota.io"]` listed, a tenant key adds `notify.pylota.io`, but adding the `pylota.io` apex, or `replace_mx` there, gets `403 scope_denied` (`zone_not_allowed`) ([H8](../edge-cases.md)) |
 | `it::domains::h6_rule_failure` | Literal rule creation fails → address stays `pending` with `routing_rule_failed`, retried, activated only with its rule ([H6](../edge-cases.md)) |
 | `core::domain_fsm::h7_resolver_disagreement` | One resolver erroring or disagreeing never changes state; two consecutive agreeing cycles do ([H7](../edge-cases.md), FR-DOM-4) |
 | `core::domain_fsm::transition_table` | Every row of the state machine table, including 14 days in `failing` and reminders at 24 h, 72 h and 7 days |

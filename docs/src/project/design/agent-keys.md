@@ -296,7 +296,7 @@ published again.
 | `PM_WEB_BOT_AUTH` | `off` | `on` publishes the directory and allows signed HTTP requests (after S13 passes) |
 | `PM_IDENTITY_KEY_OVERLAP_DAYS` | `7` | How long a retiring identity key stays published |
 | Binding `RL_SIGN` | 600 per 60 s | Keyed by identity ID |
-| Tenant policy `web_bot_auth.allowed` | `false` | A tenant must opt in before its identities can sign HTTP requests |
+| Tenant policy `web_bot_auth.allowed` | `false` | A tenant must be opted in, by a platform key (the field is platform-only), before its identities can sign HTTP requests |
 
 ## 10. Security and privacy
 

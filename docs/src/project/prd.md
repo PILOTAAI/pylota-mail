@@ -172,7 +172,9 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
 - **FR-KEY-1** API keys **must** be scoped at one of four levels: `platform`, `partner`, `tenant` or `identity`.
   Each key holds a list of permissions. A key can never create a key wider than itself.
 - **FR-KEY-2** Key secrets **must** be shown once, stored only as a keyed hash, support expiry, and
-  support rotation with an overlap window.
+  support rotation with an overlap window. No stored record, an idempotency record included, **may** hold
+  a secret: an idempotent replay of a response that carried one returns it without the secret
+  (`"secret_replayed": false`).
 - **FR-KEY-3** Tenant and identity scope **must** come from the authenticated key, never from the request body.
 - **FR-KEY-4** A deployment **must** support **partners**: integrators that run their own customers as
   tenants of a shared deployment (Pylota on Pylota Mail Cloud). A platform key creates, suspends and
@@ -180,9 +182,14 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
   act on them as a platform key does, and on nothing else: a tenant created by another partner or by no
   partner, and everything in it, **must** answer it as a missing one does. It **must never** mint a partner
   or platform key, hold `platform:ops`, `partners:manage` or `identities:sign`, or change a tenant's
-  billing mode, which comes from the partner's `default_billing_mode`. A partner's webhook endpoints
-  **must** receive only its own tenants' events. A suspended partner's keys **must** be refused while its
-  tenants keep working, and a partner **must not** be deletable while it has a tenant that is not erased
+  billing mode, which comes from the partner's `default_billing_mode`. A partner key **must not** raise its
+  tenants' limits above the deployment default or the platform's value (lower-only policy fields),
+  set a platform-only policy field, lift a platform suspension or resume an abuse pause, and a partner
+  **must** be bounded by `max_tenants` and a tenant-creation rate. A partner's webhook endpoints **must**
+  receive only its own tenants' events. A suspended partner **must** be contained: its keys and its
+  tenants' API keys refused and deliveries to its and its tenants' endpoints held, while inbound mail is
+  still stored. A partner **must not** be deletable while it has a tenant that is not erased, and deletion
+  **must** keep the row (soft delete), so a tenant's `partner_id` never changes
   ([REST API › Partners](../reference/api.md#partners), [Security › Partner keys](design/security.md#partner-keys)).
 
 ### 6.2 Identities and addresses

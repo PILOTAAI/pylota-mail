@@ -667,9 +667,13 @@ Every runbook ends by recording what was done in the incident log and checking t
 3. **Remediate.** Rotate integrator secrets that may have been read through the key (webhook secrets
    with `rotate-secret`). Cancel queued sends made by the key (`POST …/cancel`). If the key was a
    platform key, review every tenant; if it was a partner key, review its partner's tenants
-   (`GET /v1/tenants?partner_id=`), and to stop every key of that partner at once, suspend the partner
-   (`PATCH /v1/partners/{partner_id}` with `status: suspended`, a platform key), which leaves its tenants'
-   mail running. For `rpc_owner_mismatch`, treat it as a possible isolation bug:
+   (`GET /v1/tenants?partner_id=`), and to contain the partner at once, suspend it
+   (`PATCH /v1/partners/{partner_id}` with `status: suspended`, a platform key): every key of the partner
+   and every API key of its tenants then gets `403 partner_suspended`, so nothing sends for those tenants,
+   their inbound mail is still stored, and deliveries to the partner's and its tenants' endpoints are held
+   until it is `active` again ([J13](../edge-cases.md)). Before reactivating, rotate the partner's keys
+   and check its endpoints' URLs, because held deliveries go out on reactivation. For
+   `rpc_owner_mismatch`, treat it as a possible isolation bug:
    capture the logged IDs and open a private security advisory.
 4. **Verify.** Requests with the old key return `401 key_revoked`.
 
@@ -678,7 +682,7 @@ Every runbook ends by recording what was done in the incident log and checking t
 1. **Diagnose.** `identity.paused` with `reason: abuse_threshold` carries the complaint and bounce
    metrics. Review recent outbound messages and recipients.
 2. **Mitigate.** Keep the identity paused (inbound continues). Resume only with a tenant, partner or platform key
-   after the cause is fixed (`PATCH … {"status": "active"}`, audit-logged). For a whole tenant,
+   (only a platform key on a tenant a partner's key created, [J17](../edge-cases.md)) after the cause is fixed (`PATCH … {"status": "active"}`, audit-logged). For a whole tenant,
    suspend it. For `mailbox_size` (above 70% of 10 GB), set `retention.message_days` for the tenant or
    split traffic across identities; raw MIME and attachments are already in R2.
 3. **Verify.** Rates stay below the thresholds for a week after resuming.

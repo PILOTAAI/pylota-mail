@@ -317,13 +317,27 @@ idempotency for non-mail POSTs, and the thread and link keyring (`signing_keys`,
 [Security](design/security.md#62-rotation-procedures)).
 
 **Partners and partner keys** (FR-KEY-4) land here with the other key levels: the `partners` table and
-the `partner_id` columns of `tenants`, `api_keys` and `webhook_endpoints` (all in `0001_init.sql`); the
-five `/v1/partners` routes; `level: "partner"` in `POST /v1/keys`; the partner checks of authentication
-(`403 partner_suspended`) and of the owner check ([Security › Partner keys](design/security.md#partner-keys));
-`POST /v1/tenants` with a partner key (its `partner_id` and `default_billing_mode`); and the
-`foreign_partner` class of the cross-tenant suite. Partner endpoints (`POST /v1/webhooks` with a partner
-key, and their scoped delivery) land with the webhook routes in M8, and `quarantine.key_release` with the
-release route in M7.
+the `partner_id` columns of `tenants`, `api_keys` and `webhook_endpoints`, `tenants.suspended_by` and
+`policy_ceilings_json`, `partners.max_tenants` and `ramp_exempt`, `zone_claims` and
+`event_index.partner_id` (all in `0001_init.sql`); the five `/v1/partners` routes, with the soft delete;
+`level: "partner"` in `POST /v1/keys`; the partner checks of authentication (`403 partner_suspended` for
+the partner's keys and for its tenants' keys) and of the owner check, which compares only a partner key's
+own `partner_id` with a tenant's, so a `NULL` never matches
+([Security › Partner keys](design/security.md#partner-keys)); `POST /v1/tenants` with a partner key (its
+`partner_id`, `default_billing_mode`, `max_tenants` and `RL_PARTNER`, `RlBucket::Partner`); the
+per-field policy classes and platform ceilings of
+[Configuration › Who may change a field](../reference/configuration.md#who-may-change-a-field);
+`suspended_by`; the frozen `erasing` and `erased` tenant for non-platform writes; idempotency records
+keyed by the calling key, with one-time secrets stripped; and the `foreign_partner` class of the
+cross-tenant suite. Partner endpoints (`POST /v1/webhooks` with a partner key, and their scoped delivery)
+land with the webhook routes in M8, and `quarantine.key_release` with the release route in M7.
+
+**The cross-tenant matrix grows with each route family.** J10's matrix (`it::security::cross_tenant_matrix`
+with its `foreign_partner` class, and `it::partners::j10_foreign_partner_not_found`) starts here with the
+tenant, partner and key routes. Each milestone that adds a route family extends both in the same pull
+request: M6 the identity and address routes, M7 the message, thread and quarantine routes, M8 the webhook
+endpoint routes, and M13 the domain routes, with M13 also adding the `foreign_zone` case
+([H8](edge-cases.md)).
 
 **Tenants without owner or billing behaviour.** `POST /v1/tenants` accepts `owner` and `billing` as
 [REST API](../reference/api.md) specifies, validates them, and stores them: the owner's `users` and
@@ -367,11 +381,18 @@ well-formed answer. Later milestones replace behaviour, never a signature:
 - `/health`, `/v1/me`, `/openapi.json` and `/.well-known/security.txt` are served (the last as
   [Security](design/security.md) specifies, from `PM_SECURITY_CONTACT`).
 - J6 (`it::keys::j6_revoke_rotate`, above).
-- Partners (FR-KEY-4): `it::partners::routes_and_audit`; `it::partners::policy_caps_lower_only`; J10 (`it::partners::j10_foreign_partner_not_found`,
-  and the `foreign_partner` class of `it::security::cross_tenant_matrix`); J11
-  (`it::keys::j11_partner_key_limits`); J13 (`it::partners::j13_suspended_partner`); a partner key's
-  requests counted in `RL_API` by key ID (`it::auth::rate_limited`). `DELETE /v1/partners/{partner_id}`
-  ships here with its `409 partner_has_tenants`; J12 is accepted in M14, because its test erases the
+- Partners (FR-KEY-4): `it::partners::routes_and_audit`; `it::partners::policy_caps_lower_only` (its
+  `send_policy.daily_cap` cases are added in M6 with the identity routes); J10
+  (`it::partners::j10_foreign_partner_not_found`, and the `foreign_partner` class of
+  `it::security::cross_tenant_matrix`, for this milestone's routes); J11
+  (`it::keys::j11_partner_key_limits`); J18 (`it::partners::j18_partner_limits`: `max_tenants` and
+  `RL_PARTNER`); a partner key's requests counted in `RL_API` by key ID (`it::auth::rate_limited`). The
+  authentication part of J13 runs here (`it::partners::j13_suspended_partner`: partner and tenant keys
+  refused with `403 partner_suspended`); J13 is accepted in M9, once inbound storage (M7), held deliveries
+  (M8) and the send path (M9) exist. The `suspended_by` and ceiling parts of J17 run here too; J17 is
+  accepted in M9 with its abuse-pause part. The key part of J19 (`POST /v1/keys` and key rotation) runs
+  here; J19 is accepted in M8 with the webhook secrets. `DELETE /v1/partners/{partner_id}` ships here with
+  its `409 partner_has_tenants` and soft delete; J12 is accepted in M14, because its test erases the
   partner's tenant first.
 - NFR-SEC-1: the cross-tenant suite (`it::security::cross_tenant_matrix`), with its `foreign_partner`
   class, finds 0 cross-tenant reads or writes. Every later milestone extends it with its routes, and it
@@ -410,7 +431,9 @@ stub that accepts `JobRequest::Start` and runs no step, so the job stays `queued
 `deleting`. M14 replaces the stub with the real `JobRunner`, whose every-minute restart of jobs left
 `queued` picks these up.
 
-**Acceptance:** A5, A12, J9, plus `identity.created`, `identity.updated`,
+**Acceptance:** A5, A12, J9, the identity and address routes added to J10's matrix
+(`it::security::cross_tenant_matrix`, `it::partners::j10_foreign_partner_not_found`), the
+`send_policy.daily_cap` cases of `it::partners::policy_caps_lower_only`, plus `identity.created`, `identity.updated`,
 `identity.paused` and `identity.resumed` events that reach the outbox, `event_index` and a `pm-webhooks`
 message (consumed once M8 lands); a crash between commit and dispatch repeats the dispatch, never loses
 it. The system identity is never listed and refuses tenant keys. The pause itself
@@ -435,7 +458,8 @@ rule 5 (E5) depends on its registrations.
 
 **Acceptance:** A2, A6 (`it::inbound::a6_reject_codes`; its SES part in M23), A9, A10 (inbound part), A13, B1 (documented), B3, B12, B14, C1, D4, D5, D9, D10,
 E4 (`it::wait::e4_*`), E5, J1, J2, J7, J14 (`it::quarantine::j14_key_release_policy`), J16
-(`it::quarantine::j16_key_release_override`), and every `conf::` corpus case ingested end to end through workerd.
+(`it::quarantine::j16_key_release_override`), the message, thread and quarantine routes added to J10's
+matrix, and every `conf::` corpus case ingested end to end through workerd.
 Rows whose inbound side needs a later milestone are accepted there: C7 (it matches replies to outbound
 mail), D7 (suppressions and lists) and loopback L3 in M9, and C3 (a retiring address) and A4's role-mail
 routing (it sends a new message and needs a tenant domain) in M13.
@@ -468,8 +492,14 @@ temporarily failed mail.
 - Auto-disable on `410` and on 100 consecutive failures.
 - J15: partner endpoints receive only their partner's tenants' events, by fan-out and by replay, and
   `webhook.disabled` for a partner endpoint reaches that partner's other endpoints and platform endpoints
-  (`it::webhooks::j15_partner_scope_filter`). M8 also adds the endpoint cases (another partner's endpoint
-  by ID) to `it::partners::j10_foreign_partner_not_found`.
+  (`it::webhooks::j15_partner_scope_filter`), with replay selecting on `event_index.partner_id` and never
+  replaying `webhook.test` (`it::webhooks::replay_by_ids_and_window`). M8 also adds the endpoint routes to
+  J10's matrix (another partner's endpoint by ID, in `it::partners::j10_foreign_partner_not_found` and
+  `it::security::cross_tenant_matrix`).
+- J19 (`it::idempotency::j19_per_key_no_secret`): replays are per key, and a replay of key creation and
+  rotation, webhook creation and webhook secret rotation returns no secret (`"secret_replayed": false`).
+- The delivery hold of J13 (`it::webhooks::j13_held_while_partner_suspended`): deliveries to a suspended
+  partner's endpoints and its tenants' endpoints are held and resume on reactivation.
 - NFR-REL-4: the retry schedule reaches 24 hours within its 13 attempts, and `webhook_delivery_latency_ms`
   and `webhook_dead_total` are emitted for the SLI.
 - `webhook_endpoints.secret_enc` and `prev_secret_enc` are registered in `crates/core/src/sealed.rs`
@@ -493,7 +523,11 @@ lazily and reconciliation is event-driven, so neither has an alarm; no cron is i
 **Implements:** FR-OUT-1–12, FR-DLV-1–5, NFR-PERF-1/2.
 
 **Acceptance:** A7, A8, A10, C2, C4, C6, C7, D6 (exchange cap), D7, E2, E3, E8, G1–G6, G8–G11 (G5 with
-signed links), K3, L1–L4. G3's `it::ops::provider_quota_80` fires through M17 Foundation's evaluator,
+signed links; G9's re-check of the marketing transport at `BeginTransport`), K3, L1–L4. J13
+(`it::partners::j13_suspended_partner`, whose authentication part runs from M5): no send is accepted for
+a suspended partner's tenants, their inbound mail is stored, and with M8's held deliveries the row is
+accepted here. J17 (`it::partners::j17_operator_enforcement`): with the abuse auto-pause, resuming an
+identity paused for `abuse_threshold` on a partner's tenant needs a platform key. G3's `it::ops::provider_quota_80` fires through M17 Foundation's evaluator,
 which merges first. G7 needs domain states and is accepted in M13. Also: the allow and block lists
 (`it::lists::entries_crud`) and their effect on sends and on inbound mail (`it::send::list_filters`,
 `it::inbound::receive_allow_skips_spam`; D7 covers receive-block), the custom-header rules checked at the
@@ -573,7 +607,11 @@ CLI `pmail domains subscribe`. The other connection methods, `nameservers` inclu
 **Acceptance:**
 
 - H1, H2 (`core::dns::h2_spf_lookup_count`; its MAIL FROM part, `it::ses::h2_mail_from_spf_preflight`,
-  is for `dns_records` and `send_only` domains and is accepted in M23), H3–H7, G7, C3, A11, A14, A4's
+  is for `dns_records` and `send_only` domains and is accepted in M23), H3–H7, H8
+  (`it::domains::h8_zone_permission` for `cloudflare_zone`, `replace_mx` and the listed zones of
+  `domains.cloudflare_zones`; the `zone_claims` written by `nameservers` and `delegated_subdomain`, and the
+  refusal of those methods under a claimed or deployment zone, are added in M23), the domain routes added
+  to J10's matrix with the `foreign_zone` case of `it::security::cross_tenant_matrix`, G7, C3, A11, A14, A4's
   role-mail routing (`it::inbound::a4_role_mail_routing`), the promote,
   retire and rollback flows
   (`it::addresses::promote_retire_rollback`, `it::addresses::retirement_cron`), and the API part of J5
@@ -623,7 +661,9 @@ migration (the `domains` method columns, `ses_ingest`, `addresses.ses_bounce_rul
   `kind`, `inbound` and `transport`, and invalid combinations are refused.
 - The `nameservers` and `delegated_subdomain` parts of M13's domain tests:
   `it::domains::onboarding_idempotent_created_zones`, `it::domains::s9_manual_delivery_events_nameservers`
-  and `it::domains::cf_token_required_other_methods`.
+  and `it::domains::cf_token_required_other_methods`, and the claimed-zone part of H8
+  (`it::domains::h8_zone_permission`: `zone_claims` written with the domain row, deleted by `delete_zone`
+  and on `zone_expired`, and the refusal of a name under a deployment or another tenant's zone).
 - `pmail setup ses` is idempotent: it runs twice against a recorded AWS API fake with no duplicate
   resources, never deactivates an existing active rule set, and prints the IAM policy before applying it.
 - Every new error code and `transport_unavailable` reason in the design is returned by at least one test.
@@ -659,8 +699,11 @@ also needs S11; without it, `smtp_relay` ships with `inbound: forward` only. `cl
 **Acceptance:** F6, I1–I7, the `reparse` job that J3 starts (J3 itself is accepted with M17 Completion,
 which adds its start through `POST /v1/platform/jobs`), plus every erasure scope with receipt counts and
 empty probes (identity and tenant scope also delete `identity_keys` and write `key_tombstones`; with M25
-this is O7), J12 (a partner whose tenants are all erased can be deleted, and not before:
-`it::partners::j12_delete_with_tenants`), the optional backup copy (`it::retention::backup_copy`), and
+this is O7), J12 (a partner whose tenants are all erased can be deleted, softly, and not before:
+`it::partners::j12_delete_with_tenants`), I8 (writes to an `erasing` or `erased` tenant refused for
+non-platform keys, reads kept for its partner key, a second tenant-scope erasure answered `200` or
+`409 tenant_erased`, and the tenant's idempotency records deleted by `tenant_id`:
+`it::erasure::i8_erasing_tenant_frozen`), the optional backup copy (`it::retention::backup_copy`), and
 `it::logs::i5_no_content_in_logs`, which greps captured Worker logs for any test-message body string and
 any test address. NFR-PRV-1: in a time-controlled harness every erasure scope completes within 24 hours,
 and a step that keeps failing still produces a receipt (`it::erasure::step_retry_and_fail`). Tenant scope
@@ -883,6 +926,7 @@ deletion (`console/pages/settings.rs` and the person step of `jobs/erasure.rs`).
 
 - Edge rows W20–W34, with the tests named in the register (`it::oauth::*`, `it::signup::*`, `it::totp::*`,
   `it::landing::routing_table`, `it::checkout::*`, `it::abuse::free_ramp`, `it::abuse::ramp_evaluator`,
+  `it::abuse::partner_ramp` (W30's partner part: a partner's tenants are ramped unless `ramp_exempt`),
   `it::console::delete_account_owner_required`).
 - Erasure extension: person deletion ([Privacy §6.9](design/privacy.md#69-people-console-accounts)) is
   owned here. That covers account deletion at `/console/settings`, the person-rows stub of tenant

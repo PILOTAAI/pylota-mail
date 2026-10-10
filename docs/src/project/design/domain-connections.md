@@ -63,7 +63,15 @@ This table is in the [Custom domains guide](../../guides/custom-domains.md) in t
 
 ### 3.1 `cloudflare_zone`
 
-Unchanged: [Identities, addresses and domains › Kind `zone`](identity-domains.md#kind-zone).
+[Identities, addresses and domains › Kind `zone`](identity-domains.md#kind-zone). The zone is found in
+the deployment's own Cloudflare account, which also holds other tenants' zones and the zones of the
+deployment's hosts, so a tenant or partner key may use only a zone created for its tenant by `nameservers`
+or `delegated_subdomain` (`zone_claims`) or one listed in its platform-only policy
+`domains.cloudflare_zones`. A name under the zone of `PM_PLATFORM_DOMAIN`, `PM_API_HOST` or
+`PM_CONSOLE_HOST` is refused, and so is `replace_mx` on any zone the tenant may not use:
+`403 scope_denied`, `details.reason = "zone_not_allowed"`
+([Zone permission](identity-domains.md#zone-permission), [H8](../edge-cases.md)). Platform keys may use
+any zone.
 
 ### 3.2 `nameservers`
 
@@ -73,7 +81,10 @@ made safe for domains that are not empty.
 1. **Who may use it.** Platform keys always. Tenant and partner keys only when the tenant's policy has
    `domains.allow_create_zone: true`; otherwise `422 transport_unavailable` with
    `details.reason = "zone_creation_not_allowed"`. The default is `false` for self-hosted deployments, and
-   Pylota Mail Cloud sets it to `true`.
+   Pylota Mail Cloud sets it to `true`. For those keys the name must not be under the zone of
+   `PM_PLATFORM_DOMAIN`, `PM_API_HOST` or `PM_CONSOLE_HOST`, nor under a zone created for another tenant
+   (`403 scope_denied`, `details.reason = "zone_not_allowed"`,
+   [Zone permission](identity-domains.md#zone-permission)).
 2. **Dedicated-domain check ([N21](../edge-cases.md)).** Moving nameservers hands the whole domain to this
    deployment, which only manages mail records. Before creating the zone, the Worker queries both DoH
    resolvers for `A`, `AAAA` and `MX` at the name and for `CNAME`, `A` and `AAAA` at `www.{name}`. If any exist and the
@@ -86,11 +97,14 @@ made safe for domains that are not empty.
    read 2026-10-09) ([N22](../edge-cases.md)).
 4. **NS records.** The returned `name_servers` are the only records the customer sets: at their
    registrar, not at a DNS host. The domain is `pending`, with reminders at 24 hours, 72 hours and 7 days.
+   The zone is recorded in `zone_claims` for the tenant with the domain row, so it can never be used by
+   another tenant.
 5. **Expiry ([N23](../edge-cases.md)).** A Free-plan zone that is not activated within 28 days is deleted
    by Cloudflare ([domain status](https://developers.cloudflare.com/dns/zone-setups/reference/domain-status/),
    read 2026-10-09). At day 21 the monitor sends a final `domain.reminder`. If the zone disappears, the
-   domain moves to `removed` with `state_reason = zone_expired`, and `domain.removed` carries
-   `reason: "zone_expired"` (a removal the user asked for carries `"requested"`). The user can add it again.
+   domain moves to `removed` with `state_reason = zone_expired`, its `zone_claims` row is deleted, and
+   `domain.removed` carries `reason: "zone_expired"` (a removal the user asked for carries `"requested"`).
+   The user can add it again.
 6. Once the zone is active, onboarding continues as `cloudflare_zone` at an apex (catch-all).
    `confirm_dedicated: true` also stands for `replace_mx: true` there, because the user has already
    accepted that existing mail on the domain stops.
@@ -112,7 +126,10 @@ Routing catch-all and Email Sending work on a child zone; no Cloudflare page say
 1. `POST /zones` with `"type": "full"` and the subdomain as the name, for example
    `agents.brightwell.example`. The child zone may live in a different account from the parent
    ([parent on full](https://developers.cloudflare.com/dns/zone-setups/subdomain-setup/setup/parent-on-full/),
-   read 2026-10-09).
+   read 2026-10-09). For a tenant or partner key, the subdomain must not be under a deployment host's zone
+   or another tenant's claimed zone (`403 scope_denied`, `zone_not_allowed`); the new child zone is
+   recorded in `zone_claims` for the tenant with the domain row
+   ([Zone permission](identity-domains.md#zone-permission)).
 2. The records shown are the zone's `name_servers` as `NS` records for the subdomain, which the customer
    adds at their DNS host. No TXT is needed for a full child zone.
 3. A zone hold on the customer's own Cloudflare account may block creation. Whether a hold reaches other
@@ -605,6 +622,11 @@ New error codes:
 | 422 | `smtp_tls_required` | The relay does not offer STARTTLS on 587 (or TLS on 465); credentials were not sent |
 | 422 | `smtp_auth_failed` | The relay answered `535` to `AUTH`. Also a domain health issue |
 
+`scope_denied` (403) gains `details.reason = "zone_not_allowed"`: a tenant or partner key named a zone
+its tenant may not use with `cloudflare_zone` or `replace_mx`, or a `nameservers` or
+`delegated_subdomain` name under a deployment host's zone or another tenant's zone
+([Zone permission](identity-domains.md#zone-permission)).
+
 `transport_unavailable` (422) gains `details.reason`:
 
 | `reason` | When |
@@ -615,7 +637,7 @@ New error codes:
 | `subdomain_setup_disabled` | `delegated_subdomain` while `PM_CF_SUBDOMAIN_SETUP` is not `on` |
 | `zone_creation_not_allowed` | `nameservers` by a tenant or partner key whose tenant's policy lacks `domains.allow_create_zone: true` |
 | `method_not_supported` | The method does not support the operation: `PATCH transport` to a transport the method cannot use; `probe` when the transport is not `smtp`; `test-forwarding` without `inbound: forward` |
-| `marketing_needs_ses` | A `kind: marketing` send from a domain whose transport is `cloudflare`, the platform domain included ([Outbound › Pipeline](outbound.md), step 9): Cloudflare Email Service is for transactional mail only |
+| `marketing_needs_ses` | A `kind: marketing` send from a domain whose transport is `cloudflare`, the platform domain included ([Outbound › Policy pipeline](outbound.md#policy-pipeline), step 15, with the From address resolved at step 13): Cloudflare Email Service is for transactional mail only. A message accepted before its domain moved to `cloudflare` (or that would fall back to the platform domain) ends `rejected` with the send-failure reason `marketing_needs_ses` at transport time |
 
 ## 9. Configuration
 

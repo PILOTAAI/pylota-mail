@@ -326,18 +326,27 @@ Stripe redirects to `/console/plan/return?session_id={CHECKOUT_SESSION_ID}`.
 
 ### 10.1 New-workspace send ramp
 
-The ramp limits what a new Free workspace can send before it has a sending history ([W30](../edge-cases.md)).
+The ramp limits what a new Free workspace, or a new tenant of a partner, can send before it has a
+sending history ([W30](../edge-cases.md)).
 
-- **When it applies.** `PM_BILLING=stripe`, the workspace is `metered` on the catalog's `default_plan`
-  (Free), and `tenants.ramp_lifted_at IS NULL`. That is every new Free workspace for its first 7 days
-  (only a paid plan can set the column that early), and afterwards until the daily evaluation lifts it.
-  The default tenant (billing `disabled`) and `exempt` workspaces are never ramped.
+- **When it applies.** `tenants.ramp_lifted_at IS NULL`, and either:
+  - the tenant has no partner, `PM_BILLING=stripe`, and the workspace is `metered` on the catalog's
+    `default_plan` (Free). That is every new Free workspace for its first 7 days (only a paid plan can set
+    the column that early), and afterwards until the daily evaluation lifts it. The default tenant
+    (billing `disabled`) and `exempt` workspaces without a partner are never ramped; or
+  - the tenant was created by a partner's key (`tenants.partner_id` set) and that partner's
+    `ramp_exempt` is `0`, the default, whatever `PM_BILLING` and the tenant's billing mode (`exempt`
+    included): a partner cannot skip the ramp by provisioning `exempt` tenants. Only a platform key sets
+    `ramp_exempt` (`PATCH /v1/partners/{partner_id}`), for a partner whose sending it vouches for; it
+    applies at once to the partner's ramped tenants.
 - **What it does.** Outbound policy step 18 uses an effective tenant cap of
   min(`policy.tenant_daily_send_cap`, 50) ([Outbound › Policy pipeline](outbound.md#policy-pipeline)).
   The 51st message of the day gets `429 daily_cap_reached` with `details.resets_at`, like any tenant cap.
   Identity caps are unchanged.
 - **Daily evaluation.** The `*/15` cron runs `crons/signup_ramp.rs` once per UTC day (the run whose UTC
-  hour is 03 and minute is below 15). It selects the ramped workspaces created at least 7 days ago and
+  hour is 03 and minute is below 15), on every deployment: with billing off it finds only partners'
+  tenants, and on a deployment with neither it selects nothing. It selects the ramped workspaces (both
+  kinds above) created at least 7 days ago and
   asks each one's `TenantQuota` for `OutcomeRates { since: created_at }`: the number of delivery
   outcomes recorded for its identities since then, and how many were `bounced` and `complained`. They
   come from the tenant's per-day outcome counters, which `RecordOutcome` increments with every outcome
@@ -353,7 +362,8 @@ The ramp limits what a new Free workspace can send before it has a sending histo
   suspend the tenant (FR-TEN-3) or change its plan with `PATCH /v1/tenants/{tenant_id}/billing`.
 - **Lifted at once on a paid plan.** The billing webhook's state application sets `ramp_lifted_at` when
   the workspace moves to a paid plan ([Billing › Applying state](billing.md#applying-state)), so a later
-  downgrade to Free does not ramp it again.
+  downgrade to Free does not ramp it again. This applies to a partner's `metered` tenant too; an `exempt`
+  tenant has no plan, so only the daily evaluation (or `ramp_exempt`) ends its ramp.
 
 ## 11. Data model
 
@@ -463,4 +473,5 @@ The global retention job deletes `oauth_states` rows 24 hours after `expires_at`
 | `it::onboarding::derived_steps` | Each checklist step turns done from real data alone; each Overview banner condition shows its banner and hides it once resolved (FR-CON-12) |
 | `it::abuse::free_ramp` | 51st send on day 1 of a Free workspace → `429 daily_cap_reached` (effective cap min(policy, 50)); lifted at once on upgrade, and not ramped again after a downgrade ([W30](../edge-cases.md)) |
 | `it::abuse::ramp_evaluator` | On day 7 the daily evaluation lifts the ramp when the rates are under the thresholds; outcomes of an identity deleted before the evaluation still count (the tenant's per-day counters, not the identity's `outcomes` rows); with a complaint rate above them the ramp stays and is evaluated again daily, and the third failure fires `signup_ramp_review` without suspending the tenant ([W30](../edge-cases.md)) |
+| `it::abuse::partner_ramp` | A tenant created by a partner key is ramped (51st send of the day → `429 daily_cap_reached`) with billing mode `exempt` and with billing `disabled` on the deployment, and the daily evaluation lifts it on day 7 as for a Free workspace; with the partner's `ramp_exempt` set by a platform key its tenants are not ramped, including ones already ramped; a tenant without a partner in billing mode `exempt` is still never ramped ([W30](../edge-cases.md), §10.1) |
 | `it::hosts::console_api_split` | With two hosts, console paths 404 on the API host and API paths 404 on the console host; no `Set-Cookie` on the API host |

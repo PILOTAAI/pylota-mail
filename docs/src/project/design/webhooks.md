@@ -56,8 +56,10 @@ pub fn append(tx: &impl Sql, ids: &impl Ids, clock: &impl Clock, owner: &Owner,
 2. One D1 `batch`:
 
    ```sql
-   INSERT OR IGNORE INTO event_index (id, tenant_id, identity_id, type, owner_kind, owner_id, payload_json, occurred_at)
-   VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7);   -- owner_kind mailbox | domain | job; owner_id = this object's ID
+   INSERT OR IGNORE INTO event_index (id, tenant_id, identity_id, type, owner_kind, owner_id, partner_id, payload_json, occurred_at)
+   VALUES (?1, ?2, ?3, ?4, ?5, ?6, (SELECT partner_id FROM tenants WHERE id = ?2), NULL, ?7);
+   -- owner_kind mailbox | domain | job; owner_id = this object's ID; partner_id = the tenant's partner
+   -- (NULL for a tenant no partner created), which never changes, so replay can select on it
    ```
 
 3. `send_batch` to `pm-webhooks`: one `WebhookJob::Fanout` per event (at most 100 per call). Queue
@@ -161,8 +163,9 @@ For a `Fanout` (FR-WH-1). An endpoint has one of three scopes, from its row: `te
 `partner` (`partner_id` set) or `platform` (both `NULL`). The scope filter runs here, in the `Fanout`
 consumer (`consumers/webhooks.rs`), before any `Deliver` is queued; replay (`webhooks/replay.rs`) applies
 the same match function to the events it selects ([Replay](#replay)). The `Deliver` consumer only
-re-reads the endpoint to skip a deleted or disabled one, so these two are the only places that decide
-which endpoints receive an event.
+re-reads the endpoint to skip a deleted or disabled one, and holds a delivery while the endpoint's partner
+is suspended ([Delivering an attempt](#delivering-an-attempt)), so these two are the only places that
+decide which endpoints receive an event.
 
 1. Load the enabled endpoints that can see the event, cached in the isolate for 30 seconds per tenant
    (per partner for an event with no tenant). `?1` is the event's `tenant_id`; `?2` is that tenant's
@@ -318,8 +321,17 @@ For `Deliver { event_id, endpoint_id, attempt, first_attempt, replay }`:
 
    `succeeded` or `dead` → ack. `failed` → make sure attempt `n + 1` is queued (step 7) and ack, without
    a second HTTP request. Unless `replay`, also ack if any attempt for this endpoint and event succeeded.
-2. **Endpoint**: re-read the row. Deleted → ack. Disabled → record the attempt as `dead` with
-   `endpoint_disabled` (so it can be replayed) and ack.
+2. **Endpoint**: re-read the row, with the status of its partner (its own `partner_id`, or its tenant's:
+   `LEFT JOIN tenants t ON t.id = e.tenant_id LEFT JOIN partners p ON p.id = COALESCE(e.partner_id, t.partner_id)`).
+   Deleted → ack. Disabled → record the attempt as `dead` with `endpoint_disabled` (so it can be
+   replayed) and ack.
+   **Partner suspended** ([J13](../edge-cases.md)) → hold: send the same `Deliver` again to `pm-webhooks`
+   with `delay_seconds = 900` and ack, recording nothing, so the hold uses no attempt of the retry schedule
+   and does not count towards auto-disable. When the partner is `active` again the next copy is delivered
+   normally. A delivery still held when its event leaves the replay window (30 days from `occurred_at`,
+   or the tenant's `retention.events_days` if shorter) is recorded `dead` with `event_unavailable`. This
+   holds the deliveries to the partner's endpoints and to its tenants' endpoints; platform endpoints are
+   not held.
 3. **Payload**: `payload_json` from `event_index` for platform events; otherwise
    `MailboxRequest::GetEvents` (or the domain or job equivalent) on `owner_id`, with the event's tenant and
    identity in the RPC envelope. Messages in one queue batch for the same owner are fetched in one call.
@@ -379,8 +391,9 @@ seconds, at most 86,400 (the Queues delay limit). The 13th attempt is the last: 
   ```sql
   UPDATE webhook_endpoints SET enabled = 0, disabled_reason = 'failing', updated_at = ?2
   WHERE id = ?1 AND enabled = 1;
-  INSERT OR IGNORE INTO event_index (id, tenant_id, identity_id, type, owner_kind, owner_id, payload_json, occurred_at)
-  VALUES (?3, ?4, NULL, 'webhook.disabled', 'platform', 'platform', ?5, ?2);
+  INSERT OR IGNORE INTO event_index (id, tenant_id, identity_id, type, owner_kind, owner_id, partner_id, payload_json, occurred_at)
+  VALUES (?3, ?4, NULL, 'webhook.disabled', 'platform', 'platform', ?6, ?5, ?2);
+  -- ?6: the disabled endpoint's partner: its own partner_id, or its tenant's (NULL for neither)
   ```
 
   `data` is `{ "webhook_id": "whk_…", "reason": "gone" }` or `{ … "reason": "failing" }`. The event goes
@@ -395,9 +408,12 @@ seconds, at most 86,400 (the Queues delay limit). The 13th attempt is the last: 
 `POST /v1/webhooks/{id}/replay` with `webhooks:manage` (FR-WH-3):
 
 1. **Select events** from `event_index` whose `occurred_at` is within the last 30 days (or the tenant's
-   `retention.events_days`, if shorter; 30 days for platform events, which have no tenant), scoped to
-   the endpoint's tenant (all tenants for a platform endpoint; for a partner endpoint, the tenants whose
-   `partner_id` is its partner's, plus platform events with no tenant), at most 1,000 per request (more → `400 invalid_request` asking for a
+   `retention.events_days`, if shorter; 30 days for platform events, which have no tenant), never of type
+   `webhook.test` (`AND type <> 'webhook.test'`: a test is a one-off attempt, not an event to deliver
+   again), scoped by the endpoint: `tenant_id = ?` for a tenant endpoint; `partner_id = ?` for a partner
+   endpoint, with its own `partner_id`, which selects the events of its partner's tenants and the
+   `webhook.disabled` events about its partner's endpoints, through `event_index_partner_time`; nothing
+   more for a platform endpoint. At most 1,000 per request (more → `400 invalid_request` asking for a
    narrower window):
    - by IDs: `WHERE id IN (…)` (at most 100 IDs);
    - by window: `WHERE occurred_at >= ?since AND occurred_at < ?until`, plus, when `status` is given,
@@ -415,9 +431,10 @@ seconds, at most 86,400 (the Queues delay limit). The 13th attempt is the last: 
 ## Test deliveries
 
 `POST /v1/webhooks/{id}/test` writes a `webhook.test` platform event (`data: { "message": "hello" }`) to
-`event_index`, performs **one** attempt synchronously within the request (same signing, SSRF rules and
-15-second deadline), records it in `webhook_deliveries`, and returns that delivery row. It is never
-retried.
+`event_index` (with the endpoint's `tenant_id` and partner, as `webhook.disabled`), performs **one**
+attempt synchronously within the request (same signing, SSRF rules and 15-second deadline), records it in
+`webhook_deliveries`, and returns that delivery row. It is never retried, never fanned out and never
+replayed ([Replay](#replay)).
 
 ## The pm-webhooks message
 
@@ -478,9 +495,10 @@ event and endpoint IDs, status codes and durations, never payloads or URLs' quer
 | `it::webhooks::no_redirects_and_caps` | A `3xx` is a failure and is not followed; a slow endpoint times out at 15 s; only 4 KB of the body is read (FR-WH-5) |
 | `it::webhooks::j4_retry_schedule` | A time-controlled harness sees 13 attempts at the scheduled delays (±10%), then `dead` ([J4](../edge-cases.md), FR-WH-3) |
 | `it::webhooks::disable_on_410` | `410 Gone` disables at once and emits `webhook.disabled` to other platform endpoints |
+| `it::webhooks::j13_held_while_partner_suspended` | While a partner is `suspended`, deliveries to its partner endpoint and to an endpoint of one of its tenants are re-queued every 15 minutes with no `webhook_deliveries` row and no change to `consecutive_failures`, while a platform endpoint receives the same events; after `active`, both endpoints receive every held event once; a delivery held past the replay window is recorded `dead` with `event_unavailable` ([J13](../edge-cases.md), FR-KEY-4) |
 | `it::webhooks::j15_partner_scope_filter` | With partners P and Q, each with a partner endpoint subscribed to `*`: events of P's tenants reach P's endpoint and platform endpoints, never Q's; events of a tenant no partner created reach no partner endpoint; a tenant endpoint still receives only its tenant; replay to P's endpoint never selects Q's or an unpartnered tenant's events; a `410` on P's endpoint sends `webhook.disabled` to P's other endpoint and to platform endpoints, never to Q's or to tenant endpoints; `POST /v1/webhooks` with a partner key returns `scope: "partner"` and `partner_id`, and the 21st partner endpoint gets `422 webhook_limit_reached` ([J15](../edge-cases.md), FR-WH-1, FR-KEY-4) |
 | `it::webhooks::disable_after_100_failures_24h` | 100 failures within 24 h do not disable; 100 spread over ≥ 24 h do |
-| `it::webhooks::replay_by_ids_and_window` | Replay by IDs and by window with `status: dead`; the limit is 30 days from `occurred_at` (an event that went `dead` on day 3 cannot be replayed after day 30), or `events_days` when shorter; erased events are not replayed |
+| `it::webhooks::replay_by_ids_and_window` | Replay by IDs and by window with `status: dead`; the limit is 30 days from `occurred_at` (an event that went `dead` on day 3 cannot be replayed after day 30), or `events_days` when shorter; erased events are not replayed; a `webhook.test` event is never replayed, also when named by ID; a partner endpoint's replay selects on `event_index.partner_id` (an event written by the outbox carries its tenant's partner) |
 | `it::webhooks::notifier_handoff_never_blocks` | `message.received` reaches the tenant's Notifier only when a `new_mail` preference is on (after the 60-second cache), and never for a re-parse; `message.triaged` reaches it under the same condition, with `filter = all` as with `needs_reply`; a failing Notifier leaves every delivery queued and the event acked |
 | `it::webhooks::identity_key_events` | Creating, rotating and revoking an identity key emits `identity.key_created`, `identity.key_rotated` (with `previous_kid`) and `identity.key_revoked` with the identity's `identity_id` and the next `sequence`; an existing active key returned by `POST …/keys` and a second revoke emit nothing |
 | `it::webhooks::filters` | Event-type and identity filters; `*` includes new types; platform endpoints see every tenant (FR-WH-1) |
