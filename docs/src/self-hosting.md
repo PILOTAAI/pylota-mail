@@ -90,7 +90,7 @@ permission.
 | Scope | Permission | Your token (`CLOUDFLARE_API_TOKEN`) | Worker token (`PM_CF_API_TOKEN`) | Used for |
 |---|---|---|---|---|
 | Account | Workers Scripts · Edit | Yes | – | Uploading the Worker, its secrets, cron triggers and Durable Object migrations; reading secret names (`doctor`); deleting the Worker (`destroy`) |
-| Account | D1 · Edit | Yes | – | Creating the `pylota-mail` database, applying migrations, and the CLI's D1 queries (setup, `doctor`, `secrets rotate-master`, `domains add --local-token`, `domains subscribe`) |
+| Account | D1 · Edit | Yes | – | Creating the `pylota-mail` database, applying migrations, the CLI's D1 queries (setup, `doctor`, `domains add --local-token`, `domains subscribe`), and the export, Time Travel restore and replay of `pmail ops restore d1` |
 | Account | Workers R2 Storage · Edit | Yes | – | Creating the `pylota-mail-blobs` bucket (and the backup bucket) and its lifecycle rule |
 | Account | Queues · Edit | Yes | Yes | Creating the five work queues and their dead-letter queues (your token); listing queues and creating each domain's Email Sending event subscription to `pm-delivery-events` (both) |
 | Account | Vectorize · Edit | Yes | Only if spike S6 fails | Creating the `pm-mail-chunks` index, its metadata indexes and later index generations; the Worker's REST fallback |
@@ -182,7 +182,7 @@ and run the same command again. It finds what already exists and creates only wh
 |---|---|---|
 | Release bundle | `deploy/.bundle/<version>/` | The verified Worker release that setup deploys |
 | D1 database | `pylota-mail` | In the chosen jurisdiction. Migrations applied. Holds the control plane: tenants, identities, the address directory, domains, hashed API keys, webhooks, suppressions, jobs, audit log |
-| R2 bucket | `pylota-mail-blobs` | Same jurisdiction. Lifecycle rule deletes `inbound-staging/` after one day |
+| R2 bucket | `pylota-mail-blobs` | Same jurisdiction. Lifecycle rules delete `inbound-staging/` after 15 days and abort incomplete multipart uploads after one day |
 | Queues | `pm-inbound`, `pm-outbound`, `pm-delivery-events`, `pm-webhooks`, `pm-index` | Each with a dead-letter queue (`pm-inbound-dlq` and so on) |
 | Vectorize index | `pm-mail-chunks` | 1,024 dimensions, cosine, eight metadata indexes. Holds no message text |
 | Email Routing | On the platform domain | Enabled, with a catch-all rule that sends every address to the Worker |
@@ -543,18 +543,30 @@ rolling back one release is safe; do not jump back across several releases.
 
 | Store | What protects it | Notes |
 |---|---|---|
-| D1 (control plane) | D1 Time Travel: restore to any point in the last 30 days | Restoring D1 alone can leave it out of step with the mailboxes. Restore both to the same point in time |
-| Durable Object SQLite (mailboxes) | Point-in-time recovery for the last 30 days, per object | Exposed by Cloudflare as an API inside the object. Pylota Mail's restore drill tooling is planned (P1) |
+| D1 (control plane) | D1 Time Travel: restore to any point in the last 30 days | One restore rewinds the whole database. `pmail ops restore d1` exports it first and re-applies every later change you do not exclude |
+| Durable Object SQLite (mailboxes) | Point-in-time recovery for the last 30 days, per object | Exposed by Cloudflare as an API inside the object; `pmail ops restore mailbox` calls it, and `pmail ops restore reconcile` re-queues later mail and re-applies erasures |
 | R2 (raw mail, attachments, exports) | Raw `.eml` is the source of truth. Any message can be re-parsed from it ([J3](project/edge-cases.md)) | If you copy the bucket elsewhere, erasure must reach the copy too ([I6](project/edge-cases.md)) |
 | Vectorize | Rebuilt from the mailboxes by a re-embed job | Holds no text |
 
 The recovery objectives are RPO ≤ 1 minute for indexes and ≤ 15 minutes for blobs, and RTO ≤ 4 hours
 ([NFR-OPS-2](project/prd.md#7-non-functional-requirements)).
 
+Before any restore, freeze the deployment (`pmail ops freeze`), and follow the restore runbook
+step by step ([Observability › Restore from PITR](project/design/observability.md#restore-from-pitr)).
+
 Point-in-time recovery is also **residual retention**: for 30 days after an erasure, a restore could
-bring the erased data back. Keep the `erasure.completed` events (or the erasure receipts) outside the
-deployment, and re-run any erasure that completed after the restore point. See
-[Privacy](guides/privacy.md#backups-and-residual-retention).
+bring the erased data back. The runbook re-applies every erasure that completed after the restore point
+from its stored record; keep the `erasure.completed` events (or the receipts) outside the deployment as
+your own evidence. See [Privacy](guides/privacy.md#backups-and-residual-retention).
+
+### Alerts when you run it alone
+
+Set `PM_ALERT_EMAIL` to your address: page alerts are emailed at once, and ticket alerts once a day
+([Observability › Alert email](project/design/observability.md#55-alert-email-and-the-external-heartbeat)).
+Then add the heartbeat workflow, which runs `pmail doctor` from GitHub Actions every 15 minutes and
+fails, so GitHub emails you, when the deployment stops answering or a page alert fires; set
+`PM_HEARTBEAT_KEY_ID` so the Worker alerts you in turn if the heartbeat stops. `pmail doctor` fails its
+`alerts` check while no alert address is set.
 
 ## What it costs
 

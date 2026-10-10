@@ -18,6 +18,8 @@ ADR supersedes it (AGENTS.md).
 | [0007](0007-agentic-search.md) | Agentic search with verified citations | Accepted | 2026-10-09 |
 | [0008](0008-domains-on-any-dns-host.md) | Domains on any DNS host | Accepted | 2026-10-09 |
 | [0009](0009-local-mcp-protocol-types.md) | Local MCP protocol types | Accepted | 2026-10-09 |
+| [0010](0010-solo-operator.md) | One person builds and operates Pylota Mail Cloud | Accepted | 2026-10-10 |
+| [0011](0011-plan-items-changed-for-v1.md) | Plan items that v1.0 defers or does differently | Accepted | 2026-10-10 |
 
 ## When to write one
 
@@ -55,7 +57,7 @@ Statuses: `Proposed`, `Accepted`, `Rejected`, `Superseded by NNNN`, `Deprecated`
 |---|---|
 | Status | Proposed |
 | Date | YYYY-MM-DD |
-| Deciders | Pylota engineering |
+| Deciders | The owner (TREFT LTD) |
 | Related | PRD IDs, design documents, spikes, other ADRs |
 
 ## Context

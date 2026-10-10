@@ -208,7 +208,9 @@ our own outage:
    `envelope_to_hash` = hex `HMAC-SHA256(PM_HASH_KEY, base)`.
 2. Write it as in step 6 (same retries; failure → `Err(TempFail::Storage)`).
 3. Queue `InboundJob::Staged`; failure → delete the object, `Err(TempFail::Queue)`.
-4. Return `Ok(())`. The R2 lifecycle rule deletes `inbound-staging/` objects after 1 day as a backstop.
+4. Return `Ok(())`. The R2 lifecycle rule deletes `inbound-staging/` objects after 15 days as a backstop:
+   longer than the 14 days a pointer can wait in `pm-inbound-dlq`, so a pointer redriven on its last day
+   still finds its object ([J7](../edge-cases.md), [Privacy § 5.3](privacy.md#53-global-retention-job)).
 
 ### The `pm-inbound` message
 
@@ -319,7 +321,7 @@ the [consumer](#the-pm-inbound-consumer):
 the key is still `queued` or `held`, the consumer deletes the S3 object (`DeleteObject`). A pointer whose
 ledger row is no longer `queued` is acked without work: the hook inserts the row and then enqueues, which
 is not one transaction, so the backstop cron re-sends the pointer of any row still `queued` 15 minutes
-after `received_at`, and duplicates must be harmless. The 1-day lifecycle rule
+after `received_at`, and duplicates must be harmless. The 15-day lifecycle rule
 on `inbound-staging/` removes the R2 copy, and the bucket's 14-day lifecycle rule is the backstop for S3.
 
 **Many recipients.** One SES message can name recipients on several domains, of several tenants. Each
@@ -1305,6 +1307,7 @@ outbound consumer sets this field. For a loopback pointer the consumer:
 | `it::inbound::j2_retry_idempotent` | The consumer crashes after `ingest`; the retry stores nothing twice and writes the attachments ([J2](../edge-cases.md)) |
 | `it::jobs::j3_reparse` | Re-parse updates parsed fields, keeps IDs and thread, re-emits with `reprocessed: true` ([J3](../edge-cases.md)) |
 | `it::inbound::j7_d1_transient` | D1 down in `email()` → staged, routed by the consumer, unroutable staged mail dropped ([J7](../edge-cases.md)) |
+| `it::inbound::j7_staging_outlives_dlq` | A staged message whose pointer is dead-lettered and redriven 14 days later (fake clock) is still routed and stored: the object is not deleted before 15 days, and the `staging` step re-queues it daily meanwhile ([J7](../edge-cases.md)) |
 | `it::ses::push_and_backstop_once`, `it::ses::unknown_recipient_dropped`, `it::ses::cross_tenant_recipients` | One message per object and recipient; unknown recipients dropped with no bounce; recipients of two tenants stay apart ([N3](../edge-cases.md), [N6](../edge-cases.md), [N28](../edge-cases.md)) |
 | `it::ses::verdict_mapping`, `it::ses::large_message_40mb` | SPF from SES, DKIM and DMARC recomputed, virus `FAIL` quarantined, spam `FAIL` scores 0.9; a 39 MB message is ingested ([N5](../edge-cases.md), [N27](../edge-cases.md)) |
 | `it::inbound::probe_and_forwarding_check` | `pm-probe+{token}` and a forwarding-check token are recorded on the domain's monitor and never stored as messages; an unknown forwarding token is ordinary mail ([N12](../edge-cases.md), [N18](../edge-cases.md)) |

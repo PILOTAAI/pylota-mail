@@ -4,7 +4,7 @@
 |---|---|
 | Status | Accepted |
 | Date | 2026-10-09 |
-| Deciders | Pylota engineering |
+| Deciders | The owner (TREFT LTD) |
 | Related | FR-DOM-1, FR-DOM-2, FR-ADR-1…7, FR-IN-2, FR-OUT-6; [Identities and domains](../design/identity-domains.md); [Threading](../design/threading.md) |
 
 ## Context

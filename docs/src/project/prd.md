@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Product | Pylota Mail |
-| Document owner | Pylota engineering |
+| Document owner | TREFT LTD (the owner, who is the sole developer and the Cloud operator) |
 | Status | Approved for build (v1.0) |
 | Last reviewed | 2026-10-10 |
 | Licence | FSL-1.1-ALv2 (Fair Source; each release becomes Apache-2.0 two years after it ships) |
@@ -93,7 +93,7 @@ Pylota's own experience showed the cost of these gaps:
 - Bulk marketing campaigns. Marketing mail is supported per message with consent and unsubscribe
   headers, but there are no list-management or campaign features.
 - Scheduled send and server-side drafts (planned for v1.1).
-- OAuth 2.1 for the MCP endpoint (planned for v1.1; v1.0 uses API keys as bearer tokens).
+- OAuth 2.1 for the MCP endpoint (planned for v1.1; v1.0 uses API keys as bearer tokens; [ADR 0011](adr/0011-plan-items-changed-for-v1.md)).
 - Running on platforms other than Cloudflare Workers.
 
 ### Unique selling propositions
@@ -616,6 +616,7 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
 | NFR-PRV-1 | Erasure completes | ≤ 24 h, receipt always produced |
 | NFR-OPS-1 | Fresh deploy, hands-on time | ≤ 15 minutes |
 | NFR-OPS-2 | Recovery point / time objectives | RPO ≤ 1 min (indexes); ≤ 15 min (blobs) against infrastructure loss, from R2's durability. R2 has no versioning or replication, so blobs deleted by a bug are recoverable only with the optional nightly backup bucket (RPO 24 h, off by default); RTO ≤ 4 h |
+| NFR-OPS-3 | Operator alerting with one operator | Every page alert reaches the operator through two independent channels (alert email from the deployment, and an external scheduled heartbeat that fails when the deployment does not answer or a page alert fires) within 15 minutes; a stopped deployment or a stopped heartbeat is detected within 1 hour; conditions that need a safe action at once are contained automatically ([Observability § 5.5–5.6](design/observability.md#55-alert-email-and-the-external-heartbeat)) |
 | NFR-COST-1 | Idle deployment cost beyond Workers Paid | ≈ 0 (no always-on compute) |
 | NFR-BILL-1 | Metered actions allowed beyond a granted allowance | 0 (holds are atomic per workspace) |
 | NFR-BILL-2 | Metered actions failed because a billing provider was unreachable | 0 (metering is in-process; Stripe is only needed to change plans) |
@@ -625,7 +626,7 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
 
 - Pylota cut over from AgentMail. Every operator has four identities, inbound mail works end to end,
   and none of the edge-case register's `S` rows fails in production for 30 days.
-- A third party deploys from the README alone, with no help, inside 15 minutes (measured in usability runs).
+- A fresh agent session deploys from the self-hosting page alone, with no help, inside 15 minutes of hands-on time (measured by the M20 rehearsal, [ADR 0010](adr/0010-solo-operator.md)).
 - Agents in Pylota's eval suite find and cite the right email in at least 90% of mail-retrieval tasks.
 - Zero duplicate sends attributed to retries.
 

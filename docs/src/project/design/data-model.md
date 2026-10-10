@@ -340,7 +340,7 @@ CREATE TABLE jobs (
   tenant_id         TEXT,
   kind              TEXT NOT NULL
                     CHECK (kind IN ('erasure','retention','export','reembed','reparse','reindex','domain_remove',
-                                    'backup')),
+                                    'backup','restore_reconcile')),
   status            TEXT NOT NULL CHECK (status IN ('queued','running','completed','failed','canceled')),
   runner_do_id      TEXT NOT NULL,                         -- JobRunner Durable Object id
   params_json       TEXT NOT NULL,                         -- JobRequest::Start params; a counterparty erasure may
@@ -368,15 +368,22 @@ CREATE TABLE erasure_requests (
                                          'canceled')),
   receipt_json         TEXT,
   created_by_key_id    TEXT,
+  resumes_id           TEXT REFERENCES erasure_requests(id), -- the failed request this one resumes, or the
+                                                           -- completed_with_holds one it continues (Privacy § 6.1)
+  deadline_at          INTEGER NOT NULL,                   -- created_at + 24 h; copied from the failed request
+                                                           -- when resuming one. Read by the job's retry limit and
+                                                           -- the erasure_overdue alert (Privacy § 4)
   created_at           INTEGER NOT NULL,
   completed_at         INTEGER
 );
+CREATE INDEX erasure_requests_tenant ON erasure_requests(tenant_id, scope, created_at DESC);
 
 CREATE TABLE exports (
   id            TEXT PRIMARY KEY,                          -- exp_
   tenant_id     TEXT NOT NULL,
   job_id        TEXT NOT NULL REFERENCES jobs(id),
   scope         TEXT NOT NULL CHECK (scope IN ('counterparty','identity')),
+  identity_id   TEXT,                                      -- identity scope; returned in the export object
   status        TEXT NOT NULL CHECK (status IN ('queued','running','completed','failed','canceled','expired')),
   r2_key        TEXT,
   size          INTEGER,
@@ -708,6 +715,20 @@ CREATE TABLE billing_events (                              -- Stripe webhook ded
 
 CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);
 
+-- Deployment-wide operator switches (Observability § 5.6). Written by PUT /v1/platform/switches
+-- (platform:ops) and by the automatic containment rules; read, with a 60-second per-isolate cache, by the
+-- request router (read_only), the outbound submit and consumer (read_only, free_sending) and the tenant
+-- retention job (emergency_prune); shown by GET /v1/platform/status. A missing row means the default.
+CREATE TABLE ops_switches (
+  name       TEXT PRIMARY KEY CHECK (name IN ('read_only','free_sending','emergency_prune')),
+  state      TEXT NOT NULL CHECK (state IN ('on','off')),  -- defaults: read_only off, free_sending on,
+                                                           -- emergency_prune off
+  set_by     TEXT NOT NULL CHECK (set_by IN ('auto','platform')),
+  reason     TEXT NOT NULL,                                -- the containment rule, or the operator's note
+  actor_key_id TEXT,                                       -- the platform key, when set_by = 'platform'
+  set_at     INTEGER NOT NULL
+);
+
 -- Deployment-wide Durable Objects whose IDs must be minted inside the Worker (jurisdiction).
 CREATE TABLE platform_objects (
   name       TEXT PRIMARY KEY CHECK (name IN ('ses_control')),
@@ -852,6 +873,16 @@ CREATE TABLE platform_objects (
   ([Privacy § 6.9](privacy.md#69-people-console-accounts)).
 - **Billing events retention.** `billing_events` rows are deleted 400 days after `received_at` by the
   global retention job ([Privacy § 5.3](privacy.md#53-global-retention-job)).
+- **Erasure requests and exports.** `erasure_requests.deadline_at` is written at insert (`created_at` +
+  24 hours, or the resumed request's value) and read by the JobRunner's retry limit, the
+  `erasure_overdue` alert and the API object. `resumes_id` is written when a tenant-scope request resumes
+  a failed request or continues a `completed_with_holds` one, and by the `held_erasures` and identity
+  hold continuations; it is returned in the API object. `identity_id` and `target_id` are returned in the
+  API object and read by `POST /v1/platform/erasure-requests/{erasure_id}/reapply`, with
+  `counterparty_hash` ([Privacy § 11](privacy.md#11-what-remains-after-deletion)).
+  `exports.identity_id` is written by `POST /v1/exports` and returned in the export object;
+  `erasure_requests.completed_at` is also read by an export's `complete` step
+  ([Privacy § 6.11](privacy.md#611-exports-and-copies-in-flight-i9)).
 
 ## 2. `IdentityMailbox` Durable Object (SQLite)
 
@@ -1202,10 +1233,16 @@ CREATE TABLE counters (
                                                            --   http_signatures};
                                                            -- tenant outcomes: outcomes, bounced, complained
                                                            --   (RecordOutcome; summed by OutcomeRates; never
-                                                           --   pruned, ForgetIdentity leaves them)
+                                                           --   pruned, ForgetIdentity leaves them);
+                                                           -- per-domain outcomes: dom:{domain_id}:outcomes,
+                                                           --   dom:{domain_id}:bounced, dom:{domain_id}:complained
+                                                           --   (RecordOutcome; read by the domain bounce and
+                                                           --   complaint rules, Observability § 5.3; windows
+                                                           --   older than 25 hours deleted by RecordOutcome)
   window TEXT NOT NULL,                                    -- YYYY-MM-DD: the tenant's time zone for daily caps,
                                                            -- UTC for usage:* (flushed to usage_daily) and for
-                                                           -- the tenant outcome counters
+                                                           -- the tenant outcome counters; YYYY-MM-DDTHH (UTC
+                                                           -- hour) for the per-domain outcome counters
   value  INTEGER NOT NULL,
   PRIMARY KEY (metric, window)
 );
@@ -1293,8 +1330,8 @@ CREATE TABLE sent (                                        -- per-day counters f
 
 | Key | Content | Custom metadata | Deleted by |
 |---|---|---|---|
-| `inbound-staging/{yyyy}/{mm}/{dd}/{ulid}.eml` | Raw message before routing resolves | `envelope_to_hash` | The inbound consumer after the move, or the lifecycle rule (1 day) |
-| `inbound-staging/ses/{key}` | Raw message received through SES, copied from S3 (`in/{key}`) before its recipients are resolved | – | The lifecycle rule (1 day); a held message whose copy is gone is fetched from S3 again |
+| `inbound-staging/{yyyy}/{mm}/{dd}/{ulid}.eml` | Raw message before routing resolves | `envelope_to_hash` | The inbound consumer after the move, or the lifecycle rule (15 days, longer than the 14-day dead-letter retention, [J7](../edge-cases.md)) |
+| `inbound-staging/ses/{key}` | Raw message received through SES, copied from S3 (`in/{key}`) before its recipients are resolved | – | The lifecycle rule (15 days); a held message whose copy is gone is fetched from S3 again |
 | `t/{ten}/i/{idn}/m/{msg}/raw.eml` | Raw inbound MIME | `tenant`, `identity`, `message` | Retention (`raw_days`), erasure |
 | `t/{ten}/i/{idn}/m/{msg}/a/{att}` | Attachment bytes | same, plus `sha256` | Erasure, message retention |
 | `t/{ten}/i/{idn}/m/{msg}/a/{att}.md` | Extracted text (Markdown, with page markers) | same | as above |

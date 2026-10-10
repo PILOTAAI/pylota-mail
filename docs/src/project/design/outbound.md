@@ -491,7 +491,14 @@ For `Send`:
 
 1. **Re-read** identity, tenant and the sending domain from D1. If the identity is now `paused` or
    `deleting`, or the tenant `suspended`, call `Cancel` with actor `system` (status `canceled`,
-   `message.canceled`, audit entry `message.cancel` with the reason) and ack.
+   `message.canceled`, audit entry `message.cancel` with the reason) and ack. If `Cancel` answers
+   `NotCancelable`: with an active transport claim, ack (the claimed attempt settles the message); with
+   deliveries already `submitted` (an SMTP relay that deferred only some recipients), re-enqueue with the
+   `Paused` back-off, so the remaining recipients go out if the identity and tenant are active again
+   within 24 hours of submit and otherwise end `failed` (`quota_exhausted`), as every back-off does. While
+   the deployment is frozen, or the `read_only` switch is on, or the `free_sending` switch is off for a
+   Free or ramped workspace, the consumer re-enqueues the message with a delay instead (300 s, or the
+   `Paused` back-off for `free_sending`) and cancels nothing ([Observability § 5.6](observability.md#56-automatic-containment)).
 2. **`BeginTransport { message_id, domain_state, fallback }`** in the mailbox:
    - status not `queued` → `NotQueued` → ack (a duplicate, or already handled);
    - sending domain `pending` or `verifying` → `DomainNotReady` → no claim; re-enqueue with the `Paused`
@@ -794,9 +801,9 @@ and sent to `pm-outbound` as `TransportEvent`, then handled by the same consumer
 ## Abuse auto-pause (FR-DLV-3)
 
 `TenantQuota.outcomes` keeps the last 1,000 outcomes per identity. For each `outcome`, the consumer calls
-`QuotaRequest::RecordOutcome { identity_id, outcome, at }`, which in one transaction inserts it with the
-next `seq`, deletes rows beyond 1,000 for that identity, increments the tenant's per-day counters (below),
-and evaluates:
+`QuotaRequest::RecordOutcome { identity_id, domain_id, outcome, at }`, which in one transaction inserts it
+with the next `seq`, deletes rows beyond 1,000 for that identity, increments the tenant's per-day counters
+and the per-domain hourly counters (below), and evaluates:
 
 ```text
 complaints = complained outcomes among the identity's last 1,000 rows
@@ -827,6 +834,19 @@ workspace was created, which the per-identity `outcomes` rows cannot (they keep 
 deleted with the identity). `OutcomeRates { since }` sums them over the UTC days from the day of `since`
 for the new-workspace send ramp ([Cloud sign-up › New-workspace send ramp](cloud-signup.md#101-new-workspace-send-ramp)).
 They are never pruned (three rows a day at most); tenant erasure's `delete_all` removes them.
+
+**Per-domain outcome counters.** `RecordOutcome` also increments `dom:{domain_id}:outcomes`, and
+`dom:{domain_id}:bounced` or `dom:{domain_id}:complained`, in the window of the UTC hour of `at`
+(`domain_id` is the sending domain the delivery used: the platform domain for a fallback send), and
+deletes that domain's windows older than 25 hours. It then sums the last hour's and the last 24 hours'
+windows of that domain and answers `domain_alert` when bounced/outcomes > 2% with ≥ 50 outcomes in the
+hour, or complained/outcomes > 0.1% with ≥ 200 outcomes in 24 hours, and `suspend` at twice either
+threshold (4% with ≥ 100, or 0.2% with ≥ 500). The delivery-event consumer reports `domain_alert` as the
+state alert `bounce_rate:{tenant_id}:{domain_id}` or `complaint_rate:{tenant_id}:{domain_id}`, and on
+`suspend` runs `UPDATE tenants SET status = 'suspended', suspended_by = 'platform', suspended_at = ?2
+WHERE id = ?1 AND status = 'active'`, which pauses the tenant's identities as any suspension does, then
+writes `tenant.auto_suspend` and reports `containment:tenant_suspended`
+([Observability § 5.3 and § 5.6](observability.md#56-automatic-containment)).
 
 **The system identity is exempt.** For the identity with `is_system = 1` the consumer still records each
 outcome but never runs the pause: pausing it would stop every sign-in, invitation and notification email
@@ -1086,9 +1106,10 @@ pub enum QuotaRequest {
     Release { identity_id: String, day: String, tenant_counted: bool },
                                                      // undoes a Reserve; tenant_counted is false exactly when
                                                      // that Reserve had tenant_cap None
-    RecordOutcome { identity_id: String, outcome: Outcome, at: i64 },
-                                                     // the identity's abuse windows (outcomes rows), and the
-                                                     // tenant's per-day outcome counters
+    RecordOutcome { identity_id: String, domain_id: String, outcome: Outcome, at: i64 },
+                                                     // the identity's abuse windows (outcomes rows), the
+                                                     // tenant's per-day outcome counters and the per-domain
+                                                     // hourly counters → { pause, domain_alert, suspend }
     OutcomeRates { since: i64 },                     // the daily ramp evaluation (Cloud sign-up § 10.1): sums
                                                      // the tenant's outcome counters over the UTC days from
                                                      // since's day → { outcomes, bounced, complained }
@@ -1233,6 +1254,7 @@ Agent        API handler      IdentityMailbox     pm-outbound consumer   Cloudfl
 | `core::ses::sigv4_vectors`, `core::sns::verify_v2_vectors`, `it::ses::sns_tampered_rejected` | S8: SigV4 and SNS verification; `SignatureVersion` 1, a wrong host or topic and a stale timestamp are refused on `/hooks/ses` |
 | `it::send::sends_hold_with_daily_cap` | Step 18 takes the `sends` hold and the daily reserve together; a `402` keeps neither; a lock failure releases both; a back-off extends the hold; the transport outcome settles it (FR-BILL-4, FR-BILL-5) |
 | `core::smtp::state_machine` | Every row of the SMTP outcome table: no `STARTTLS` → refused before `AUTH`, `535` → `sender_domain_unavailable`, `5xx` on one `RCPT` → that delivery `rejected`, `4xx` on some `RCPT`s → `DATA` still sent to the others and `Accepted` with those recipients in `deferred` (the message stays `queued`), `4xx` on every `RCPT` → no `DATA` and a retry ([N14](../edge-cases.md), [N16](../edge-cases.md), [N20](../edge-cases.md)) |
+| `it::smtp::paused_partial_send_backoff` | An SMTP send with one recipient deferred and one `submitted`, whose identity is then paused: the consumer's `Cancel` answers `NotCancelable`, the message is re-enqueued with the `Paused` back-off (not canceled), the deferred recipient is sent once the identity is resumed within 24 hours, and ends `failed` (`quota_exhausted`) otherwise |
 | `it::smtp::uncertain_after_final_dot` | Connection dropped after the final `.` → `uncertain`, never resent ([N15](../edge-cases.md)) |
 | `it::smtp::probe_unaligned_falls_back` | Failing probes → `failing` → the next send uses the platform address; no relay send before the first passing probe ([N18](../edge-cases.md), FR-DOM-6) |
 | `it::smtp::parallel_cap` | A batch of 10 SMTP sends never has more than four sockets open at once |

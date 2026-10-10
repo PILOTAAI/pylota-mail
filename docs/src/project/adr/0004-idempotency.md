@@ -4,7 +4,7 @@
 |---|---|
 | Status | Accepted |
 | Date | 2026-10-09 |
-| Deciders | Pylota engineering |
+| Deciders | The owner (TREFT LTD) |
 | Related | FR-OUT-1, FR-OUT-2, FR-DLV-4, PRD goal 3; [Outbound](../design/outbound.md); [Errors](../../reference/errors.md); [G1](../edge-cases.md), [G2](../edge-cases.md) |
 
 ## Context

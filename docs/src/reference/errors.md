@@ -57,7 +57,7 @@ whether or not the first attempt reached the server.
 | 403 | `partner_suspended` | no | A platform operator suspended the key's partner. Every partner key of it, and every tenant and identity key of its tenants, gets this on every route, `GET /v1/me` included, until the partner is `active` again. The tenants' status does not change and their inbound mail is still stored; deliveries to the partner's and the tenants' endpoints are held ([J13](../project/edge-cases.md)) |
 | 403 | `partner_tenant_limit` | no | `POST /v1/tenants` with a partner key whose partner already has `max_tenants` tenants that are not erased (default 25; `details.max_tenants`). Erase a tenant, or ask the platform operator to raise the limit ([J18](../project/edge-cases.md)) |
 | 403 | `test_mode_recipient` | no | A test tenant tried to send outside the simulator or this deployment |
-| 403 | `policy_denied` | no | The tenant's policy forbids the action. In v1.0: a signed HTTP request (`POST …/http-signatures`) while tenant policy `web_bot_auth.allowed` is `false`, the default ([O13](../project/edge-cases.md)). A platform operator turns it on in the tenant's policy |
+| 403 | `policy_denied` | no | The tenant's policy forbids the action. In v1.0: a signed HTTP request (`POST …/http-signatures`) while tenant policy `web_bot_auth.allowed` is `false`, the default ([O13](../project/edge-cases.md)). A platform operator turns it on in the tenant's policy. Also a send from a workspace on the Free plan or still in its send ramp while the platform operator's `free_sending` switch is off (`details.reason = "free_sending_off"`, [Observability › Automatic containment](../project/design/observability.md#56-automatic-containment)) |
 | 403 | `invalid_signature` | no | An SNS message to `POST /hooks/ses` (SES delivery events) or `POST /hooks/ses/inbound` (SES inbound mail) failed verification: `SignatureVersion` not `2`, a bad signature, a signing certificate not on `sns.{PM_SES_REGION}.amazonaws.com`, another topic, or a stale `Timestamp`. Not returned to API callers |
 
 ### Validation
@@ -113,6 +113,7 @@ whether or not the first attempt reached the server.
 | 409 | `not_cancelable` | no | The message is past `queued` |
 | 409 | `not_uncertain` | no | `resolve` was called on a message that is not `uncertain` |
 | 409 | `auto_reply_not_allowed` | no | An auto-reply to automated mail, or over the automatic-exchange limit ([D6](../project/edge-cases.md)) |
+| 409 | `not_frozen` | no | `POST /v1/platform/identities/{identity_id}/restore` while the deployment is not frozen for a restore. Run `pmail ops freeze` first ([Restore from PITR](../project/design/observability.md#restore-from-pitr)) |
 | 410 | `raw_expired` | no | Raw MIME is past retention |
 | 410 | `cursor_expired` | no | A pagination cursor older than 24 hours |
 | 423 | `legal_hold` | no | `DELETE …/messages/{message_id}` on a message whose thread is under a legal hold. Nothing was created. Erasure requests (`POST /v1/erasure-requests`) never return it: they skip held threads and list them in the receipt |
@@ -147,7 +148,7 @@ and they return `429 daily_cap_reached` or `429 agentic_budget_exhausted`.
 |---|---|---|---|
 | 500 | `internal_error` | yes | A bug. Logged with `request_id` |
 | 502 | `upstream_error` | yes | A Cloudflare or SES API returned an unexpected error during a synchronous call (domain add, verify), or the SMTP relay could not be reached when a domain create (`smtp_relay`) or a `PATCH` with `smtp` tested it |
-| 503 | `unavailable` | yes | A dependency is temporarily unavailable (D1, a Durable Object overloaded) |
+| 503 | `unavailable` | yes | A dependency is temporarily unavailable (D1, a Durable Object overloaded). `details.reason` names an operator state when there is one: `frozen` (a restore is in progress; `Retry-After: 300`), `read_only` (an automatic containment rule stopped writes from non-platform keys) or `storage_full` (the D1 database is full; nothing was written) |
 | 503 | `search_degraded` | yes | Only when the request set `"require_mode": true` and the requested mode is unavailable. Otherwise search degrades and sets `degraded: true` |
 | 504 | `timeout` | yes | An internal deadline was exceeded. For sends this happens **before** the message is queued, so a retry with the same key is safe |
 

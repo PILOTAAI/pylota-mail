@@ -97,7 +97,7 @@ A key holds a list of permissions. Every endpoint below names the one it needs.
 | `members:read` | List console members and pending invitations (tenant, partner and platform keys; every console role holds it) |
 | `members:manage` | Invite, revoke, change roles and remove console members (tenant, partner and platform keys). Includes `members:read` |
 | `partners:manage` | Create, list, read, update and delete partners, the integrators whose partner keys create tenants ([Partners](#partners)). Platform keys only |
-| `platform:ops` | Platform operations: signing-key rotation, the dead-letter queue, maintenance jobs, waitlist invitations (platform keys only) |
+| `platform:ops` | Platform operations: signing-key rotation, the dead-letter queue, maintenance jobs, waitlist invitations, switches, mailbox restores and re-applied erasures (platform keys only) |
 
 Key levels limit which resources a key can reach, whatever its permissions. From widest to narrowest:
 
@@ -1042,7 +1042,9 @@ carries `extracted_text` (quotes stripped) rather than the full `text`.
 ```
 
 `DELETE /v1/identities/{identity_id}/threads/{thread_id}/hold` (`erasure:manage`) removes it. Both are
-audit-logged.
+audit-logged. On a tenant that is `erasing` with held threads, these two routes are the one write that
+a partner key (and a platform key) can still make, so a hold can be extended or released
+([Privacy design § 8](../project/design/privacy.md#8-legal-holds)).
 
 ### `GET /v1/identities/{identity_id}/messages` — `messages:read`
 
@@ -1624,16 +1626,24 @@ and revoking are audit-logged (`key.create`, `key.revoke`).
 Held threads are skipped and listed in the receipt (FR-PRV-4): an erasure request is never refused
 because of a hold (it never returns `423 legal_hold`). The request's `status` is `queued`, `running`,
 `completed`, `completed_with_holds` (finished, but at least one held thread was skipped), `failed`, or
-`canceled` (a tenant erasure superseded it). Returns `202` with the object below. A `tenant` request for
-a tenant already `erasing` returns the existing request with `200` (same `era_` ID); for an `erased`
-tenant it returns `409 tenant_erased` ([I8](../project/edge-cases.md)):
+`canceled` (a tenant erasure superseded it). Returns `202` with the object below. An erasure that keeps
+failing is retried automatically until 20 hours after the request (`deadline_at` − 4 hours), then ends
+`failed`; submit it again to restart it. A `tenant` request for a tenant already `erasing` depends on the
+tenant's latest tenant-scope request ([I8](../project/edge-cases.md)): `queued` or `running` returns it
+with `200` (same `era_` ID); `failed` returns `202` with a new request that resumes the failed one at its
+failed step (`resumes_id` names it; `deadline_at` is copied); `completed_with_holds` returns `202` with a
+continuation request (`resumes_id` names it) that finishes the erasure once no hold remains. For an
+`erased` tenant it returns `409 tenant_erased`. A tenant erasure never deletes a held thread: while one
+remains the request ends `completed_with_holds` and the tenant stays `erasing`
+([Privacy design § 6.6](../project/design/privacy.md#66-tenant-scope)):
 
 #### Erasure request object
 
 ```json
 {
   "id": "era_01J9…", "tenant_id": "ten_01J9…", "scope": "counterparty", "status": "completed",
-  "created_at": "…", "completed_at": "…", "created_by_key_id": "key_01J9…",
+  "identity_id": null, "target_id": null, "resumes_id": null,
+  "created_at": "…", "deadline_at": "…", "completed_at": "…", "created_by_key_id": "key_01J9…",
   "receipt": {
     "messages_deleted": 14, "attachments_deleted": 9, "r2_objects_deleted": 38,
     "fts_rows_deleted": 14, "refs_deleted": 51, "vectors_deleted": 63,
@@ -1643,6 +1653,10 @@ tenant it returns `409 tenant_erased` ([I8](../project/edge-cases.md)):
   }
 }
 ```
+
+`identity_id` is set for message, thread and identity scope, and `target_id` (the `msg_` or `thr_` ID) for
+message and thread scope; the counterparty address is never stored or returned. `deadline_at` is when
+the 24 hours of NFR-PRV-1 end, counted from the first request.
 
 `GET /v1/erasure-requests/{erasure_id}` and `GET /v1/erasure-requests` (filters: `tenant_id`, `status`). An
 `erasure.completed` event is emitted. The partner key of an erased tenant's partner can still read the
@@ -1659,13 +1673,14 @@ identities) or `identity` (with `identity_id`: the whole mailbox). Returns `202`
 (`status: "queued"`).
 
 ```json
-{ "id": "exp_01JA4…", "tenant_id": "ten_01J9…", "scope": "counterparty", "status": "completed",
-  "size": 1843321, "created_at": "…", "expires_at": "…",
+{ "id": "exp_01JA4…", "tenant_id": "ten_01J9…", "scope": "counterparty", "identity_id": null,
+  "status": "completed", "size": 1843321, "created_at": "…", "expires_at": "…",
   "download_url": "https://mail.example.com/v1/links/bDE6Mz…" }
 ```
 
 `status` is `queued`, `running`, `completed`, `failed`, `canceled` (a tenant erasure superseded it) or
-`expired`. The finished export has
+`expired` (7 days after creation, or earlier when an erasure of the tenant expired it, because the ZIP
+could hold erased mail). The finished export has
 `download_url`: a [signed link](#get-v1linkstoken) valid until `expires_at` (7 days) to a ZIP holding
 one `.eml` per message plus `messages.json`. The link is minted again on each `GET`. An
 `export.completed` event is emitted.
@@ -1757,7 +1772,16 @@ Audit rows cover administrative actions: keys (`key.create`, `key.rotate`, `key.
 (`partner.create`, `partner.update`, `partner.delete`), tenants (`tenant.create`, with the `partner_id`
 when a partner key created it), identity status, identity signing keys
 (`identity_key.create`, `identity_key.rotate`, `identity_key.revoke`), quarantine releases, holds,
-suppression removals, erasure, resolve, members, billing, and platform operations. **Sends are not
+suppression removals, erasure, resolve, members, billing, platform operations (`ops.switch`,
+`mailbox.restore`, `master_key.activated`), automatic containment (`partner.auto_suspend`,
+`tenant.auto_suspend`), and **reads of mail content by platform and partner keys** (`mail.read`): every
+request by a platform or partner key to a route that returns mail content (`GET …/threads/{thread_id}`,
+`GET …/messages`, `GET …/messages/{message_id}`, its `raw`, `attachments/{attachment_id}`,
+`attachments/{attachment_id}/text` and `related`, `GET …/quarantine`, `GET …/wait`,
+`POST …/identities/{identity_id}/search`, `POST /v1/tenants/{tenant_id}/search`, and the MCP tools that
+read the same) writes one row before the response, with `target_type` `message`, `thread` or `identity`,
+`target_id` and `details.route`; if the row cannot be written the request fails with
+`503 unavailable`. **Sends are not
 audit rows**: each send is recorded by its message, its events (`message.sent` and the delivery events)
 and its per-recipient delivery log. To review what a key sent, list the outbound messages of the
 identities it reaches for the period; request logs also carry the key ID for 7 days.
@@ -1797,7 +1821,7 @@ removed (`409 owner_required`).
 
 ## Platform operations
 
-Platform keys with `platform:ops`. Every call is audit-logged.
+Platform keys with `platform:ops` (`GET /v1/platform/status`: `audit:read`). Every call that changes something is audit-logged.
 
 ### `POST /v1/platform/keys/{purpose}/rotate`
 
@@ -1866,6 +1890,7 @@ Starts a maintenance job ([J3](../project/edge-cases.md)):
 | `reparse` | Re-parses messages from raw MIME with the deployed parser and re-emits their events with `reprocessed: true`. Messages past `raw_days` are skipped and counted |
 | `reembed` | Re-chunks and re-embeds messages into Vectorize, for example after a model change |
 | `reindex` | Rebuilds the keyword index (FTS5 and references) of each mailbox |
+| `restore_reconcile` | After a mailbox point-in-time restore: re-queues inbound mail received after `after` whose raw MIME is still in R2, and re-inserts sends made after it as `uncertain` with their idempotency records ([Restore from PITR](../project/design/observability.md#restore-from-pitr)). Needs `after` and `identity_ids`; runs even while the deployment is frozen |
 
 `tenant_id` is required; `identity_ids` (default: every identity of the tenant), `after` and `before`
 narrow it. Returns `202` with the job:
@@ -1876,8 +1901,71 @@ narrow it. Returns `202` with the job:
 ```
 
 `status` is `queued`, `running`, `completed`, `failed` or `canceled`; `result` holds counts once it
-ends. `Idempotency-Key` is optional. `GET /v1/platform/jobs/{job_id}` returns jobs started through this
-endpoint; erasure and export jobs are read through their own requests.
+ends, and for a failed job the failed step and error code. `Idempotency-Key` is optional.
+`GET /v1/platform/jobs/{job_id}` returns any job except erasure and export jobs, which are read through
+their own requests: the jobs started here, and the `retention`, `backup` and `domain_remove` jobs that a
+`job_failed:{kind}` alert names.
+
+### `GET /v1/platform/status`
+
+Platform keys with `audit:read` (the external heartbeat's key holds only that). The deployment's
+operational state, read by `pmail doctor`, `pmail ops status` and the heartbeat
+([Observability § 5.5](../project/design/observability.md#55-alert-email-and-the-external-heartbeat)):
+
+```json
+{
+  "frozen": false, "frozen_since": null,
+  "switches": { "read_only": "off", "free_sending": "on", "emergency_prune": "off" },
+  "alert_email": "configured",
+  "firing": [ { "alert": "dlq:pm-inbound", "severity": "page", "fired_at": "2026-10-10T03:12:00Z" } ],
+  "master_key": { "active_slot": "a", "remaining": 0, "activated_at": "2026-07-01T09:00:00Z",
+                  "slots": [ { "slot": "a", "present": true, "kid": "3f9a0c1d2e4b5a67" },
+                             { "slot": "b", "present": true, "kid": "88c1d0e2f3a4b596" } ] },
+  "capacity": { "d1_bytes": 1840000000, "d1_pct": 18.4, "vectors": 2100000, "vectors_pct": 10.5,
+                "tenants": 1204, "namespaces_pct": 2.4, "measured_at": "2026-10-10T03:00:00Z" }
+}
+```
+
+`alert_email` is `configured` or `missing` (neither `PM_ALERT_EMAIL` nor a `mailto:` `PM_SECURITY_CONTACT`).
+`firing` lists every state alert that is firing. `master_key.remaining` counts sealed values not yet
+re-sealed with the active slot's key; `activated_at` is when the Worker first saw that key
+([Security § 6.2](../project/design/security.md#62-rotation-procedures)). Key IDs are not secret: every
+ciphertext carries one. Key material is never returned.
+
+### `PUT /v1/platform/switches`
+
+`platform:ops`. `name` is `read_only`, `free_sending` or `emergency_prune`
+([Observability § 5.6](../project/design/observability.md#56-automatic-containment)):
+
+```json
+{ "name": "read_only", "state": "off", "reason": "rpc_owner_mismatch fixed in 1.0.3" }
+```
+
+Returns `200` with `{ "name", "state", "set_by": "platform", "reason", "set_at" }`. Readers cache a
+switch for 60 seconds. The audit action is `ops.switch`. `Idempotency-Key` is optional.
+
+### `POST /v1/platform/identities/{identity_id}/restore`
+
+`platform:ops`. Restores one identity's mailbox to a point in time, or undoes such a restore
+([Restore from PITR](../project/design/observability.md#restore-from-pitr)). Only while the deployment is
+frozen (`PM_FREEZE = "on"`); otherwise `409 not_frozen`.
+
+```json
+{ "at": "2026-10-09T09:00:00Z" }
+```
+
+or `{ "bookmark": "<undo bookmark>" }`. `at` must be within the last 30 days. Returns `200` with
+`{ "identity_id", "restored_to", "undo_bookmark" }`; the audit action `mailbox.restore` records the undo
+bookmark too.
+
+### `POST /v1/platform/erasure-requests/{erasure_id}/reapply`
+
+`platform:ops` and `erasure:manage`. Creates a new erasure request that repeats a stored one after a
+restore brought erased data back. No body. The new request has the same tenant, scope, `identity_id`
+and `target_id`, reason `reapply_after_restore:{erasure_id}` and its own `deadline_at`; a counterparty
+erasure matches by the stored keyed hash of the address, which is never needed in clear
+([Privacy design § 11](../project/design/privacy.md#11-what-remains-after-deletion)). Returns `202` with
+the new erasure request. It runs even while the deployment is frozen. `Idempotency-Key` is optional.
 
 ### `POST /v1/platform/waitlist/invite`
 

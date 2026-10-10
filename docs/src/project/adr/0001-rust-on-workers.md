@@ -4,7 +4,7 @@
 |---|---|
 | Status | Accepted |
 | Date | 2026-10-09 |
-| Deciders | Pylota engineering |
+| Deciders | The owner (TREFT LTD) |
 | Related | PRD goals 6–7, NFR-SEC-2, NFR-COST-1; [Rust workspace](../design/rust-workspace.md); spikes S1, S4, S5, S6 |
 
 ## Context

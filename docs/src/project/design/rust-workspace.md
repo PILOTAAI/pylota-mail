@@ -338,7 +338,8 @@ pub struct Config {
     pub secrets: Secrets,
 }
 pub struct Secrets {                 // each decoded from base64; 32 bytes for the PM_* keys
-    pub master_key: [u8; 32], pub master_key_next: Option<[u8; 32]>,
+    pub master_key_a: Option<[u8; 32]>, pub master_key_b: Option<[u8; 32]>,   // PM_MASTER_KEY, PM_MASTER_KEY_B
+    pub master_key_active: MasterSlot,   // PM_MASTER_KEY_ACTIVE: A (default) or B; that slot must be Some
     pub key_pepper: [u8; 32], pub hash_key: [u8; 32],
     pub cf_api_token: Option<String>, pub ses: Option<SesCredentials>,
     pub stripe: Option<StripeSecrets>,                   // PM_STRIPE_SECRET_KEY, PM_STRIPE_WEBHOOK_SECRET
@@ -365,12 +366,14 @@ than `closed` without `PM_TERMS_URL`, `PM_PRIVACY_URL`, `PM_DPA_URL` and `PM_TER
 | `PM_BILLING=stripe` without `PM_STRIPE_SECRET_KEY` or `PM_STRIPE_WEBHOOK_SECRET` | The Worker starts with billing not started: every workspace behaves as `disabled` (no plan checks; holds still run), Checkout, Portal and `/billing/stripe/webhook` answer `503 unavailable`, `/health` reports `"status": "degraded"` with `"billing": "stripe_secrets_missing"`, and `pmail doctor` fails `secrets` |
 | `PM_SIGNUP` is not `closed` and a `PM_TERMS_*`, `PM_PRIVACY_URL` or `PM_DPA_URL` value is missing | `config_invalid`, as above |
 | `PM_WEB_BOT_AUTH=on` in a release built without signed HTTP requests (spike S13 failed, so its fallback was taken) | `config_invalid` naming `PM_WEB_BOT_AUTH`: the variable cannot be turned on, and is never silently ignored |
+| The master-key slot named by `PM_MASTER_KEY_ACTIVE` (default `a`) is empty, `PM_MASTER_KEY_ACTIVE` is not `a` or `b`, or both slots hold keys with the same key ID | `config_invalid` naming the secret ([Security §6.2](security.md#62-rotation-procedures)) |
+| `PM_FREEZE=on` | The Worker starts frozen: `/health` adds `"frozen": true` and every handler follows the freeze rules of [Observability › Restore from PITR](observability.md#restore-from-pitr) |
 
 Test: `platform::config::startup_rules` covers each row.
 
 The thread, link, cursor and `web_bot_auth` keys are not secrets of the Worker: they live sealed in D1 `signing_keys`
 ([Data model](data-model.md#1-d1-control-plane)). `worker::keyring` loads and opens them with
-`master_key` (or `master_key_next`, by the envelope's kid), caches the opened ring per isolate for
+the master-key slot whose key ID matches the envelope's kid, caches the opened ring per isolate for
 5 minutes, and creates the first key of a purpose on first use with `Rng` (`web_bot_auth` only while
 `PM_WEB_BOT_AUTH=on`). Identity signing keys live in `identity_keys`, one ring per identity, opened the
 same way when the identity signs ([Agent signing keys](agent-keys.md#2-keys)).
@@ -902,8 +905,9 @@ binding = "METRICS"
 dataset = "pylota_mail_metrics"
 ```
 
-- Secrets (`PM_MASTER_KEY`, `PM_KEY_PEPPER`, `PM_HASH_KEY`, and the optional `PM_MASTER_KEY_NEXT`
-  (during a master-key rotation only), `PM_CF_API_TOKEN`, `PM_SES_ACCESS_KEY_ID`,
+- Secrets (`PM_MASTER_KEY`, `PM_KEY_PEPPER`, `PM_HASH_KEY`, and the optional `PM_MASTER_KEY_B` and
+  `PM_MASTER_KEY_ACTIVE` (the second master-key slot and its selector, Security §6.2),
+  `PM_CF_API_TOKEN`, `PM_SES_ACCESS_KEY_ID`,
   `PM_SES_SECRET_ACCESS_KEY`, `PM_STRIPE_SECRET_KEY`, `PM_STRIPE_WEBHOOK_SECRET`,
   `PM_OAUTH_GOOGLE_CLIENT_SECRET`, `PM_OAUTH_GITHUB_CLIENT_SECRET`) are uploaded with `wrangler secret`,
   never written to the file. Thread, link, cursor and `web_bot_auth` keys are not secrets: the Worker
@@ -934,7 +938,8 @@ dataset = "pylota_mail_metrics"
 | `cargo xtask openapi` | Generates `openapi.json` from `api-types` and compares it semantically with `docs/src/reference/openapi.yaml` |
 | `cargo xtask gen-unicode` | Regenerates `crates/core/src/address/confusables_table.rs` from the pinned UTS #39 data files checked into `crates/core/data/` |
 | `cargo xtask eval-search`, `eval-agentic`, `eval-triage` | Quality gates on the golden set (build plan M18) |
-| `cargo xtask release --version <v>` | Builds the Worker, then writes `dist/pylota-mail-worker-<v>.tar.gz` containing `build/index.js`, `build/index_bg.wasm`, `build/worker/shim.mjs`, `migrations/d1/*.sql`, `deploy/wrangler.toml.tmpl` and `VERSION`; collects the CLI binaries built by the CI matrix; writes `dist/SHA256SUMS` (`<sha256 hex>␠␠<filename>` per line) and its detached signature `SHA256SUMS.sig` made with the release signing key held in CI secrets. Verification by `pmail deploy` is specified in [CLI and setup](cli.md) |
+| `cargo xtask release --version <v>` | Builds the Worker, then writes `dist/pylota-mail-worker-<v>.tar.gz` containing `build/index.js`, `build/index_bg.wasm`, `build/worker/shim.mjs`, `migrations/d1/*.sql`, `deploy/wrangler.toml.tmpl` and `VERSION`; collects the CLI binaries built by the CI matrix; writes `dist/SHA256SUMS` (`<sha256 hex>␠␠<filename>` per line). It does not sign: the signing key never enters CI ([Security › Supply chain](security.md#11-supply-chain)). Verification by `pmail deploy` is specified in [CLI and setup](cli.md) |
+| `cargo xtask release sign <tag>` | Run by the owner on their own machine with the offline minisign key: downloads `SHA256SUMS` and every listed file from the draft release, checks each checksum and `gh attestation verify` (provenance naming `release.yml` on that tag), then writes the detached signature `SHA256SUMS.sig` and uploads it to the draft release |
 
 Fuzz targets (each a `fuzz_target!` over `&[u8]` calling one `core` entry point):
 
@@ -987,9 +992,11 @@ audit` on `main`, and the `live::` suite against staging when staging credential
 
 Release (`.github/workflows/release.yml`, on a `v*` tag): the full CI gate; CLI binaries for macOS
 (arm64, x64), Linux (x64, arm64) and Windows (x64); `cargo xtask release`; an SBOM for the Worker and
-the CLI (`cargo cyclonedx --format json`); signed `SHA256SUMS` and build provenance (`actions/attest@v4`,
-[Security › Supply chain](security.md#11-supply-chain)); a GitHub Release with the bundle, the binaries,
-the SBOMs, `SHA256SUMS` and `SHA256SUMS.sig`; then `cargo publish` for `pylota-mail` and
+the CLI (`cargo cyclonedx --format json`); `SHA256SUMS` and build provenance (`actions/attest@v4`,
+[Security › Supply chain](security.md#11-supply-chain)) on a draft release; a wait for the owner's offline
+signature (`cargo xtask release sign`); the `publish` job, which verifies `SHA256SUMS.sig` against the
+compiled-in public keys and publishes the GitHub Release with the bundle, the binaries, the SBOMs,
+`SHA256SUMS` and `SHA256SUMS.sig`; then `cargo publish` for `pylota-mail` and
 `pylota-mail-cli` (and the crates they depend on).
 
 ## 11. The Rust SDK (FR-SDK-1)

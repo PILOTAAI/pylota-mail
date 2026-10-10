@@ -4,7 +4,7 @@
 |---|---|
 | Status | Accepted |
 | Date | 2026-10-09 |
-| Deciders | Pylota engineering |
+| Deciders | The owner (TREFT LTD) |
 | Related | FR-MCP-1; spike S5 ([Design › Spikes](../design/index.md#spikes)); [MCP server §2.7](../design/mcp.md#27-protocol-types-rmcp-and-spike-s5); `AGENTS.md` ("No tokio") |
 
 ## Context

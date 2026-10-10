@@ -146,7 +146,7 @@ The **message summary** used in `data.message` is:
 | Type | `data` |
 |---|---|
 | `erasure.completed` | `erasure_request` (with receipt) |
-| `erasure.failed` | `erasure_request_id`, `step`, `error`. Retried by the job runner before this is sent |
+| `erasure.failed` | `erasure_request_id`, `step`, `error`. Sent only after the job runner retried the step until 20 hours after the first request; submit the erasure again to restart it (a tenant erasure resumes at the failed step) |
 | `export.completed` | `export_id`, `expires_at` (fetch the download link from the API) |
 | `suppression.created` | `address_hint`, `reason`, `source_message_id` |
 | `quota.warning` | `metric` (`sends` in v1), `used`, `limit`, `scope` (tenant or identity). Sent at 80% and at 100% of a daily send cap |
