@@ -215,8 +215,8 @@ read 2026-10-09). Pass: `401` before registration. Fallback: signed HTTP request
 
 - New permission `identities:sign`. It is granted like any other permission (there are no wildcard
   permissions): a tenant key holds it when it is in the key's list, and an identity key holds it only when
-  granted, for its own identity. Platform keys cannot sign as an identity: creating a platform key with
-  `identities:sign` is refused with `400 invalid_request` and `details.reason =
+  granted, for its own identity. Platform and partner keys cannot sign as an identity: creating a platform
+  or partner key with `identities:sign` is refused with `400 invalid_request` and `details.reason =
   "permission_not_allowed_for_level"`. In the console, the owner's and admins' session principals hold it,
   so they can create keys that carry it.
 - Console: owners and admins create, rotate and revoke identity keys on the identity page (sensitive
@@ -250,8 +250,8 @@ and `kid` (`identity.key_rotated` also carries `previous_kid`). They are identit
 the D1 change through the identity's mailbox like the other `identity.*` events. Errors: the new
 `web_bot_auth_disabled` (422) and `policy_denied` (403); `key_not_found` (404), the existing code for a
 missing key, also covers an unknown `kid` and the directory while it is off; plus the existing
-`identity_not_found`, `identity_paused`, `invalid_request`, `permission_denied`, `scope_denied` and
-`rate_limited`.
+`tenant_suspended` (checked first, before `identity_paused`), `identity_not_found`, `identity_paused`,
+`invalid_request`, `permission_denied`, `scope_denied` and `rate_limited`.
 
 ## 8. Data model
 
@@ -296,7 +296,7 @@ published again.
 | `PM_WEB_BOT_AUTH` | `off` | `on` publishes the directory and allows signed HTTP requests (after S13 passes) |
 | `PM_IDENTITY_KEY_OVERLAP_DAYS` | `7` | How long a retiring identity key stays published |
 | Binding `RL_SIGN` | 600 per 60 s | Keyed by identity ID |
-| Tenant policy `web_bot_auth.allowed` | `false` | A tenant must opt in before its identities can sign HTTP requests |
+| Tenant policy `web_bot_auth.allowed` | `false` | A tenant must be opted in, by a platform key (the field is platform-only), before its identities can sign HTTP requests |
 
 ## 10. Security and privacy
 

@@ -154,7 +154,7 @@ Every message has a `kind` ([G9](../project/edge-cases.md)):
 | Kind | Use | Requirements |
 |---|---|---|
 | `transactional` | The default. Booking confirmations, answers, invoices, anything the recipient expects | None |
-| `marketing` | Promotional mail, one message at a time | An `unsubscribe` object (`{ "url": "https://…", "mailto": "…" }`) and the tenant's consent attestation (`"consent": { "basis": "opt_in", "recorded_at": "…" }`). Without them: `400 marketing_requirements_missing` |
+| `marketing` | Promotional mail, one message at a time | An `unsubscribe` object (`{ "url": "https://…", "mailto": "…" }`) and the tenant's consent attestation (`"consent": { "basis": "opt_in", "recorded_at": "…" }`). Without them: `400 marketing_requirements_missing`. The sending domain must use the `ses` or `smtp` transport: Cloudflare Email Service is for transactional mail only, so marketing from the platform domain or a `cloudflare`-transport domain gets `422 transport_unavailable` |
 | `auto_reply` | An automatic answer the agent sends without a human | Allowed only in reply to a non-automated message. Sets `Auto-Submitted: auto-replied` |
 
 Marketing mail gets RFC 8058 one-click unsubscribe headers (`List-Unsubscribe` and
@@ -186,8 +186,14 @@ mode at `none`.
 
 ## Custom headers
 
-`headers` accepts `X-` headers plus `Importance`, `Priority`, `Sensitivity`, `Keywords`, `Comments`
-and `Organization`. Anything else fails with `400 header_not_allowed`. The service sets threading,
+`headers` accepts `X-` headers whose name uses only letters, digits, `-` and `_` (`X-Booking-Ref`), plus
+`Importance`, `Priority`, `Sensitivity`, `Keywords`, `Comments` and `Organization`. Names are matched
+case-insensitively, as Cloudflare matches them, so `importance` works and is sent as `Importance`.
+Anything else fails with `400 header_not_allowed`, and so do the reserved `X-Pylota-*` and
+`X-AI-Generated` in any case. `Importance` takes `high`, `normal` or `low`,
+`Priority` `normal`, `non-urgent` or `urgent`, and `Sensitivity` `personal`, `private` or
+`company-confidential`; another value fails with `400 invalid_request`. Both are checked when you send, so
+a bad header never turns into a rejected message later. The service sets threading,
 `Reply-To`, `Auto-Submitted` and unsubscribe headers itself, and Cloudflare sets `Message-ID`, `Date`
 and the DKIM signature. Custom headers can total 16 KB, with values of at most 2,048 bytes.
 
@@ -399,16 +405,17 @@ not, because you made them.
 | Sends per tenant per day | `tenant_daily_send_cap` 5,000 | `429 daily_cap_reached` |
 | Cloudflare's daily sending quota for the account | Set by Cloudflare | Not your error: the queue backs off and retries for up to 24 hours, then `failed` with `quota_exhausted` ([G3](../project/edge-cases.md)) |
 
-Daily caps count in the tenant's time zone. A `quota.warning` event is sent at 80% and at 100% of a
-cap.
+Daily caps count in the tenant's time zone. A `quota.warning` event is sent at 80% and at 100% of the
+identity or tenant daily send cap.
 
 An identity is **paused automatically** with reason `abuse_threshold` when its complaint rate exceeds
 0.3% over its last 1,000 sends, or its bounce rate exceeds 5% over its last 200
 ([FR-DLV-3](../project/prd.md#66-delivery); policy `abuse.complaint_rate_pause` and
 `abuse.bounce_rate_pause`). It keeps receiving mail. An `identity.paused` event carries the metrics.
 Find out why the rates rose (a stale address list, an agent writing to strangers) before resuming:
-setting `status: "active"` on an identity paused for abuse needs a platform or tenant key and is
-audit-logged.
+setting `status: "active"` on an identity paused for abuse needs a platform, partner or tenant key and is
+audit-logged. On a workspace a partner created, only the deployment's operator (a platform key) can resume
+it.
 
 ## When a domain fails
 

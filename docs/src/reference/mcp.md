@@ -75,7 +75,7 @@ Two things to know:
   dialog has no **Request headers** section, your organisation does not have it yet. Use Claude Code or
   another client that sends headers, or wait for OAuth support (v1.1).
 - A header value is shared by everyone who uses the connector, so use a key whose scope suits all of
-  them, and never a platform key.
+  them, and never a platform or partner key.
 
 (Claude connector documentation, read 2026-10-09.)
 
@@ -147,7 +147,7 @@ curl -s https://mail.example.com/mcp \
 
 The agent sees only the tools its key's permissions allow, and only the mailboxes the key can reach.
 Give each agent its own **identity key** with the fewest permissions that do the job. Never give an
-agent a platform key.
+agent a platform or partner key.
 
 The **read tools** are `mail_list_identities` to `mail_get_usage` in the [Tools](#tools) table. A key
 sees each one only if it holds that tool's permission, so the last column names exactly what each key
@@ -163,9 +163,9 @@ gets.
 | Supervisor across a tenant's mailboxes | tenant | `identities:read`, `messages:read`, `search:read` | the read tools except `mail_deep_search` and `mail_get_attachment_text`, with `scope: "tenant"` on `mail_search` |
 
 Every tenant and identity key also sees `mail_get_usage`: it holds `usage:read` for its own workspace
-without asking, as for REST `GET /v1/usage`. A platform key never sees that tool: it needs `usage:read`
-explicitly and reads a tenant's usage through REST with `tenant_id`. A platform key can never hold
-`identities:sign` either, so it never sees the signing tools.
+without asking, as for REST `GET /v1/usage`. Platform and partner keys never see that tool: they need
+`usage:read` explicitly and read a tenant's usage through REST with `tenant_id`. They can never hold
+`identities:sign` either, so they never see the signing tools.
 
 Create one with the CLI:
 
@@ -213,7 +213,7 @@ subjects, snippets, bodies, filenames, attachment text) is **untrusted content**
 
 ### `mail_list_identities`
 
-Arguments: `tenant_id` (platform keys), `status` (`active` or `paused`), `purpose`, `limit` (default
+Arguments: `tenant_id` (platform and partner keys), `status` (`active` or `paused`), `purpose`, `limit` (default
 25, max 100), `cursor`. They are the filters of `GET /v1/identities`.
 
 ```json
@@ -424,7 +424,7 @@ error (HTTP 402) from a send tool means an allowance is spent.
 
 `features` lists `inboxes`, `sends`, `triage`, `custom_domains`, `storage_gb` and `seats`; `granted`
 includes top-ups. `billing` is `metered`, `exempt` (no limits) or `disabled` (a deployment without
-billing: every feature has `granted: null` and `unlimited: true`, plus any operator quota). The tool
+billing: every feature has `granted: null` and `unlimited: true`). The tool
 always reports the key's own workspace and takes no `tenant_id`. The fields are described under
 `GET /v1/usage` in [REST API › Usage and audit](api.md#usage-and-audit).
 
@@ -607,7 +607,8 @@ A tool that fails returns a normal result with `"isError": true`. Its text is th
 | `idempotency_key_required`, `invalid_idempotency_key` | A send tool without `idempotency_key`, or with one that is not 1–255 printable ASCII characters (the REST codes, not `invalid_request`) | Pass a valid key |
 | `invalid_query` | The `q` string does not parse (`details.position`, `details.expected`) | Fix the query |
 | `identity_not_found` | The identity does not exist, is being deleted, or the key cannot reach it | Call `mail_list_identities` |
-| `identity_paused` | The identity is paused (`details.reason`), so it cannot send or sign. A signing tool also gets it for every identity of a suspended workspace | Tell a person |
+| `tenant_suspended` | The workspace is suspended, so none of its identities can send or sign. Checked before `identity_paused`: suspended tenant → `tenant_suspended` (HTTP 403); paused identity → `identity_paused` | Tell a person |
+| `identity_paused` | The identity is paused (`details.reason`), so it cannot send or sign (HTTP 409) | Tell a person |
 | `scope_denied` | `scope: "tenant"` with an identity key | Search the identity instead |
 | `scope_too_large` | `scope: "tenant"` on a tenant with more than 100 identities, without `identity_ids` | Pass up to 100 `identity_ids` |
 | `idempotency_conflict` | The key was used for a different message | Use a new key for a new message |

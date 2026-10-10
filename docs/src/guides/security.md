@@ -19,6 +19,7 @@ Every request is authenticated with an API key: `Authorization: Bearer pmk_live_
 | Level | Reaches |
 |---|---|
 | `platform` | Every tenant. For administration only |
+| `partner` | The tenants its partner's keys created, for an integrator that runs its customers as tenants of a shared deployment. Never another partner's tenants, and never the deployment's operations ([REST API › Partners](../reference/api.md#partners)) |
 | `tenant` | One tenant: its identities, domains, webhooks and keys |
 | `identity` | One identity's mailbox. With `domains:read` or `webhooks:read`, it can also read the tenant's domains or webhooks |
 
@@ -26,10 +27,11 @@ A key also holds a list of permissions ([REST API › Permissions](../reference/
 Both must allow a request. A key can never create a key wider than itself in level, tenant, identity
 or permissions (`403 key_scope_exceeded`) ([FR-KEY-1](../project/prd.md#61-tenancy-and-access)).
 
-Some permissions belong to particular levels. `tenants:manage` and `platform:ops` are for platform keys
-only. `members:read`, `members:manage`, `suppressions:manage`, `audit:read` and `usage:read` cannot be
-listed on identity keys (an identity key still reads its own workspace's `GET /v1/usage`, as every
-tenant and identity key does). `identities:sign` cannot be held by platform keys. Creating a key that
+Some permissions belong to particular levels. `platform:ops` and `partners:manage` are for platform keys
+only, and `tenants:manage` for platform and partner keys. `members:read`, `members:manage`,
+`suppressions:manage`, `audit:read` and `usage:read` cannot be listed on identity keys (an identity key
+still reads its own workspace's `GET /v1/usage`, as every tenant and identity key does).
+`identities:sign` cannot be held by platform or partner keys. Creating a key that
 lists a permission its level cannot hold is refused with `400 invalid_request` and
 `details.reason: "permission_not_allowed_for_level"`. Creating a platform key also needs an explicit,
 non-empty `permissions` list (`400 invalid_request` without one): there is no implicit full set.
@@ -48,11 +50,28 @@ non-empty `permissions` list (`400 invalid_request` without one): there is no im
 | A privacy tool for data requests | `tenant` | `erasure:manage` |
 | Suppression and list management | `tenant` | `suppressions:manage` |
 | Dashboards | `tenant` or `platform` | `usage:read`, `audit:read` |
+| An integrator provisioning its customers on a shared deployment (for example Pylota on Pylota Mail Cloud) | `partner` | `tenants:manage`, `keys:manage`, `webhooks:manage` and what its back end needs; `quarantine:review` only for its human review screen |
 | Deployment administration | `platform` | `tenants:manage`, `keys:manage` and what the task needs |
 
 Never give `quarantine:review`, `erasure:manage`, `keys:manage`, `suppressions:manage` or
 `tenants:manage` to an agent. Never give any mailbox permission to a public or customer-facing agent
 ([F2](../project/edge-cases.md)).
+
+### What a partner key cannot change
+
+A partner key manages its own tenants, but the deployment's operator keeps the last word
+([Security › Partner keys](../project/design/security.md#partner-keys)):
+
+- it can lower its tenants' send caps, abuse thresholds, retention and AI switches but never raise them
+  above the deployment default or a value the operator set, and it cannot set `web_bot_auth.allowed`,
+  `domains.allow_create_zone` or `domains.cloudflare_zones`
+  ([Configuration › Who may change a field](../reference/configuration.md#who-may-change-a-field));
+- it cannot lift a suspension the operator made, or resume an identity paused for abuse;
+- it has at most `max_tenants` tenants (25 by default), creates tenants and invitations at most 10 a
+  minute, and its new tenants follow the send ramp unless the operator exempts the partner;
+- when the operator suspends the partner, its keys and every key of its tenants stop at once, and webhook
+  deliveries to it and its tenants are held until it is reactivated;
+- it cannot write to a tenant that is being erased; it can still read the tenant and its erasure receipt.
 
 ### How keys are stored and checked
 
@@ -144,9 +163,9 @@ use the deployment's key instead, as above.
 - **Revocation.** If a key may have leaked, `POST …/keys/{kid}/revoke` retires it at once. It leaves the
   key set, and verifiers drop it within the 5-minute cache. Key routes keep working while the identity
   is paused, so you can deal with a leak before resuming it.
-- **The kill switch.** Pausing an identity, or suspending its tenant, stops new signatures
-  (`409 identity_paused`) and withdraws its key set (`404`), so a service that refetches it stops
-  accepting the identity's assertions within the cache time.
+- **The kill switch.** Pausing an identity, or suspending its tenant, stops new signatures (suspended
+  tenant → `403 tenant_suspended`; paused identity → `409 identity_paused`) and withdraws its key set
+  (`404`), so a service that refetches it stops accepting the identity's assertions within the cache time.
 - **Erasure.** Deleting an identity deletes its keys and tombstones their key IDs, which are never
   published again.
 - **Replay protection lies with verifiers.** Pylota Mail keeps no record of the tokens it mints, so it
@@ -258,7 +277,10 @@ leave it out by default, and its `message.quarantined` event carries no text. It
 request asks for it explicitly (a `status` filter on a list, `include_quarantined` in search) **and**
 the key holds `quarantine:review`. Mail stored `hidden` or `throttled` follows the same rule.
 
-- Release is a human action. It needs `quarantine:review`, takes a reason, and is audit-logged.
+- Release is a human action. It needs `quarantine:review`, takes a reason, and is audit-logged. Where
+  `PM_QUARANTINE_KEY_RELEASE` is `off` (Pylota Mail Cloud), only a person in the console can release,
+  unless the workspace's policy has `quarantine.key_release: true`, which only the operator or the
+  workspace's partner can set, so that a partner's own review screen can release through its key.
 - Receive-allow lists skip spam quarantine but **never** authentication quarantine.
 - No agent should hold `quarantine:review`.
 

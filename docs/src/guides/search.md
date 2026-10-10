@@ -93,8 +93,8 @@ Normalisation means formatting does not matter: `AB12 CDE`, `ab12cde` and `AB12C
 match `ref:AB12CDE` ([F5](../project/edge-cases.md)). Amounts are stored with their currency
 (`GBP:412.80`) and phone numbers in international form (`+447700900123`).
 
-Turn packs on, and add your own patterns, in the tenant policy (a platform key with
-`tenants:manage`):
+Turn packs on, and add your own patterns, in the tenant policy (a platform key, or the tenant's partner
+key, with `tenants:manage`):
 
 ```json
 {
@@ -200,7 +200,7 @@ start again from the first page.
 
 ## Search across a tenant
 
-A tenant or platform key can search every identity of a tenant at once
+A tenant, partner or platform key can search every identity of a tenant at once
 ([FR-SRCH-10](../project/prd.md#68-search)):
 
 ```bash
@@ -216,7 +216,7 @@ CLI: `pmail search "ref:AB12CDE" --tenant acme`.
   `422 scope_too_large`.
 - An identity key asking for tenant scope gets `403 scope_denied` ([F3](../project/edge-cases.md)).
 - Every mode works here, `agentic` included: agentic search runs at identity or tenant scope, and at
-  tenant scope it needs a tenant or platform key with `search:read` and `search:agentic`. CLI:
+  tenant scope it needs a tenant, partner or platform key with `search:read` and `search:agentic`. CLI:
   `pmail ask "<question>" --tenant acme`.
 - If one identity's mailbox is slow or unavailable, the others are returned after a 900 ms deadline per
   identity, with `partial: true` and the missing ones in `failed_identities[]`

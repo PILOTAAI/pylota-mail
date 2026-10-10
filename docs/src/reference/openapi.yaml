@@ -33,17 +33,24 @@ info:
       cookie is set or read on the API host.
     - **Format.** JSON (`application/json; charset=utf-8`). Times are RFC 3339 UTC strings. Sizes are bytes.
     - **IDs** are a type prefix, an underscore and a 26-character upper-case Crockford base32 ULID
-      (`ten_ idn_ adr_ dom_ thr_ msg_ att_ whk_ dlv_ evt_ key_ era_ exp_ job_ aud_ req_ usr_ inv_ dlq_ hld_ prb_`).
+      (`ten_ idn_ adr_ dom_ thr_ msg_ att_ whk_ dlv_ evt_ key_ era_ exp_ job_ aud_ req_ usr_ inv_ dlq_ hld_ prb_ ptn_`).
     - **Pagination.** List endpoints take `limit` (default 25, max 100) and `cursor`, and return
       `{ "data": [...], "next_cursor": "…" | null }`. Cursors are opaque and expire after 24 hours
       (`410 cursor_expired`).
     - **Idempotency.** `Idempotency-Key` is required on send, reply, reply-all and forward (except on a
-      dry run, `dry_run=true`), and optional on every other `POST` except the two signing endpoints
-      (`…/assertions` and `…/http-signatures`), which ignore it and never record it. Keys are kept for 30 days, scoped per
-      identity for mail and per tenant for everything else. A replay returns the original response with the header `Idempotent-Replayed: true`
-      (and `"deduplicated": true` in mail responses).
-    - **Rate limits.** Every authenticated response carries `RateLimit-Limit`, `RateLimit-Remaining` and
-      `RateLimit-Reset`. A `429` also carries `Retry-After`.
+      dry run, `dry_run=true`, where it is optional and never recorded), and optional on every other
+      `POST` except four (`x-idempotency: none`), which ignore it and never record it: the two signing
+      endpoints (`…/assertions` and `…/http-signatures`) and the two SNS endpoints (`/hooks/ses` and
+      `/hooks/ses/inbound`). Keys are kept for 30 days, scoped per
+      identity for mail, and per calling API key and tenant (or partner, or deployment, when the request
+      names no tenant) for everything else. A replay returns the original response with the header
+      `Idempotent-Replayed: true` (and `"deduplicated": true` in mail responses); a response that carried
+      a one-time secret is replayed without it and with `"secret_replayed": false`.
+    - **Rate limits.** Every authenticated response carries `RateLimit-Limit`: the limit of the bucket that
+      applied, per period. A `429` also carries `Retry-After` and `RateLimit-Reset`, the seconds to the end
+      of the bucket's current period; for `rate_limited` the two are equal, and the other `429` codes set
+      `Retry-After` to their own wait. `RateLimit-Remaining` is not sent: the Workers rate-limiting binding
+      answers only allow or deny, so the Worker cannot know how many requests are left.
     - **Errors.** Every non-2xx response uses the `Error` envelope. Handle unknown error codes by HTTP status.
     - **Evolution.** Additive changes (new fields, new event types, new enum values) can happen within
       `/v1`. Clients must ignore unknown fields and handle unknown enum values, even where this document
@@ -57,9 +64,9 @@ info:
     | Extension | On | Meaning |
     |---|---|---|
     | `x-required-permission` | operation | Array of permissions the key must hold, all of them. `[]` means any valid key |
-    | `x-key-levels` | operation | Key levels (`platform`, `tenant`, `identity`) that can call the operation at all |
+    | `x-key-levels` | operation | Key levels (`platform`, `partner`, `tenant`, `identity`) that can call the operation at all. A `partner` key acts only on the tenants its partner's keys created |
     | `x-permission-notes` | operation | Conditional permission or scope rules that the two fields above cannot express |
-    | `x-rate-limit-buckets` | operation | Rate-limit buckets the request counts against (`api`, `search`, `agentic`, `send`, `sign`) |
+    | `x-rate-limit-buckets` | operation | Rate-limit buckets the request counts against (`api`, `search`, `agentic`, `send`, `sign`, `partner`; `partner` only for a partner key's calls) |
     | `x-idempotency` | operation | `required`, `optional` or `none` for the `Idempotency-Key` header. `required` means a request without it fails with `400 idempotency_key_required`, except a dry run (`dry_run=true`). `none` means the header is ignored and never recorded |
     | `x-error-codes` | response | The `error.code` values this operation can return with that status |
 
@@ -84,7 +91,13 @@ tags:
   - name: Meta
     description: Health, the OpenAPI document and the calling key.
   - name: Tenants
-    description: Tenants and their policy. Platform keys with `tenants:manage`.
+    description: >-
+      Tenants and their policy. Keys with `tenants:manage`: platform keys for every tenant, partner keys for
+      the tenants their partner's keys created.
+  - name: Partners
+    description: >-
+      Partners: integrators whose partner keys create tenants and act only on those tenants. Platform keys
+      with `partners:manage`.
   - name: Identities
     description: Agent identities (one mailbox each).
   - name: Addresses
@@ -120,7 +133,7 @@ tags:
   - name: Audit
     description: Audit log.
   - name: Members
-    description: Console members and invitations of a workspace. `members:manage`, tenant and platform keys.
+    description: Console members and invitations of a workspace. `members:manage`, tenant, partner and platform keys.
   - name: Platform
     description: >-
       Platform operations: signing-key rotation, the dead-letter queue, maintenance jobs and waitlist
@@ -216,7 +229,7 @@ paths:
       summary: Describe the calling key
       description: Any valid key. Describes the key that made the request.
       x-required-permission: []
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -225,8 +238,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Me'}
@@ -235,6 +246,7 @@ paths:
                 name: pylota-api
                 level: tenant
                 mode: live
+                partner_id: null
                 tenant_id: ten_01J9Z3K8V4QW7X2M5N6P8R0T1Y
                 identity_id: null
                 permissions: ['identities:read', 'messages:send', 'search:read']
@@ -252,15 +264,26 @@ paths:
       tags: [Tenants]
       summary: Create a tenant
       description: >-
-        Platform keys only. `address_suffix` defaults to `"." + slug`; only one tenant (the default tenant
+        Platform and partner keys. `address_suffix` defaults to `"." + slug`; only one tenant (the default tenant
         made by `pmail setup`) can have an empty suffix. `policy` is merged over the defaults (built-in
         defaults, then `PM_DEFAULT_POLICY`). `owner` (optional) creates the workspace's console owner and
-        emails them a sign-in link; without it, a platform key can add an owner later with an invitation
+        emails them a sign-in link; without it, a platform or partner key can add an owner later with an invitation
         and an ownership transfer in the console. `billing.mode` defaults to `metered` (plan `free`) on a
-        deployment with billing on, and to `disabled` otherwise.
+        deployment with billing on, and to `disabled` otherwise. With a partner key, the tenant's
+        `partner_id` is the key's partner, for good, and its billing mode is the partner's
+        `default_billing_mode`; `billing` is platform-only. A partner key's `policy` is checked field by
+        field (platform-only, lower-only and free fields, see `TenantPolicy`); it may set
+        `quarantine.key_release`. A partner has at most `max_tenants` tenants that are not `erased`
+        (`403 partner_tenant_limit`), and a partner key's creations count in the `partner` bucket
+        (`RL_PARTNER`, 10 a minute per partner, shared with invitations). The audit row `tenant.create`
+        records the `partner_id`.
       x-required-permission: ['tenants:manage']
-      x-key-levels: [platform]
-      x-rate-limit-buckets: [api]
+      x-key-levels: [platform, partner]
+      x-permission-notes: >-
+        A partner key that sends `billing`, a platform-only policy field, or a lower-only policy field above
+        its ceiling gets `403 scope_denied` (`details.field`); beyond the partner's `max_tenants`,
+        `403 partner_tenant_limit`.
+      x-rate-limit-buckets: [api, partner]
       x-idempotency: optional
       parameters:
         - $ref: '#/components/parameters/IdempotencyKeyOptional'
@@ -288,15 +311,31 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Tenant'}
         '400': {$ref: '#/components/responses/BadRequest'}
         '401': {$ref: '#/components/responses/Unauthorized'}
-        '403': {$ref: '#/components/responses/Forbidden'}
+        '403':
+          description: >-
+            As `Forbidden`, plus `partner_tenant_limit` when the partner already has `max_tenants` tenants
+            that are not erased (`details.max_tenants`).
+          x-error-codes: [permission_denied, scope_denied, partner_suspended, partner_tenant_limit]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+              example:
+                error:
+                  code: partner_tenant_limit
+                  message: This partner already has 25 tenants that are not erased.
+                  retryable: false
+                  fix: Erase a tenant you no longer need, or ask the platform operator to raise max_tenants.
+                  request_id: req_01J9Z4K8V4QW7X2M5N6P8R0T1Y
+                  details:
+                    max_tenants: 25
         '409':
           description: The slug or address suffix is taken, or the idempotency key is in use.
           x-error-codes: [slug_taken, suffix_taken, idempotency_conflict, request_in_progress]
@@ -313,8 +352,9 @@ paths:
       operationId: listTenants
       tags: [Tenants]
       summary: List tenants
+      description: A partner key lists only the tenants its partner's keys created.
       x-required-permission: ['tenants:manage']
-      x-key-levels: [platform]
+      x-key-levels: [platform, partner]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -322,6 +362,12 @@ paths:
           in: query
           description: Only tenants with this status.
           schema: {$ref: '#/components/schemas/TenantStatus'}
+        - name: partner_id
+          in: query
+          description: >-
+            Only tenants created by this partner's keys. An unknown partner, or for a partner key any partner
+            but its own, gets `404 partner_not_found`.
+          schema: {$ref: '#/components/schemas/PartnerId'}
         - name: mode
           in: query
           description: Only tenants with this mode.
@@ -334,14 +380,13 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/TenantPage'}
         '400': {$ref: '#/components/responses/BadRequest'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
         '410': {$ref: '#/components/responses/CursorExpired'}
         '429': {$ref: '#/components/responses/TooManyRequests'}
         '500': {$ref: '#/components/responses/InternalError'}
@@ -354,9 +399,12 @@ paths:
       operationId: getTenant
       tags: [Tenants]
       summary: Get a tenant
-      description: Platform keys with `tenants:manage` can read any tenant. A tenant key can read its own tenant.
+      description: >-
+        Platform keys with `tenants:manage` can read any tenant, and partner keys with `tenants:manage` the
+        tenants their partner's keys created, also while the tenant is `erasing` and after it is `erased`
+        (its name is then `''`). A tenant key can read its own tenant.
       x-required-permission: ['tenants:manage']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-permission-notes: A tenant key can read its own tenant without `tenants:manage`.
       x-rate-limit-buckets: [api]
       x-idempotency: none
@@ -366,8 +414,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Tenant'}
@@ -385,9 +431,21 @@ paths:
         Updatable: `name`, `timezone`, `policy` (deep merge; `null` resets a field to its default) and
         `status` (`active` or `suspended`). While a tenant is suspended, inbound mail gets a temporary
         failure for up to five days and then a permanent one, and every send is refused (FR-TEN-3).
-        Tenants are deleted through an erasure request with `scope: "tenant"`.
+        `suspended_by` records which level suspended it; a partner key cannot lift a suspension a platform
+        key made. Tenants are deleted through an erasure request with `scope: "tenant"`; once a tenant is
+        `erasing` or `erased`, only the erasure job changes its status (`409 tenant_erased` for a platform
+        key, `404 tenant_not_found` for any other key). `partner_id` and `mode` never change. Only a
+        platform key, or the partner key of the tenant's own partner, can set
+        `policy.quarantine.key_release` (a tenant key cannot call this operation: it can never hold
+        `tenants:manage`). A value a platform key sets on a lower-only policy field becomes that field's
+        ceiling for partner keys.
       x-required-permission: ['tenants:manage']
-      x-key-levels: [platform]
+      x-key-levels: [platform, partner]
+      x-permission-notes: >-
+        A partner key updates only the tenants its partner's keys created. Each policy field present is
+        checked by its class (see `TenantPolicy`): a platform-only field, or a lower-only field above
+        min(deployment default, platform ceiling), gets `403 scope_denied` with `details.field`, and so does
+        `status: "active"` on a tenant a platform key suspended (`details.field = "status"`).
       x-rate-limit-buckets: [api]
       x-idempotency: none
       requestBody:
@@ -406,8 +464,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Tenant'}
@@ -415,7 +471,215 @@ paths:
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
+        '409':
+          description: A platform key changed the `status` of a tenant that is `erasing` or `erased`.
+          x-error-codes: [tenant_erased]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
         '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+
+  # ──────────────────────────────────────────── Partners ──────────────────────────────────────────
+
+  /partners:
+    post:
+      operationId: createPartner
+      tags: [Partners]
+      summary: Create a partner
+      description: >-
+        Platform keys with `partners:manage`. A partner is an integrator that creates tenants for its own
+        customers and manages them with partner keys (FR-KEY-4), which a platform key then mints with
+        `POST /v1/keys` (`level: partner`). Every tenant a partner key creates gets the partner's
+        `partner_id` and `default_billing_mode`. `max_tenants` (default 25) and `ramp_exempt` (default
+        `false`) bound what the partner's keys can create and send. Audit-logged (`partner.create`).
+      x-required-permission: ['partners:manage']
+      x-key-levels: [platform]
+      x-rate-limit-buckets: [api]
+      x-idempotency: optional
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyOptional'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/PartnerCreateRequest'}
+            example:
+              name: Pylota
+              default_billing_mode: exempt
+      responses:
+        '201':
+          description: The partner was created.
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
+            Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Partner'}
+              example:
+                id: ptn_01JA2B3C4D5E6F7G8H9J0K1M2N
+                name: Pylota
+                status: active
+                default_billing_mode: exempt
+                max_tenants: 25
+                ramp_exempt: false
+                created_at: '2026-10-10T09:00:00Z'
+                updated_at: '2026-10-10T09:00:00Z'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/IdempotencyConflict'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    get:
+      operationId: listPartners
+      tags: [Partners]
+      summary: List partners
+      x-required-permission: ['partners:manage']
+      x-key-levels: [platform]
+      x-rate-limit-buckets: [api]
+      x-idempotency: none
+      parameters:
+        - name: status
+          in: query
+          description: Only partners with this status.
+          schema: {$ref: '#/components/schemas/PartnerStatus'}
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: A page of partners.
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PartnerPage'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '410': {$ref: '#/components/responses/CursorExpired'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+
+  /partners/{partner_id}:
+    parameters:
+      - $ref: '#/components/parameters/PartnerIdPath'
+    get:
+      operationId: getPartner
+      tags: [Partners]
+      summary: Get a partner
+      description: >-
+        A deleted partner is returned with `status: "deleted"` and an empty `name`.
+      x-required-permission: ['partners:manage']
+      x-key-levels: [platform]
+      x-rate-limit-buckets: [api]
+      x-idempotency: none
+      responses:
+        '200':
+          description: The partner.
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Partner'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    patch:
+      operationId: updatePartner
+      tags: [Partners]
+      summary: Update or suspend a partner
+      description: >-
+        Updatable: `name`, `status` (`active` or `suspended`), `default_billing_mode`, `max_tenants` and
+        `ramp_exempt`. `suspended` refuses at once, with `403 partner_suspended` on every route, every key
+        of the partner and every API key of its tenants, so nothing can send for them; the tenants' status
+        does not change and their inbound mail is still stored. Deliveries to the partner's endpoints and
+        to its tenants' endpoints are held and resume when the partner is `active` again ([J13]). A new
+        `default_billing_mode` applies to tenants created afterwards; existing tenants keep theirs, which
+        only a platform key changes (`PATCH /v1/tenants/{tenant_id}/billing`). A deleted partner gets
+        `404 partner_not_found`. Audit-logged (`partner.update`).
+      x-required-permission: ['partners:manage']
+      x-key-levels: [platform]
+      x-rate-limit-buckets: [api]
+      x-idempotency: none
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/PartnerUpdateRequest'}
+            example:
+              status: suspended
+      responses:
+        '200':
+          description: The updated partner.
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Partner'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+    delete:
+      operationId: deletePartner
+      tags: [Partners]
+      summary: Delete a partner
+      description: >-
+        A soft delete: the partner stays with `status: "deleted"` and an empty `name`; its partner keys are
+        revoked and deleted, and its partner webhook endpoints deleted with their deliveries. The erased
+        tenants keep their `partner_id`. Refused with `409 partner_has_tenants` while any tenant with this
+        `partner_id` is not `erased` (`active`, `suspended` or `erasing`); erase them first with an erasure
+        request of scope `tenant` ([J12]). A deleted partner gets `404 partner_not_found`. Audit-logged
+        (`partner.delete`).
+      x-required-permission: ['partners:manage']
+      x-key-levels: [platform]
+      x-rate-limit-buckets: [api]
+      x-idempotency: none
+      responses:
+        '204':
+          description: The partner was deleted.
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409':
+          description: The partner still has tenants that are not erased. Nothing changed.
+          x-error-codes: [partner_has_tenants]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+              example:
+                error:
+                  code: partner_has_tenants
+                  message: This partner still has 3 tenants that are not erased.
+                  retryable: false
+                  fix: Erase each of the partner's tenants (POST /v1/erasure-requests with scope tenant), then delete the partner.
+                  request_id: req_01J9Z4K8V4QW7X2M5N6P8R0T1Y
+                  details:
+                    tenants: 3
         '429': {$ref: '#/components/responses/TooManyRequests'}
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
@@ -437,7 +701,10 @@ paths:
         `200` and the existing identity; with a different body it returns `409 client_id_conflict`.
         `owner` is required before the identity can send (`identity_owner_required`).
       x-required-permission: ['identities:write']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
+      x-permission-notes: >-
+        A `send_policy.daily_cap` above the tenant's effective `identity_daily_send_cap` needs a platform
+        key (`403 scope_denied`, `details.field = "send_policy.daily_cap"`).
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -466,8 +733,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -477,15 +742,13 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Identity'}
         '400':
           description: The request is invalid.
-          x-error-codes: [invalid_request, invalid_idempotency_key, address_reserved, address_unsupported, local_part_too_long]
+          x-error-codes: [invalid_request, invalid_idempotency_key, address_invalid, address_reserved, address_unsupported, local_part_too_long]
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
           content:
@@ -498,8 +761,11 @@ paths:
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
         '409':
-          description: The identity conflicts with an existing one, or the idempotency key is in use.
-          x-error-codes: [client_id_conflict, username_taken, address_taken, domain_not_ready, idempotency_conflict, request_in_progress]
+          description: >-
+            The identity conflicts with an existing one, the idempotency key is in use, or the primary
+            address on a `zone` subdomain would be the domain's 201st literal routing rule
+            (`domain_in_use`, `details.reason = "routing_rule_limit"`).
+          x-error-codes: [client_id_conflict, username_taken, address_taken, domain_not_ready, domain_in_use, idempotency_conflict, request_in_progress]
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
           content:
@@ -522,7 +788,7 @@ paths:
       tags: [Identities]
       summary: List a tenant's identities
       x-required-permission: ['identities:read']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -548,8 +814,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/IdentityPage'}
@@ -572,7 +836,7 @@ paths:
         identities. An identity key sees only its own identity. The system identity (the sender of
         `PM_SYSTEM_FROM`) is never listed.
       x-required-permission: ['identities:read']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -594,8 +858,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/IdentityPage'}
@@ -616,7 +878,7 @@ paths:
         Resolves any `active` or `retiring` address to its identity. Unknown, retired and out-of-scope
         addresses all return `404 identity_not_found`.
       x-required-permission: ['identities:read']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -632,8 +894,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Identity'}
@@ -653,7 +913,7 @@ paths:
       tags: [Identities]
       summary: Get an identity
       x-required-permission: ['identities:read']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -662,8 +922,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Identity'}
@@ -681,10 +939,16 @@ paths:
         Updatable: `display_name`, `purpose`, `owner`, `signature`, `metadata`, `send_policy` and `status`
         (`active` or `paused`). A paused identity still receives and stores mail and refuses every send with
         `identity_paused` (FR-IDN-3). Setting `status: "active"` on an identity paused for
-        `abuse_threshold` needs a platform or tenant key and is audit-logged.
+        `abuse_threshold` needs a platform, partner or tenant key and is audit-logged; on a tenant a
+        partner's key created it needs a platform key. A `send_policy.daily_cap` above the tenant's
+        effective `identity_daily_send_cap` needs a platform key.
       x-required-permission: ['identities:write']
-      x-key-levels: [platform, tenant, identity]
-      x-permission-notes: Resuming an identity paused for `abuse_threshold` needs a platform or tenant key, and is audit-logged.
+      x-key-levels: [platform, partner, tenant, identity]
+      x-permission-notes: >-
+        Resuming an identity paused for `abuse_threshold` needs a platform, partner or tenant key, and is
+        audit-logged; on a tenant a partner's key created, only a platform key (`403 scope_denied`
+        otherwise). `send_policy.daily_cap` above the tenant's `identity_daily_send_cap` from any other key
+        gets `403 scope_denied` (`details.field = "send_policy.daily_cap"`).
       x-rate-limit-buckets: [api]
       x-idempotency: none
       requestBody:
@@ -700,8 +964,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Identity'}
@@ -723,7 +985,7 @@ paths:
         and their key IDs tombstoned, so they are never published again ([O7]). While the identity is
         `deleting` or `deleted`, signing and its JWK Set return `404 identity_not_found`.
       x-required-permission: ['identities:write', 'erasure:manage']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -732,8 +994,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ErasureRequest'}
@@ -755,7 +1015,7 @@ paths:
       summary: List an identity's addresses
       description: Every address of the identity, in every status.
       x-required-permission: ['identities:read']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -767,8 +1027,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/AddressPage'}
@@ -789,7 +1047,7 @@ paths:
         pending address per identity and domain is allowed: a newer request replaces an older pending one
         ([A11]). Emits `identity.address_added`, and `identity.address_activated` once active.
       x-required-permission: ['identities:write']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -808,8 +1066,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -826,8 +1082,10 @@ paths:
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
         '409':
-          description: The address is taken, or the idempotency key is in use.
-          x-error-codes: [address_taken, idempotency_conflict, request_in_progress]
+          description: >-
+            The address is taken, the idempotency key is in use, or the address is on a `zone` subdomain that
+            already has 200 literal routing rules (`domain_in_use`, `details.reason = "routing_rule_limit"`).
+          x-error-codes: [address_taken, domain_in_use, idempotency_conflict, request_in_progress]
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
           content:
@@ -866,7 +1124,7 @@ paths:
         is how you roll back (FR-ADR-4). Fails with `409 domain_not_ready` unless the domain is `healthy` or
         `degraded`. Emits `identity.address_promoted`.
       x-required-permission: ['identities:write']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -884,8 +1142,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -922,7 +1178,7 @@ paths:
         identity's platform address (`409 address_in_use`), which stays active as the fallback address for
         the identity's whole life. Emits `identity.address_retired` when the address becomes `retired`.
       x-required-permission: ['identities:write']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -940,8 +1196,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -975,7 +1229,7 @@ paths:
         Only for `pending` addresses that never received mail. Any other address returns
         `409 address_in_use`: retire it instead. The platform address can never be deleted.
       x-required-permission: ['identities:write']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -984,8 +1238,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
@@ -1018,7 +1270,7 @@ paths:
         `forwarding` becomes `ok`; otherwise `failed` ([N12]). The check is never stored as a message and
         does not count as a plan send. No webhook event is sent: read the address again for the result.
       x-required-permission: ['identities:write']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -1029,8 +1281,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -1080,7 +1330,7 @@ paths:
         while the identity is paused (including every identity of a suspended tenant), so a suspected leak
         can be handled before it resumes. A `deleting` or `deleted` identity returns `404 identity_not_found`.
       x-required-permission: ['identities:read']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -1096,8 +1346,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/IdentityKeyPage'}
@@ -1153,7 +1401,7 @@ paths:
         created, `identity.key_created` is emitted and the audit action is `identity_key.create`. Available
         while the identity is paused; a `deleting` or `deleted` identity returns `404 identity_not_found`.
       x-required-permission: ['identities:write']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -1164,8 +1412,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -1190,8 +1436,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -1221,7 +1465,7 @@ paths:
         `identity_key.rotate`. Available while the identity is paused; a `deleting` or `deleted` identity
         returns `404 identity_not_found`.
       x-required-permission: ['identities:write']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -1232,8 +1476,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -1295,7 +1537,7 @@ paths:
         `identity.key_revoked`; the audit action is `identity_key.revoke`. No body. Available while the
         identity is paused.
       x-required-permission: ['identities:write']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -1306,8 +1548,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -1397,8 +1637,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/AssertionResponse'}
@@ -1505,8 +1743,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/HttpSignatureResponse'}
@@ -1604,6 +1840,14 @@ paths:
         - **`cloudflare_zone`, `nameservers`, `delegated_subdomain`** need `PM_CF_API_TOKEN`
           (`422 cf_token_required`). For an apex `cloudflare_zone`, `pmail domains add --local-token` with the
           operator's own Cloudflare token works instead (catch-all, no literal rules).
+        - **Zone permission** (tenant and partner keys, before any Cloudflare call): `cloudflare_zone` and
+          `replace_mx` work only on a zone this deployment created for the tenant (`nameservers`,
+          `delegated_subdomain`) or one listed in its platform-only policy `domains.cloudflare_zones` (names
+          strictly under a listed zone: its apex, and `replace_mx` there, stay platform-only). A zone
+          created for another tenant, and any name under the zones of the platform domain, the API host or
+          the console host, is refused, as is a `nameservers` or `delegated_subdomain` name inside such a
+          zone: `403 scope_denied` with `details.reason = "zone_not_allowed"` ([H8]). Platform keys may use
+          any zone.
         - **`nameservers`** creates the zone. Tenant keys need the policy `domains.allow_create_zone: true`
           (`422 transport_unavailable`, `zone_creation_not_allowed`). A name with A, AAAA or MX records, or a
           `www` CNAME, A or AAAA record, needs `confirm_dedicated: true` (`409 domain_not_dedicated`, with
@@ -1630,8 +1874,11 @@ paths:
           is refused with `400 spf_lookup_limit`; `details.lookups` gives the count and `fix` names the
           includes to flatten ([H2]).
       x-required-permission: ['domains:write']
-      x-key-levels: [platform, tenant]
-      x-permission-notes: '`nameservers` (or the old `create_zone: true`) needs a platform key, or a tenant key whose policy has `domains.allow_create_zone: true`.'
+      x-key-levels: [platform, partner, tenant]
+      x-permission-notes: >-
+        `nameservers` (or the old `create_zone: true`) needs a platform key, or a tenant or partner key whose
+        tenant's policy has `domains.allow_create_zone: true`. For a tenant or partner key, the zone must be
+        one the tenant may use (`403 scope_denied`, `details.reason = "zone_not_allowed"`).
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -1682,8 +1929,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -1703,7 +1948,25 @@ paths:
         '402':
           $ref: '#/components/responses/BillingLimit'
           description: 'The plan''s `custom_domains` allowance is spent (`details.feature: "custom_domains"`). Nothing was stored.'
-        '403': {$ref: '#/components/responses/Forbidden'}
+        '403':
+          description: >-
+            As `Forbidden`. `scope_denied` with `details.reason = "zone_not_allowed"`: a tenant or partner key
+            named a Cloudflare zone its tenant may not use ([H8]).
+          x-error-codes: [permission_denied, scope_denied, tenant_suspended, partner_suspended]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+              example:
+                error:
+                  code: scope_denied
+                  message: This key cannot use the Cloudflare zone brightwell.example.
+                  retryable: false
+                  fix: Use a zone created for this tenant, or ask the platform operator to add it to domains.cloudflare_zones.
+                  request_id: req_01J9Z4K8V4QW7X2M5N6P8R0T1Y
+                  details:
+                    reason: zone_not_allowed
         '404': {$ref: '#/components/responses/NotFound'}
         '409':
           description: >-
@@ -1765,7 +2028,6 @@ paths:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             Retry-After: {$ref: '#/components/headers/Retry-After'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
             RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
@@ -1784,7 +2046,7 @@ paths:
         The tenant's domains. The platform domain is visible to every key, with `tenant_id: null`, and is
         included in this list. An identity key with `domains:read` can read its tenant's domains.
       x-required-permission: ['domains:read']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -1796,8 +2058,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/DomainPage'}
@@ -1819,7 +2079,7 @@ paths:
       summary: Get a domain
       description: 'The platform domain is visible to every key, with `tenant_id: null`.'
       x-required-permission: ['domains:read']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -1828,8 +2088,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Domain'}
@@ -1846,23 +2104,26 @@ paths:
       description: |
         The body has `transport`, `smtp` or both. Audit-logged.
 
-        - **`transport`** (platform keys only; others get `403 scope_denied`) switches the transport that
+        - **`transport`** (platform keys only; partner and tenant keys get `403 scope_denied`) switches the transport that
           sends as a domain on Cloudflare: `cloudflare` or `ses`. This is the Email Sending failover of
           [J5]. `ses` needs the SES transport configured (`422 transport_unavailable`,
-          `ses_not_configured`) and a verified SES identity for the domain. `dns_records` and `send_only`
+          `ses_not_configured`) and an SES identity for the domain (`ses_region` set): a `cloudflare_zone`,
+          `nameservers` or `delegated_subdomain` domain gets one, with its three DKIM records, during
+          onboarding when the SES transport is configured; a domain onboarded without one gets
+          `422 transport_unavailable`. `dns_records` and `send_only`
           domains send only through `ses`, `smtp_relay` domains only through `smtp`, and the platform domain
           only through `cloudflare`; another value returns `422 transport_unavailable`,
           `method_not_supported`. The change applies to sends that reach the transport after it and starts
           a health check at once (alignment differs per transport).
-        - **`smtp`** (tenant or platform keys; `smtp_relay` domains only, otherwise `method_not_supported`)
+        - **`smtp`** (tenant, partner or platform keys; `smtp_relay` domains only, otherwise `method_not_supported`)
           rotates the relay credentials or changes the relay. The port rule and the one-off connection of
           domain create apply (`400 smtp_port_not_allowed`, `422 smtp_tls_required`,
           `422 smtp_auth_failed`, `502 upstream_error`). The new values are kept pending until an alignment
           probe with them passes; until then sends keep using the current values, which `smtp` in the
           response still shows. The probe result arrives as a domain health change.
       x-required-permission: ['domains:write']
-      x-key-levels: [platform, tenant]
-      x-permission-notes: '`transport` needs a platform key: a tenant key gets `403 scope_denied`. `smtp` is allowed for tenant and platform keys.'
+      x-key-levels: [platform, partner, tenant]
+      x-permission-notes: '`transport` needs a platform key: a partner or tenant key gets `403 scope_denied`. `smtp` is allowed for tenant, partner and platform keys.'
       x-rate-limit-buckets: [api]
       x-idempotency: none
       requestBody:
@@ -1890,8 +2151,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Domain'}
@@ -1918,7 +2177,28 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Error'}
-        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '429':
+          description: >-
+            A rate limit was hit (`rate_limited`), or the deployment's SES control-plane budget of one call per
+            second had no slot within 5 seconds (`upstream_rate_limited`; `Retry-After` is the wait).
+          x-error-codes: [rate_limited, upstream_rate_limited]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            Retry-After: {$ref: '#/components/headers/Retry-After'}
+            RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
+            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+              example:
+                error:
+                  code: upstream_rate_limited
+                  message: The Amazon SES control-plane budget had no free slot within 5 seconds.
+                  retryable: true
+                  fix: Wait for the number of seconds in the Retry-After header, then retry.
+                  request_id: req_01J9Z4K8V4QW7X2M5N6P8R0T1Y
+                  details:
+                    retry_after: 3
         '500': {$ref: '#/components/responses/InternalError'}
         '502':
           $ref: '#/components/responses/UpstreamError'
@@ -1935,7 +2215,7 @@ paths:
         retired-address receipt rules (`pm-retired-{n}`). The domain moves to `removing`, then `removed`,
         and `domain.removed` is emitted with `reason: requested`.
       x-required-permission: ['domains:write']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -1944,8 +2224,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Domain'}
@@ -1960,7 +2238,28 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Error'}
-        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '429':
+          description: >-
+            A rate limit was hit (`rate_limited`), or the deployment's SES control-plane budget of one call per
+            second had no slot within 5 seconds (`upstream_rate_limited`; `Retry-After` is the wait).
+          x-error-codes: [rate_limited, upstream_rate_limited]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            Retry-After: {$ref: '#/components/headers/Retry-After'}
+            RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
+            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+              example:
+                error:
+                  code: upstream_rate_limited
+                  message: The Amazon SES control-plane budget had no free slot within 5 seconds.
+                  retryable: true
+                  fix: Wait for the number of seconds in the Retry-After header, then retry.
+                  request_id: req_01J9Z4K8V4QW7X2M5N6P8R0T1Y
+                  details:
+                    retry_after: 3
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
 
@@ -1977,7 +2276,7 @@ paths:
         `ok`, `missing`, `mismatch` or `unexpected` (an extra record that conflicts, for example a second
         SPF record).
       x-required-permission: ['domains:read']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -1986,8 +2285,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/DomainRecords'}
@@ -2034,7 +2331,7 @@ paths:
         `smtp_from_rewritten` or `smtp_probe_timeout`. At most once a minute per domain
         (`429 rate_limited`). A probe also runs before the domain's first send and every day after.
       x-required-permission: ['domains:write']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -2045,8 +2342,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -2093,7 +2388,7 @@ paths:
         domain (`429 rate_limited`). A state change still needs two consecutive agreeing results from two
         resolvers (FR-DOM-4).
       x-required-permission: ['domains:write']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -2104,8 +2399,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -2130,7 +2423,7 @@ paths:
       summary: Get a domain's health
       description: The current health state, open issues with exact fixes, recent checks and whether fallback sending is active.
       x-required-permission: ['domains:read']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -2139,8 +2432,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/DomainHealth'}
@@ -2179,7 +2470,7 @@ paths:
         `_pylota-mail` record in `records`. The domain leaves `suspended` once the new record is observed.
         Any other state returns `409 domain_not_suspended`.
       x-required-permission: ['domains:write']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -2190,8 +2481,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -2228,7 +2517,7 @@ paths:
         key with `quarantine:review` reaches them through `GET …/messages` with an explicit `status` filter,
         or `GET …/quarantine` (quarantined messages only).
       x-required-permission: ['messages:read']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -2273,8 +2562,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ThreadPage'}
@@ -2321,7 +2608,7 @@ paths:
         message carries `extracted_text` (quotes and signature removed) rather than the full `text`; use
         `include` for more. `next_cursor` pages through the messages.
       x-required-permission: ['messages:read']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -2341,8 +2628,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Thread'}
@@ -2362,7 +2647,7 @@ paths:
         `labels_add` and `labels_remove` apply to every message in the thread. `read: true` marks every
         message read. `archived` archives or unarchives the thread.
       x-required-permission: ['messages:write']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       requestBody:
@@ -2381,8 +2666,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ThreadSummary'}
@@ -2407,7 +2690,7 @@ paths:
         A held thread is skipped by retention and erasure, and erasure receipts list it (FR-PRV-4).
         Replaces any existing hold on the thread. Audit-logged.
       x-required-permission: ['erasure:manage']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -2426,8 +2709,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -2447,7 +2728,7 @@ paths:
       summary: Remove a thread's legal hold
       description: Audit-logged.
       x-required-permission: ['erasure:manage']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -2456,8 +2737,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ThreadSummary'}
@@ -2485,7 +2764,7 @@ paths:
         `quarantine:review`. A key without it that sends such a filter gets `200` with none of those
         messages, never `403`, as search treats `include_quarantined`.
       x-required-permission: ['messages:read']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-permission-notes: A `status` filter of `quarantined`, `hidden` or `throttled` returns those messages only if the key also holds `quarantine:review`; without it the page has none of them (never `403`).
       x-rate-limit-buckets: [api]
       x-idempotency: none
@@ -2519,8 +2798,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/MessagePage'}
@@ -2563,8 +2840,12 @@ paths:
         - **`from_address`** must be an `active` address of the identity, or a `retiring` one on a thread
           that already uses it ([G7]; with `thread_id`). Otherwise `400 invalid_request` with
           `details.errors[0].path = "from_address"`. The default is the primary.
-        - **`headers`** accepts only `X-` headers plus `Importance`, `Priority`, `Sensitivity`, `Keywords`,
-          `Comments` and `Organization` (`400 header_not_allowed`). Everything else is set by the service.
+        - **`headers`** accepts only `X-` names matching `^X-[A-Za-z0-9_-]+$` plus `Importance`, `Priority`,
+          `Sensitivity`, `Keywords`, `Comments` and `Organization`, matched case-insensitively
+          (`400 header_not_allowed`).
+          `Importance` must be `high`, `normal` or `low`, `Priority` `normal`, `non-urgent` or `urgent`, and
+          `Sensitivity` `personal`, `private` or `company-confidential` (`400 invalid_request`). Everything
+          else is set by the service.
         - **Size**: the encoded message must fit the transport limit (5 MiB with Cloudflare), otherwise
           `413 message_too_large`. With `policy.large_attachments: "link"`, oversized attachments become
           expiring signed links instead.
@@ -2572,7 +2853,7 @@ paths:
         Failures after `202` arrive as message status and events (`message.rejected`, `message.failed`,
         `message.uncertain`, `message.bounced`), never as HTTP errors.
       x-required-permission: ['messages:send']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api, send]
       x-idempotency: required
       parameters:
@@ -2612,8 +2893,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -2645,7 +2924,7 @@ paths:
         By default the message carries `extracted_text` and not `text`, `html` or `headers`. `include`
         adds them. Quarantined messages need `quarantine:review`.
       x-required-permission: ['messages:read']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-permission-notes: A `quarantined`, `hidden` or `throttled` message needs `quarantine:review` as well; without it the message is `404 message_not_found`, as if it did not exist.
       x-rate-limit-buckets: [api]
       x-idempotency: none
@@ -2657,8 +2936,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Message'}
@@ -2739,7 +3016,7 @@ paths:
       tags: [Messages]
       summary: Label a message or mark it read
       x-required-permission: ['messages:write']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       requestBody:
@@ -2757,8 +3034,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Message'}
@@ -2776,7 +3051,7 @@ paths:
       summary: Erase a message
       description: Starts an erasure request of scope `message` for this message. A message in a thread under a legal hold is refused with `423 legal_hold` and nothing is created; an erasure request (`createErasureRequest`) instead skips held threads and lists them in its receipt.
       x-required-permission: ['erasure:manage']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -2785,8 +3060,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ErasureRequest'}
@@ -2810,7 +3083,8 @@ paths:
         The raw `message/rfc822` bytes: the message as received, or for an outbound message the composed
         MIME that was sent. Available for `policy.retention.raw_days` (default 90), then `410 raw_expired`.
       x-required-permission: ['messages:read']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
+      x-permission-notes: A `quarantined`, `hidden` or `throttled` message needs `quarantine:review` as well; without it the message is `404 message_not_found`, as if it did not exist.
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -2819,8 +3093,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             message/rfc822:
               schema:
@@ -2849,8 +3121,8 @@ paths:
         attachment's type; when the declared type and the type sniffed from the bytes disagree, the sniffed
         type wins ([B10]). Attachments with a `risk` need `quarantine:review`.
       x-required-permission: ['attachments:read']
-      x-key-levels: [platform, tenant, identity]
-      x-permission-notes: An attachment with a non-null `risk` needs `quarantine:review` as well (`403 permission_denied`).
+      x-key-levels: [platform, partner, tenant, identity]
+      x-permission-notes: A `quarantined`, `hidden` or `throttled` message needs `quarantine:review` as well; without it the attachment is `404 message_not_found`, as if the message did not exist. That check comes first; then an attachment with a non-null `risk` needs `quarantine:review` too (`403 permission_denied`).
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -2859,8 +3131,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Content-Disposition: {$ref: '#/components/headers/Content-Disposition-Attachment'}
             X-Content-Type-Options: {$ref: '#/components/headers/X-Content-Type-Options'}
             Content-Security-Policy: {$ref: '#/components/headers/Content-Security-Policy'}
@@ -2890,7 +3160,8 @@ paths:
         (extraction failed or the type is unsupported) or `skipped` (by policy or risk). Without `pages`,
         every page is returned, capped at 200 KB of text (`truncated: true` when cut).
       x-required-permission: ['attachments:read']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
+      x-permission-notes: A `quarantined`, `hidden` or `throttled` message needs `quarantine:review` as well; without it the message is `404 message_not_found`, as if it did not exist.
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -2907,8 +3178,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/AttachmentText'}
@@ -2937,7 +3206,8 @@ paths:
       summary: Re-run triage on a message
       description: Queues triage again. A `message.triaged` event follows when it finishes (or fails).
       x-required-permission: ['messages:write']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
+      x-permission-notes: A `quarantined`, `hidden` or `throttled` message needs `quarantine:review` as well; without it the message is `404 message_not_found`, as if it did not exist.
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -2948,8 +3218,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
         '400': {$ref: '#/components/responses/BadRequest'}
         '401': {$ref: '#/components/responses/Unauthorized'}
@@ -2969,11 +3237,17 @@ paths:
       tags: [Quarantine]
       summary: Release a quarantined message
       description: >-
-        Moves a quarantined message to `received`, emits `message.released` and runs triage. Audit-logged.
-        When `PM_QUARANTINE_KEY_RELEASE` is `off` (Pylota Mail Cloud), every API key gets
-        `403 permission_denied` and the release has to be done by a person in the console (FR-CON-6).
+        Moves a quarantined message to `received`, emits `message.released` and runs triage. Audit-logged
+        (`quarantine.release`, with the key). When `PM_QUARANTINE_KEY_RELEASE` is `off` (Pylota Mail Cloud),
+        every API key gets `403 permission_denied` and the release has to be done by a person in the console
+        (FR-CON-6), unless the message's tenant has `policy.quarantine.key_release: true`. Then any key with
+        `quarantine:review` that reaches the message may release it, the tenant's partner key included.
       x-required-permission: ['quarantine:review']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
+      x-permission-notes: >-
+        Allowed for API keys when `PM_QUARANTINE_KEY_RELEASE` is `on` (or `PM_CONSOLE=off`), or when the
+        tenant's `policy.quarantine.key_release` is `true`; otherwise `403 permission_denied`. Only a platform
+        key, or the partner key of the tenant's own partner, can set `quarantine.key_release`.
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -2991,15 +3265,23 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Message'}
         '400': {$ref: '#/components/responses/BadRequest'}
         '401': {$ref: '#/components/responses/Unauthorized'}
-        '403': {$ref: '#/components/responses/Forbidden'}
+        '403':
+          description: >-
+            The key lacks `quarantine:review`; or release by API keys is off for this tenant
+            (`PM_QUARANTINE_KEY_RELEASE=off` and `policy.quarantine.key_release` is `false`), so only a person
+            can release, in the console (`permission_denied`); or the partner is suspended.
+          x-error-codes: [permission_denied, scope_denied, tenant_suspended, partner_suspended]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
         '404': {$ref: '#/components/responses/NotFound'}
         '409':
           description: The message is not quarantined, or the idempotency key is in use.
@@ -3032,7 +3314,8 @@ paths:
         `dry_run`, policy, size and response behave as in `sendMessage`. `kind: "auto_reply"` is refused for
         automated mail or over the automatic-exchange limit (`409 auto_reply_not_allowed`, [D6]).
       x-required-permission: ['messages:send']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
+      x-permission-notes: 'The message replied to or forwarded must be visible to the key: a `quarantined` one needs `quarantine:review` as well, and a `hidden` or `throttled` one can never be the target; otherwise `404 message_not_found`, as if it did not exist.'
       x-rate-limit-buckets: [api, send]
       x-idempotency: required
       parameters:
@@ -3055,8 +3338,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -3090,7 +3371,8 @@ paths:
         reveals that the identity was BCC'd ([A10]). The combined recipients count against
         `policy.max_recipients`.
       x-required-permission: ['messages:send']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
+      x-permission-notes: 'The message replied to or forwarded must be visible to the key: a `quarantined` one needs `quarantine:review` as well, and a `hidden` or `throttled` one can never be the target; otherwise `404 message_not_found`, as if it did not exist.'
       x-rate-limit-buckets: [api, send]
       x-idempotency: required
       parameters:
@@ -3111,8 +3393,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -3146,7 +3426,8 @@ paths:
         `risk` are never forwarded. Idempotency, `dry_run`, policy, size and response behave as in
         `sendMessage`.
       x-required-permission: ['messages:send']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
+      x-permission-notes: 'The message replied to or forwarded must be visible to the key: a `quarantined` one needs `quarantine:review` as well, and a `hidden` or `throttled` one can never be the target; otherwise `404 message_not_found`, as if it did not exist.'
       x-rate-limit-buckets: [api, send]
       x-idempotency: required
       parameters:
@@ -3168,8 +3449,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -3201,7 +3480,7 @@ paths:
         Only while the message is `queued` (FR-OUT-11). Returns the message with `status: "canceled"` and
         emits `message.canceled`. Any later status returns `409 not_cancelable`.
       x-required-permission: ['messages:send']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -3212,8 +3491,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -3248,7 +3525,7 @@ paths:
         later delivery events still apply. `not_sent` marks the message `failed` with reason
         `resolved_not_sent`, after which you may send again with a **new** `Idempotency-Key`. Audit-logged.
       x-required-permission: ['messages:write']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -3266,8 +3543,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -3319,7 +3594,7 @@ paths:
         **Agentic mode** (`mode: "agentic"`, an `AgenticRequest`) returns an `AgenticResponse`. With
         `stream: true` and `Accept: text/event-stream`, the response is a server-sent event stream instead.
       x-required-permission: ['search:read']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-permission-notes: '`mode: "agentic"` needs `search:agentic`. `include_quarantined: true` returns quarantined mail only if the key also holds `quarantine:review`.'
       x-rate-limit-buckets: [api, search, agentic]
       x-idempotency: optional
@@ -3367,8 +3642,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -3520,14 +3793,14 @@ paths:
       description: >-
         The same body and modes as `searchIdentity`, plus an optional `identity_ids` filter. Runs across
         every identity of the tenant, up to 100; more without an `identity_ids` filter returns
-        `422 scope_too_large`. Hits carry `identity_id`. Needs a tenant or platform key: an identity key
+        `422 scope_too_large`. Hits carry `identity_id`. Needs a tenant, partner or platform key: an identity key
         gets `403 scope_denied` ([F3], FR-SRCH-10). Facet counts are summed across identities. The response
         always carries `partial` and `failed_identities`: each identity's mailbox has 900 ms from the start
         of the fan-out, and one that errors or misses it is listed in `failed_identities` with
         `partial: true` ([F15]); otherwise they are `false` and `[]`. `mode: "agentic"` with agentic search
         turned off by tenant policy returns `422 agentic_disabled`.
       x-required-permission: ['search:read']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-permission-notes: '`mode: "agentic"` needs `search:agentic`. `include_quarantined: true` returns quarantined mail only if the key also holds `quarantine:review`.'
       x-rate-limit-buckets: [api, search, agentic]
       x-idempotency: optional
@@ -3555,8 +3828,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -3638,7 +3909,7 @@ paths:
       summary: Find related messages
       description: Semantically similar messages from other threads of the same identity, as search hits.
       x-required-permission: ['search:read']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api, search]
       x-idempotency: none
       parameters:
@@ -3656,8 +3927,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/SearchHitList'}
@@ -3678,7 +3947,7 @@ paths:
       summary: Search contacts
       description: People and services the identity has exchanged mail with.
       x-required-permission: ['search:read']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api, search]
       x-idempotency: none
       parameters:
@@ -3697,8 +3966,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ContactPage'}
@@ -3736,7 +4003,7 @@ paths:
         message passed authentication (`verdict: pass`) ([E4]). An active `wait` also marks OTP mail from
         that sender domain as solicited for 30 minutes ([E5]).
       x-required-permission: ['search:read']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -3783,8 +4050,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/WaitResponse'}
@@ -3809,7 +4074,7 @@ paths:
         Quarantined messages, newest first, each with its `quarantine_reason`. Release one with
         `releaseMessage`.
       x-required-permission: ['quarantine:review']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -3821,8 +4086,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/MessagePage'}
@@ -3841,14 +4104,16 @@ paths:
     post:
       operationId: createPlatformWebhook
       tags: [Webhooks]
-      summary: Create a platform webhook endpoint
+      summary: Create a platform or partner webhook endpoint
       description: >-
-        Platform keys only. A platform endpoint receives events from every tenant (filtered by `events` and
-        `identity_ids`). The response carries `secret` (`whsec_…`), **shown only once**. `events: ["*"]`
-        subscribes to everything, including event types added later. The URL must be HTTPS; private,
-        loopback and reserved addresses are refused (FR-WH-5).
+        Platform and partner keys. With a platform key it creates a platform endpoint (`scope: "platform"`),
+        which receives events from every tenant; with a partner key, a partner endpoint
+        (`scope: "partner"`), which receives only the events of the tenants its partner's keys created. Both
+        are filtered by `events` and `identity_ids`. The response carries `secret` (`whsec_…`), **shown only
+        once**. `events: ["*"]` subscribes to everything, including event types added later. The URL must be
+        HTTPS; private, loopback and reserved addresses are refused (FR-WH-5).
       x-required-permission: ['webhooks:manage']
-      x-key-levels: [platform]
+      x-key-levels: [platform, partner]
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -3869,8 +4134,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -3881,7 +4144,7 @@ paths:
         '409': {$ref: '#/components/responses/IdempotencyConflict'}
         '413': {$ref: '#/components/responses/PayloadTooLarge'}
         '422':
-          description: The tenant (or the platform) already has 20 webhook endpoints.
+          description: The tenant (or the partner, or the platform) already has 20 webhook endpoints.
           x-error-codes: [webhook_limit_reached]
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
@@ -3896,11 +4159,11 @@ paths:
       tags: [Webhooks]
       summary: List webhook endpoints
       description: >-
-        With a platform key: the platform endpoints. With a tenant key: the tenant's endpoints. An identity
-        key reads its tenant's endpoints, read-only.
+        With a platform key: the platform endpoints. With a partner key: its partner's endpoints. With a
+        tenant key: the tenant's endpoints. An identity key reads its tenant's endpoints, read-only.
       x-required-permission: ['webhooks:read']
       x-permission-notes: '`webhooks:manage` includes `webhooks:read`. An identity key can read its tenant''s endpoints and deliveries with `webhooks:read`.'
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -3912,8 +4175,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/WebhookPage'}
@@ -3938,7 +4199,7 @@ paths:
         everything, including event types added later. The URL must be HTTPS; private, loopback and
         reserved addresses are refused (FR-WH-5).
       x-required-permission: ['webhooks:manage']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -3959,8 +4220,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -3972,7 +4231,7 @@ paths:
         '409': {$ref: '#/components/responses/IdempotencyConflict'}
         '413': {$ref: '#/components/responses/PayloadTooLarge'}
         '422':
-          description: The tenant (or the platform) already has 20 webhook endpoints.
+          description: The tenant (or the partner, or the platform) already has 20 webhook endpoints.
           x-error-codes: [webhook_limit_reached]
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
@@ -3989,7 +4248,7 @@ paths:
       description: An identity key can read its tenant's endpoints read-only.
       x-required-permission: ['webhooks:read']
       x-permission-notes: '`webhooks:manage` includes `webhooks:read`. An identity key can read its tenant''s endpoints and deliveries with `webhooks:read`.'
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -4001,8 +4260,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/WebhookPage'}
@@ -4024,7 +4281,7 @@ paths:
       summary: Get a webhook endpoint
       x-required-permission: ['webhooks:read']
       x-permission-notes: '`webhooks:manage` includes `webhooks:read`. An identity key can read its tenant''s endpoints and deliveries with `webhooks:read`.'
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -4033,8 +4290,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Webhook'}
@@ -4052,7 +4307,7 @@ paths:
         Accepts `url`, `events`, `identity_ids`, `description` and `enabled`. `enabled: true` re-enables a
         disabled endpoint; `enabled: false` disables it with `disabled_reason: manual`.
       x-required-permission: ['webhooks:manage']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       requestBody:
@@ -4069,8 +4324,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Webhook'}
@@ -4088,7 +4341,7 @@ paths:
       summary: Delete a webhook endpoint
       description: Deletes the endpoint. Its delivery log is deleted with it.
       x-required-permission: ['webhooks:manage']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -4097,8 +4350,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
@@ -4117,7 +4368,7 @@ paths:
         Issues a new secret and returns it once. During the overlap (0–168 hours, default 24) every
         delivery carries both signatures in `webhook-signature` (FR-WH-2).
       x-required-permission: ['webhooks:manage']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -4135,8 +4386,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -4160,7 +4409,7 @@ paths:
       summary: Send a test event
       description: Sends a `webhook.test` event straight away and returns the delivery attempt.
       x-required-permission: ['webhooks:manage']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -4171,8 +4420,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -4196,7 +4443,7 @@ paths:
       description: Delivery attempts to this endpoint, newest first. Kept for 30 days.
       x-required-permission: ['webhooks:read']
       x-permission-notes: '`webhooks:manage` includes `webhooks:read`. An identity key can read its tenant''s endpoints and deliveries with `webhooks:read`.'
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -4217,8 +4464,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/WebhookDeliveryPage'}
@@ -4245,7 +4490,7 @@ paths:
         that); the window never starts from when a delivery went `dead`. Older events are not queued.
         Returns the number of events queued.
       x-required-permission: ['webhooks:manage']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -4272,8 +4517,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -4303,7 +4546,7 @@ paths:
         Suppressed recipients of the tenant. Addresses are stored only as a keyed hash, so items show a
         masked `address_hint`; use `address` for an exact lookup.
       x-required-permission: ['suppressions:manage']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -4323,8 +4566,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/SuppressionPage'}
@@ -4341,7 +4582,7 @@ paths:
       tags: [Suppressions]
       summary: Suppress an address
       x-required-permission: ['suppressions:manage']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -4361,8 +4602,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -4393,7 +4632,7 @@ paths:
         Removes a `manual`, `unsubscribe`, `hard_bounce` or `provider` suppression. Removing a `complaint`
         suppression needs `"confirm_complaint_removal": true` in the body and is audit-logged.
       x-required-permission: ['suppressions:manage']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       requestBody:
@@ -4409,8 +4648,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
         '400': {$ref: '#/components/responses/BadRequest'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
@@ -4436,7 +4673,7 @@ paths:
         - **Send-block**: refused per recipient.
         - **Send-allow**: with `policy.send_allowlist_only`, only listed recipients are allowed.
       x-required-permission: ['suppressions:manage']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -4448,8 +4685,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ListEntryPage'}
@@ -4473,7 +4708,7 @@ paths:
       tags: [Lists]
       summary: Get a list entry
       x-required-permission: ['suppressions:manage']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -4482,8 +4717,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ListEntry'}
@@ -4500,7 +4733,7 @@ paths:
       summary: Add or update a list entry
       description: Adds the entry, or updates its `note` if it already exists.
       x-required-permission: ['suppressions:manage']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       requestBody:
@@ -4516,8 +4749,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ListEntry'}
@@ -4534,7 +4765,7 @@ paths:
       tags: [Lists]
       summary: Remove a list entry
       x-required-permission: ['suppressions:manage']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -4543,8 +4774,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
         '400': {$ref: '#/components/responses/BadRequest'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
@@ -4562,21 +4791,28 @@ paths:
       summary: Create an API key
       description: >-
         The new key's level, tenant, identity and permissions must all lie within the caller's own,
-        otherwise `403 key_scope_exceeded` (FR-KEY-1). A tenant or identity key's `mode` follows its tenant.
+        otherwise `403 key_scope_exceeded` (FR-KEY-1). A tenant or identity key's `mode` follows its tenant;
+        platform and partner keys are `live`.
         The response carries `secret` (`pmk_live_…` or `pmk_test_…`), **shown only once**; only a keyed
         hash is stored (FR-KEY-2).
 
         - **Explicit permissions.** `permissions` is required at every level, `platform` included: there is
           no implicit full set. A missing or empty list is `400 invalid_request`.
         - **Permissions tied to levels.** A permission the new key's level cannot hold is refused, whoever
-          the caller is, with `400 invalid_request` and `details.reason = "permission_not_allowed_for_level"`: `tenants:manage`
-          and `platform:ops` on a tenant or identity key; `members:read`, `members:manage`,
-          `suppressions:manage`, `audit:read` and `usage:read` on an identity key (an identity key holds
-          `usage:read` implicitly for its own workspace's `GET /v1/usage`); `identities:sign` on a platform
-          key. The table is under `Permission`.
+          the caller is, with `400 invalid_request` and `details.reason = "permission_not_allowed_for_level"`: `platform:ops`
+          and `partners:manage` on any key but a platform key; `tenants:manage` on a tenant or identity key;
+          `members:read`, `members:manage`, `suppressions:manage`, `audit:read` and `usage:read` on an
+          identity key (an identity key holds `usage:read` implicitly for its own workspace's
+          `GET /v1/usage`); `identities:sign` on a platform or partner key. The table is under `Permission`.
+        - **Partner keys** (FR-KEY-4). `level: partner` needs `partner_id` and no `tenant_id` or
+          `identity_id`, and only a platform key may ask for it (an unknown partner is
+          `404 partner_not_found`); other levels refuse `partner_id`. A partner key mints only `tenant` and
+          `identity` keys of the tenants its partner's keys created; a `partner` or `platform` key, or another
+          tenant, is `403 key_scope_exceeded`.
         - **Order.** These two checks run first; the scope check (`403 key_scope_exceeded`) comes after them.
+          Minting is audit-logged (`key.create`, with `level` and, for a partner key, `partner_id`).
       x-required-permission: ['keys:manage']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -4599,8 +4835,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -4631,8 +4865,8 @@ paths:
                         message: identities:sign cannot be held by a platform key
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403':
-          description: The key lacks `keys:manage`, the target is out of scope, or the new key would be wider than the caller.
-          x-error-codes: [permission_denied, scope_denied, key_scope_exceeded, tenant_suspended]
+          description: The key lacks `keys:manage`, the target is out of scope, the new key would be wider than the caller, or the partner is suspended.
+          x-error-codes: [permission_denied, scope_denied, key_scope_exceeded, tenant_suspended, partner_suspended]
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
           content:
@@ -4648,9 +4882,11 @@ paths:
       operationId: listKeys
       tags: [Keys]
       summary: List API keys
-      description: Keys within the caller's scope (never with secrets).
+      description: >-
+        Keys within the caller's scope (never with secrets). A partner key lists only tenant and identity
+        keys of its own tenants.
       x-required-permission: ['keys:manage']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -4662,8 +4898,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ApiKeyPage'}
@@ -4683,7 +4917,7 @@ paths:
       tags: [Keys]
       summary: Get an API key
       x-required-permission: ['keys:manage']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -4692,8 +4926,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ApiKey'}
@@ -4709,7 +4941,7 @@ paths:
       summary: Revoke an API key
       description: Revokes the key immediately. Later requests with it get `401 key_revoked`.
       x-required-permission: ['keys:manage']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -4718,8 +4950,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
@@ -4738,7 +4968,7 @@ paths:
         Issues a new secret for the same key and returns it once. The old secret keeps working until the
         overlap ends (0–168 hours, default 24).
       x-required-permission: ['keys:manage']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -4756,8 +4986,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -4793,9 +5021,14 @@ paths:
         | `counterparty` | `counterparty_address` | Every message to or from that address, in every identity of the tenant |
         | `identity` | `identity_id` | The whole mailbox. Its addresses are tombstoned |
         | `tenant` | none | Everything in the tenant. Then the tenant is marked `erased` |
+
+        A `tenant` request for a tenant that is already `erasing` returns the existing request with `200`
+        (the same `era_` ID) and starts nothing; for an `erased` tenant it returns `409 tenant_erased`. Any
+        other erasure request naming an `erasing` or `erased` tenant, like every write to such a tenant,
+        gets `404 tenant_not_found` from a non-platform key.
       x-required-permission: ['erasure:manage']
-      x-key-levels: [platform, tenant, identity]
-      x-permission-notes: An identity key can only erase within its own identity (`message`, `thread` and `identity` scopes). `counterparty` needs a tenant or platform key; `tenant` needs a platform key or the tenant's own key.
+      x-key-levels: [platform, partner, tenant, identity]
+      x-permission-notes: An identity key can only erase within its own identity (`message`, `thread` and `identity` scopes). `counterparty` needs a tenant, partner or platform key; `tenant` needs a platform key, the partner key of the tenant's own partner, or the tenant's own key.
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -4816,9 +5049,16 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErasureRequest'}
+        '200':
+          description: >-
+            A `tenant` request for a tenant already being erased: the existing tenant-scope request, unchanged.
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ErasureRequest'}
@@ -4826,7 +5066,16 @@ paths:
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
-        '409': {$ref: '#/components/responses/IdempotencyConflict'}
+        '409':
+          description: >-
+            The tenant is already `erased` (`tenant_erased`, for a `tenant` request), or the idempotency key
+            is in use.
+          x-error-codes: [tenant_erased, idempotency_conflict, request_in_progress]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
         '413': {$ref: '#/components/responses/PayloadTooLarge'}
         '429': {$ref: '#/components/responses/TooManyRequests'}
         '500': {$ref: '#/components/responses/InternalError'}
@@ -4836,7 +5085,7 @@ paths:
       tags: [Privacy]
       summary: List erasure requests
       x-required-permission: ['erasure:manage']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -4853,8 +5102,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ErasureRequestPage'}
@@ -4875,9 +5122,10 @@ paths:
       summary: Get an erasure request
       description: >-
         The request and its status. `completed_with_holds` means the erasure finished but skipped held
-        threads, which the receipt lists in `held`.
+        threads, which the receipt lists in `held`. The partner key of an erased tenant's partner can still
+        read the tenant's erasure requests and receipts.
       x-required-permission: ['erasure:manage']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -4886,8 +5134,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/ErasureRequest'}
@@ -4932,8 +5178,8 @@ paths:
         (`status: "queued"`). When finished, the export has a `download_url` (a signed link valid until
         `expires_at`, 7 days) and an `export.completed` event is emitted.
       x-required-permission: ['erasure:manage']
-      x-key-levels: [platform, tenant, identity]
-      x-permission-notes: '`counterparty` scope needs a tenant or platform key. An identity key can export only its own identity.'
+      x-key-levels: [platform, partner, tenant, identity]
+      x-permission-notes: '`counterparty` scope needs a tenant, partner or platform key. An identity key can export only its own identity.'
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -4953,8 +5199,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -4981,7 +5225,7 @@ paths:
         `download_url`, a signed link (`getSignedLink`) valid until `expires_at`. The link is minted again on
         each `GET`.
       x-required-permission: ['erasure:manage']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -4990,8 +5234,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Export'}
@@ -5023,17 +5265,17 @@ paths:
         their limits before they hit `402 billing_limit`.
 
         - **Who can read it.** Every tenant and identity key holds `usage:read` implicitly for its own
-          workspace, so they can always call this without listing it. A platform key must hold `usage:read`
-          explicitly and must pass `tenant_id`; without `tenant_id` it gets `400 invalid_request`.
+          workspace, so they can always call this without listing it. A platform or partner key must hold
+          `usage:read` explicitly and must pass `tenant_id`; without `tenant_id` it gets `400 invalid_request`.
         - `billing` is `metered`, `exempt` (no limits) or `disabled` (self-hosted without billing; `features`
-          show counts with `granted: null`, `unlimited: true`, plus any operator quota from tenant policy).
+          show the real `used` with `granted: null`, `remaining: null` and `unlimited: true`).
         - `used` for `storage_gb` is measured, rounded up, and refreshed at least hourly.
         - `granted` includes top-ups. `plans` is the catalog from `PM_PLAN_CATALOG`.
       x-required-permission: ['usage:read']
-      x-key-levels: [platform, tenant, identity]
+      x-key-levels: [platform, partner, tenant, identity]
       x-permission-notes: >-
-        Tenant and identity keys hold `usage:read` implicitly for their own workspace. Platform keys must
-        hold it explicitly and pass `tenant_id` (`400 invalid_request` without it).
+        Tenant and identity keys hold `usage:read` implicitly for their own workspace. Platform and partner
+        keys must hold it explicitly and pass `tenant_id` (`400 invalid_request` without it).
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -5047,8 +5289,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/UsageSummary'}
@@ -5113,12 +5353,12 @@ paths:
       tags: [Usage]
       summary: Get daily usage
       description: >-
-        Usage per UTC day. `from` and `to` are dates at most 92 days apart. A platform key can name a tenant
-        with `tenant_id` and needs `usage:read` explicitly; a tenant key gets its own tenant and holds
+        Usage per UTC day. `from` and `to` are dates at most 92 days apart. A platform or partner key can name
+        a tenant with `tenant_id` and needs `usage:read` explicitly; a tenant key gets its own tenant and holds
         `usage:read` implicitly for it. `assertions` and `http_signatures` count signing calls, which are
         not metered against any plan allowance.
       x-required-permission: ['usage:read']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -5141,8 +5381,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/DailyUsage'}
@@ -5207,9 +5445,9 @@ paths:
       operationId: getTenantBilling
       tags: [Usage]
       summary: Get a workspace's billing account
-      description: Platform keys only.
+      description: Platform keys, and partner keys for the tenants their partner's keys created.
       x-required-permission: ['tenants:manage']
-      x-key-levels: [platform]
+      x-key-levels: [platform, partner]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -5218,8 +5456,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/BillingAccount'}
@@ -5234,8 +5470,9 @@ paths:
       tags: [Usage]
       summary: Change a workspace's billing mode or plan
       description: >-
-        Platform keys only. Accepts `mode` (`metered`, `exempt`, `disabled`) and, for workspaces without a
-        Stripe subscription, `plan_id` (a complimentary plan). Plans paid through Stripe change only through
+        Platform keys only: a partner key gets `403 scope_denied` on its own tenants, so only a platform key
+        changes a partnered tenant's billing mode. Accepts `mode` (`metered`, `exempt`, `disabled`) and, for
+        workspaces without a Stripe subscription, `plan_id` (a complimentary plan). Plans paid through Stripe change only through
         Stripe: a `plan_id` on such a workspace returns `409 plan_managed_by_stripe`. Audit-logged.
       x-required-permission: ['tenants:manage']
       x-key-levels: [platform]
@@ -5254,8 +5491,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/BillingAccount'}
@@ -5283,14 +5518,18 @@ paths:
       summary: List audit events
       description: >-
         Audit entries, newest first. They never hold message content or clear-text addresses. Audit rows
-        cover administrative actions: keys, tenants, identity status, identity signing keys
+        cover administrative actions: keys (`key.create`, `key.rotate`, `key.revoke`), partners
+        (`partner.create`, `partner.update`, `partner.delete`), tenants (`tenant.create`, with the
+        `partner_id` when a partner key created it), identity status, identity signing keys
         (`identity_key.create`, `identity_key.rotate`, `identity_key.revoke`), quarantine releases, holds,
         suppression removals, erasure, resolve, members, billing and platform operations. **Sends are not
         audit rows**: each send is recorded by its message, its events (`message.sent` and the delivery
         events) and its per-recipient delivery log. To review what a key sent, list the outbound messages
-        of the identities it reaches for the period; request logs also carry the key ID for 7 days.
+        of the identities it reaches for the period; request logs also carry the key ID for 7 days. A partner
+        key reads the rows of its own tenants only; rows about a partner itself have no `tenant_id` and are
+        for platform keys.
       x-required-permission: ['audit:read']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       parameters:
@@ -5319,8 +5558,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/AuditEventPage'}
@@ -5360,7 +5597,7 @@ paths:
         each customer workspace). Needs `members:read`, which every console role holds and `members:manage`
         includes.
       x-required-permission: ['members:read']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -5369,8 +5606,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/MemberList'}
@@ -5409,10 +5644,11 @@ paths:
         Sends an invitation email from the deployment's platform identity. A pending invitation uses a seat;
         with no seat left the request fails with `402 billing_limit` (`details.feature: "seats"`). Roles:
         `admin`, `member`, `viewer`. The owner is set at workspace creation (`owner` in `createTenant`) or by
-        an ownership transfer in the console.
+        an ownership transfer in the console. A partner key's invitations count in the `partner` bucket
+        (`RL_PARTNER`, 10 a minute per partner, shared with tenant creation).
       x-required-permission: ['members:manage']
-      x-key-levels: [platform, tenant]
-      x-rate-limit-buckets: [api]
+      x-key-levels: [platform, partner, tenant]
+      x-rate-limit-buckets: [api, partner]
       x-idempotency: optional
       parameters:
         - $ref: '#/components/parameters/IdempotencyKeyOptional'
@@ -5430,8 +5666,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -5459,7 +5693,7 @@ paths:
       summary: Revoke an invitation
       description: Revokes a pending invitation and frees its seat.
       x-required-permission: ['members:manage']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -5468,8 +5702,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
@@ -5489,7 +5721,7 @@ paths:
         Removes a member from the workspace and ends their sessions. The owner cannot be removed
         (`409 owner_required`): transfer ownership in the console first.
       x-required-permission: ['members:manage']
-      x-key-levels: [platform, tenant]
+      x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
@@ -5498,8 +5730,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
@@ -5561,8 +5791,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -5647,8 +5875,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/DlqItemPage'}
@@ -5693,8 +5919,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -5747,8 +5971,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -5791,8 +6013,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Job'}
@@ -5834,8 +6054,6 @@ paths:
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-            RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-            RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
             Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
           content:
             application/json:
@@ -7142,7 +7360,7 @@ webhooks:
       operationId: onWebhookDisabled
       tags: [Events]
       summary: 'webhook.disabled'
-      description: 'A webhook endpoint was disabled. Sent to the platform''s other endpoints only.'
+      description: 'A webhook endpoint was disabled. Sent to platform endpoints and, when the disabled endpoint belongs to a partner (a partner endpoint, or an endpoint of a tenant a partner''s key created), to that partner''s other endpoints; never to tenant endpoints or to the endpoint itself.'
       security: []
       parameters:
         - $ref: '#/components/parameters/WebhookIdHeader'
@@ -7407,7 +7625,9 @@ components:
     TenantIdQuery:
       name: tenant_id
       in: query
-      description: Platform keys only. Restrict to one tenant. Other keys are always restricted to their own tenant.
+      description: >-
+        Platform and partner keys only (a partner key, one of its own tenants). Restrict to one tenant. Other
+        keys are always restricted to their own tenant.
       schema: {$ref: '#/components/schemas/TenantId'}
     IdempotencyKeySend:
       name: Idempotency-Key
@@ -7440,9 +7660,13 @@ components:
       in: header
       required: false
       description: >-
-        Optional. 1–255 printable ASCII characters. Kept for 30 days, scoped to the tenant (or the platform
-        for platform-level requests). The same key with the same request returns the original response with
-        `Idempotent-Replayed: true`; with a different request, `409 idempotency_conflict`.
+        Optional. 1–255 printable ASCII characters. Kept for 30 days, scoped to the calling API key and the
+        tenant (or, for a request that names no tenant, to the partner for a partner key and to the platform
+        for a platform key), so another key never receives this key's replay. The same key with the same
+        request returns the original response with `Idempotent-Replayed: true`; with a different request,
+        `409 idempotency_conflict`. A response that carried a one-time secret (`createKey`, `rotateKey`,
+        `createWebhook`, `createTenantWebhook`, `rotateWebhookSecret`) is replayed without it and with
+        `"secret_replayed": false`.
       schema:
         type: string
         minLength: 1
@@ -7454,6 +7678,11 @@ components:
       in: path
       required: true
       schema: {$ref: '#/components/schemas/TenantId'}
+    PartnerIdPath:
+      name: partner_id
+      in: path
+      required: true
+      schema: {$ref: '#/components/schemas/PartnerId'}
     IdentityIdPath:
       name: identity_id
       in: path
@@ -7605,22 +7834,21 @@ components:
       description: The request ID (`req_…`). Every response carries it, and errors echo it as `error.request_id`.
       schema: {$ref: '#/components/schemas/RequestId'}
     RateLimit-Limit:
-      description: The request quota of the bucket that applied to this request, per window.
-      schema:
-        type: integer
-        minimum: 0
-    RateLimit-Remaining:
-      description: Requests left in the current window.
+      description: >-
+        The limit of the rate-limit bucket that applied to this request, per period (for example `600` for
+        the per-key bucket of 600 requests a minute). Every authenticated response carries it.
       schema:
         type: integer
         minimum: 0
     RateLimit-Reset:
-      description: Seconds until the current window resets.
+      description: >-
+        Sent only with a `429`: seconds until the end of the bucket's current period. There is no
+        `RateLimit-Remaining` header, because the rate-limiting binding answers only allow or deny.
       schema:
         type: integer
         minimum: 0
     Retry-After:
-      description: Seconds to wait before retrying.
+      description: Seconds to wait before retrying. On a `429 rate_limited` it equals `RateLimit-Reset`.
       schema:
         type: integer
         minimum: 0
@@ -7748,8 +7976,10 @@ components:
     Forbidden:
       description: >-
         The key lacks the permission (`details.required` names it), the resource is outside the key's
-        tenant or identity, or the tenant is suspended.
-      x-error-codes: [permission_denied, scope_denied, tenant_suspended]
+        tenant or identity, the tenant is suspended, or the key's partner is suspended
+        (`partner_suspended`, on every route: a partner key, or a tenant or identity key of one of the
+        partner's tenants).
+      x-error-codes: [permission_denied, scope_denied, tenant_suspended, partner_suspended]
       headers:
         Request-Id: {$ref: '#/components/headers/Request-Id'}
       content:
@@ -7768,7 +7998,7 @@ components:
       description: >-
         As `Forbidden`, plus `test_mode_recipient` when a test tenant sends outside `*@simulator.invalid`
         and this deployment ([L1]).
-      x-error-codes: [permission_denied, scope_denied, tenant_suspended, test_mode_recipient]
+      x-error-codes: [permission_denied, scope_denied, tenant_suspended, partner_suspended, test_mode_recipient]
       headers:
         Request-Id: {$ref: '#/components/headers/Request-Id'}
       content:
@@ -7779,7 +8009,7 @@ components:
         The resource does not exist **or** is outside the key's scope (deliberately indistinguishable). A
         `404` always carries one of this service's own codes; a `404` without this envelope came from
         something else and must not be read as "already deleted".
-      x-error-codes: [tenant_not_found, identity_not_found, address_not_found, domain_not_found, thread_not_found, message_not_found, attachment_not_found, webhook_not_found, key_not_found, erasure_not_found, export_not_found, suppression_not_found, list_entry_not_found, member_not_found, invitation_not_found, job_not_found, dlq_item_not_found]
+      x-error-codes: [tenant_not_found, identity_not_found, address_not_found, domain_not_found, thread_not_found, message_not_found, attachment_not_found, webhook_not_found, key_not_found, erasure_not_found, export_not_found, suppression_not_found, list_entry_not_found, member_not_found, invitation_not_found, job_not_found, dlq_item_not_found, partner_not_found]
       headers:
         Request-Id: {$ref: '#/components/headers/Request-Id'}
       content:
@@ -7860,7 +8090,9 @@ components:
           schema: {$ref: '#/components/schemas/Error'}
     SendUnprocessable:
       description: >-
-        The sending domain's transport is not configured (for example SES for an `external` domain). Only a
+        The sending domain's transport is not configured (for example SES for an `external` domain), or a
+        `kind: marketing` message comes from a domain whose transport is `cloudflare` (`details.reason =
+        "marketing_needs_ses"`: Cloudflare Email Service is for transactional mail only). Only a
         dry run (`dry_run=true`) returns `all_recipients_suppressed` (a real send whose every recipient is
         suppressed is accepted and ends `suppressed`) and `recipient_blocked` (a recipient is on the
         send-block list).
@@ -7901,8 +8133,6 @@ components:
       headers:
         Request-Id: {$ref: '#/components/headers/Request-Id'}
         RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-        RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
-        RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
       content:
         application/json:
           schema: {$ref: '#/components/schemas/DryRunResult'}
@@ -7931,7 +8161,6 @@ components:
         Request-Id: {$ref: '#/components/headers/Request-Id'}
         Retry-After: {$ref: '#/components/headers/Retry-After'}
         RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-        RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
         RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
       content:
         application/json:
@@ -7954,7 +8183,6 @@ components:
         Request-Id: {$ref: '#/components/headers/Request-Id'}
         Retry-After: {$ref: '#/components/headers/Retry-After'}
         RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-        RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
         RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
       content:
         application/json:
@@ -7968,7 +8196,6 @@ components:
         Request-Id: {$ref: '#/components/headers/Request-Id'}
         Retry-After: {$ref: '#/components/headers/Retry-After'}
         RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
-        RateLimit-Remaining: {$ref: '#/components/headers/RateLimit-Remaining'}
         RateLimit-Reset: {$ref: '#/components/headers/RateLimit-Reset'}
       content:
         application/json:
@@ -8040,6 +8267,11 @@ components:
       description: Tenant ID (`ten_` + ULID).
       pattern: '^ten_[0-9A-HJKMNP-TV-Z]{26}$'
       examples: [ten_01J9Z3K8V4QW7X2M5N6P8R0T1Y]
+    PartnerId:
+      type: string
+      description: Partner ID (`ptn_` + ULID).
+      pattern: '^ptn_[0-9A-HJKMNP-TV-Z]{26}$'
+      examples: [ptn_01JA2B3C4D5E6F7G8H9J0K1M2N]
     IdentityId:
       type: string
       description: Identity ID (`idn_` + ULID).
@@ -8225,11 +8457,27 @@ components:
             `identity_paused`: why the identity is paused. `transport_unavailable`: why the deployment or
             the domain's method cannot do what was asked. `invalid_request` on `POST /v1/keys`:
             `permission_not_allowed_for_level` when `permissions` lists one the new key's level cannot hold.
+            `scope_denied` on a domain create: `zone_not_allowed` when a non-platform key names a Cloudflare
+            zone its tenant may not use (`cloudflare_zone`, `replace_mx`; see `TenantPolicy.domains`).
           anyOf:
             - $ref: '#/components/schemas/PauseReason'
             - $ref: '#/components/schemas/TransportUnavailableReason'
             - type: string
               const: permission_not_allowed_for_level
+            - type: string
+              const: zone_not_allowed
+        field:
+          type: string
+          description: >-
+            `scope_denied`: the request field the key may not set to that value, as a dotted path: a
+            platform-only or lower-only policy field written by a partner key (`policy.tenant_daily_send_cap`
+            is reported as `tenant_daily_send_cap`), `send_policy.daily_cap` above the tenant's identity cap,
+            or `status` when a partner key tries to lift a platform suspension.
+          examples: [tenant_daily_send_cap, send_policy.daily_cap, status]
+        max_tenants:
+          type: integer
+          minimum: 0
+          description: '`partner_tenant_limit`: the partner''s `max_tenants`.'
         records:
           type: array
           description: >-
@@ -8274,6 +8522,10 @@ components:
           type: [string, 'null']
           format: uri
           description: '`billing_limit`: the console plan page, or `null` when the console is off.'
+        tenants:
+          type: integer
+          minimum: 1
+          description: '`partner_has_tenants`: how many of the partner''s tenants are not erased yet.'
         lookups:
           type: integer
           minimum: 0
@@ -8293,6 +8545,8 @@ components:
         - scope_denied
         - key_scope_exceeded
         - tenant_suspended
+        - partner_suspended
+        - partner_tenant_limit
         - test_mode_recipient
         - invalid_signature
         - policy_denied
@@ -8331,6 +8585,7 @@ components:
         - invitation_not_found
         - job_not_found
         - dlq_item_not_found
+        - partner_not_found
         - idempotency_conflict
         - request_in_progress
         - client_id_conflict
@@ -8343,6 +8598,8 @@ components:
         - domain_not_dedicated
         - zone_hold
         - owner_required
+        - partner_has_tenants
+        - tenant_erased
         - plan_managed_by_stripe
         - address_taken
         - address_is_primary
@@ -8392,9 +8649,10 @@ components:
         | `ses_receiving_not_configured` | `dns_records`, or `smtp_relay` with `inbound: ses`, without `PM_SES_INBOUND_TOPIC_ARN` (and the bucket and queue) |
         | `ses_identity_limit` | The SES region already has 10,000 identities, and the method needs one (`dns_records`, `send_only`, `smtp_relay` with `inbound: ses`) |
         | `subdomain_setup_disabled` | `delegated_subdomain` while `PM_CF_SUBDOMAIN_SETUP` is not `on` |
-        | `zone_creation_not_allowed` | `nameservers` by a tenant key whose policy lacks `domains.allow_create_zone: true` |
+        | `zone_creation_not_allowed` | `nameservers` by a tenant or partner key whose tenant's policy lacks `domains.allow_create_zone: true` |
         | `method_not_supported` | The domain's method does not support the operation: `PATCH` with a transport it cannot use, `probe` on a domain whose transport is not `smtp`, `test-forwarding` on an address whose domain does not use `inbound: forward` |
-      enum: [ses_not_configured, ses_receiving_not_configured, ses_identity_limit, subdomain_setup_disabled, zone_creation_not_allowed, method_not_supported]
+        | `marketing_needs_ses` | A `kind: marketing` send or reply from a domain whose transport is `cloudflare`, the platform domain included: Cloudflare Email Service is for transactional mail only. Use a domain with the `ses` or `smtp` transport |
+      enum: [ses_not_configured, ses_receiving_not_configured, ses_identity_limit, subdomain_setup_disabled, zone_creation_not_allowed, method_not_supported, marketing_needs_ses]
 
     # ── Keys and access ──────────────────────────────────────────────────────────────────────────
 
@@ -8405,9 +8663,9 @@ components:
 
         | Permission | Allows |
         |---|---|
-        | `tenants:manage` | Create, update and suspend tenants, and their billing accounts (platform keys only) |
+        | `tenants:manage` | Create, update and suspend tenants, and their billing accounts. Platform keys, for every tenant; partner keys, for the tenants their partner's keys created, without changing billing |
         | `identities:read`, `identities:write` | Read, and create, update, pause or delete identities and addresses, and test forwarding; read, and create, rotate or revoke identity signing keys. Deleting an identity also needs `erasure:manage`, because it starts an identity-scope erasure |
-        | `identities:sign` | Mint agent assertions and Web Bot Auth HTTP signatures as an identity. Tenant and identity keys (an identity key only for its own identity); platform keys cannot hold it |
+        | `identities:sign` | Mint agent assertions and Web Bot Auth HTTP signatures as an identity. Tenant and identity keys (an identity key only for its own identity); platform and partner keys cannot hold it |
         | `domains:read`, `domains:write` | Read, and add, update, verify, probe or remove domains |
         | `messages:read` | Threads, messages, raw MIME, deliveries |
         | `messages:send` | Send, reply, reply-all, forward, cancel |
@@ -8418,13 +8676,14 @@ components:
         | `quarantine:review` | See and release quarantined mail |
         | `webhooks:read` | Read webhook endpoints and their deliveries |
         | `webhooks:manage` | Create, change, test, rotate and delete webhook endpoints, and replay. Includes `webhooks:read` |
-        | `keys:manage` | API keys within the caller's scope |
+        | `keys:manage` | API keys within the caller's scope. A partner key manages only tenant and identity keys of its own tenants |
         | `erasure:manage` | Erasure requests, legal holds, exports |
         | `suppressions:manage` | Suppressions and allow or block lists |
-        | `usage:read` | Plan, allowances and usage figures. Every tenant and identity key holds it implicitly for its own workspace; platform keys must hold it explicitly and pass `tenant_id` |
+        | `usage:read` | Plan, allowances and usage figures. Every tenant and identity key holds it implicitly for its own workspace; platform and partner keys must hold it explicitly and pass `tenant_id` |
         | `audit:read` | Audit log |
-        | `members:read` | List console members and pending invitations (tenant and platform keys; every console role holds it) |
-        | `members:manage` | Invite, revoke, change roles and remove console members (tenant and platform keys). Includes `members:read` |
+        | `members:read` | List console members and pending invitations (tenant, partner and platform keys; every console role holds it) |
+        | `members:manage` | Invite, revoke, change roles and remove console members (tenant, partner and platform keys). Includes `members:read` |
+        | `partners:manage` | Create, list, read, update and delete partners (platform keys only) |
         | `platform:ops` | Platform operations: signing-key rotation, the dead-letter queue, maintenance jobs, waitlist invitations (platform keys only) |
 
         Which key levels can hold a permission. `POST /v1/keys` refuses any other combination with
@@ -8432,12 +8691,14 @@ components:
 
         | Permissions | Key levels |
         |---|---|
-        | `tenants:manage`, `platform:ops` | platform |
-        | `members:read`, `members:manage`, `suppressions:manage`, `audit:read`, `usage:read` | platform, tenant |
+        | `platform:ops`, `partners:manage` | platform |
+        | `tenants:manage` | platform, partner |
+        | `members:read`, `members:manage`, `suppressions:manage`, `audit:read`, `usage:read` | platform, partner, tenant |
         | `identities:sign` | tenant, identity |
-        | Every other permission | platform, tenant, identity |
+        | Every other permission | platform, partner, tenant, identity |
       enum:
         - 'tenants:manage'
+        - 'partners:manage'
         - 'identities:read'
         - 'identities:write'
         - 'identities:sign'
@@ -8463,11 +8724,12 @@ components:
     KeyLevel:
       type: string
       description: >-
-        `platform` reaches every tenant; `tenant` reaches its own tenant; `identity` reaches its own identity,
-        plus its tenant's domains read-only with `domains:read` and its tenant's webhook endpoints and
-        deliveries read-only with `webhooks:read`. A route or field that needs a higher level returns
-        `403 scope_denied`.
-      enum: [platform, tenant, identity]
+        From widest to narrowest: `platform` reaches every tenant; `partner` reaches the tenants its
+        partner's keys created and its partner's webhook endpoints (FR-KEY-4); `tenant` reaches its own
+        tenant; `identity` reaches its own identity, plus its tenant's domains read-only with `domains:read`
+        and its tenant's webhook endpoints and deliveries read-only with `webhooks:read`. A route or field
+        that needs a higher level returns `403 scope_denied`.
+      enum: [platform, partner, tenant, identity]
     Mode:
       type: string
       description: '`live` or `test`. Mail a `test` tenant sends never leaves the deployment (FR-TEN-2).'
@@ -8475,15 +8737,20 @@ components:
     Me:
       type: object
       description: The key that made the request.
-      required: [key_id, name, level, mode, tenant_id, identity_id, permissions, expires_at]
+      required: [key_id, name, level, mode, partner_id, tenant_id, identity_id, permissions, expires_at]
       properties:
         key_id: {$ref: '#/components/schemas/KeyId'}
         name:
           type: string
         level: {$ref: '#/components/schemas/KeyLevel'}
         mode: {$ref: '#/components/schemas/Mode'}
+        partner_id:
+          description: '`null` unless the key is partner-level.'
+          oneOf:
+            - $ref: '#/components/schemas/PartnerId'
+            - type: 'null'
         tenant_id:
-          description: '`null` for platform keys.'
+          description: '`null` for platform and partner keys.'
           oneOf:
             - $ref: '#/components/schemas/TenantId'
             - type: 'null'
@@ -8537,7 +8804,7 @@ components:
       examples: [.acme]
     Tenant:
       type: object
-      required: [id, slug, name, mode, status, address_suffix, timezone, policy, created_at, updated_at]
+      required: [id, slug, name, mode, status, suspended_by, partner_id, address_suffix, timezone, policy, created_at, updated_at]
       properties:
         id: {$ref: '#/components/schemas/TenantId'}
         slug: {$ref: '#/components/schemas/TenantSlug'}
@@ -8546,6 +8813,20 @@ components:
           examples: [Acme Car Hire]
         mode: {$ref: '#/components/schemas/Mode'}
         status: {$ref: '#/components/schemas/TenantStatus'}
+        suspended_by:
+          type: [string, 'null']
+          description: >-
+            Who suspended the tenant while `status` is `suspended`: `platform` (a platform key; a partner key
+            cannot lift it) or `partner` (the tenant's partner key). `null` otherwise.
+          enum: [platform, partner, null]
+        partner_id:
+          description: >-
+            The partner whose key created the tenant, or `null` (created by a platform key, by `pmail setup` or
+            by self-serve sign-up). Set at creation and never changed, also after the tenant is erased and
+            the partner deleted.
+          oneOf:
+            - $ref: '#/components/schemas/PartnerId'
+            - type: 'null'
         address_suffix: {$ref: '#/components/schemas/AddressSuffix'}
         timezone:
           type: string
@@ -8578,8 +8859,8 @@ components:
         owner:
           type: object
           description: >-
-            Creates the workspace's console owner and emails them a sign-in link. Without it, a platform key
-            can add an owner later with an invitation and an ownership transfer in the console.
+            Creates the workspace's console owner and emails them a sign-in link. Without it, a platform or
+            partner key can add an owner later with an invitation and an ownership transfer in the console.
           required: [email]
           properties:
             email: {$ref: '#/components/schemas/EmailAddress'}
@@ -8589,7 +8870,9 @@ components:
               examples: [Sam Patel]
         billing:
           type: object
-          description: The workspace's billing account.
+          description: >-
+            The workspace's billing account. Platform keys only: a partner key gets `403 scope_denied`, and its
+            tenants take the partner's `default_billing_mode`.
           properties:
             mode:
               description: Defaults to `metered` (plan `free`) on a deployment with billing on, and to `disabled` otherwise.
@@ -8608,14 +8891,26 @@ components:
           $ref: '#/components/schemas/TenantPolicyPatch'
         status:
           type: string
-          description: '`suspended` suspends the tenant (FR-TEN-3); `active` resumes it.'
+          description: >-
+            `suspended` suspends the tenant (FR-TEN-3) and records `suspended_by`; `active` resumes it, except
+            that a partner key cannot resume a tenant a platform key suspended (`403 scope_denied`).
           enum: [active, suspended]
 
     TenantPolicy:
       type: object
       description: >-
         The full effective policy of a tenant: the built-in defaults shown here, then `PM_DEFAULT_POLICY`,
-        then the tenant's own values, deep-merged.
+        then the tenant's own values, deep-merged. Who may write each field (docs › Configuration › Who may
+        change a field): platform keys write every field. For a partner key, `web_bot_auth.allowed`,
+        `domains.allow_create_zone` and `domains.cloudflare_zones` are platform-only;
+        `quarantine.key_release` is allowed on its own tenants; the lower-only fields
+        (`identity_daily_send_cap`, `tenant_daily_send_cap`, `max_recipients`, `auto_reply.allowed`,
+        `auto_reply.max_automatic_exchanges`, `inbound.per_sender_per_hour`, `inbound.extract_image_text`,
+        `retention.raw_days`, `retention.events_days`, `triage.enabled`, `search.agentic_enabled`,
+        `search.agentic_daily_cap`, `search.agentic_max_steps`, `search.agentic_max_seconds` and the `abuse`
+        thresholds) may be set at most to min(deployment default, platform ceiling), a switch to `true`
+        only when both allow it; every other field is free. A refused field gets `403 scope_denied` with
+        `details.field` and nothing is stored. Tenant and identity keys cannot write the policy.
       required: [identity_daily_send_cap, tenant_daily_send_cap, max_recipients, send_allowlist_only, large_attachments, link_ttl_hours, ai_disclosure, auto_reply, quarantine, inbound, retention, triage, search, webhook_text_bytes, abuse, domains, domain_fallback, web_bot_auth]
       properties:
         identity_daily_send_cap:
@@ -8627,7 +8922,10 @@ components:
           type: integer
           minimum: 0
           default: 5000
-          description: Sends per tenant per day (tenant time zone). Then `429 daily_cap_reached`.
+          description: >-
+            Sends per tenant per day (tenant time zone). Then `429 daily_cap_reached`. With billing on, a new
+            workspace on the Free plan has an effective cap of the lower of this value and 50 until its
+            new-workspace send ramp is lifted (at the earliest on day 7, or at once on a paid plan).
         max_recipients:
           type: integer
           minimum: 1
@@ -8683,7 +8981,7 @@ components:
             max_automatic_exchanges: 2
         quarantine:
           type: object
-          required: [on_auth_fail, spam_threshold, unsolicited_otp]
+          required: [on_auth_fail, spam_threshold, unsolicited_otp, key_release]
           properties:
             on_auth_fail:
               type: boolean
@@ -8699,10 +8997,18 @@ components:
               type: boolean
               default: true
               description: Quarantine password-reset and OTP mail that no `wait` asked for ([E5]).
+            key_release:
+              type: boolean
+              default: false
+              description: >-
+                Lets keys with `quarantine:review` that reach this tenant (its partner key included) release
+                quarantined mail even when `PM_QUARANTINE_KEY_RELEASE` is `off`. Only a platform key, or the
+                partner key of the tenant's own partner, can set it, at creation or later ([J14], [J16]).
           default:
             on_auth_fail: true
             spam_threshold: 0.8
             unsolicited_otp: true
+            key_release: false
         inbound:
           type: object
           required: [per_sender_per_hour, extract_attachment_text, extract_image_text, ses_bounce_retired]
@@ -8859,17 +9165,34 @@ components:
             bounce_rate_pause: 0.05
         domains:
           type: object
-          required: [allow_create_zone]
+          required: [allow_create_zone, cloudflare_zones]
           properties:
             allow_create_zone:
               type: boolean
               default: false
               description: >-
-                Lets the tenant's own keys use the `nameservers` method, which creates a Cloudflare zone.
-                Without it, they get `422 transport_unavailable` (`zone_creation_not_allowed`). Platform keys
-                may always use it. Pylota Mail Cloud sets it to `true`.
+                Lets the tenant's own keys, and its partner key, use the `nameservers` method, which creates a
+                Cloudflare zone. Without it, they get `422 transport_unavailable` (`zone_creation_not_allowed`).
+                Platform keys may always use it. Pylota Mail Cloud sets it to `true` in `PM_DEFAULT_POLICY`.
+                Platform-only.
+            cloudflare_zones:
+              type: array
+              maxItems: 50
+              uniqueItems: true
+              default: []
+              items:
+                type: string
+                pattern: '^[a-z0-9.-]{1,253}$'
+              description: >-
+                Zones of the deployment's Cloudflare account, by A-label name, that the tenant's own keys and
+                its partner key may use with `cloudflare_zone` and `replace_mx`, besides the zones this
+                deployment created for the tenant (`nameservers`, `delegated_subdomain`). A zone created for
+                another tenant, or under the zones of the deployment's platform domain, API host or console
+                host, is refused even when listed (`403 scope_denied`, `details.reason = "zone_not_allowed"`).
+                Platform keys may use any zone. Platform-only.
           default:
             allow_create_zone: false
+            cloudflare_zones: []
         domain_fallback:
           type: boolean
           default: true
@@ -8884,7 +9207,7 @@ components:
               description: >-
                 Lets the tenant's identities sign HTTP requests (Web Bot Auth). While it is `false`,
                 `POST …/http-signatures` returns `403 policy_denied` ([O13]). It has no effect while the
-                deployment has `PM_WEB_BOT_AUTH=off`. Agent assertions do not depend on it.
+                deployment has `PM_WEB_BOT_AUTH=off`. Agent assertions do not depend on it. Platform-only.
           default:
             allowed: false
 
@@ -8941,6 +9264,9 @@ components:
               maximum: 1
             unsolicited_otp:
               type: [boolean, 'null']
+            key_release:
+              type: [boolean, 'null']
+              description: Platform keys, and the partner key of the tenant's own partner, only.
         inbound:
           type: [object, 'null']
           properties:
@@ -9029,6 +9355,17 @@ components:
           properties:
             allow_create_zone:
               type: [boolean, 'null']
+            cloudflare_zones:
+              type: [array, 'null']
+              description: >-
+                Platform-only. Zones a tenant or partner key may use with `cloudflare_zone`, beyond the zones
+                created for the tenant. A listed zone grants names strictly under it: its apex, and
+                `replace_mx` there, stay platform-only.
+              maxItems: 50
+              uniqueItems: true
+              items:
+                type: string
+                pattern: '^[a-z0-9.-]{1,253}$'
         domain_fallback:
           type: [boolean, 'null']
         web_bot_auth:
@@ -9202,6 +9539,88 @@ components:
           description: How matched values are normalised before storage and comparison.
           examples: [upper]
 
+    # ── Partners ─────────────────────────────────────────────────────────────────────────────────
+
+    PartnerStatus:
+      type: string
+      description: >-
+        `suspended` refuses every key of the partner, and every API key of its tenants, with
+        `403 partner_suspended`, and holds deliveries to its and its tenants' endpoints; the tenants' status
+        does not change. `deleted` is set by `DELETE /v1/partners/{partner_id}` and is final.
+      enum: [active, suspended, deleted]
+    PartnerBillingMode:
+      type: string
+      description: >-
+        The billing mode given to every tenant a partner key creates (`billing_accounts.mode`). Only a
+        platform key changes a tenant's mode afterwards.
+      enum: [exempt, metered]
+    Partner:
+      type: object
+      description: >-
+        An integrator whose partner keys create tenants and act only on those tenants (FR-KEY-4). A partner
+        holds nothing but its name and these settings. A deleted partner stays, with `status: "deleted"`
+        and an empty `name`.
+      required: [id, name, status, default_billing_mode, max_tenants, ramp_exempt, created_at, updated_at]
+      properties:
+        id: {$ref: '#/components/schemas/PartnerId'}
+        name:
+          type: string
+          description: '`""` once the partner is deleted.'
+          examples: [Pylota]
+        status: {$ref: '#/components/schemas/PartnerStatus'}
+        default_billing_mode: {$ref: '#/components/schemas/PartnerBillingMode'}
+        max_tenants: {$ref: '#/components/schemas/PartnerMaxTenants'}
+        ramp_exempt: {$ref: '#/components/schemas/PartnerRampExempt'}
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+    PartnerCreateRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+        default_billing_mode:
+          description: Defaults to `metered`.
+          allOf:
+            - $ref: '#/components/schemas/PartnerBillingMode'
+          default: metered
+        max_tenants: {$ref: '#/components/schemas/PartnerMaxTenants'}
+        ramp_exempt: {$ref: '#/components/schemas/PartnerRampExempt'}
+    PartnerUpdateRequest:
+      type: object
+      minProperties: 1
+      properties:
+        name:
+          type: string
+          minLength: 1
+        status:
+          type: string
+          description: '`deleted` cannot be set here: use `DELETE /v1/partners/{partner_id}`.'
+          enum: [active, suspended]
+        default_billing_mode: {$ref: '#/components/schemas/PartnerBillingMode'}
+        max_tenants: {$ref: '#/components/schemas/PartnerMaxTenants'}
+        ramp_exempt: {$ref: '#/components/schemas/PartnerRampExempt'}
+    PartnerMaxTenants:
+      type: integer
+      minimum: 0
+      default: 25
+      description: >-
+        The most tenants that are not `erased` the partner may have; the next `POST /v1/tenants` by a partner
+        key gets `403 partner_tenant_limit`. Default 25: with the default `tenant_daily_send_cap` of 5,000,
+        one partner can send at most 125,000 messages a day (1,250 while its new tenants are on the send
+        ramp). Lowering it below the current count refuses new tenants and changes no existing one.
+    PartnerRampExempt:
+      type: boolean
+      default: false
+      description: >-
+        `true` lets the partner's new tenants skip the new-workspace send ramp (a tenant daily cap of 50 for
+        at least 7 days). `false`, the default: they follow it whatever their billing mode.
+
     # ── Identities ───────────────────────────────────────────────────────────────────────────────
 
     IdentityStatus:
@@ -9214,10 +9633,20 @@ components:
     Username:
       type: string
       description: >-
-        Lower-case local-part stem. Reserved and confusable names (RFC 2142 roles, `noreply`,
-        `mailer-daemon`, homoglyphs) are refused with `address_reserved` ([A4]). Username plus tenant suffix
-        is at most 40 characters (`local_part_too_long`, [A12]).
+        The stored form of a username: the lower-case local-part stem. Requests send a `UsernameInput`,
+        which the service validates and lower-cases into this form.
       pattern: '^[a-z0-9][a-z0-9._-]{0,23}$'
+      examples: [bookings]
+    UsernameInput:
+      type: string
+      description: >-
+        A username as sent in a request. The schema does not constrain it: the service validates it with
+        the username rules ([A1], [A3], [A4], [A12]) and returns their own codes, never a generic
+        `invalid_request`. A reserved name, a confusable one (homoglyphs, mixed scripts, right-to-left
+        characters) or a name that folds to a reserved one gets `400 address_reserved`; any other non-ASCII
+        character `400 address_unsupported`; a name whose lower-cased form does not match the stored form
+        `^[a-z0-9][a-z0-9._-]{0,23}$` (at most 24 characters, no `..`, not ending in `.`) gets
+        `400 address_invalid`; username plus tenant suffix over 40 characters gets `400 local_part_too_long`.
       examples: [bookings]
     DisplayName:
       type: string
@@ -9251,11 +9680,17 @@ components:
         daily_cap:
           type: integer
           minimum: 0
-          description: Sends per day for this identity. Defaults to the tenant's `identity_daily_send_cap`.
+          description: >-
+            Sends per day for this identity. Defaults to the tenant's `identity_daily_send_cap`. Only a
+            platform key may set it above that cap (`403 scope_denied` with `details.field`).
         auto_reply:
           type: string
-          description: 'Whether the identity may send `kind: "auto_reply"` messages.'
-          examples: [allowed]
+          enum: [allowed, denied]
+          default: allowed
+          description: >-
+            Whether the identity may send `kind: "auto_reply"` messages. `denied` refuses them
+            (`409 auto_reply_not_allowed`); `allowed`, the default, leaves the decision to the tenant's
+            `policy.auto_reply.allowed` and the exchange cap.
         require_known_recipient:
           type: boolean
           default: false
@@ -9302,7 +9737,7 @@ components:
       type: object
       required: [username, display_name]
       properties:
-        username: {$ref: '#/components/schemas/Username'}
+        username: {$ref: '#/components/schemas/UsernameInput'}
         display_name: {$ref: '#/components/schemas/DisplayName'}
         purpose:
           type: string
@@ -9333,7 +9768,9 @@ components:
         send_policy: {$ref: '#/components/schemas/IdentitySendPolicy'}
         status:
           type: string
-          description: '`paused` pauses with reason `manual`; `active` resumes.'
+          description: >-
+            `paused` pauses with reason `manual`; `active` resumes (an `abuse_threshold` pause on a tenant a
+            partner's key created needs a platform key).
           enum: [active, paused]
 
     # ── Addresses ────────────────────────────────────────────────────────────────────────────────
@@ -9388,9 +9825,12 @@ components:
         local_part:
           type: string
           description: >-
-            The local part on the tenant domain. At most 40 characters, leaving room for a thread token.
-            Reserved and confusable names are refused with `address_reserved`.
-          pattern: '^[a-z0-9][a-z0-9._-]{0,39}$'
+            The local part on the tenant domain. The schema does not constrain it: the service validates it
+            with the username rules for a tenant domain, with a maximum of 40 characters (room for a thread
+            token), and returns their own codes, never a generic `invalid_request`: `400 address_reserved`
+            for a reserved or confusable name, `400 address_unsupported` for any other non-ASCII character,
+            and `400 address_invalid` when the lower-cased form does not match the stored form
+            `^[a-z0-9][a-z0-9._-]{0,39}$` (no `..`, not ending in `.`).
           examples: [bookings]
         domain_id: {$ref: '#/components/schemas/DomainId'}
     PromoteAddressRequest:
@@ -9551,11 +9991,17 @@ components:
           type: boolean
         ses_region:
           type: [string, 'null']
-          description: The SES region when `inbound` or `transport` is `ses`.
+          description: >-
+            The region of the domain's SES identity: set when `inbound` or `transport` is `ses`, and on a
+            Cloudflare-method domain that has an SES identity for the [J5] failover; otherwise `null`.
           examples: [eu-west-2]
         mail_from_domain:
           type: [string, 'null']
-          description: The custom MAIL FROM domain, `pm-bounce.{name}`, when SES sends for the domain. The local part `pm-bounce` is reserved on such domains.
+          description: >-
+            The custom MAIL FROM domain, `pm-bounce.{name}`, of a `dns_records` or `send_only` domain, whose
+            mail SES sends. The local part `pm-bounce` is reserved on such domains. Otherwise `null`, including
+            a Cloudflare-method domain sending through its [J5] failover identity after a `PATCH` to `ses`:
+            that identity has no custom MAIL FROM.
           examples: [pm-bounce.agents.brightwell.example]
         smtp:
           description: '`smtp_relay` only, otherwise `null`. Never the password.'
@@ -9580,7 +10026,7 @@ components:
           description: >-
             `active`: provider delivery events reach the service. `manual`: a Cloudflare-transport domain was
             created without an Email Sending event subscription (spike S9 fallback); delivery statuses stop at
-            `sent` until `pmail domains subscribe <domain>` has run. `none`: `sending` is false.
+            `submitted` until `pmail domains subscribe <domain>` has run. `none`: `sending` is false.
         details:
           description: '`null`, or the operator step that remains while `delivery_events` is `manual`.'
           oneOf:
@@ -10351,10 +10797,12 @@ components:
       required: [kind, value]
       properties:
         kind:
-          description: A built-in kind, or `custom:<name>` for a tenant pattern.
+          description: >-
+            A built-in kind, or `custom:<name>` for a tenant pattern (a booking reference, for example, is
+            `custom:booking`).
           anyOf:
             - type: string
-              enum: [uk_plate, pcn, invoice, order, booking, amount, phone, email, domain, date]
+              enum: [uk_plate, pcn, invoice, order, amount, phone, email, domain, date]
             - type: string
               pattern: '^custom:.+$'
         value:
@@ -10423,12 +10871,33 @@ components:
     SendHeaders:
       type: object
       description: >-
-        Custom headers. Only `X-` headers plus `Importance`, `Priority`, `Sensitivity`, `Keywords`,
-        `Comments` and `Organization` are accepted (`400 header_not_allowed`); everything else is set by the
-        service. At most 16 KB in total; each value at most 2,048 bytes.
+        Custom headers, checked when the request arrives, never later at the transport. Names are matched
+        case-insensitively, as Cloudflare matches them. A name must be an `X-` name matching
+        `^X-[A-Za-z0-9_-]+$`, the prefix in either case (at most 100 bytes, sent as given; `X-Pylota-*` and
+        `X-AI-Generated` are reserved in any case), or one of `Importance`, `Priority`, `Sensitivity`,
+        `Keywords`, `Comments` and `Organization` in any case, which is sent in that casing; any other name
+        is `400 header_not_allowed` (the schema leaves names unconstrained, so that this code and not a
+        generic `invalid_request` is returned). Two names that differ only in case are `400 invalid_request`.
+        The enums below are listed under the canonical names and apply to every casing. `Importance` takes
+        only `high`, `normal` or `low`, `Priority` only `normal`, `non-urgent` or `urgent`, and
+        `Sensitivity` only `personal`, `private` or `company-confidential`; another value, an empty value or
+        one with CR or LF is `400 invalid_request`. Everything else is set by the service. At most 16 KB in
+        total; each value at most 2,048 bytes.
       additionalProperties:
         type: string
+        minLength: 1
         maxLength: 2048
+        pattern: '^[^\r\n]+$'
+      properties:
+        Importance:
+          type: string
+          enum: [high, normal, low]
+        Priority:
+          type: string
+          enum: [normal, non-urgent, urgent]
+        Sensitivity:
+          type: string
+          enum: [personal, private, company-confidential]
       examples:
         - X-Booking-Ref: BK-2291
     SendRequest:
@@ -10465,6 +10934,7 @@ components:
           description: HTML body.
         attachments:
           type: array
+          maxItems: 32
           items: {$ref: '#/components/schemas/AttachmentInput'}
         kind:
           type: string
@@ -10508,6 +10978,7 @@ components:
           type: [string, 'null']
         attachments:
           type: array
+          maxItems: 32
           items: {$ref: '#/components/schemas/AttachmentInput'}
         kind:
           type: string
@@ -10554,7 +11025,8 @@ components:
           description: Attach the original's attachments (never those with a `risk`).
         attachments:
           type: array
-          description: Extra attachments.
+          maxItems: 32
+          description: Extra attachments, at most 32 as on a send.
           items: {$ref: '#/components/schemas/AttachmentInput'}
         labels:
           type: array
@@ -11097,11 +11569,22 @@ components:
           const: '*'
     Webhook:
       type: object
-      required: [id, tenant_id, url, events, identity_ids, description, enabled, disabled_reason, created_at, updated_at]
+      required: [id, scope, partner_id, tenant_id, url, events, identity_ids, description, enabled, disabled_reason, created_at, updated_at]
       properties:
         id: {$ref: '#/components/schemas/WebhookId'}
+        scope:
+          type: string
+          description: >-
+            Whose events the endpoint receives: `platform`, every tenant's; `partner`, only those of the
+            tenants its partner's keys created; `tenant`, its tenant's. Set by the key that created it.
+          enum: [platform, partner, tenant]
+        partner_id:
+          description: The partner of a `partner` endpoint; `null` otherwise.
+          oneOf:
+            - $ref: '#/components/schemas/PartnerId'
+            - type: 'null'
         tenant_id:
-          description: '`null` for a platform endpoint.'
+          description: '`null` for a platform or partner endpoint.'
           oneOf:
             - $ref: '#/components/schemas/TenantId'
             - type: 'null'
@@ -11129,16 +11612,25 @@ components:
           type: string
           format: date-time
     WebhookCreated:
-      description: An endpoint with its signing secret. The secret is shown only in this response.
+      description: >-
+        An endpoint with its signing secret. The secret is shown only in this response: an idempotent replay
+        (`Idempotent-Replayed: true`) returns the same body without `secret` and with
+        `"secret_replayed": false`, because the stored response never holds it.
       allOf:
         - $ref: '#/components/schemas/Webhook'
         - type: object
-          required: [secret]
           properties:
             secret:
               type: string
               pattern: '^whsec_[A-Za-z0-9+/]+={0,2}$'
               description: '`whsec_` followed by the base64-encoded signing key.'
+            secret_replayed:
+              type: boolean
+              const: false
+              description: Present only on an idempotent replay, which carries no secret. Rotate the secret if it was lost.
+          oneOf:
+            - required: [secret]
+            - required: [secret_replayed]
     WebhookCreateRequest:
       type: object
       required: [url, events]
@@ -11331,13 +11823,18 @@ components:
 
     ApiKey:
       type: object
-      required: [id, name, level, mode, tenant_id, identity_id, permissions, expires_at, revoked_at, last_used_at, created_at]
+      required: [id, name, level, mode, partner_id, tenant_id, identity_id, permissions, expires_at, revoked_at, last_used_at, created_at]
       properties:
         id: {$ref: '#/components/schemas/KeyId'}
         name:
           type: string
         level: {$ref: '#/components/schemas/KeyLevel'}
         mode: {$ref: '#/components/schemas/Mode'}
+        partner_id:
+          description: '`null` unless the key is partner-level.'
+          oneOf:
+            - $ref: '#/components/schemas/PartnerId'
+            - type: 'null'
         tenant_id:
           oneOf:
             - $ref: '#/components/schemas/TenantId'
@@ -11364,22 +11861,32 @@ components:
           type: string
           format: date-time
     ApiKeyCreated:
-      description: A key with its secret. The secret is shown only in this response.
+      description: >-
+        A key with its secret. The secret is shown only in this response: an idempotent replay
+        (`Idempotent-Replayed: true`) returns the same body without `secret` and with
+        `"secret_replayed": false`, because the stored response never holds it (FR-KEY-2).
       allOf:
         - $ref: '#/components/schemas/ApiKey'
         - type: object
-          required: [secret]
           properties:
             secret:
               type: string
               pattern: '^pmk_(live|test)_.{12}_.+$'
               description: '`pmk_live_<lookup12>_<secret>` or `pmk_test_<lookup12>_<secret>`.'
+            secret_replayed:
+              type: boolean
+              const: false
+              description: Present only on an idempotent replay, which carries no secret. Rotate or revoke the key if the secret was lost.
+          oneOf:
+            - required: [secret]
+            - required: [secret_replayed]
     ApiKeyCreateRequest:
       type: object
       description: >-
         `tenant_id` is required for `tenant` and `identity` keys, and `identity_id` for `identity` keys;
-        neither is allowed on `platform` keys. `permissions` is required at every level, `platform`
-        included (no implicit full set). Level, tenant, identity and permissions must lie within the
+        neither is allowed on `platform` or `partner` keys. `partner_id` is required for `partner` keys, which
+        only a platform key may create, and refused on every other level. `permissions` is required at every
+        level, `platform` included (no implicit full set). Level, tenant, identity and permissions must lie within the
         caller's own (`403 key_scope_exceeded`), and each permission must be one the level can hold
         (`400 invalid_request`, `details.reason = "permission_not_allowed_for_level"`; see `Permission`).
       required: [name, level, permissions]
@@ -11388,6 +11895,7 @@ components:
           type: string
           minLength: 1
         level: {$ref: '#/components/schemas/KeyLevel'}
+        partner_id: {$ref: '#/components/schemas/PartnerId'}
         tenant_id: {$ref: '#/components/schemas/TenantId'}
         identity_id: {$ref: '#/components/schemas/IdentityId'}
         permissions:
@@ -11675,7 +12183,7 @@ components:
       type: string
       description: >-
         `metered` (the plan's allowances plus top-ups), `exempt` (no limits) or `disabled` (self-hosted
-        without billing; only operator quotas from tenant policy apply).
+        without billing; only the daily caps in tenant policy apply).
       enum: [metered, exempt, disabled]
     UsageFeatureName:
       type: string
@@ -12071,7 +12579,7 @@ components:
             minimum: 0
         created_by_key_id:
           type: [string, 'null']
-          description: The API key that started the job, or `null` for jobs the system started (retention, backup).
+          description: The API key that started the job, or `null` for a job the system started itself (for example the `reembed` job that the cron creates during an embedding-model change).
     WaitlistInviteRequest:
       type: object
       required: [count]
@@ -12427,6 +12935,15 @@ components:
         data:
           type: array
           items: {$ref: '#/components/schemas/Tenant'}
+        next_cursor:
+          type: [string, 'null']
+    PartnerPage:
+      type: object
+      required: [data, next_cursor]
+      properties:
+        data:
+          type: array
+          items: {$ref: '#/components/schemas/Partner'}
         next_cursor:
           type: [string, 'null']
     IdentityPage:
@@ -13163,7 +13680,7 @@ components:
             data: {$ref: '#/components/schemas/QuotaWarningData'}
 
     WebhookDisabledEvent:
-      description: '`webhook.disabled`: A webhook endpoint was disabled. Sent to the platform''s other endpoints only.'
+      description: '`webhook.disabled`: A webhook endpoint was disabled. Sent to platform endpoints and, when the disabled endpoint belongs to a partner (a partner endpoint, or an endpoint of a tenant a partner''s key created), to that partner''s other endpoints; never to tenant endpoints or to the endpoint itself.'
       allOf:
         - $ref: '#/components/schemas/EventBase'
         - type: object
@@ -13318,7 +13835,8 @@ components:
         | `transport_connection_lost` | `uncertain` | The connection dropped after the request was written |
         | `resolved_not_sent` | `failed` | A human resolved an uncertain send as not sent |
         | `domain_failing_no_fallback` | `failed` | The domain failed and fallback was disabled by policy |
-      enum: [provider_validation, sender_domain_unavailable, recipient_suppressed_by_provider, quota_exhausted, transport_timeout, transport_connection_lost, resolved_not_sent, domain_failing_no_fallback]
+        | `marketing_needs_ses` | `rejected` | A `kind: marketing` message whose sending domain uses the `cloudflare` transport when it reached the transport (the domain's transport changed, or fallback moved it to the platform domain, after it was accepted). Cloudflare Email Service is for transactional mail only |
+      enum: [provider_validation, sender_domain_unavailable, recipient_suppressed_by_provider, quota_exhausted, transport_timeout, transport_connection_lost, resolved_not_sent, domain_failing_no_fallback, marketing_needs_ses]
     EventAttachment:
       type: object
       required: [id, filename, content_type, size]

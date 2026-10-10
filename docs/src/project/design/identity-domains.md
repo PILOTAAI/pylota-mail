@@ -29,7 +29,7 @@ Items the documentation does not confirm are marked "verify at build time" with 
 | `active` | `PATCH status: paused` | `identities:write` | `pause_reason = 'manual'`; `identity.paused` | `paused` |
 | `active` | Abuse threshold ([Outbound](outbound.md#abuse-auto-pause-fr-dlv-3)) | – | `pause_reason = 'abuse_threshold'`; `identity.paused` with `metrics` | `paused` |
 | `active` | Tenant suspended | – | `pause_reason = 'tenant_suspended'`; `identity.paused` | `paused` |
-| `paused` | `PATCH status: active` | reason `manual`: `identities:write`; reason `abuse_threshold`: platform or tenant key, audit-logged; reason `tenant_suspended`: refused (`409 identity_paused`) | `pause_reason = NULL`; `identity.resumed` | `active` |
+| `paused` | `PATCH status: active` | reason `manual`: `identities:write`; reason `abuse_threshold`: platform, partner or tenant key, audit-logged, and only a platform key on a tenant a partner's key created ([J17](../edge-cases.md)); reason `tenant_suspended`: refused (`409 identity_paused`) | `pause_reason = NULL`; `identity.resumed` | `active` |
 | `paused` (`tenant_suspended`) | Tenant resumed | – | `identity.resumed` | `active` |
 | `active`, `paused` | `DELETE` | `identities:write` and `erasure:manage` | Tombstone and remove every address; create the identity-scope erasure ([Privacy](privacy.md)) | `deleting` |
 | `deleting` | Erasure completed with no holds left | – | `identity.deleted`, once, from the erasure job's outbox with `identity_id` set ([Privacy § 6.5](privacy.md#65-identity-scope-fr-idn-4)) | `deleted` |
@@ -52,19 +52,38 @@ normal outbound pipeline.
   cron mints the mailbox and sends `MailboxRequest::Init`, as the [monitor hook](#create) does for
   domains. At most one row has `is_system = 1` (a partial unique index).
 - **Exempt from username validation.** Its local part may be a reserved name (`no-reply` is), because
-  only setup writes it. It must still be ASCII, at most 64 octets, with a valid address syntax.
+  only setup writes its addresses, at creation and when `PM_SYSTEM_FROM` changes, and setup writes them
+  through its internal path (the D1 query API), never the public routes, so the reserved-name and
+  role-name steps of [Username validation](#username-validation) never run for it. Setup still checks
+  that the local part is ASCII, at most 64 octets, with a valid address syntax.
 - **Not listed to tenants.** List endpoints (`GET /v1/identities`, `GET /v1/tenants/{t}/identities`,
   `mail_list_identities`, the console) never return it, and a tenant or identity key that names it gets
   `404 identity_not_found`. Only a platform key reads or changes it, by ID. It is not counted against
   `inboxes`.
 - **Mail sent to it** is stored in its mailbox like any identity's (bounces and replies to sign-in mail),
   readable only with a platform key.
+- **Exempt from the tenant daily cap and from abuse auto-pause.** Its sends are not counted against the
+  default tenant's `tenant_daily_send_cap`; its own `send_policy.daily_cap` (50,000) still applies
+  ([Outbound › Policy pipeline](outbound.md#policy-pipeline), step 18). The delivery consumer records its
+  outcomes but never pauses it ([Outbound › Abuse auto-pause](outbound.md#abuse-auto-pause-fr-dlv-3)):
+  one person's bounce must not stop everyone's sign-in mail. When a notification send through it is still
+  refused (`429 daily_cap_reached`, `409 identity_paused` after a manual pause, or `409 domain_not_ready`),
+  the Notifier keeps the item, retries it and raises `system_mail_blocked`
+  ([Notifications § 7](notifications.md#7-when-system-mail-cannot-be-sent)).
 - **Fixed retention.** Its mailbox keeps messages 30 days and raw MIME 7 days, whatever the default
   tenant's `retention` policy says: the tenant retention job uses these cutoffs for the identity with
   `is_system = 1` ([Privacy §5.2](privacy.md#52-steps-of-a-tenant-retention-job)). Deleting a person also
   erases the system mail sent to them ([Privacy §6.9](privacy.md#69-people-console-accounts)).
-- **Changing `PM_SYSTEM_FROM`.** A re-run of setup adds the new address to the system identity and
-  promotes it; the old address retires as usual.
+- **Changing `PM_SYSTEM_FROM`.** A re-run of setup inserts the new address as an `active` alias on the
+  platform domain through its internal path, in one D1 query API batch as at creation (no reserved-name
+  or role-name check, so `noreply` is accepted), then promotes it through the API with the bootstrap
+  platform key; the old address retires as usual. This is the one exception to the rule that every
+  identity keeps exactly one platform-domain address for life ([Format](#format)): only setup's internal
+  write creates a second platform-domain address, for the system identity only, while the public
+  `POST …/addresses` never does (and would refuse a reserved name with `400 address_reserved`).
+  Promoting it makes the previous primary `retiring` with the usual grace, as on any other domain,
+  instead of an `active` alias. The promoted address is the system identity's platform address from then
+  on. Every other identity's platform address still cannot be retired or deleted.
 - **Without the console** (`PM_CONSOLE=off`) it still exists and still sends invitations, because
   `PM_SYSTEM_FROM` and `PM_CONSOLE_HOST` are top-level settings, not console settings
   ([Rust workspace §6.1](rust-workspace.md#61-errors-and-configuration)).
@@ -75,7 +94,11 @@ normal outbound pipeline.
 
 1. Validate the body: `username` ([Username validation](#username-validation)), `display_name` (1–78
    characters, Unicode allowed, no CR or LF), `owner.email` (RFC 5321), `signature.html` (sanitised with
-   the inbound policy before storage), `metadata` (≤ 16 keys, ≤ 512 bytes per value).
+   the inbound policy before storage), `metadata` (≤ 16 keys, ≤ 512 bytes per value). For any key but a
+   platform key, `send_policy.daily_cap` may not exceed the tenant's effective
+   `identity_daily_send_cap` (`403 scope_denied`, `details.field = "send_policy.daily_cap"`); the same
+   check runs on `PATCH /v1/identities/{identity_id}`
+   ([Configuration › Who may change a field](../../reference/configuration.md#who-may-change-a-field)).
 2. **`client_id`** (FR-IDN-1): `client_fingerprint = hex(sha256(canonical_json(body)))` (canonical JSON as
    in [Outbound](outbound.md#idempotency-fingerprint)).
    `SELECT id, client_fingerprint FROM identities WHERE tenant_id = ?1 AND client_id = ?2` decides
@@ -100,8 +123,9 @@ normal outbound pipeline.
 
 `PATCH /v1/identities/{id}` updates D1, then sends `MailboxRequest::EmitEvent` with `identity.updated`
 (`changed` = field names), `identity.paused` or `identity.resumed`. Suspending a tenant
-(`PATCH /v1/tenants/{id}` with `status: suspended`) sets `tenants.suspended_at` and, in the same D1
-batch, pauses every `active` identity with `pause_reason = 'tenant_suspended'`; resuming reverses only
+(`PATCH /v1/tenants/{id}` with `status: suspended`) sets `tenants.suspended_at` and `suspended_by`
+(`platform` or `partner`, from the calling key's level; a partner key cannot resume a tenant whose
+`suspended_by` is `platform`, `403 scope_denied`) and, in the same D1 batch, pauses every `active` identity with `pause_reason = 'tenant_suspended'`; resuming reverses only
 those. Each identity then gets its event.
 
 ### Delete (FR-IDN-4, A13)
@@ -128,9 +152,10 @@ erased address is dropped like an unknown one instead of bouncing with `5.1.6`),
 
 ## Username validation
 
-`core::address::validate_username(input, domain_class, tenant_suffix, existing_usernames) -> Result<String, AddressError>`
+`core::address::validate_username(input, domain_class, max_len, tenant_suffix, existing_usernames) -> Result<String, AddressError>`
 runs these steps in order (`domain_class` selects the reserved set below: `Platform` for a username of
-the default tenant, `Tenant` for any other username and for a local part on a tenant domain) ([A1](../edge-cases.md), [A3](../edge-cases.md), [A4](../edge-cases.md),
+the default tenant, `Tenant` for any other username and for a local part on a tenant domain; `max_len` is
+24 for a username and 40 for an alias local part on a tenant domain, `POST …/addresses`) ([A1](../edge-cases.md), [A3](../edge-cases.md), [A4](../edge-cases.md),
 [A12](../edge-cases.md), FR-ADR-6, FR-ADR-7):
 
 | # | Step | Error |
@@ -138,12 +163,20 @@ the default tenant, `Tenant` for any other username and for a local part on a te
 | 1 | `fold(input)` (below) equals the fold of a name reserved on this domain class | `400 address_reserved` |
 | 2 | Input contains a non-ASCII character and is mixed-script (its resolved script set is empty), or contains a strong right-to-left character | `400 address_reserved` |
 | 3 | Input contains any other non-ASCII character (SMTPUTF8 local parts cannot be routed by Email Routing) | `400 address_unsupported` |
-| 4 | Lower-case (ASCII). Must match `^[a-z0-9][a-z0-9._-]{0,23}$`, must not contain `..`, must not end in `.` | `400 address_invalid` |
+| 4 | Lower-case (ASCII). Must match `^[a-z0-9][a-z0-9._-]{0,N}$` with `N = max_len − 1` (`{0,23}` for a username, `{0,39}` for an alias local part), must not contain `..`, must not end in `.` | `400 address_invalid` |
 | 5 | Exact match of a name or pattern reserved on this domain class | `400 address_reserved` |
 | 6 | `len(username) + len(tenant_suffix) > 40` (room for a thread token in 64 octets) | `400 local_part_too_long` |
 | 7 | Another non-deleted identity in the tenant has the same username, or a different username with the same fold | `409 username_taken` |
 
 Display names are Unicode and never refused for script reasons (FR-ADR-7).
+
+Request validation of `username` and `local_part` runs through this function, never through a schema
+pattern: `openapi.yaml` leaves both request fields unconstrained and documents the stored form, so a
+non-ASCII or confusable input gets `address_unsupported` or `address_reserved` from steps 1–3, not a
+generic `400 invalid_request`. Every route that writes a username or an address runs it, for every
+identity. The only writes that skip it are setup's writes of the system identity's username and
+addresses, through the D1 query API rather than a route ([The system identity](#the-system-identity)),
+which check ASCII, length and address syntax only.
 
 **Reserved names** (FR-ADR-6):
 
@@ -208,13 +241,14 @@ set means mixed-script.
 | Domain | Address | Notes |
 |---|---|---|
 | Platform | `{name}{tenant.address_suffix}@{PM_PLATFORM_DOMAIN}`, for example `bookings.acme@agents.example` | `{name}` is validated as a username. Only the default tenant (made by setup) has an empty suffix |
-| Tenant `zone`, `delegated` or `external` | `{local_part}@{domain}`, for example `bookings@mail.acmecarhire.example` | `local_part` validated as a username |
+| Tenant `zone`, `delegated` or `external` | `{local_part}@{domain}`, for example `bookings@mail.acmecarhire.example` | `local_part` validated as a username for a tenant domain, with a maximum of 40 characters |
 
 Addresses are stored lower case with an A-label domain; dots are significant ([A1](../edge-cases.md)).
 At most 20 addresses per identity in any state, and one `pending` address per identity and domain.
 
-Every identity keeps exactly one platform-domain address for its whole life. It is the **fallback
-address** ([Fallback behaviour](#fallback-behaviour), FR-DOM-6), so it is never retired automatically,
+Every identity keeps exactly one platform-domain address for its whole life (the system identity, whose
+address setup may change, is the one exception: [The system identity](#the-system-identity)). It is the
+**fallback address** ([Fallback behaviour](#fallback-behaviour), FR-DOM-6), so it is never retired automatically,
 cannot be retired or deleted through the API (`409 address_in_use`), and on promotion away from it
 becomes an `active` alias rather than `retiring`.
 
@@ -226,7 +260,7 @@ becomes an `active` alias rather than `retiring`.
 | `pending` | Domain reaches `healthy`/`degraded` and the address is routed | – | `identity.address_activated` | `active` |
 | `pending` | Literal rule creation fails ([H6](../edge-cases.md)) | – | Stays `pending`; retried by the domain's monitor (1, 5, 15, 60 minutes, then hourly); issue `routing_rule_failed` on the domain's health | `pending` |
 | `pending` | `DELETE …/addresses/{id}` | Never received mail | Delete the row and its rule | – |
-| `active` alias | `POST …/promote` | Domain `healthy` or `degraded` (else `409 domain_not_ready`) | In one batch: this address becomes `primary`; the previous primary becomes an alias, `retiring` with `retire_at = now + retire_previous_after_days` (default 90, range 0–365; 0 means `retired` now), except the platform address, which becomes an `active` alias. When the promoted address is itself the platform address, this is a **rollback** as in the next row: the current primary becomes an `active` alias, not `retiring` ([A14](../edge-cases.md)); `identity.address_promoted` with `previous_primary` | `active` primary |
+| `active` alias | `POST …/promote` | Domain `healthy` or `degraded` (else `409 domain_not_ready`) | In one batch: this address becomes `primary`; the previous primary becomes an alias, `retiring` with `retire_at = now + retire_previous_after_days` (default 90, range 0–365; 0 means `retired` now), except the platform address, which becomes an `active` alias (the system identity's previous platform address retires instead, [The system identity](#the-system-identity)). When the promoted address is itself the platform address, this is a **rollback** as in the next row: the current primary becomes an `active` alias, not `retiring` ([A14](../edge-cases.md)); `identity.address_promoted` with `previous_primary` | `active` primary |
 | `retiring` alias | `POST …/promote` (**rollback**, FR-ADR-4) | Domain `healthy` or `degraded` | This address becomes `primary`, `retire_at = NULL`; the current primary becomes an `active` alias (the change is undone, not mirrored); `identity.address_promoted` | `active` primary |
 | `active` alias | `POST …/retire` | Not the primary (`409 address_is_primary`); not the platform address (`409 address_in_use`) | `after_days > 0`: `retiring`, `retire_at = now + after_days`; `0`: `retired` now with `identity.address_retired` | `retiring` / `retired` |
 | `retiring` | `POST …/retire` | – | `retire_at` updated (`0` retires now) | `retiring` / `retired` |
@@ -316,7 +350,7 @@ The request names a `method`. When it is absent, the old `kind` is mapped (`zone
 | `method` | Onboarding | The deployment needs (refusal without it) |
 |---|---|---|
 | `cloudflare_zone` | [Kind `zone`](#kind-zone) | `PM_CF_API_TOKEN` (`422 cf_token_required`) |
-| `nameservers` | [Creating a zone](#creating-a-zone), then [Kind `zone`](#kind-zone) at the apex | `PM_CF_API_TOKEN` that can create zones (`422 cf_token_required`); for a tenant key, the policy `domains.allow_create_zone: true` (`422 transport_unavailable`, `details.reason = "zone_creation_not_allowed"`) |
+| `nameservers` | [Creating a zone](#creating-a-zone), then [Kind `zone`](#kind-zone) at the apex | `PM_CF_API_TOKEN` that can create zones (`422 cf_token_required`); for a tenant or partner key, the policy `domains.allow_create_zone: true` (`422 transport_unavailable`, `details.reason = "zone_creation_not_allowed"`) |
 | `delegated_subdomain` | [Domains on any DNS host §3.3](domain-connections.md#33-delegated_subdomain) | `PM_CF_API_TOKEN` (`422 cf_token_required`) and `PM_CF_SUBDOMAIN_SETUP=on` (`422 transport_unavailable`, `subdomain_setup_disabled`) |
 | `dns_records` | [§4.3](domain-connections.md#43-dns_records) | SES with receiving (`422 transport_unavailable`, `ses_not_configured` or `ses_receiving_not_configured`) |
 | `send_only` | [Kind `external`](#kind-external) and [§4.4](domain-connections.md#44-send_only) | SES (`422 transport_unavailable`, `ses_not_configured`) |
@@ -347,6 +381,44 @@ records and the SES endpoint hosts of `ses_region`
 ([§4.1](domain-connections.md#41-what-each-method-asks-the-customer-to-publish)). `GET …/records`
 re-reads them; they are never copied from documentation or templates.
 
+#### Zone permission
+
+`cloudflare_zone`, `nameservers` and `delegated_subdomain` work inside the deployment's own Cloudflare
+account, which holds every tenant's zones and the zones of the deployment's own hosts. A tenant or
+partner key may therefore use only zones its tenant is entitled to ([H8](../edge-cases.md)). Platform
+keys skip this check. Two sources grant a zone to a tenant:
+
+- **Claimed zones.** `zone_claims` ([Data model](data-model.md#1-d1-control-plane)) records each zone
+  this deployment created for a tenant (`nameservers`, `delegated_subdomain`): the row is inserted in the
+  D1 batch that inserts the domain row, and `zone_name` is unique, so a zone is claimed by one tenant at
+  most. The claim is deleted by the `delete_zone` step of [Domain removal](#domain-removal) and when the
+  zone expires (`zone_expired`, [Creating a zone](#creating-a-zone) step 5), together with the zone.
+- **Listed zones.** The tenant's policy `domains.cloudflare_zones`, an array of zone names that only a
+  platform key can write ([Configuration › Who may change a field](../../reference/configuration.md#who-may-change-a-field)),
+  for zones of the account that an operator assigns to the tenant.
+
+The check runs in two places, both before anything is written, and refuses with `403 scope_denied`,
+`details.reason = "zone_not_allowed"`:
+
+1. **By name, before any Cloudflare call.** Let the *deployment zones* be the registrable domains (public
+   suffix list) of `PM_PLATFORM_DOMAIN`, `PM_API_HOST` and `PM_CONSOLE_HOST`. The name is refused when it
+   equals or is under a deployment zone, or under a zone another tenant claimed. For `cloudflare_zone`
+   (and with it `replace_mx`, which deletes MX records only inside that zone), the name must also equal or
+   be under a zone this tenant claimed or a zone in its `domains.cloudflare_zones`. A listed zone grants
+   names strictly under it: its apex, and `replace_mx` there, stay platform-only, so listing an operator's
+   zone (for example `pylota.io`, to allow `notify.pylota.io`) never hands over that zone's own mail.
+   `nameservers` and
+   `delegated_subdomain` create their own zone and need no grant, only the two refusals.
+2. **On the zone found** ([Kind `zone`](#kind-zone) step 1, which takes the most specific zone of the
+   account containing the name). The found zone must be claimed by this tenant (`zone_claims.zone_id`
+   with its `tenant_id`), or listed in its `domains.cloudflare_zones` by name and claimed by no other
+   tenant. A zone claimed by another tenant is refused even when the policy lists it, so a listed parent
+   zone never reaches a more specific zone another tenant owns.
+
+Both refusals have the same body, whether or not a zone of that name exists in the account, so the
+answer does not reveal other tenants' zones. `pmail domains add --local-token` runs with the operator's
+own Cloudflare token and inserts the row itself; it is a platform operation and not checked.
+
 #### Kind `zone`
 
 The `cloudflare_zone` method. Needs `PM_CF_API_TOKEN` (`422 cf_token_required` without it, as above) and
@@ -355,7 +427,9 @@ The `cloudflare_zone` method. Needs `PM_CF_API_TOKEN` (`422 cf_token_required` w
 1. **Find the zone.** List zones by name for the account, trying the domain and then each parent label
    up to the registrable domain (`GET /zones?name={name}`; verify the query parameters at build time).
    Not found: `404 domain_not_found`. The `nameservers` method creates the zone instead
-   ([Creating a zone](#creating-a-zone)).
+   ([Creating a zone](#creating-a-zone)). For a tenant or partner key, the found zone then passes the
+   second [zone permission](#zone-permission) check, or the request gets `403 scope_denied`
+   (`zone_not_allowed`) before anything is changed.
 2. **Existing mail at an apex ([H5](../edge-cases.md)).** Query MX at the apex on both DoH resolvers. If
    it has MX records other than the hosts Email Routing expects (taken from step 6, never hard-coded) and
    the request lacks `"replace_mx": true`, refuse with `409 existing_mx` and a fix saying that existing
@@ -385,6 +459,23 @@ The `cloudflare_zone` method. Needs `PM_CF_API_TOKEN` (`422 cf_token_required` w
    each sent message for about seven days and is on by default for new sending domains,
    [Privacy](privacy.md#3-jurisdiction-and-residency)). Both fields are in the Cloudflare API reference
    for this endpoint (read 2026-10-09).
+
+   **SES identity for the failover** (optional; only when `sending`, the SES transport is configured, and
+   the domain is a tenant domain, never the platform domain). This prepares the Email Sending failover of
+   [J5](../edge-cases.md), so that [`PATCH` to `ses`](#changing-the-transport-j5) works later without any
+   DNS change: create the SES identity as in step 2 of [Kind `external`](#kind-external)
+   (`CreateEmailIdentity`, or `GetEmailIdentity` on `AlreadyExistsException`, through the SES token bucket of
+   [Domains on any DNS host §4.8](domain-connections.md#48-ses-api-rate-one-request-per-second)), publish
+   its three Easy DKIM CNAMEs `{token}._domainkey.{domain}` → `{token}.{SigningHostedZone}` through the DNS
+   records API, and set `ses_identity` = the domain and `ses_region` = `PM_SES_REGION`. The CNAMEs join
+   `records_json` with `purpose: "dkim"` and `required: false`. No custom MAIL FROM is set up: during a
+   failover SES uses its own MAIL FROM domain, so SPF does not align but Easy DKIM does, and DMARC passes
+   on DKIM. This step never refuses the domain: when the token bucket answers `Busy`, or an SES call fails,
+   the domain is created without it and its monitor runs the step again in the background (a background
+   caller, at most once an hour); when the region already holds 10,000 identities it is skipped. Until it
+   has run, a `PATCH` to `ses` gets `422 transport_unavailable`. A domain added before SES was configured
+   has no SES identity, and neither has one inserted by `pmail domains add --local-token`, because the
+   Worker has no Cloudflare token to publish the CNAMEs with.
 7. **Event subscription** (when `sending`): find the queue ID of `pm-delivery-events` by listing the
    account's queues, then `POST /accounts/{account_id}/event_subscriptions/subscriptions` with:
 
@@ -408,12 +499,13 @@ The `cloudflare_zone` method. Needs `PM_CF_API_TOKEN` (`422 cf_token_required` w
    call, and is safe to retry. Delivery events for the domain start only once
    `pmail domains subscribe {domain}` has run ([CLI and setup §18.4](cli.md#184-domains-subscribe)): it
    creates the subscription with the operator's local `CLOUDFLARE_API_TOKEN` and records its ID. Until
-   then sends work, delivery statuses stay at `sent` (the transport's acceptance), uncertain sends are not
+   then sends work, delivery statuses stay at `submitted` (the transport's acceptance), uncertain sends are not
    reconciled, and `pmail doctor` fails `sending.event_subscriptions` with that command as the fix. The
    same applies to a `nameservers` domain, whose step 7 runs in the monitor once the zone is active. If
    S9 also shows that the Worker cannot delete a subscription, domain removal keeps going and `pmail
-   doctor` lists the left-over subscription with the `wrangler queues subscription delete` command. Test:
-   `it::domains::s9_manual_delivery_events`.
+   doctor` lists the left-over subscription with the `wrangler queues subscription delete` command. Tests:
+   `it::domains::s9_manual_delivery_events` (`cloudflare_zone`) and
+   `it::domains::s9_manual_delivery_events_nameservers`.
 
    `delivery_events` is derived, not stored: `active` when the domain sends through Cloudflare and has an
    `event_subscription_id`, or sends through SES or SMTP (their events arrive through SNS or DSNs);
@@ -430,7 +522,7 @@ The `cloudflare_zone` method. Needs `PM_CF_API_TOKEN` (`422 cf_token_required` w
 
 This is the `nameservers` method (old spelling: `kind: zone` with `"create_zone": true`), for a domain
 used only for mail ([Domains on any DNS host §3.2](domain-connections.md#32-nameservers)). Platform keys
-may always use it; tenant keys only when their policy has `domains.allow_create_zone: true` (see
+may always use it; tenant and partner keys only when the tenant's policy has `domains.allow_create_zone: true` (see
 [Adding a domain](#adding-a-domain)).
 
 1. **Dedicated-domain check ([N21](../edge-cases.md)).** Before creating anything, query both DoH
@@ -442,14 +534,18 @@ may always use it; tenant keys only when their policy has `domains.allow_create_
    `details.retry_after` of 10800 seconds ([N22](../edge-cases.md)); a zone hold becomes `409 zone_hold`.
 3. The zone is created in a pending state and the response's `name_servers` are returned in `records` as
    `NS` records (`purpose: "ns"`) to set at the registrar. `expected_ns_json` is set to `name_servers`.
+   The D1 batch that inserts the domain row also inserts its `zone_claims` row (zone ID, zone name, the
+   tenant, the domain), so no other tenant can use the zone through `cloudflare_zone`
+   ([Zone permission](#zone-permission)). The first [zone permission](#zone-permission) check ran before
+   step 1.
 4. Steps 2–8 of [Kind `zone`](#kind-zone) run once the zone is active: the monitor polls the zone
    (`GET /zones/{zone_id}`, `status = "active"`; verify the field at build time) on each check while the
    domain is `pending`, and runs onboarding then, at the apex (catch-all). `confirm_dedicated` stands in
    for `replace_mx` at step 2, because the user has already accepted that existing mail stops.
 5. **Expiry ([N23](../edge-cases.md)).** Cloudflare deletes a Free-plan zone that is not activated within
    28 days. The monitor sends a final `domain.reminder` at day 21. If the zone disappears, the domain
-   moves to `removed` with `state_reason = zone_expired` and `domain.removed` carries
-   `reason: "zone_expired"`; the user can add it again.
+   moves to `removed` with `state_reason = zone_expired`, its `zone_claims` row is deleted, and
+   `domain.removed` carries `reason: "zone_expired"`; the user can add it again.
 
 #### Kind `external`
 
@@ -549,11 +645,22 @@ record the result is `ok`, `missing`, `mismatch` or `unexpected`, and its issue 
 | Routing DKIM (`cf2024-1._domainkey.{domain}`, per the routing API) | `receiving` with `inbound = routing` | TXT equals the API's | `routing_dkim_missing` (degraded) |
 | Return path (`cf-bounce.{domain}` MX and SPF TXT, per the sending API) | `sending` with `transport = cloudflare` | Records equal the API's | `return_path_missing` (fail) |
 | Sending DKIM (`{dkim_selector}._domainkey.{domain}`, from the sending API) | `sending` with `transport = cloudflare` | TXT `p=` equals the API's | `dkim_missing`, `dkim_mismatch` (fail) |
-| SES DKIM (three CNAMEs) | `transport = ses` or `inbound = ses` | Each CNAME points to `{token}.{SigningHostedZone}`, and SES `GetEmailIdentity` reports `DkimAttributes.Status = SUCCESS` (once a day) | `dkim_missing` (fail); `ses_dkim_failed` (`FAILED`, fail) |
+| SES DKIM (three CNAMEs) | `transport = ses` or `inbound = ses`; informational on a Cloudflare-transport domain with `ses_identity` (below) | Each CNAME points to `{token}.{SigningHostedZone}`, and SES `GetEmailIdentity` reports `DkimAttributes.Status = SUCCESS` (once a day) | `dkim_missing` (fail); `ses_dkim_failed` (`FAILED`, fail) |
 | DMARC (`_dmarc.{domain}`, else the organisational domain) | `sending` | Exactly one valid `v=DMARC1` record with `p=quarantine` or `p=reject`, and alignment possible ([H3](../edge-cases.md)) | `dmarc_missing` (degraded); `dmarc_policy_none` (degraded); `dmarc_multiple` (degraded); `dmarc_alignment_impossible` (fail) |
 | Ownership TXT (`_pylota-mail.{domain}`) | all except platform | Contains `pm-verify={ownership_token}` | `ownership_record_missing` (ownership) |
 | NS (weekly) | zone and platform | The NS set equals `expected_ns_json` | `nameservers_changed` (ownership) |
 | RDAP (weekly) | zone, delegated and external | Fingerprint equals `rdap_fingerprint` | `registration_changed` (ownership) |
+
+**The failover identity while `transport = cloudflare`.** On a `zone` or `delegated` domain that has
+`ses_identity` (the optional step of [Kind `zone`](#kind-zone)) and still sends through Cloudflare, the
+three SES DKIM CNAMEs and the daily `GetEmailIdentity` check run, but only for information: each record's
+result is shown in `GET …/records` and `GET …/health`, and they add no issue to the outcome, so they never
+change the domain's state. After a `PATCH` to `ses`, the rows for `transport = ses` replace those for
+`transport = cloudflare` (return path and sending DKIM): the SES DKIM CNAMEs and the SES identity check
+count with their levels; the receiving, DMARC, ownership, NS and RDAP rows are unchanged; and the MAIL FROM
+row of [Domains on any DNS host § 6](domain-connections.md#6-health-checks-per-method) does not apply,
+because the failover identity has no custom MAIL FROM (`mail_from_domain` stays `null`), so failing over
+never makes the domain `degraded`.
 
 The checks that depend on the connection method (SES inbound MX, SES identity, MAIL FROM, the SES
 account, the alignment probe, SMTP login, parent delegation and doubled names) are in
@@ -662,10 +769,12 @@ per resolver, and `fallback_active`.
 `PATCH /v1/domains/{domain_id}` with `{ "transport": "ses" | "cloudflare" }` is the Email Sending
 failover ([J5](../edge-cases.md)). Only platform keys may call it (`403 scope_denied` otherwise). It
 needs `ses_identity` set, SES configured and the SES DKIM records in `records_json` for `ses`
-(`422 transport_unavailable` otherwise). Only the methods that put the domain on Cloudflare
+(`422 transport_unavailable` otherwise). A `cloudflare_zone`, `nameservers` or `delegated_subdomain`
+domain gets all three during onboarding when SES is configured (the optional step of
+[Kind `zone`](#kind-zone)), so `PATCH` to `ses` works for any such domain that has `ses_identity`. Only the methods that put the domain on Cloudflare
 (`cloudflare_zone`, `nameservers`, `delegated_subdomain`) can switch; any other method, and the platform
 domain, gets `422 transport_unavailable` with `details.reason = "method_not_supported"`. An `smtp_relay`
-domain changes its relay with `PATCH` and `smtp` instead (tenant or platform key with `domains:write`);
+domain changes its relay with `PATCH` and `smtp` instead (tenant, partner or platform key with `domains:write`);
 the new values are kept pending until a probe passes
 ([§5.3](domain-connections.md#53-proving-alignment-the-probe)). A transport change updates `domains.transport`,
 writes an `audit_log` row (`domain.transport`), and asks the monitor for a check at once, because DKIM
@@ -684,7 +793,9 @@ idempotent:
 4. `disable_sending`: `DELETE /zones/{zone_id}/email/sending/subdomains/{tag}` (this also removes its DNS
    records; routing still active elsewhere is unaffected).
 5. `delete_subscription`: delete the event subscription by `event_subscription_id`.
-6. `delete_ses_identity` (when `ses_identity` is set): `DELETE /v2/email/identities/{domain}`.
+6. `delete_ses_identity` (when `ses_identity` is set): `DELETE /v2/email/identities/{domain}`; on a
+   `zone` or `delegated` domain, also delete the three DKIM CNAMEs that onboarding published through the
+   DNS records API.
 7. `prune_retired_rules` (`inbound = ses`): remove the domain's retired addresses from their
    `pm-retired-{n}` rules (read, merge, write, as in
    [Domains on any DNS host § 4.6](domain-connections.md#46-retired-and-unknown-recipients)) and clear
@@ -692,8 +803,8 @@ idempotent:
    the rule entries only use capacity.
 8. `delete_ownership_record` (zone, delegated): delete the `_pylota-mail` TXT.
 9. `delete_zone` (`nameservers`, `delegated_subdomain`): `DELETE /zones/{zone_id}`, because this
-   deployment created the zone for a domain used only for mail. A zone found through `cloudflare_zone`
-   belongs to the account owner and is never deleted.
+   deployment created the zone for a domain used only for mail, then delete its `zone_claims` row. A zone
+   found through `cloudflare_zone` belongs to the account owner and is never deleted.
 10. `finish`: `UPDATE domains SET state = 'removed', smtp_sealed = NULL, smtp_pending_sealed = NULL,
     updated_at = ?` and emit `domain.removed` (`reason: requested`).
 
@@ -726,7 +837,7 @@ What the Worker does with each permission marked for it in that table:
 | Zone · Edit | Creating a zone for `nameservers` and `delegated_subdomain`, and deleting it on [removal](#domain-removal) (`delete_zone`). Whether a zone-scoped grant can create new zones is not stated; verify at build time |
 | Zone Settings · Edit | Enabling routing, setting sub-addressing and reading the routing DNS records (steps 5 and 8); `disable_routing` on removal |
 | Email Routing Rules · Edit | The catch-all rule on an apex and the literal rules per address on a subdomain ([Routing an address](#routing-an-address)) |
-| DNS · Edit | The ownership TXT, and MX removal for `replace_mx` (steps 2 and 4) |
+| DNS · Edit | The ownership TXT, MX removal for `replace_mx` (steps 2 and 4), and the SES DKIM CNAMEs of the failover identity (step 6) |
 | Email Sending · Edit | Sending onboarding and its DNS records (step 6) and the suppression list (G4). It is named in the Email Service docs but not on the permissions page; its scope is verified at build time |
 | Queues · Edit | Listing queues and creating a domain's event subscription to `pm-delivery-events` (step 7) |
 | Vectorize · Edit, Workers AI · Read and Edit | Only the REST fallbacks, if spike S6 fails |
@@ -751,7 +862,8 @@ forwarded).
 | `it::addresses::promote_retire_rollback` | Promote, retire after grace, rollback by promoting the retiring address, events emitted (FR-ADR-2–4) |
 | `it::addresses::a14_platform_address_kept` | Promoting away keeps the platform address `active`; retiring or deleting it is refused with `409 address_in_use`; promoting it again rolls back: it is `primary` and the custom address is an `active` alias with `retire_at = NULL` ([A14](../edge-cases.md), FR-ADR-2, FR-DOM-6) |
 | `core::address::a4_role_names_by_domain` | `support`, `sales`, `info`, `marketing` are refused on the platform domain and allowed on a tenant domain; `postmaster` and `abuse` are refused on both ([A4](../edge-cases.md), FR-ADR-6) |
-| `it::domains::transport_patch` | Platform key switches a domain to `ses` and back; a tenant key gets `403 scope_denied`; no SES identity gives `422 transport_unavailable` ([J5](../edge-cases.md)) |
+| `it::domains::transport_patch` | With SES configured, a `cloudflare_zone` domain is onboarded with `ses_identity`, `ses_region` and its three DKIM CNAMEs (created through the Cloudflare API fake, `required: false`); while it sends through Cloudflare, a missing CNAME or a `FAILED` SES DKIM status changes no state; a platform key switches it to `ses` and back; a tenant key gets `403 scope_denied`; a domain without an SES identity gives `422 transport_unavailable` ([J5](../edge-cases.md)) |
+| `it::domains::remove_deletes_ses_identity` | Removing a `cloudflare_zone` domain that onboarding gave a failover SES identity runs `delete_ses_identity`: the SES fake no longer has the identity and the Cloudflare DNS fake no longer has its three DKIM CNAMEs; a provider `404` with its own not-found code counts as done, any other `404` is retried; tenant erasure's `remove_domains` does the same for every such domain of the tenant ([Domain removal](#domain-removal), [Privacy §6.6](privacy.md#66-tenant-scope)) |
 | `it::addresses::retirement_cron` | `retire_at` reached → `retired`, `identity.address_retired`, inbound `550 5.1.6` (FR-ADR-3) |
 | `it::addresses::c3_reply_from_retiring` | Replies from the retiring address the counterparty used ([C3](../edge-cases.md)) |
 | `it::domains::h1_failing_fallback` | DNS fake removes DKIM; after two agreeing checks `failing`; sends fall back with thread continuity; restore → `recovered`; pinned threads stay ([H1](../edge-cases.md), FR-DOM-5, FR-DOM-6) |
@@ -759,12 +871,16 @@ forwarded).
 | `core::dns::h3_strict_alignment` | `adkim=s`/`aspf=s` against Cloudflare and SES signing domains ([H3](../edge-cases.md)) |
 | `it::domains::h4_ownership_change` | NS move, ownership TXT removed, RDAP change → `suspended`; reprove → `verifying` ([H4](../edge-cases.md)) |
 | `it::domains::h5_existing_mx` | Apex with existing MX refused without `replace_mx` ([H5](../edge-cases.md)) |
+| `it::domains::h8_zone_permission` | With the Cloudflare fake holding a zone claimed by tenant B, a zone listed in tenant A's `domains.cloudflare_zones`, an unlisted zone, and the zone of `PM_PLATFORM_DOMAIN`: a tenant key and a partner key of tenant A get `403 scope_denied` (`zone_not_allowed`, the same body for an existing and a missing zone) for `cloudflare_zone` on B's zone (also when A's policy lists it, and for a name under a listed parent zone that resolves to B's zone), on the unlisted zone, and with `replace_mx` on any of them, and for `nameservers` or `delegated_subdomain` under the platform zone or B's zone; nothing is written and no MX record is deleted; the listed zone and a zone created for A by `nameservers` are accepted; the `zone_claims` row is written with the domain and deleted by `delete_zone` and by `zone_expired`; a platform key may use every zone; a partner key cannot set `domains.cloudflare_zones` (`403 scope_denied`); with `domains.cloudflare_zones: ["pylota.io"]` listed, a tenant key adds `notify.pylota.io`, but adding the `pylota.io` apex, or `replace_mx` there, gets `403 scope_denied` (`zone_not_allowed`) ([H8](../edge-cases.md)) |
 | `it::domains::h6_rule_failure` | Literal rule creation fails → address stays `pending` with `routing_rule_failed`, retried, activated only with its rule ([H6](../edge-cases.md)) |
 | `core::domain_fsm::h7_resolver_disagreement` | One resolver erroring or disagreeing never changes state; two consecutive agreeing cycles do ([H7](../edge-cases.md), FR-DOM-4) |
 | `core::domain_fsm::transition_table` | Every row of the state machine table, including 14 days in `failing` and reminders at 24 h, 72 h and 7 days |
 | `it::send::g7_domain_states` | Retiring, pending and failing domain behaviour at send time ([G7](../edge-cases.md)) |
-| `it::domains::onboarding_idempotent` | Adding a tenant domain with each Cloudflare method succeeds, and re-running a failed add against the recorded Cloudflare API fake creates nothing twice (FR-DOM-2, FR-DOM-3, FR-OPS-1) |
+| `it::domains::onboarding_idempotent` | Adding a `cloudflare_zone` domain (apex and subdomain) succeeds, and re-running a failed add against the recorded Cloudflare API fake creates nothing twice (FR-DOM-2, FR-DOM-3, FR-OPS-1; build plan M13) |
+| `it::domains::onboarding_idempotent_created_zones` | The same for `nameservers` and `delegated_subdomain`: a failed add, and onboarding steps 2–8 run by the monitor once the zone is active, re-run without creating anything twice (build plan M23) |
 | `it::domains::records_from_api` | Records in responses equal the fake provider's API answers, never templates (FR-DOM-3) |
-| `it::domains::s9_manual_delivery_events` | With the Cloudflare fake answering `403` to the subscription create, `cloudflare_zone` and `nameservers` domains are created with `event_subscription_id = NULL`, `delivery_events: "manual"` and `details.action = "run pmail domains subscribe {domain}"`; a `503` answer fails the create with `502 upstream_error`; once the subscription ID is recorded, `delivery_events` is `active` and a delivery event updates the recipient (spike S9 fallback, FR-DOM-3) |
+| `it::domains::s9_manual_delivery_events` | With the Cloudflare fake answering `403` to the subscription create, a `cloudflare_zone` domain is created with `event_subscription_id = NULL`, `delivery_events: "manual"` and `details.action = "run pmail domains subscribe {domain}"`; a `503` answer fails the create with `502 upstream_error`; once the subscription ID is recorded, `delivery_events` is `active` and a delivery event updates the recipient (spike S9 fallback, FR-DOM-3; build plan M13) |
+| `it::domains::s9_manual_delivery_events_nameservers` | The same fallback for a `nameservers` domain, whose step 7 runs in the monitor once the zone is active: the `403` leaves `delivery_events: "manual"` with the same `details.action` (build plan M23) |
 | `it::domains::cron_mints_missing_monitor` | A row with `monitor_do_id = ''` (platform, or inserted by `pmail domains add --local-token`) gets one `DomainMonitor`, `Init`, and `domain.created` when it has a `tenant_id`; two overlapping cron runs mint one ID |
-| `it::domains::cf_token_required_by_method` | Without `PM_CF_API_TOKEN`: `cloudflare_zone`, `nameservers` and `delegated_subdomain` → `422 cf_token_required`; `dns_records`, `send_only` and `smtp_relay` are unaffected |
+| `it::domains::cf_token_required_by_method` | Without `PM_CF_API_TOKEN`: adding a `cloudflare_zone` domain, and creating an address that needs a literal rule, → `422 cf_token_required` (build plan M13) |
+| `it::domains::cf_token_required_other_methods` | Without `PM_CF_API_TOKEN`: `nameservers` and `delegated_subdomain` → `422 cf_token_required`; `dns_records`, `send_only` and `smtp_relay` are unaffected (build plan M23) |

@@ -18,9 +18,11 @@ Self-hosting is free under FSL-1.1-ALv2. You pay only your own Cloudflare usage
   (`identity_daily_send_cap`, `tenant_daily_send_cap`) and the daily agentic-search cap
   (`search.agentic_daily_cap`). They return `429 daily_cap_reached` or `429 agentic_budget_exhausted`
   ([Configuration › Tenant policy](../reference/configuration.md#tenant-policy)).
-- `GET /v1/usage` still reports what each workspace uses, with `"billing": "disabled"`, no plan limits,
-  and any operator quota from tenant policy.
-- [Usage alerts](#usage-alerts) go out only for features that have an operator quota in tenant policy.
+- `GET /v1/usage` still reports what each workspace uses, with `"billing": "disabled"` and no plan
+  limits (every feature `granted: null`, `unlimited: true`).
+- No [usage alerts](#usage-alerts) are sent: with no plan there is no limit to reach. The identity and
+  tenant daily send caps above still emit `quota.warning` to webhooks at 80% and 100%; the agentic-search
+  cap emits none, only its `429`.
 
 Turning billing on (`PM_BILLING=stripe`, with a plan catalog and Stripe keys) is an operator choice,
 described in the [billing design](../project/design/billing.md#self-host-mode). FSL-1.1-ALv2 does not
@@ -54,9 +56,10 @@ Every plan includes the full API, the MCP server, the CLI, the console, quaranti
 search modes. The per-identity send limits ([Sending › Caps](sending.md#caps-and-automatic-pausing)) stay
 on every plan as an abuse backstop.
 
-**New workspaces on Free** can send 50 messages a day for their first 7 days (`429 daily_cap_reached`
-above that). The ramp lifts on day 7 if bounce and complaint rates stay under the automatic-pause
-thresholds, or at once when the workspace moves to a paid plan.
+**New workspaces on Free** can send at most 50 messages a day for their first 7 days
+(`429 daily_cap_reached` above that). From day 7 a daily check lifts the ramp once bounce and complaint
+rates are under the automatic-pause thresholds; until then the limit stays. Moving to a paid plan lifts
+it at once, for good.
 
 Agentic search is not a plan allowance. It is rate-limited per key (20 a minute) and capped per workspace
 per day (`search.agentic_daily_cap`, 500 by default).
@@ -165,8 +168,7 @@ limits from the API and webhooks ([Notifications design](../project/design/notif
   `[Pylota Mail] Sends at 80% for Brightwell`.
 - **Webhooks are unchanged.** `quota.warning` and `billing.limit_reached` events still go to your
   endpoints, so agents and your backend learn about limits the same way as before.
-- **Self-hosted with billing off.** There are no plan limits, so alerts follow the operator quotas in
-  tenant policy, and a feature with no quota sends none.
+- **Self-hosted with billing off.** There are no plan limits, so no usage alert is sent.
 
 ## Upgrade, downgrade and cancel
 
@@ -182,6 +184,9 @@ they last signed in more than 10 minutes ago.
 - **Change plan, change top-ups, update the card, see invoices, cancel.** **Manage billing** opens the
   Stripe Customer Portal. A change applies when Stripe confirms it; Stripe prorates the price.
 - **Cancel.** The plan stays until the end of the period you paid for, then the workspace moves to Free.
+- **Delete the workspace.** Deleting a workspace (owner only, at **Settings**) stops its mail, then cancels
+  its plan and every top-up at once, with no proration and no refund, before anything else is erased
+  ([Privacy](privacy.md#console-accounts)).
 
 **A downgrade never deletes data.** If you have more identities, custom domains or members than the new
 plan allows, all of them are kept and keep working: identities still send and receive, domains still
@@ -211,8 +216,8 @@ Paying later restores the plan, with a `billing.plan_changed` event whose reason
 Agents can read their own limits before they hit one ([REST API › Usage](../reference/api.md#usage-and-audit)).
 
 **`GET /v1/usage`** works with every tenant and identity key for its own workspace: they hold
-`usage:read` there implicitly. A platform key needs `usage:read` and must pass `tenant_id` (a request
-without `tenant_id` gets `400 invalid_request`).
+`usage:read` there implicitly. A platform or partner key needs `usage:read` and must pass `tenant_id` (a
+request without `tenant_id` gets `400 invalid_request`).
 
 ```bash
 curl https://mail.example.com/v1/usage -H "Authorization: Bearer $PYLOTA_MAIL_KEY"
@@ -242,7 +247,7 @@ curl https://mail.example.com/v1/usage -H "Authorization: Bearer $PYLOTA_MAIL_KE
 - `granted` includes top-ups. `remaining` also allows for actions in flight, so it is what you can use now.
 - `plans` is the full plan catalog.
 
-**`GET /v1/usage/daily`** (`usage:read`, tenant or platform key) gives per-day figures: inbound,
+**`GET /v1/usage/daily`** (`usage:read`, tenant, partner or platform key) gives per-day figures: inbound,
 outbound, sends, triage, search, agentic searches, AI usage, storage, and the agent assertions and
 signed HTTP requests minted (`assertions`, `http_signatures`), for up to 92 days per request. Signing is
 counted but not limited by any plan.
@@ -254,8 +259,8 @@ on a deployment without billing.
 `--json` for the raw response.
 
 **MCP.** [`mail_get_usage`](../reference/mcp.md#mail_get_usage) returns the same object. It is read-only
-and takes no input; every tenant and identity key sees it for its own workspace, and platform keys do
-not (they use REST with `tenant_id`). A `billing_limit` tool error also carries the feature, the numbers
+and takes no input; every tenant and identity key sees it for its own workspace, and platform and
+partner keys do not (they use REST with `tenant_id`). A `billing_limit` tool error also carries the feature, the numbers
 and `resets_at` in its `details`.
 
 ## Tax

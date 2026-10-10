@@ -5,7 +5,8 @@ to the reference and design documents that hold the detail.
 
 ```text
 Deployment (platform) ── platform keys, the platform mail domain, platform webhooks
-  └─ Tenant (ten_)           live | test · policy · address suffix · quotas
+  ├─ Partner (ptn_)          partner keys, partner webhooks · creates and manages its own tenants
+  └─ Tenant (ten_)           live | test · policy · address suffix · quotas · partner_id (optional)
        ├─ Domain (dom_)      zone | delegated | external · connection method
        ├─ Webhook (whk_)     tenant endpoints
        ├─ API key (key_)     tenant or identity level
@@ -30,12 +31,27 @@ belongs to exactly one tenant, apart from platform-level settings and the platfo
 | `address_suffix` | Appended to usernames on the platform domain, `"." + slug` by default. `bookings` in tenant `acme` becomes `bookings.acme@agents.example`. Only the default tenant made by `pmail setup` has an empty suffix |
 | `policy` | Caps, quarantine thresholds, retention, triage rules, search settings and more. See [Configuration › Tenant policy](reference/configuration.md#tenant-policy) |
 | `status` | `active`, `suspended`, `erasing` or `erased` |
+| `partner_id` | The partner whose key created the tenant, or `null`. It never changes |
 
 While a tenant is **suspended**, every send is refused (`403 tenant_suspended`) and inbound mail is
 answered with a temporary failure (a 4xx reply, so senders retry) for up to five days, then refused permanently
 (`550 5.2.1`) ([FR-TEN-3](project/prd.md#61-tenancy-and-access)).
 
 Reference: [REST API › Tenants](reference/api.md#tenants).
+
+## Partners
+
+A **partner** is an integrator that runs its own customers as tenants of a shared deployment, for
+example Pylota with its car-rental operators on Pylota Mail Cloud. The deployment's operator creates the
+partner and gives it a **partner key**. With it the partner creates tenants and manages them: their
+identities, domains, keys, webhooks and mail. It reaches only the tenants its own keys created, never
+another customer's ([FR-KEY-4](project/prd.md#61-tenancy-and-access)). Its tenants get the partner's
+billing mode, which only the operator can change. A partner's own webhook endpoints receive the events
+of its tenants and nobody else's. The operator bounds a partner: at most `max_tenants` tenants (25 by
+default), limits it can lower but not raise, and suspension, which stops the partner's keys and its
+tenants' keys at once while their mail keeps arriving.
+
+Reference: [REST API › Partners](reference/api.md#partners).
 
 ## Identities
 
@@ -239,6 +255,7 @@ An **API key** has a level, a mode and a list of permissions:
 | Level | Reaches |
 |---|---|
 | `platform` | Every tenant |
+| `partner` | The tenants its partner's keys created, and the partner's own webhooks. It can never sign as an identity or reach the deployment's operations |
 | `tenant` | Its own tenant: all its identities, domains and webhooks |
 | `identity` | Its own identity. It can also read the tenant's domains and webhooks if it holds the matching `:read` permission |
 
@@ -276,8 +293,10 @@ Guide: [Sending › Safe retries](guides/sending.md#safe-retries).
 
 **Quarantine** holds inbound mail that should not reach an agent: mail that failed authentication,
 scored above the spam threshold, carries a risky attachment, or is an unsolicited one-time code.
-Quarantined mail is stored but hidden from every key without `quarantine:review`, and is released only
-by a person with that permission. Lists and search leave quarantined, `hidden` and `throttled` mail out
+Quarantined mail is stored but hidden from every key without `quarantine:review`. A person with that
+permission releases it in the console; a key with it can release it too where the deployment allows
+(`PM_QUARANTINE_KEY_RELEASE=on`, the self-hosting default) or the tenant's policy does
+(`quarantine.key_release`). Lists and search leave quarantined, `hidden` and `throttled` mail out
 by default; it appears only when a request asks for it explicitly and the key holds
 `quarantine:review`. Released mail is then triaged like any other.
 

@@ -435,8 +435,8 @@
           <li class="usp">
             <p class="usp-num" aria-hidden="true">07</p>
             <h3>Tested against the edge cases</h3>
-            <p class="usp-text">A public register of 201 edge cases, from SMTPUTF8 addresses to zip bombs, DNS takeovers, lost SES notifications and billing races, each mapped to a named test. Search quality is gated in CI.</p>
-            <p class="usp-proof">201 edge cases · 201 named tests</p>
+            <p class="usp-text">A public register of 213 edge cases, from SMTPUTF8 addresses to zip bombs, DNS takeovers, lost SES notifications and billing races. Every case the service owns is mapped to a named test. Search quality is gated in CI.</p>
+            <p class="usp-proof">213 edge cases · 227 named tests</p>
           </li>
           <li class="usp">
             <p class="usp-num" aria-hidden="true">08</p>
@@ -572,8 +572,8 @@
           <h3 id="limits-title" class="limits-title">Limits</h3>
           <dl class="limits-grid">
             <div><dt>Inbound message</dt><dd><span class="lim-num">25</span> MiB</dd></div>
-            <div><dt>Outbound message</dt><dd><span class="lim-num">5</span> MiB</dd><dd class="lim-note">larger files go out as expiring links</dd></div>
-            <div><dt>Recipients per message</dt><dd><span class="lim-num">50</span></dd></div>
+            <div><dt>Outbound message</dt><dd><span class="lim-num">5</span> MiB</dd><dd class="lim-note">larger files can go out as expiring links (opt-in)</dd></div>
+            <div><dt>Recipients per message</dt><dd><span class="lim-num">49</span></dd></div>
             <div><dt>Webhook retries</dt><dd>up to <span class="lim-num">72</span> h</dd></div>
           </dl>
         </section>
@@ -748,7 +748,7 @@ pmail ask <span class="t-s">"Did the insurer accept the Golf claim?"</span> --id
           <p class="eyebrow">Security</p>
           <h2 id="sec-title">Give each agent the narrowest key that does the job.</h2>
           <ul class="ticks ticks-lg">
-            <li>Keys are scoped to a platform, a tenant or a single identity, and a key can never create one wider than itself.</li>
+            <li>Keys are scoped to the platform, a partner's own tenants, a tenant or a single identity, and a key can never create one wider than itself.</li>
             <li>Keys are stored only as hashes.</li>
             <li>No key can release quarantined mail without the human-review permission.</li>
             <li>Every message an agent reads carries trust metadata, so it knows what came from a verified sender.</li>

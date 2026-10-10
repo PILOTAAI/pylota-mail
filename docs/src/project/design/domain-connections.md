@@ -63,17 +63,28 @@ This table is in the [Custom domains guide](../../guides/custom-domains.md) in t
 
 ### 3.1 `cloudflare_zone`
 
-Unchanged: [Identities, addresses and domains › Kind `zone`](identity-domains.md#kind-zone).
+[Identities, addresses and domains › Kind `zone`](identity-domains.md#kind-zone). The zone is found in
+the deployment's own Cloudflare account, which also holds other tenants' zones and the zones of the
+deployment's hosts, so a tenant or partner key may use only a zone created for its tenant by `nameservers`
+or `delegated_subdomain` (`zone_claims`) or one listed in its platform-only policy
+`domains.cloudflare_zones`, which allows names strictly under the listed zone, never its apex. A name under the zone of `PM_PLATFORM_DOMAIN`, `PM_API_HOST` or
+`PM_CONSOLE_HOST` is refused, and so is `replace_mx` on any zone the tenant may not use:
+`403 scope_denied`, `details.reason = "zone_not_allowed"`
+([Zone permission](identity-domains.md#zone-permission), [H8](../edge-cases.md)). Platform keys may use
+any zone.
 
 ### 3.2 `nameservers`
 
 This is `create_zone` from [Creating a zone](identity-domains.md#creating-a-zone), opened to tenants and
 made safe for domains that are not empty.
 
-1. **Who may use it.** Platform keys always. Tenant keys only when the tenant's policy has
+1. **Who may use it.** Platform keys always. Tenant and partner keys only when the tenant's policy has
    `domains.allow_create_zone: true`; otherwise `422 transport_unavailable` with
    `details.reason = "zone_creation_not_allowed"`. The default is `false` for self-hosted deployments, and
-   Pylota Mail Cloud sets it to `true`.
+   Pylota Mail Cloud sets it to `true`. For those keys the name must not be under the zone of
+   `PM_PLATFORM_DOMAIN`, `PM_API_HOST` or `PM_CONSOLE_HOST`, nor under a zone created for another tenant
+   (`403 scope_denied`, `details.reason = "zone_not_allowed"`,
+   [Zone permission](identity-domains.md#zone-permission)).
 2. **Dedicated-domain check ([N21](../edge-cases.md)).** Moving nameservers hands the whole domain to this
    deployment, which only manages mail records. Before creating the zone, the Worker queries both DoH
    resolvers for `A`, `AAAA` and `MX` at the name and for `CNAME`, `A` and `AAAA` at `www.{name}`. If any exist and the
@@ -86,11 +97,14 @@ made safe for domains that are not empty.
    read 2026-10-09) ([N22](../edge-cases.md)).
 4. **NS records.** The returned `name_servers` are the only records the customer sets: at their
    registrar, not at a DNS host. The domain is `pending`, with reminders at 24 hours, 72 hours and 7 days.
+   The zone is recorded in `zone_claims` for the tenant with the domain row, so it can never be used by
+   another tenant.
 5. **Expiry ([N23](../edge-cases.md)).** A Free-plan zone that is not activated within 28 days is deleted
    by Cloudflare ([domain status](https://developers.cloudflare.com/dns/zone-setups/reference/domain-status/),
    read 2026-10-09). At day 21 the monitor sends a final `domain.reminder`. If the zone disappears, the
-   domain moves to `removed` with `state_reason = zone_expired`, and `domain.removed` carries
-   `reason: "zone_expired"` (a removal the user asked for carries `"requested"`). The user can add it again.
+   domain moves to `removed` with `state_reason = zone_expired`, its `zone_claims` row is deleted, and
+   `domain.removed` carries `reason: "zone_expired"` (a removal the user asked for carries `"requested"`).
+   The user can add it again.
 6. Once the zone is active, onboarding continues as `cloudflare_zone` at an apex (catch-all).
    `confirm_dedicated: true` also stands for `replace_mx: true` there, because the user has already
    accepted that existing mail on the domain stops.
@@ -112,7 +126,10 @@ Routing catch-all and Email Sending work on a child zone; no Cloudflare page say
 1. `POST /zones` with `"type": "full"` and the subdomain as the name, for example
    `agents.brightwell.example`. The child zone may live in a different account from the parent
    ([parent on full](https://developers.cloudflare.com/dns/zone-setups/subdomain-setup/setup/parent-on-full/),
-   read 2026-10-09).
+   read 2026-10-09). For a tenant or partner key, the subdomain must not be under a deployment host's zone
+   or another tenant's claimed zone (`403 scope_denied`, `zone_not_allowed`); the new child zone is
+   recorded in `zone_claims` for the tenant with the domain row
+   ([Zone permission](identity-domains.md#zone-permission)).
 2. The records shown are the zone's `name_servers` as `NS` records for the subdomain, which the customer
    adds at their DNS host. No TXT is needed for a full child zone.
 3. A zone hold on the customer's own Cloudflare account may block creation. Whether a hold reaches other
@@ -364,7 +381,10 @@ Amazon SES throttles every API action except `SendEmail`, `SendRawEmail` and `Se
 ([SES quotas › SES API sending quotas](https://docs.aws.amazon.com/ses/latest/dg/quotas.html), read
 2026-10-09). The Worker makes such control-plane calls from several places: domain create, `PATCH` to
 `ses` and removal (`CreateEmailIdentity`, `GetEmailIdentity`, `PutEmailIdentityMailFromAttributes`,
-`DeleteEmailIdentity`), the daily identity check of each SES domain, the 15-minute platform check
+`DeleteEmailIdentity`), including the optional failover identity of a `cloudflare_zone`, `nameservers` or
+`delegated_subdomain` domain ([Identities and domains › Kind `zone`](identity-domains.md#kind-zone), step
+6: a request-path caller at create, and a background caller when the monitor runs onboarding once a new
+zone is active or retries a skipped step), the daily identity check of each domain with an SES identity, the 15-minute platform check
 (`GetAccount`, the active receipt rule set) and the retired-address rule sync (§4.6). With up to 10,000
 identities in a region, uncoordinated calls would be throttled.
 
@@ -525,9 +545,9 @@ These rows add to [What each check verifies](identity-domains.md#what-each-check
 | Record or check | Applies to | `ok` when | Issue codes (level) |
 |---|---|---|---|
 | SES inbound MX at the domain | `inbound = ses` | The MX set contains `inbound-smtp.{ses_region}.amazonaws.com` | `mx_missing` (fail); `mx_unexpected`: another MX host too (degraded) ([N9](../edge-cases.md)); `mx_wrong_region`: an SES inbound host for another region (fail) ([N8](../edge-cases.md)) |
-| SES identity | `transport = ses` or `inbound = ses` | `GetEmailIdentity` (once a day, at the domain's hash offset, through the SES token bucket, §4.8): `VerifiedForSendingStatus = true` and `DkimAttributes.Status = SUCCESS` | `ses_dkim_failed` (fail) ([N10](../edge-cases.md)) |
+| SES identity | `transport = ses` or `inbound = ses`; on a Cloudflare-transport domain with `ses_identity` (the [J5](../edge-cases.md) failover identity), informational only: shown, never an issue that changes the state ([Identities and domains › What each check verifies](identity-domains.md#what-each-check-verifies)) | `GetEmailIdentity` (once a day, at the domain's hash offset, through the SES token bucket, §4.8): `VerifiedForSendingStatus = true` and `DkimAttributes.Status = SUCCESS` | `ses_dkim_failed` (fail) ([N10](../edge-cases.md)) |
 | SES DKIM CNAMEs | as above | Each CNAME points at `{token}.{SigningHostedZone}` | `dkim_missing` (fail) |
-| MAIL FROM | `transport = ses` | `MailFromAttributes.MailFromDomainStatus = SUCCESS`, and the MX and SPF at `pm-bounce.{domain}` match | `mail_from_failed` (degraded) ([N11](../edge-cases.md)) |
+| MAIL FROM | `transport = ses` with `mail_from_domain` set (`dns_records`, `send_only`). Not a Cloudflare-method domain sent through its J5 failover identity: that identity has no custom MAIL FROM (SES uses its default), so a failed-over domain never turns `degraded` for it | `MailFromAttributes.MailFromDomainStatus = SUCCESS`, and the MX and SPF at `pm-bounce.{domain}` match | `mail_from_failed` (degraded) ([N11](../edge-cases.md)) |
 | SES account | deployment, in `pmail doctor` and the 15-minute platform check | Production access enabled, sending not paused, the receipt rule set active and containing `pm-deliver` | `ses_sending_paused`, `ses_rule_missing` (platform alerts; every SES domain uses fallback while sending is paused) ([N10](../edge-cases.md)) |
 | Alignment probe | `transport = smtp` | Last probe (with the live values) passed within 26 hours | `smtp_unaligned`, `smtp_from_rewritten` (degraded for the first in a row, fail from the second; [§5.3](#53-proving-alignment-the-probe)); `smtp_probe_timeout` (fail before the first pass; after it degraded, then fail after three in a row) |
 | SMTP login | `transport = smtp` | The last send or probe authenticated | `smtp_auth_failed`, `smtp_tls_required` (fail) |
@@ -546,8 +566,9 @@ method      TEXT NOT NULL CHECK (method IN ('platform','cloudflare_zone','namese
                                              'send_only','smtp_relay','delegated_subdomain')),
 inbound     TEXT NOT NULL CHECK (inbound IN ('routing','ses','forward','none')),
 transport   TEXT NOT NULL CHECK (transport IN ('cloudflare','ses','smtp')),
-ses_region        TEXT,          -- set when inbound or transport is ses
-mail_from_domain  TEXT,          -- pm-bounce.{domain}
+ses_region        TEXT,          -- set when the domain has an SES identity: inbound or transport is ses, or the
+                                 -- J5 failover identity of a Cloudflare-method domain
+mail_from_domain  TEXT,          -- pm-bounce.{domain} (dns_records, send_only); NULL for a J5 failover identity
 smtp_sealed       BLOB,          -- pm1 envelope of {host, port, username, password, probe_from}
 smtp_pending_sealed BLOB,        -- values from PATCH waiting for a passing probe (pm1, aad column smtp_pending_sealed)
 probe_last_at     INTEGER,
@@ -583,7 +604,7 @@ storage until they arrive or expire (15 and 10 minutes).
 |---|---|
 | `POST /v1/tenants/{tenant_id}/domains` | New field `method` (required for new clients; when it is absent, the old `kind` is mapped: `zone` → `cloudflare_zone`, `external` → `send_only`; `create_zone: true` with `kind: zone` is the old spelling of `nameservers`). New fields: `confirm_dedicated` (`nameservers`), `smtp` and `inbound` (`smtp_relay`). `replace_mx` applies to a `cloudflare_zone` apex and to `dns_records`. `402 billing_limit` (`feature: custom_domains`) as before. `422 cf_token_required` only for `cloudflare_zone`, `nameservers` and `delegated_subdomain` |
 | Domain object | Adds `method`, `inbound`, `transport`, `ses_region`, `mail_from_domain`, `smtp` (`host`, `port`, `username`, `probe_from`; never the password; `null` unless `smtp_relay`) and `probe` (`last_at`, `result`; `null` unless the transport is `smtp`). `kind` is `platform`, `zone`, `delegated` or `external`. Records gain `host` (relative to the registrable domain) next to `name` |
-| `PATCH /v1/domains/{id}` | `transport` (platform key only, as before) and `smtp` (tenant or platform key with `domains:write`: rotate credentials or change the host). New `smtp` values stay pending until a probe with them passes ([5.3](#53-proving-alignment-the-probe)). `200` with the domain |
+| `PATCH /v1/domains/{id}` | `transport` (platform key only, as before) and `smtp` (tenant, partner or platform key with `domains:write`: rotate credentials or change the host). New `smtp` values stay pending until a probe with them passes ([5.3](#53-proving-alignment-the-probe)). `200` with the domain |
 | `POST /v1/domains/{id}/probe` | `domains:write`. Runs the alignment probe now (`smtp` transport only); `202 { "probe_id": "prb_…" }`; at most once a minute per domain (`429 rate_limited`); the result arrives as a domain health change |
 | `POST /v1/identities/{identity_id}/addresses/{address_id}/test-forwarding` | `identities:write`. Domains with `inbound: forward` (`send_only`, `smtp_relay`); `202`; the result is in the address's `forwarding` |
 | Address object | Adds `forwarding` (`null` unless the domain uses `inbound: forward`, else `unverified`, `ok` or `failed`) and `forwarding_checked_at` |
@@ -601,6 +622,11 @@ New error codes:
 | 422 | `smtp_tls_required` | The relay does not offer STARTTLS on 587 (or TLS on 465); credentials were not sent |
 | 422 | `smtp_auth_failed` | The relay answered `535` to `AUTH`. Also a domain health issue |
 
+`scope_denied` (403) gains `details.reason = "zone_not_allowed"`: a tenant or partner key named a zone
+its tenant may not use with `cloudflare_zone` or `replace_mx`, or a `nameservers` or
+`delegated_subdomain` name under a deployment host's zone or another tenant's zone
+([Zone permission](identity-domains.md#zone-permission)).
+
 `transport_unavailable` (422) gains `details.reason`:
 
 | `reason` | When |
@@ -609,8 +635,9 @@ New error codes:
 | `ses_receiving_not_configured` | `dns_records`, or `smtp_relay` with `inbound: ses`, without `PM_SES_INBOUND_TOPIC_ARN` (and bucket and queue) |
 | `ses_identity_limit` | The SES region already has 10,000 identities; creating a domain that needs one ([4.3](#43-dns_records)) |
 | `subdomain_setup_disabled` | `delegated_subdomain` while `PM_CF_SUBDOMAIN_SETUP` is not `on` |
-| `zone_creation_not_allowed` | `nameservers` by a tenant key whose policy lacks `domains.allow_create_zone: true` |
+| `zone_creation_not_allowed` | `nameservers` by a tenant or partner key whose tenant's policy lacks `domains.allow_create_zone: true` |
 | `method_not_supported` | The method does not support the operation: `PATCH transport` to a transport the method cannot use; `probe` when the transport is not `smtp`; `test-forwarding` without `inbound: forward` |
+| `marketing_needs_ses` | A `kind: marketing` send from a domain whose transport is `cloudflare`, the platform domain included ([Outbound › Policy pipeline](outbound.md#policy-pipeline), step 15, with the From address resolved at step 13): Cloudflare Email Service is for transactional mail only. A message accepted before its domain moved to `cloudflare` (or that would fall back to the platform domain) ends `rejected` with the send-failure reason `marketing_needs_ses` at transport time |
 
 ## 9. Configuration
 

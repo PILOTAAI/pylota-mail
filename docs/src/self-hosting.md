@@ -56,7 +56,8 @@ Download the binary for your platform from the
 signed `SHA256SUMS` file in the same release. Builds exist for macOS (arm64, x64), Linux (x64, arm64)
 and Windows (x64).
 
-Or build it with Cargo:
+Or build it with Cargo, once `pylota-mail-cli` is published to crates.io (until then, build it from a
+checkout of the repository with `cargo install --path crates/cli --locked`):
 
 ```bash
 cargo install pylota-mail-cli --locked
@@ -110,7 +111,11 @@ recommended setting, because the CLI writes to several zones: the platform mail 
 of the API host and the console host, and the zone of every tenant domain you add with
 `pmail domains add --local-token`. The Worker's token likewise needs every zone that tenants add with
 `cloudflare_zone`, and a zone it creates for `nameservers` or `delegated_subdomain` exists in no list of
-specific zones. For least privilege, give your own token **specific zones** instead: the mail domain's
+specific zones. A tenant or partner key can use a zone through `cloudflare_zone` only when this
+deployment created it for that tenant or a platform key listed it in the tenant's policy
+`domains.cloudflare_zones` (then only for names under it, never its apex); the zones of your mail domain, API host and console host are refused to every
+key but a platform key ([Identities and domains › Zone permission](project/design/identity-domains.md#zone-permission)).
+For least privilege, give your own token **specific zones** instead: the mail domain's
 zone, the API host's zone, the console host's zone, and each tenant zone you will add with
 `--local-token` (add a zone to the token before you add its domain).
 
@@ -184,7 +189,7 @@ and run the same command again. It finds what already exists and creates only wh
 | Ownership record | TXT `_pylota-mail.agents.example` | `pm-verify=…`, the proof that this deployment controls the domain |
 | Email Sending | On the platform domain | Onboarded. Cloudflare adds MX and SPF records on `cf-bounce.agents.example`, DKIM at `cf-bounce._domainkey.agents.example` and DMARC at `_dmarc.agents.example` |
 | Event subscription | Platform domain → `pm-delivery-events` | Delivery, bounce, complaint and other Email Sending events |
-| Rate-limit namespaces | `RL_API`, `RL_SEARCH`, `RL_AGENTIC`, `RL_SEND`, `RL_SIGNIN`, `RL_SIGN` | Six bindings, with namespace IDs from 1001 that no other Worker in the account uses |
+| Rate-limit namespaces | `RL_API`, `RL_SEARCH`, `RL_AGENTIC`, `RL_SEND`, `RL_SIGNIN`, `RL_SIGN`, `RL_PARTNER` | Seven bindings, with namespace IDs from 1001 that no other Worker in the account uses |
 | Worker secrets | `PM_MASTER_KEY`, `PM_KEY_PEPPER`, `PM_HASH_KEY` | 32 random bytes each, one purpose each. The keys that sign thread tokens, links, search cursors and Web Bot Auth requests, and each identity's signing keys, are generated later by the Worker itself and kept sealed in D1. See [Configuration › Secrets](reference/configuration.md#secrets) |
 | Worker | `pylota-mail` | Its six Durable Object classes (`IdentityMailbox`, `DomainMonitor`, `JobRunner`, `TenantQuota`, `SesControl`, `Notifier`), its cron triggers and the API host's Custom Domain (two, with `--console-host`) |
 | Temporary platform key | `setup-bootstrap`, in your CLI profile | Expires after 24 hours. Replace it in [step 5](#5-create-the-first-api-key) |
@@ -219,8 +224,8 @@ setup, it finds nothing to change and exits without deploying.
 
 ```bash
 pmail keys create --level platform --name first-key --permissions \
-tenants:manage,platform:ops,keys:manage,identities:read,identities:write,domains:read,domains:write,\
-messages:read,messages:send,messages:write,attachments:read,search:read,search:agentic,\
+tenants:manage,partners:manage,platform:ops,keys:manage,identities:read,identities:write,domains:read,\
+domains:write,messages:read,messages:send,messages:write,attachments:read,search:read,search:agentic,\
 quarantine:review,webhooks:read,webhooks:manage,erasure:manage,suppressions:manage,usage:read,\
 audit:read,members:read,members:manage
 ```
@@ -394,7 +399,8 @@ names are allowed, except `postmaster` and `abuse`, whose mail goes to the tenan
   suppress the recipient permanently, and count towards automatic pausing
   ([Sending › Bounces, complaints and suppressions](guides/sending.md#bounces-complaints-and-suppressions)).
 - The system identity also sends people's notification emails from the platform domain: new-mail
-  counts, usage alerts and the daily "needs a person" email, as each person chooses in the console
+  counts, usage alerts (only with `PM_BILLING=stripe`; with billing off no allowance has a limit) and the
+  daily "needs a person" email, as each person chooses in the console
   ([Notifications](project/design/notifications.md)). `PM_NOTIFICATIONS = "on"` is the default; set it
   to `"off"` in `deploy/wrangler.toml` and run `pmail deploy` to send only `account` notifications
   (security and billing events, which cannot be turned off).

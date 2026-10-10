@@ -13,7 +13,7 @@ designed in [Notifications and usage alerts](notifications.md#4-usage-alerts); t
 | Code | `crates/worker/src/billing/{mod.rs, catalog.rs, quota.rs, stripe.rs, webhook.rs, usage.rs}`, `handlers/{usage.rs, plans.rs, billing.rs}`, console page `console/pages/plan.rs`. The `TenantQuota` class lives in `quota/mod.rs` ([Outbound › TenantQuota](outbound.md#tenantquota)); `billing/quota.rs` adds allowances and holds to it |
 | Tables | D1 `billing_accounts`, `billing_events`; `TenantQuota` `allowances`, `holds` ([Data model](data-model.md#1-d1-control-plane), [Other Durable Objects](data-model.md#3-other-durable-objects)) |
 | Configuration | `PM_BILLING`, `PM_PLAN_CATALOG`, `PM_BILLING_GRACE_DAYS`, `PM_STRIPE_SECRET_KEY`, `PM_STRIPE_WEBHOOK_SECRET` ([Configuration](../../reference/configuration.md#variables)) |
-| Contracts | `GET /v1/usage`, `GET /v1/usage/daily`, `GET /v1/plans`, `GET`/`PATCH /v1/tenants/{id}/billing` ([REST API](../../reference/api.md#usage-and-audit)). The usage routes need `usage:read`, which every tenant and identity key holds implicitly for its own workspace; a platform key must hold it explicitly and pass `tenant_id` (`400 invalid_request` without it); `402 billing_limit`, `409 plan_managed_by_stripe` ([Errors](../../reference/errors.md#policy-and-limits)); `billing.*` events ([Webhook events](../../reference/events.md#workspaces-members-and-billing)) |
+| Contracts | `GET /v1/usage`, `GET /v1/usage/daily`, `GET /v1/plans`, `GET`/`PATCH /v1/tenants/{id}/billing` ([REST API](../../reference/api.md#usage-and-audit)). The usage routes need `usage:read`, which every tenant and identity key holds implicitly for its own workspace; a platform or partner key must hold it explicitly and pass `tenant_id` (`400 invalid_request` without it); `402 billing_limit`, `409 plan_managed_by_stripe` ([Errors](../../reference/errors.md#policy-and-limits)); `billing.*` events ([Webhook events](../../reference/events.md#workspaces-members-and-billing)) |
 | External facts | Stripe documentation, read on 2026-10-09 (see the `Verified` line at the end) |
 
 ## Principles
@@ -39,11 +39,14 @@ Each workspace has one mode in `billing_accounts.mode` (FR-BILL-1):
 |---|---|---|---|
 | `metered` | Yes: the plan's allowances plus top-ups | Pylota Mail Cloud customers, or any deployment that sells plans | Numbers from the catalog |
 | `exempt` | None | The operator's own workspaces on a deployment that sells plans | `NULL` (unlimited) |
-| `disabled` | None; operator quotas in tenant policy still apply | Self-hosting without billing | `NULL` (unlimited) |
+| `disabled` | None. The daily caps in tenant policy (`identity_daily_send_cap`, `tenant_daily_send_cap`, `search.agentic_daily_cap`) still apply, as on every workspace | Self-hosting without billing | `NULL` (unlimited) |
 
 - `POST /v1/tenants` sets the mode from `billing.mode`. The default is `metered` on plan `free` when
-  `PM_BILLING=stripe`, and `disabled` otherwise.
-- `PATCH /v1/tenants/{id}/billing` (platform key, `tenants:manage`) changes `mode`, and sets `plan_id` on a
+  `PM_BILLING=stripe`, and `disabled` otherwise. A tenant created with a partner key gets its partner's
+  `default_billing_mode` (`exempt` or `metered`) instead, and the partner key cannot send `billing`
+  (`403 scope_denied`); on Pylota Mail Cloud, Pylota's operators are `exempt` this way
+  ([REST API › Partners](../../reference/api.md#partners)).
+- `PATCH /v1/tenants/{id}/billing` (platform key, `tenants:manage`; a partner key gets `403 scope_denied`) changes `mode`, and sets `plan_id` on a
   workspace with no Stripe subscription (a complimentary plan). On a workspace whose plan is paid through
   Stripe, a `plan_id` change returns `409 plan_managed_by_stripe`. Both are audit-logged
   (`billing.mode_change`, `billing.plan_set`) and a plan change emits `billing.plan_changed` with reason
@@ -136,7 +139,7 @@ from one of two sources:
 
 | Workspace | Period |
 |---|---|
-| Has an active plan subscription in Stripe | The subscription item's `current_period_start` and `current_period_end` (since Stripe API version 2025-03-31.basil these are on subscription items, not on the subscription) |
+| Has an active plan subscription in Stripe | The subscription item's `current_period_start` and `current_period_end` (since Stripe API version `2025-03-31.basil`, the version every request pins, these are on subscription items, not on the subscription) |
 | No subscription (Free, a complimentary plan, `exempt`, `disabled`) | Calendar months in UTC, starting 00:00 on the 1st |
 
 Starting or ending a subscription starts a new period at that moment, so `sends` and `triage` start again
@@ -165,7 +168,9 @@ design adds the `allowances` and `holds` tables from the
 [data model](data-model.md#3-other-durable-objects) and these requests:
 
 ```rust
-// crates/worker/src/billing/quota.rs (variants added to QuotaRequest)
+// Declared in crates/worker/src/quota/mod.rs by the M5 stub, with the types they carry (Feature,
+// BillingMode, Allowances, and the Held and Denied answers), so the stub compiles and answers every
+// variant; crates/worker/src/billing/quota.rs implements their behaviour in M22 without changing them.
 pub enum Feature { Inboxes, Sends, Triage, CustomDomains, StorageGb, Seats }
 
 Hold     { feature: Feature, units: u32, r#ref: String, gates: Vec<Feature> },
@@ -226,9 +231,10 @@ a `Settle` that consumes units, the settle of a count feature's hold when its cr
   the time of the last alert. A threshold alerts when it is crossed upwards and at least 24 hours have
   passed since that value ([O21](../edge-cases.md)). For `storage_gb` the crossing is detected by
   `SetMeasured`.
-- `granted` `NULL` (exempt, or billing `disabled`) sends nothing, except that with `PM_BILLING=off` the
-  same rule runs against the operator quotas in tenant policy for the features that have one, and a
-  feature with no quota sends none ([O23](../edge-cases.md)).
+- `granted` `NULL` (exempt, or billing `disabled`) sends nothing. With `PM_BILLING=off` no usage alert is
+  ever sent: no feature has a limit to reach, and tenant policy has no quota for the six allowances
+  ([O23](../edge-cases.md)). The daily caps are not allowances; the identity and tenant send caps keep their `quota.warning` events
+  (the agentic-search cap has none).
 
 The call is fire-and-forget after commit: a lost call loses one email, never a hold or a count, and the
 `quota.warning` and `billing.limit_reached` webhook events are unchanged.
@@ -362,12 +368,21 @@ top-up and retry with the same key.
 
 ## Stripe integration
 
-Stripe is called for three things only: to create Checkout Sessions, to create Customer Portal sessions,
-and to read subscriptions when a webhook arrives ([Architecture › Console and billing](../architecture.md#console-and-billing)).
-Its signed webhooks are the only writer of subscription state (FR-BILL-10). `PM_STRIPE_SECRET_KEY` is a
-restricted key with exactly those permissions. Every request pins the API version in `Stripe-Version`
-(2025-03-31.basil or later, because periods are read from subscription items), and so does the event
-destination.
+Stripe is called for five things only ([Architecture › Console and billing](../architecture.md#console-and-billing)):
+
+| Call | When |
+|---|---|
+| Create a Checkout Session | [Checkout](#checkout) |
+| Retrieve a Checkout Session (`GET /v1/checkout/sessions/{id}`) | The return page ([Cloud sign-up › Coming back from Checkout](cloud-signup.md#9-coming-back-from-checkout)) |
+| Create a Customer Portal session | [Customer Portal](#customer-portal) |
+| Read subscriptions (`GET /v1/subscriptions?customer=…`) | When a webhook arrives ([Applying state](#applying-state)), and before cancelling |
+| Cancel subscriptions (`DELETE /v1/subscriptions/{id}`, at once, with no proration and no refund) | Workspace deletion ([Privacy › Tenant scope](privacy.md#66-tenant-scope), step `cancel_billing`), and the webhook handler when a live subscription appears for an erasing or erased workspace (`cancelled_after_erasure`, [Webhook endpoint](#webhook-endpoint)) |
+
+Its signed webhooks are the only writer of subscription state in D1 (FR-BILL-10). `PM_STRIPE_SECRET_KEY` is a
+restricted key with exactly these permissions: create and retrieve Checkout Sessions, create Customer
+Portal sessions, read subscriptions, and cancel subscriptions. Every request pins the API version in
+`Stripe-Version: 2025-03-31.basil`, because periods are read from subscription items, and the event
+destination is pinned to the same version.
 
 ### Stripe objects
 
@@ -381,7 +396,8 @@ Plan and top-ups live in separate subscriptions on purpose. The Customer Portal 
 with several products but cannot update one, and a Checkout Session in `subscription` mode creates a new
 subscription rather than changing an existing one. With one
 product per subscription, the Portal can switch the plan subscription between plan prices and change a
-top-up subscription's quantity, and the Worker never needs write access to subscriptions. Every
+top-up subscription's quantity, and the Worker's only write to a subscription is cancelling it when the
+workspace is deleted. Every
 subscription carries `metadata.tenant_id` and `metadata.kind` (`plan` or `topup:{feature}`), set through
 `subscription_data.metadata` at Checkout.
 
@@ -403,14 +419,15 @@ top-ups (for example after a downgrade to Free); the console's plan page then su
 | `automatic_tax[enabled]` | `true` (Stripe Tax). With an existing customer, `customer_update[address]=auto`, so the address entered on the page is the one taxed |
 | `tax_id_collection[enabled]` | `true`, so a business can enter its VAT number |
 | `success_url` | `https://{PM_CONSOLE_HOST}/console/plan/return?session_id={CHECKOUT_SESSION_ID}` |
-| `cancel_url` | `https://{PM_CONSOLE_HOST}/console/plan`, or `https://{PM_CONSOLE_HOST}/console` (the Overview) when Checkout was started from sign-up ([Cloud sign-up › Open sign-up](cloud-signup.md#62-after-launch-open-sign-up)) |
+| `cancel_url` | `https://{PM_CONSOLE_HOST}/console/plan`, or `https://{PM_CONSOLE_HOST}/console?upgrade={plan}` (the Overview; `{plan}` is the `plan_id`) when Checkout was started from sign-up, so the Overview can show "Finish upgrading to {plan name}" without stored state ([Cloud sign-up › Open sign-up](cloud-signup.md#62-after-launch-open-sign-up), [W24](../edge-cases.md)) |
 
 The session expires after Stripe's default of 24 hours. The console refuses a plan Checkout when a plan
 subscription already exists (the Portal changes plans), and a top-up Checkout when the plan does not allow
 top-ups or a top-up subscription for that feature exists (the Portal changes its quantity). Returning to
 `success_url` changes nothing by itself: the plan changes when the webhook arrives, usually within
-seconds. The return page checks that the session's customer is this workspace's and waits for the
-webhook without JavaScript ([Cloud sign-up › Coming back from Checkout](cloud-signup.md#9-coming-back-from-checkout)).
+seconds. The return page retrieves the session, checks that its `client_reference_id` and
+`metadata.tenant_id` are this workspace (and its customer, when `stripe_customer_id` is already set), and
+waits for the webhook without JavaScript ([Cloud sign-up › Coming back from Checkout](cloud-signup.md#9-coming-back-from-checkout)).
 
 ### Customer Portal
 
@@ -448,7 +465,17 @@ signature, not by an API key, and lives in its own route table outside the API k
    `billing_accounts.stripe_customer_id`; if the customer is not known yet (events arrive in any order),
    use the subscription's `metadata.tenant_id`. The tenant must exist and be `metered`. If the workspace
    already has a different customer ID, the outcome is `error:customer_mismatch` and an alert fires.
-   `billing_events.tenant_id` is set.
+   `billing_events.tenant_id` is set. A tenant that is `erasing` or `erased` is not an error: workspace
+   deletion cancels its subscriptions ([Privacy › Tenant scope](privacy.md#66-tenant-scope), step
+   `cancel_billing`), and the events that follow (`customer.subscription.deleted`, a final invoice) are
+   answered `200` and recorded with outcome `ignored_erased`. Nothing is applied, and no alert fires.
+   One exception closes a race: a subscription can be created after `cancel_billing` ran, when the owner
+   deletes the workspace between paying at Checkout and the first webhook (the customer ID was not linked
+   yet, so `cancel_billing` found nothing). When the event is `checkout.session.completed` with a
+   subscription, or `customer.subscription.created` or `.updated` whose subscription is not `canceled`, the
+   handler cancels that subscription at once (`DELETE /v1/subscriptions/{id}`, no proration, no final
+   invoice), records outcome `cancelled_after_erasure` and fires `billing_cancelled_after_erasure`. A failed
+   cancel answers `500`, so Stripe retries the event.
 5. **Re-read and apply** ([Applying state](#applying-state)).
 6. Set `processed_at` and `outcome`, and answer `200`.
 
@@ -503,10 +530,21 @@ says *what* is true now. This makes duplicates, late events and reordering harml
    WHERE tenant_id = ?1 AND updated_at < ?11;
    ```
 
-   plus the `event_index` rows for any `billing.*` events and an `audit_log` row. If the `UPDATE` changed
-   no row, a newer read has already been applied: the outcome is `ignored_stale`.
+   plus the `event_index` rows for any `billing.*` events and an `audit_log` row. When the new `plan_id`
+   is a paid plan (any plan other than `default_plan`), the batch also runs
+   `UPDATE tenants SET ramp_lifted_at = ?now WHERE id = ?1 AND ramp_lifted_at IS NULL`, which ends the
+   new-workspace send ramp at once and keeps it ended after a later downgrade
+   ([Cloud sign-up › Abuse and safety](cloud-signup.md#10-abuse-and-safety-on-cloud), [W30](../edge-cases.md)).
+   If the `UPDATE` of `billing_accounts` changed no row, a newer read has already been applied: the
+   outcome is `ignored_stale`.
 5. Send `SetPlan` to `TenantQuota` with the new `granted` values and period. If it fails, the event is
    answered `500` and retried; `SetPlan` is idempotent.
+6. When the status became `past_due` in this batch (the `billing.payment_failed` row below), send the
+   owner's `account` email: `NotifierRequest::Account { user_id: <the owner's usr_ ID>, event: payment_failed }`,
+   after the batch commits, on the Notifier chosen by the rule in
+   [Notifications § 3](notifications.md#3-how-notifications-are-produced). It is fire-and-forget like
+   every Notifier call: a lost call loses one email, never a state change. A redelivered event finds the
+   status already `past_due` and sends nothing.
 
 Events emitted by this step (as platform events, [Events](#events-and-errors)):
 
@@ -561,13 +599,12 @@ mailbox the action needs anyway.
 
 `PM_BILLING=off` is the default for self-hosting (FR-BILL-12, [W19]):
 
-- No plan checks. Holds succeed and only count. Operator quotas from tenant policy
+- No plan checks. Holds succeed and only count. The daily caps in tenant policy
   (`identity_daily_send_cap`, `tenant_daily_send_cap`, `search.agentic_daily_cap`) still apply and return
   `429 daily_cap_reached` or `429 agentic_budget_exhausted`.
-- `GET /v1/usage` reports `"billing": "disabled"`, each feature with `granted: null`, `unlimited: true` and
-  the real `used`, plus any operator quota.
-- Usage alerts follow the operator quotas in tenant policy; a feature with no quota sends none
-  ([Usage thresholds](#usage-thresholds)).
+- `GET /v1/usage` reports `"billing": "disabled"` and each feature with `granted: null`,
+  `remaining: null`, `unlimited: true` and the real `used`.
+- No usage alerts are sent ([Usage thresholds](#usage-thresholds), [O23](../edge-cases.md)).
 - `GET /v1/plans` returns `{ "billing_enabled": false, "data": [] }`.
 - `/billing/stripe/webhook`, `/console/plan/checkout` and `/console/plan/portal` are not registered
   (`404`). The console's plan page shows usage only.
@@ -630,6 +667,7 @@ Metrics: `quota_hold_denied_total{feature}`, `quota_hold_expired_total{feature}`
 | `it::billing::w2_stripe_down_sends_ok` | With the Stripe fake refusing connections, sends, triage and creates behave normally; Checkout and Portal show a retryable error | [W2], NFR-BILL-2 |
 | `it::billing::w3_retry_after_upgrade` | A `402` writes no idempotency row; after `SetPlan` the same key and body give one `202` and one email | [W3], FR-BILL-6 |
 | `it::billing::w4_replay_when_spent` | A completed send replays with `deduplicated: true` after the allowance is spent; no hold is taken | [W4] |
+| `it::billing::late_subscription_after_erasure` | A workspace is deleted between Checkout and the first webhook: `cancel_billing` finds no customer; the late `checkout.session.completed` and `customer.subscription.created` cancel the new subscription once (`cancelled_after_erasure`, alert fired); a failing cancel answers `500` and the retried event cancels it | [Webhook endpoint](#webhook-endpoint) |
 | `it::billing::w5_uncertain_release` | Simulator `timeout@`: the hold is released; a later reconciliation consumes one unit per recipient | [W5], FR-BILL-5 |
 | `it::billing::w6_hold_expiry` | An unsettled hold is released by the alarm after 10 minutes of test time; a count hold marks the feature stale and the next hold recounts from D1 | [W6] |
 | `it::billing::partial_smtp_settle` | An SMTP send to three recipients with `4xx` on one `RCPT`: two units consumed, one kept held with `expires_at` = retry + 10 min; the retry consumes it; after 24 h of deferral it is released and that delivery is `failed` | FR-BILL-4, FR-BILL-5, [N20](../edge-cases.md) |
@@ -641,14 +679,14 @@ Metrics: `quota_hold_denied_total{feature}`, `quota_hold_expired_total{feature}`
 | `it::billing::w12_webhook_order` | Recorded fixtures delivered twice, late and out of order end in the same state; a stale read is recorded `ignored_stale` | [W12] |
 | `it::billing::w13_grace_then_free` | `invoice.payment_failed` → `past_due`, `billing.payment_failed`, plan kept; after 7 days of test time Free limits, `billing.plan_changed` (`payment_failed_grace_ended`), nothing deleted; `invoice.paid` restores the plan (`payment_recovered`) | [W13] |
 | `it::billing::w14_webhook_signature` | Wrong secret, altered body, `t` older than 300 s, `v0` only, and a replayed request each get `400`; a header with two `v1` values verifies against either secret | [W14] |
-| `it::billing::w19_disabled` | `PM_BILLING=off`: no plan checks, `billing: disabled`, `GET /v1/plans` empty, Stripe routes `404`, operator caps still return `429` | [W19], FR-BILL-12 |
+| `it::billing::w19_disabled` | `PM_BILLING=off`: no plan checks, `billing: disabled` with every feature `granted: null`, `unlimited: true` and the real `used`, `GET /v1/plans` empty, Stripe routes `404`, the daily caps in tenant policy still return `429` | [W19], FR-BILL-12 |
 | `it::billing::period_reset` | Monthly features reset at the period end alarm; a Stripe renewal does not reset twice; starting and ending a subscription start a new period | FR-BILL-3 |
 | `it::billing::topups` | Top-up quantities add `1`, `1,000` and `1,000` units; a top-up on Free after a downgrade still counts | FR-BILL-2, PRD §13 |
 | `it::billing::reconcile_counts` | Drift between `TenantQuota` and D1 is corrected hourly, but not for a feature with an open hold | FR-BILL-4 |
 | `it::billing::stripe_fixtures` | `stripe trigger` fixtures recorded as JSON: checkout completed, subscription updated, payment failed, canceled | M22 |
 | `it::billing::plan_managed_by_stripe` | `PATCH …/billing` with `plan_id` on a Stripe-paid workspace gets `409`; on others it sets a complimentary plan and emits reason `operator` | FR-BILL-1 |
 | `it::billing::usage_matches_quota` (property) | `GET /v1/usage` equals the catalog plus `TenantQuota` state for random sequences of holds, settles and plan changes | FR-BILL-11, M22 |
-| `it::notify::usage_once_per_threshold_per_period`, `it::notify::count_feature_cooldown`, `it::notify::billing_off_quotas` | The `TenantQuota` side of usage alerts ([Usage thresholds](#usage-thresholds)), listed in [Notifications § 10](notifications.md#10-tests) | FR-BILL-13, [O20](../edge-cases.md), [O21](../edge-cases.md), [O23](../edge-cases.md) |
+| `it::notify::usage_once_per_threshold_per_period`, `it::notify::count_feature_cooldown`, `it::notify::billing_off_no_usage_alerts` | The `TenantQuota` side of usage alerts ([Usage thresholds](#usage-thresholds)), listed in [Notifications § 10](notifications.md#10-tests) | FR-BILL-13, [O20](../edge-cases.md), [O21](../edge-cases.md), [O23](../edge-cases.md) |
 
 [W1]: ../edge-cases.md
 [W2]: ../edge-cases.md
@@ -677,7 +715,11 @@ above and subscription statuses including `unpaid`, `incomplete_expired` and `pa
 non-`v1` schemes, constant-time comparison, a 5-minute default tolerance in Stripe's libraries, one
 signature per active secret during a roll of up to 24 hours, retries for up to three days in live mode,
 no ordering guarantee); `/changelog/basil/2025-03-31/deprecate-subscription-current-period-start-and-end`
-(periods moved to subscription items); `/api/subscriptions/list` (non-canceled subscriptions by default,
+(periods moved to subscription items, and the request header `Stripe-Version: 2025-03-31.basil`, the one
+version string this design pins); `/api/subscriptions/list` (non-canceled subscriptions by default,
 `limit` up to 100); `/tax/checkout/page` (Stripe Tax collects only where an active registration exists,
 and `customer_update[address]=auto` for existing customers). Not checked: the exact names of restricted-key
-permissions in the Stripe Dashboard.
+permissions in the Stripe Dashboard. Read on 2026-10-10 for the return-page and workspace-deletion calls:
+`/api/checkout/sessions/retrieve` (`GET /v1/checkout/sessions/{id}`) and `/api/subscriptions/cancel`
+(`DELETE /v1/subscriptions/{id}` cancels at once; `prorate` and `invoice_now` both default to `false`, so
+sending neither gives no proration credit and no final invoice).

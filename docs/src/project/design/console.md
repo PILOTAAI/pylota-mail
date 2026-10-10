@@ -2,7 +2,7 @@
 
 Binding design for the console at `/console`, and for the workspaces, members, roles, invitations, sign-in
 and sessions behind it. It implements FR-CON-1 to FR-CON-7 and NFR-CON-1, build plan milestone M21, and
-the edge-case rows W8–W10 and W15–W18 in the [edge-case register](../edge-cases.md); and the console parts
+the edge-case rows W9–W10 and W15–W18 in the [edge-case register](../edge-cases.md); and the console parts
 of agent signing keys (FR-IDN-6, M25) and of notifications (FR-CON-14, FR-CON-15, M26; rows O17–O19). The plan and usage
 page and everything about money is in [Plans, metering and billing](billing.md). Self-serve sign-up,
 Google and GitHub sign-in, two-step verification, the landing rules and the Overview (FR-CON-8 to
@@ -121,22 +121,27 @@ Rules:
   ([Members](#members)).
 - **Admins and the owner.** An admin can manage admins, members and viewers, but cannot change the owner
   or make anyone owner.
-- **Keys from the console** are tenant-level or identity-level, never platform-level, and can never hold a
+- **Keys from the console** are tenant-level or identity-level, never partner- or platform-level, and can never hold a
   permission the session lacks (FR-KEY-1). Owners and admins hold `identities:sign`, so they can create
   API keys that sign as an identity; members and viewers cannot. The level rules of
   [Security §4.6](security.md#46-creating-keys-fr-key-1) apply as in the API: an identity-level key never
   carries a tenant-only permission (`members:read`, `members:manage`, `suppressions:manage`,
   `audit:read`, `usage:read`), so the key form does not offer them for that level.
-- **Tenant policy** is changed with a platform key, as in the API (`PATCH /v1/tenants/{id}` needs
-  `tenants:manage`). The settings page shows the effective policy read-only.
+- **Tenant policy** is changed with a platform key, or with the partner key of the workspace's partner,
+  as in the API (`PATCH /v1/tenants/{id}` needs `tenants:manage`). The settings page shows the effective
+  policy read-only, `quarantine.key_release` included.
 - **Workspace settings** (name, time zone, `require_two_factor`) are console-only owner rights, like
   billing: the settings form posts to a console handler that checks `role = owner` and updates exactly
-  those three columns of `tenants`, with an audit row. It never calls `PATCH /v1/tenants` and never
-  touches the platform-only fields (`policy`, `status`, `mode`, `slug`, `address_suffix`, billing).
+  those three columns of `tenants`, with an audit row. It never calls `PATCH /v1/tenants/{tenant_id}`
+  and never touches the fields that need a key with `tenants:manage` (`policy`, `status`, `mode`, `slug`,
+  `address_suffix`, billing).
 - **Members list.** Every role can see members and pending invitations, through
   `GET /v1/tenants/{tenant_id}/members`, which needs `members:read` (included in `members:manage`).
-- **Quarantine release** is possible for a signed-in person with the role above. On Pylota Mail Cloud no API
-  key can release; a self-hosted deployment can also allow keys with `quarantine:review` (FR-CON-6).
+- **Quarantine release** is possible for a signed-in person with the role above. On Pylota Mail Cloud
+  (`PM_QUARANTINE_KEY_RELEASE=off`) no API key can release, except in a workspace whose policy has
+  `quarantine.key_release: true`, which only a platform key or the workspace's partner key can set (so a
+  partner such as Pylota can release from its own review screen); a self-hosted deployment can also allow
+  keys with `quarantine:review` everywhere (`on`, its default) (FR-CON-6).
 - **Every handler checks the role**, through the console's route table, which registers each route with its
   required permission exactly like the API's deny-by-default table
   ([Security](security.md#51-deny-by-default-router-table)). A viewer's `POST` to a write route gets `403`,
@@ -176,8 +181,9 @@ Every method ends in the same session creation ([Sessions](#sessions)), and the 
 1. Normalise the address (lower case, IDNA A-label domain) and validate it.
 2. If `login_tokens` already has 3 rows for this address created in the last 10 minutes, answer the
    "too many requests, wait 10 minutes" page. The page is the same whether the address is known or not.
-3. Insert a `login_tokens` row: a 32-byte random link token and a six-digit code from the platform RNG
-   (uniform, by rejection sampling), stored only as `token_hash` and `code_hash`, keyed hashes under the
+3. Insert a `login_tokens` row with `purpose = 'sign_in'`: a 32-byte random link token and a six-digit
+   code from the platform RNG (uniform, by rejection sampling), stored only as `token_hash` and
+   `code_hash`, keyed hashes under the
    current `link` signing key, whose kid goes in `key_kid` ([Keyed hashes](#keyed-hashes)), with
    `expires_at = now + 10 minutes`. The row is written for every address, known or not, so the limits
    behave the same.
@@ -203,7 +209,8 @@ registered and unregistered addresses ([W15]).
 the token, a scanner cannot burn it.
 
 The `POST` hashes the token and looks for a row that is unexpired, unused and has fewer than 10 attempts.
-On success it sets `used_at`, creates the `users` row if the address only had a pending invitation, sets
+What success does depends on the row's `purpose` ([Sign-up and waitlist tokens](#sign-up-and-waitlist-tokens)).
+For `sign_in` it sets `used_at`, creates the `users` row if the address only had a pending invitation, sets
 `last_login_at`, asks for two-step verification if the person has it, creates a session and answers `303`
 to the page chosen by [Cloud sign-up §7](cloud-signup.md#7-where-people-land) (normally `/console`).
 
@@ -219,6 +226,21 @@ Each token allows 10 attempts. On top of the per-address limits, the Workers rat
 60 seconds per client IP, keyed by `CF-Connecting-IP`, on `POST /console/sign-in`,
 `/console/sign-in/link`, `/console/sign-in/code`, `/console/sign-up` and `/console/waitlist`
 ([Cloud sign-up §10](cloud-signup.md#10-abuse-and-safety-on-cloud)).
+
+### Sign-up and waitlist tokens
+
+Sign-up and the waitlist use the same `login_tokens` machinery, limits and email, with another
+`purpose` ([Cloud sign-up §6](cloud-signup.md#6-sign-up)):
+
+| `purpose` | Written by | Sent to an address with no account | Using the link or code |
+|---|---|---|---|
+| `sign_in` | `POST /console/sign-in`, and `/console/reauth` | Never (step 5 above) | Signs in |
+| `sign_up` | `POST /console/sign-up`, with `plan`, the validated `next` (`next_path`) and `terms_version` = `PM_TERMS_VERSION` from the required checkbox | Yes, when `PM_SIGNUP=open`, or when the request carries a valid waitlist invite for that address ([Cloud sign-up §6.1](cloud-signup.md#61-before-launch-the-waitlist)); otherwise nothing is sent | Creates the `users` row, copying `terms_version` and setting `terms_accepted_at` to the token's `created_at`, then signs in and lands as [Cloud sign-up §7](cloud-signup.md#7-where-people-land) says, carrying `plan`. An address that already has an account is signed in and its accepted terms are updated |
+| `waitlist` | `POST /console/waitlist`, with the plan of interest in `plan` | Yes (double opt-in) | Writes the `waitlist` row with `confirmed_at` = now; no account, no session |
+
+The response of `POST /console/sign-up` and `POST /console/waitlist` is the same page whatever happens to
+the address, as for sign-in ([W15]), and the send happens after the response. The link and code routes
+(`/console/sign-in/link`, `/console/sign-in/code`) serve all three purposes.
 
 ### Keyed hashes
 
@@ -463,11 +485,11 @@ not people.
   says so: further notifications that day go into the next daily digest ([O24](../edge-cases.md)).
 - **When notifications are off.** With `PM_NOTIFICATIONS=off`, or while the workspace is suspended, the
   page says that only `account` emails are sent ([O26](../edge-cases.md)). With `PM_BILLING=off`, it says
-  that `usage` covers only features with an operator quota in tenant policy ([O23](../edge-cases.md)).
+  that no usage alerts are sent and hides the `usage` choice ([O23](../edge-cases.md)).
 
 ### Unsubscribe links
 
-Every `usage`, `new_mail` and `needs_person` email carries
+Every `usage`, `new_mail`, `needs_person` and `digest` email carries
 `List-Unsubscribe: <https://{PM_CONSOLE_HOST}/console/notifications/unsubscribe?t={token}>` and
 `List-Unsubscribe-Post: List-Unsubscribe=One-Click` (RFC 8058). The token (a MAC under the current `link`
 key with its kid, binding the person, the workspace and the kind, valid 90 days) is defined in
@@ -476,7 +498,7 @@ key with its kid, binding the person, the workspace and the kind, valid 90 days)
 | Route | Does |
 |---|---|
 | `GET /console/notifications/unsubscribe?t=…` | Changes nothing. With a valid token it shows the workspace and the kind with one **Unsubscribe** button, a form that `POST`s to the same URL. A mail scanner that opens the link unsubscribes no one |
-| `POST /console/notifications/unsubscribe?t=…` | Verifies the token and sets that kind to `off` for that person and workspace (an upsert of the `notification_prefs` row), then shows a confirmation page with a link to the settings page. This is the request a mail provider sends for a one-click unsubscribe |
+| `POST /console/notifications/unsubscribe?t=…` | Verifies the token and sets that kind to `off` for that person and workspace (an upsert of the `notification_prefs` row), then shows a confirmation page with a link to the settings page. A `digest` token performs three upserts, setting `usage`, `new_mail` and `needs_person` to `off`, because the digest has no row of its own: the `notification_prefs` kind `CHECK` stays those three kinds. This is the request a mail provider sends for a one-click unsubscribe |
 
 - No session is needed and none is created. Both routes are exempt from the CSRF token and `Origin`
   check ([CSRF](#csrf)), and both are served even with `PM_CONSOLE=off`.
@@ -488,19 +510,21 @@ key with its kid, binding the person, the workspace and the kind, valid 90 days)
 
 ### Account emails
 
-`account` emails cannot be turned off ([Notifications §1](notifications.md#1-kinds)). The console
-handlers that perform one of these actions call `NotifierRequest::Account { user_id, event }` on the
-`Notifier` of the person's active workspace after their D1 batch commits:
+`account` emails cannot be turned off ([Notifications §1](notifications.md#1-kinds)). The code that
+performs one of these actions calls `NotifierRequest::Account { user_id, event }` after its D1 batch
+commits, on the `Notifier` chosen by the one rule of [Notifications § 3](notifications.md#3-how-notifications-are-produced):
+the person's last-used workspace (`users.last_tenant_id`); when that is unset or gone, the workspace
+where the event happened; for an event in no workspace, the default tenant.
 
-| Event | Handler | Sent to |
+| Event (`AccountEvent`) | Called by | Sent to |
 |---|---|---|
-| Two-step verification turned off | `/console/settings/security` ([Cloud sign-up §5](cloud-signup.md#5-two-step-verification)) | The person |
-| A new sign-in method linked | The Google or GitHub callback, when it links a provider identity to an existing person ([Cloud sign-up §4](cloud-signup.md#4-google-and-github)) | The person |
-| Ownership transferred | [Members](#members) | The previous owner and the new owner |
+| `two_factor_disabled` | `/console/settings/security`, in `console/totp.rs` ([Cloud sign-up §5](cloud-signup.md#5-two-step-verification)) | The person |
+| `sign_in_method_linked` | The Google or GitHub callback, in `console/oauth.rs`, when it links a provider identity to an existing person ([Cloud sign-up §4](cloud-signup.md#4-google-and-github)) | The person |
+| `ownership_transferred` | The ownership transfer in `members/mod.rs` ([Members](#members)) | The previous owner and the new owner |
+| `payment_failed` | The billing webhook, in `billing/webhook.rs`, when the status becomes `past_due` ([Billing › Applying state](billing.md#applying-state)) | The owner |
 
-The fourth `account` event, a failed payment, belongs to [Billing](billing.md) and goes to the owner. `account` emails are
-sent with `PM_NOTIFICATIONS=off`, to a suspended workspace, past the daily caps and while a person's
-other preferences are paused.
+`account` emails are sent with `PM_NOTIFICATIONS=off`, to a suspended workspace, past the daily caps and
+while a person's other preferences are paused.
 
 ## Screens
 
@@ -508,14 +532,14 @@ other preferences are paused.
 |---|---|---|
 | `/console/sign-in` | Email form, plus "Continue with Google" and "Continue with GitHub" where enabled; then the "check your email" page with the code form | Anyone |
 | `/console/sign-in/link` | Confirm sign-in from the email link | Anyone with a link |
-| `/console/sign-up` | Sign-up with Google, GitHub or an email address, and the terms checkbox (`PM_SIGNUP=open`; [Cloud sign-up §6.2](cloud-signup.md#62-after-launch-open-sign-up)) | Anyone |
+| `/console/sign-up` | Sign-up with Google, GitHub or an email address, and the terms checkbox (`PM_SIGNUP=open`, or `?invite={token}` from a waitlist invite while `PM_SIGNUP=waitlist`; [Cloud sign-up §6](cloud-signup.md#6-sign-up)) | Anyone |
 | `/console/waitlist` | Join the waitlist, with double opt-in (`PM_SIGNUP=waitlist`; [Cloud sign-up §6.1](cloud-signup.md#61-before-launch-the-waitlist)) | Anyone |
 | `/console/oauth/{provider}/start`, `/console/oauth/{provider}/callback` | Redirects to and from Google or GitHub; no page of their own ([Cloud sign-up §4](cloud-signup.md#4-google-and-github)) | Anyone |
 | `/console/invitations/accept` | Accept an invitation | Anyone with a link |
 | `/console/notifications/unsubscribe` | Confirm and apply a one-click unsubscribe from a notification kind ([Unsubscribe links](#unsubscribe-links)) | Anyone with a link; no session |
 | `/console/reauth` | Confirm it is you, with a code (and a two-step code when enrolled) | Signed in |
 | `/console/workspaces` | Workspace picker and switcher | Signed in |
-| `/console/workspaces/new` | Create your workspace: name, address suffix, time zone ([Cloud sign-up §6.2](cloud-signup.md#62-after-launch-open-sign-up)) | Signed in, with no workspace or pending invitation, when sign-up is open |
+| `/console/workspaces/new` | Create your workspace: name, address suffix, time zone ([Cloud sign-up §6.2](cloud-signup.md#62-after-launch-open-sign-up)) | Signed in, with no workspace or pending invitation, when sign-up is open or the person has a valid waitlist invite |
 | `/console` | Overview, the workspace home: banners, the first-run checklist, "Needs a person", usage meters, inboxes and recent activity ([Cloud sign-up §8](cloud-signup.md#8-the-overview-the-screen-people-land-on)) | All roles (viewers without action buttons) |
 | `/console/connect` | Connect your agent: the `claude mcp add` line, `.mcp.json`, a `curl` request and `pmail login`, with a key ID filled in, never a secret | Owner, admin |
 | `/console/inboxes`, `/console/inboxes/{idn}` | Identities with their addresses and status; one identity's threads with triage, and its signing keys with the JWKS link ([Identity signing keys](#identity-signing-keys)) | All roles. Create, rotate and revoke signing keys: owner, admin |
@@ -543,8 +567,8 @@ The schema is in [Data model](data-model.md#1-d1-control-plane). How this design
 |---|---|
 | `users` | One row per person, keyed by sign-in address. `status = 'disabled'` blocks sign-in. Created by `owner` on `POST /v1/tenants`, by `pmail setup --owner-email`, or when an invitation is accepted |
 | `members` | Who is in which workspace, with which role. `members_one_owner` enforces one owner |
-| `invitations` | Pending, accepted, revoked or expired invitations. `invitations_pending` allows one pending invitation per address and workspace |
-| `login_tokens` | One row per sign-in or re-authentication request, holding both the link and the code hashes and the attempt count. Deleted 24 hours after expiry |
+| `invitations` | Pending, accepted, revoked or expired invitations. `invitations_pending` allows one pending invitation per address and workspace. Expired and revoked rows are deleted 30 days after `expires_at`; an accepted row stays, and loses its address when that person deletes their account ([Privacy › People](privacy.md#69-people-console-accounts)) |
+| `login_tokens` | One row per sign-in, re-authentication, sign-up or waitlist request (`purpose`), holding both the link and the code hashes and the attempt count, and for sign-up the plan, `next` and accepted terms version. Deleted 24 hours after expiry |
 | `sessions` | Console sessions with their CSRF secret and the time of the last sign-in. Deleted 30 days after expiry or revocation |
 | `oauth_identities`, `oauth_states`, `waitlist` | Google and GitHub links, OAuth flows in progress, and the waitlist ([Cloud sign-up §11](cloud-signup.md#11-data-model)) |
 | `notification_prefs` | One row per person, workspace and kind that has been saved or paused; a missing row means the default for the person's role. Written by the settings page and by unsubscribe; `paused_reason` is set by a notification bounce or complaint and cleared by **Confirm my address**. Deleted for that workspace when a member is removed or leaves, for every workspace when a person deletes their account, and with the workspace by tenant erasure |
@@ -595,7 +619,10 @@ the workspace's `tenant_id` and delivered like `webhook.disabled`
    for a console release ([Webhook events](../../reference/events.md)).
 4. **Key-based quarantine release** (FR-CON-6). Closed: `PM_QUARANTINE_KEY_RELEASE`
    ([Configuration](../../reference/configuration.md#variables)) is `on` by default for self-hosting, and
-   Pylota Mail Cloud sets it to `off`, so only a signed-in person can release there.
+   Pylota Mail Cloud sets it to `off`, so only a signed-in person can release there, except in a workspace
+   whose policy has `quarantine.key_release: true` (decided 2026-10-10). Only a platform key, or the
+   partner key of the workspace's partner, can set that field; Pylota sets it on its operators'
+   workspaces ([Configuration › Tenant policy](../../reference/configuration.md#tenant-policy)).
 5. **Erasure of console data.** Closed: tenant erasure deletes the workspace's `members`, `invitations`
    and `sessions`, and deletes every person it leaves with no workspace; deleting a person removes their
    `oauth_identities` and any `waitlist` row ([Cloud sign-up §11](cloud-signup.md#11-data-model),
@@ -618,14 +645,14 @@ the workspace's `tenant_id` and delivered like `webhook.disabled`
 | `it::console::reauth_sensitive` | Each sensitive action redirects to re-authentication after 10 minutes, writes an audit row, and the session is rotated | FR-CON-5 |
 | `it::members::invitation_lifecycle` | Accept, re-send, revoke and expire, with the seat count after each | FR-CON-4 |
 | `it::members::ownership_transfer` | Exactly one owner before and after; concurrent transfers leave one owner | FR-CON-2 |
-| `it::console::quarantine_release` | A member releases with re-authentication and an audit row; with key release off, an API key cannot release | FR-CON-6 |
+| `it::console::quarantine_release` | A member releases with re-authentication and an audit row; with key release off, an API key cannot release unless the workspace's policy has `quarantine.key_release: true` (`it::quarantine::j16_key_release_override`); the settings page shows that field read-only | FR-CON-6 |
 | `it::console::disabled` | `PM_CONSOLE=off` removes every `/console` route except the invitation-accept and unsubscribe pairs; the members API still works | FR-CON-7 |
 | `it::console::notification_settings` | Each role sees its defaults; saving writes rows for the session's person and workspace only; a mode a kind does not accept and an inbox from another workspace are refused; `account` cannot be turned off; the cap notice appears after the 50th email of the day | FR-CON-14, FR-CON-15 |
 | `it::console::identity_keys_page` | Every role sees the key list and the JWKS link; only owner and admin can create, rotate and revoke, each after re-authentication with an `identity_key.*` audit row and event; a paused identity's keys can still be revoked | FR-IDN-6, [W18] |
-| `it::console::account_emails` | Turning two-step verification off, linking a sign-in method and transferring ownership each send one `account` email after the batch commits, also with `PM_NOTIFICATIONS=off` | FR-CON-15 |
+| `it::console::account_emails` | Turning two-step verification off, linking a sign-in method, transferring ownership and a failed payment (`invoice.payment_failed` fixture) each send one `account` email after the batch commits, also with `PM_NOTIFICATIONS=off`; it goes through the Notifier of the person's `last_tenant_id` when set, and of the workspace where the event happened otherwise; a redelivered webhook sends nothing more | FR-CON-15 |
 | `it::notify::one_click_unsubscribe`, `it::notify::bounce_pauses_prefs`, `it::notify::member_removed_drops_pending` ([Notifications §10](notifications.md#10-tests)) | Unsubscribe without a session; the bounce banner and **Confirm my address**; member removal deletes preferences | [O17](../edge-cases.md)–[O19](../edge-cases.md) |
 | `cli::setup::owner_email` ([CLI and setup](cli.md)) plus `it::console::first_owner_signin` | `pmail setup --owner-email` creates the default tenant's owner, who receives a link and can sign in | FR-CON-7 |
-| Playwright `console_no_js` | Every console route works with `javaScriptEnabled: false`; an axe scan finds no serious violation | FR-CON-1, M21 |
+| `browser::console::no_js`, `browser::console::axe_scan` ([Testing §6.8](testing.md#68-browser-suite-browser)) | Every console route works with `javaScriptEnabled: false`; an axe scan finds no violation of impact `serious` or `critical` | FR-CON-1, M21 |
 | `it::console::render_budget` | Server render time p95 ≤ 300 ms on the fixture workspace | NFR-CON-1 |
 
 [W8]: ../edge-cases.md

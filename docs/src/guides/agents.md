@@ -24,8 +24,8 @@ The 17 MCP tools are `mail_list_identities`, `mail_list_threads`, `mail_search`,
 `mail_update_labels`, `mail_sign_assertion` and `mail_sign_http_request`. Send tools require an
 `idempotency_key` argument: 1–255 printable ASCII characters, spaces included
 (`^[\x20-\x7E]{1,255}$`), the same rule as the REST `Idempotency-Key` header. `mail_get_usage` shows
-the workspace's remaining allowances; every tenant and identity key can call it, and platform keys do
-not see it. The two signing tools need `identities:sign` and are hidden from keys without it
+the workspace's remaining allowances; every tenant and identity key can call it, and platform and
+partner keys do not see it. The two signing tools need `identities:sign` and are hidden from keys without it
 ([Agent assertions](#agent-assertions), [Signed HTTP requests](#signed-http-requests)). The server
 also offers one prompt, `mail_search_strategy`.
 
@@ -54,7 +54,7 @@ Rules:
   `suppressions:manage` and `tenants:manage` belong to people and back-office services.
 - **Give `identities:sign` only to an agent that signs, on its own identity key.** It lets a key speak
   for an identity to the outside world: an identity key only for its own identity, a tenant key for
-  every identity of the tenant. Platform keys cannot hold it: creating a platform key that lists it is
+  every identity of the tenant. Platform and partner keys cannot hold it: creating one that lists it is
   refused with `400 invalid_request`.
 - **One key per agent**, with a `name` that says which agent it is, so the audit log shows who did
   what, and so one key can be revoked without stopping the others.
@@ -273,8 +273,8 @@ It is off unless both of these hold:
 - the operator turned it on with `PM_WEB_BOT_AUTH=on`
   ([Deploy to Cloudflare › Signed HTTP requests](../self-hosting.md#signed-http-requests-web-bot-auth)).
   Otherwise every request gets `422 web_bot_auth_disabled`;
-- the workspace opted in: tenant policy `web_bot_auth.allowed: true`, set with a platform key that
-  holds `tenants:manage` ([Configuration › Tenant policy](../reference/configuration.md#tenant-policy)).
+- the workspace opted in: tenant policy `web_bot_auth.allowed: true`, set with a platform key that holds
+  `tenants:manage`; a partner key cannot set it ([Configuration › Who may change a field](../reference/configuration.md#who-may-change-a-field)).
   Otherwise `403 policy_denied`.
 
 Signed HTTP requests are a P1 feature. The operator can turn them on only once the Web Bot Auth format

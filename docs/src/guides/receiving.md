@@ -180,7 +180,9 @@ Releasing moves the message to `received`, emits `message.released`, runs triage
 entry. The CLI commands are `pmail quarantine list` and `pmail quarantine release`.
 
 Release is a human decision. Give `quarantine:review` to the people who review mail, not to agents
-([Security](security.md#quarantine)).
+([Security](security.md#quarantine)). Where `PM_QUARANTINE_KEY_RELEASE` is `off`, as on Pylota Mail Cloud,
+every key gets `403 permission_denied` and a person releases in the console, unless the workspace's
+policy has `quarantine.key_release: true` ([Configuration › Tenant policy](../reference/configuration.md#tenant-policy)).
 
 ## Blocked senders and throttling
 
@@ -348,7 +350,9 @@ so you can deploy the new secret without dropping events. CLI: `pmail webhooks r
   event's `occurred_at` (or `retention.events_days`, if shorter, because the payloads are then gone).
   The window counts from the event, not from when the delivery went dead.
 - After 100 consecutive failures spread over at least 24 hours, the endpoint is disabled
-  (`disabled_reason: failing`) and a `webhook.disabled` event goes to the platform's other endpoints.
+  (`disabled_reason: failing`) and a `webhook.disabled` event goes to the platform's endpoints and, for
+  an endpoint of a partner (a partner endpoint, or an endpoint of one of the partner's tenants), to that
+  partner's other endpoints; never to tenant endpoints.
   A `410 Gone` response disables the endpoint immediately. Re-enable it with
   `PATCH /v1/webhooks/{webhook_id}` and `{"enabled": true}`.
 
@@ -402,24 +406,26 @@ webhooks and the API: notifications change nothing that your endpoints receive.
 | `new_mail` | New mail arrived in inboxes the person follows | Off for everyone: opt in |
 | `needs_person` | Once a day, what needs a person: quarantined mail, uncertain sends, failing domains and failing webhooks | Daily for the owner and admins |
 | `account` | Security and billing events, such as two-step verification turned off or a failed payment | Always sent to the person concerned (the owner, for billing). Cannot be turned off |
+| `digest` | Once a day, the items a daily cap held back, as counts | Sent only to a person whose items were held back |
 
 - **Settings.** Each person chooses their own, per workspace, at **Settings › Notifications**
   (`/console/settings/notifications`). There is no API for them: API keys are not people.
 - **New-mail notifications** are `instant`, `hourly` or `daily`, for every inbox or chosen ones, and
-  optionally only for mail that needs a reply. `instant` waits 2 minutes and sends one email for
+  optionally only for mail that needs a reply (triage's `needs_reply` score at least 0.5; a message waits
+  up to 5 minutes for triage, and counts if triage does not run). `instant` waits 2 minutes and sends one email for
   everything that arrived, then at most one per inbox every 10 minutes. Daily emails, including the
   "needs a person" email, arrive at 09:00 in the workspace's time zone. Only mail that becomes visible in
   the inbox counts: quarantined, hidden and spam mail never does.
 - **Counts only, never content.** A notification names the inbox and counts messages ("3 new messages
   in bookings.acme@agents.example, 2 waiting for a reply"). It never includes a subject, a sender, a
   snippet or an attachment name, so it is safe to read on a lock screen.
-- **One-click unsubscribe.** Every `usage`, `new_mail` and `needs_person` email carries
+- **One-click unsubscribe.** Every `usage`, `new_mail`, `needs_person` and `digest` email carries
   `List-Unsubscribe` and `List-Unsubscribe-Post` (RFC 8058), so a mail app's unsubscribe button turns
-  that kind off for that person and workspace, without sign-in. `account` emails link to settings
-  instead.
+  that kind off for that person and workspace, without sign-in (for a `digest`, the three kinds it
+  summarises). `account` emails link to settings instead.
 - **Caps.** At most 50 notification emails per person and 200 per workspace a day, not counting
-  `account` emails. Past a cap, the day's remaining items go into the next daily digest, and the
-  settings page says so.
+  `account` emails or the digest. Past a cap, the day's remaining items go into one `digest` email at
+  the next 09:00, and the settings page says so.
 - If a notification hard-bounces or draws a complaint, that person's notifications pause (only
   `account` emails still go out) until they confirm their address in the console.
 

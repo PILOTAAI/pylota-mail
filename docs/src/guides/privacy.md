@@ -160,14 +160,17 @@ that provider's account ID and the address at the time of linking. A two-step ve
 recovery codes are stored encrypted.
 
 - A person can delete their own account under **Settings** once they own no workspace. That ends their
-  memberships and sessions and removes their Google and GitHub links, their notification preferences and
-  any waitlist entry.
+  memberships and sessions, removes their Google and GitHub links, their notification preferences and
+  any waitlist entry, and replaces their address with an opaque ID on the invitations they accepted.
 - Removing a member from a workspace deletes their notification preferences there and drops any
   notifications still waiting for them.
 - Deleting a workspace erases it like any tenant, and also removes its members, invitations and sessions.
-  People left with no workspace are deleted too.
-- Waitlist entries that were never confirmed are deleted after 7 days, and confirmed ones 30 days after
-  the person was invited.
+  People left with no workspace are deleted too. With billing on, the step right after the workspace's
+  mail stops cancels its plan and top-up subscriptions at once, with no proration and no refund, before
+  anything is deleted.
+- Invitations that expired or were revoked are deleted 30 days after their expiry date.
+- A waitlist entry is written only when its confirmation link is used; an unused confirmation link
+  expires after 10 minutes. Entries are deleted 30 days after the person was invited.
 
 ## What agents and notifications disclose
 

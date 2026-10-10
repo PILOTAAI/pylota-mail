@@ -97,7 +97,8 @@ an email link or code, or with Google or GitHub where enabled, plus optional two
 ([Cloud sign-up](design/cloud-signup.md)).
 
 With `PM_BILLING=stripe`, plan allowances are enforced by the workspace's `TenantQuota` object (atomic holds,
-settled when an outcome is known). Stripe is called only to open Checkout and Customer Portal sessions; its
+settled when an outcome is known). Stripe is called only to create and retrieve Checkout Sessions, to
+create Customer Portal sessions, to read subscriptions, and to cancel them when a workspace is deleted; its
 signed webhooks at `/billing/stripe/webhook` are the only writer of subscription state. No metered request
 waits on Stripe. See [Console design](design/console.md) and [Billing design](design/billing.md).
 
@@ -152,16 +153,18 @@ The full schema is in [Data model](design/data-model.md).
 
 ```text
 Platform (deployment) ── platform keys, platform domain, platform webhooks
-  └─ Tenant (ten_)  live | test, policy, quotas, address suffix
+  ├─ Partner (ptn_)  partner keys and partner webhooks; reaches only the tenants its keys created
+  └─ Tenant (ten_)  live | test, policy, quotas, address suffix, partner_id (optional)
        ├─ Domain (dom_)      kind: zone | delegated | external; method, inbound, transport
        │                     (the platform domain is shared)
        └─ Identity (idn_)    one IdentityMailbox DO
             └─ Address (adr_)  role: primary | alias, status: pending | active | retiring | retired
 ```
 
-- An API key resolves to `(level, tenant_id?, identity_id?, permissions)`. Every handler takes scope from
+- An API key resolves to `(level, partner_id?, tenant_id?, identity_id?, permissions)`. Every handler takes scope from
   the resolved key and checks the target resource's tenant against it **before** touching a Durable
-  Object. A Durable Object also checks the tenant ID passed in the internal request against its own
+  Object; for a partner key, the tenant's `partner_id` must be the key's
+  ([Security › Partner keys](design/security.md#partner-keys)). A Durable Object also checks the tenant ID passed in the internal request against its own
   stored owner, so a routing bug cannot cross tenants.
 - Every D1 query on tenant data includes `tenant_id` in its `WHERE` clause. The data-access layer
   makes it a required parameter.
@@ -254,7 +257,7 @@ Tenant scope fans out to each identity's mailbox in parallel and merges the resu
 Every state change appends an event to the owning Durable Object's **outbox**, in the same transaction
 as the change. An alarm drains the outbox to `pm-webhooks`. The consumer:
 
-- resolves matching endpoints (platform and tenant), from D1 with a short cache;
+- resolves matching endpoints (platform, partner and tenant), from D1 with a short cache;
 - signs each delivery per endpoint (Standard Webhooks);
 - POSTs it with SSRF guards;
 - records a delivery row;
@@ -304,12 +307,12 @@ See [Agent signing keys](design/agent-keys.md).
 
 ### 4.7 Notifications
 
-1. **Sources.** The `pm-webhooks` consumer hands `message.received` (and `message.triaged` while a
-   `needs_reply` filter waits) to the tenant's `Notifier` object as `NotifierRequest::Event`, after its
-   delivery work and only when someone in the workspace follows new mail. `TenantQuota` sends
+1. **Sources.** The `pm-webhooks` consumer hands `message.received`, `message.released` and
+   `message.triaged` to the tenant's `Notifier` object as `NotifierRequest::Event`, after its delivery
+   work and only when someone in the workspace follows new mail. `TenantQuota` sends
    `NotifierRequest::UsageThreshold` when a hold first crosses 80% or 100% of an allowance. Console
    handlers send `NotifierRequest::Account` after their D1 batch (two-step verification turned off, a
-   sign-in method linked, ownership transferred).
+   sign-in method linked, ownership transferred), and the billing webhook does for a failed payment.
 2. **Coalescing.** The Notifier keeps pending counts per person and inbox, applies each person's
    preferences from D1 `notification_prefs`, the daily caps and the time zone, and arms its alarm for the
    next window or the daily 09:00 run.

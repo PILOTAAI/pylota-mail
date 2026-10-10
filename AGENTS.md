@@ -10,7 +10,7 @@ repository. Humans should read it too.
 3. `docs/src/project/design/*.md` — the detailed design for each subsystem. These are binding.
 4. `docs/src/reference/api.md` and `docs/src/reference/openapi.yaml` — the public contract.
 5. `docs/src/project/build-plan.md` — the order of work, file by file, with acceptance tests.
-6. `docs/src/project/edge-cases.md` — every row must end up covered by a named test.
+6. `docs/src/project/edge-cases.md` — every row the service owns (`S` or `S+I`) must end up covered by a named test.
 
 If the code and the design disagree, the design wins until a design change is written down in
 `docs/src/project/adr/`. Do not silently change a public contract (API, events, CLI, MCP tool names).
@@ -29,8 +29,10 @@ If the code and the design disagree, the design wins until a design change is wr
 - `crates/core` does no I/O and has no `worker` dependency. It must build for both the host target and
   `wasm32-unknown-unknown`.
 - No tokio in the crates compiled into the Worker (`core`, `api-types`, `platform`, `worker`); use
-  runtime-agnostic crates there. Native-only crates (`cli`, `sdk`, `conformance`, `xtask`) may use it, and
-  `rmcp`, which needs tokio, is a native dev-dependency only. No `std::time::SystemTime::now()` in wasm code
+  runtime-agnostic crates there. In the Worker's wasm graph tokio appears only as a dependency of the
+  `worker` crate itself, with no features enabled (checked by `cargo xtask check-layering` and
+  `cargo deny`). Native-only crates (`cli`, `sdk`, `conformance`, `xtask`) may use it, and `rmcp`, which
+  enables tokio's runtime features, is a native dev-dependency only. No `std::time::SystemTime::now()` in wasm code
   (use the platform clock). No `gethostname`.
 - Pin every dependency to an exact version (`=x.y.z`). Prefer crates with no I/O.
 

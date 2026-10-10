@@ -25,6 +25,13 @@ enable = true
 # mdBook's 10 MB warning; search hits then land on the enclosing ## section.
 heading-split-level = 2
 
+# The design pages are written for implementers, who read them from the repository or browse them from
+# the design index. Leaving them out of the site search keeps the index far below mdBook's 10 MB warning
+# (about 4 MB, against 10.0 MB with them on 2026-10-10). The guides, reference, PRD, ADRs, build plan and
+# edge-case register stay searchable.
+[output.html.search.chapter]
+"project/design" = { enable = false }
+
 # Without this, book.js fetches play.rust-lang.org on pages with Rust code blocks:
 # a third-party request the site CSP blocks and the docs promise not to make.
 [output.html.playground]

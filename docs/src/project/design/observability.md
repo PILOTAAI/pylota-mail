@@ -204,17 +204,26 @@ GROUP BY domain_id
 | `identity_keys_total` | counter | op (`create`, `rotate`, `revoke`) | `fetch` and console: the identity-key handlers; a key created lazily by a first signing request counts as `create` ([Agent signing keys](agent-keys.md#2-keys)) |
 | `signatures_total` | counter | kind (`assertion`, `http_signature`), result (`ok`, or the error code, for example `rate_limited`, `identity_paused`, `policy_denied`, `web_bot_auth_disabled`) | `fetch`: `POST …/assertions` and `POST …/http-signatures` |
 | `well_known_requests_total` | counter | endpoint (`identity_jwks`, `directory`), status_class | `fetch`: `GET /.well-known/jwks/{identity_id}.json` and `GET /.well-known/http-message-signatures-directory` |
-| `notifications_sent_total` | counter | kind (`usage`, `new_mail`, `needs_person`, `account`) | `Notifier`: an email accepted by the outbound pipeline (`202`) ([Notifications](notifications.md#8-notifier-object)) |
+| `notifications_sent_total` | counter | kind (`usage`, `new_mail`, `needs_person`, `account`, `digest`) | `Notifier`: an email accepted by the outbound pipeline (`202`) ([Notifications](notifications.md#8-notifier-object)) |
 | `notifications_failed_total` | counter | kind, reason (the error code of a refused or unfinished submit, for example `unavailable` or `timeout`; or the message's `reason` when an accepted notification ends `failed` or `rejected`, for example `domain_failing_no_fallback`) | `Notifier`, for submits; the system identity's mailbox, for accepted notifications that end `failed` or `rejected`. A bounce or complaint is not counted here: it pauses the person's preferences ([O17](../edge-cases.md)) |
-| `notifications_deferred_total` | counter | reason (`cap_person`, `cap_workspace`, `paused`, `platform_domain`) | `Notifier`: an item held back by a daily cap (into the next digest, [O24](../edge-cases.md)), skipped while the person's preferences are paused, or kept for the hourly retry while the platform domain is `failing` ([O25](../edge-cases.md)) |
+| `notifications_deferred_total` | counter | reason (`cap_person`, `cap_workspace`, `paused`, `platform_domain`, `system_mail_blocked`) | `Notifier`: an item folded into the person's `digest` by a daily cap ([O24](../edge-cases.md)), skipped while the person's preferences are paused, kept for the hourly retry while the platform domain is `failing` ([O25](../edge-cases.md)), or kept for the hourly retry after the system identity's submit was refused with `429 daily_cap_reached`, `409 identity_paused` or `409 domain_not_ready` ([Notifications §7](notifications.md#7-when-system-mail-cannot-be-sent)) |
 | `notification_unsubscribes_total` | counter | kind (empty when the token cannot be read), result (`ok`, `expired`, `invalid`) | `fetch`: `POST /console/notifications/unsubscribe` ([O18](../edge-cases.md)) |
 | `usage_alerts_total` | counter | feature (`inboxes`, `sends`, `triage`, `custom_domains`, `storage_gb`, `seats`), threshold (`80`, `100`) | `TenantQuota`: a `NotifierRequest::UsageThreshold` sent, once per threshold per period, or after the 24-hour cooldown for counts ([Notifications §4](notifications.md#4-usage-alerts)) |
+| `quota_hold_denied_total` | counter | feature | `TenantQuota`: a `Hold`, or the `sends` hold of `Reserve`, denied; the caller answers `402 billing_limit` ([Billing › Hold](billing.md#hold)) |
+| `quota_hold_expired_total` | counter | feature | `TenantQuota` alarm `alarm:holds`: a hold released because it expired unsettled, meaning a request died without settling ([W6](../edge-cases.md)) |
+| `quota_consumed_without_hold_total` | counter | – | `TenantQuota` `Settle`: units consumed with no matching hold, for example a reconciled uncertain send ([W5](../edge-cases.md)) |
+| `quota_count_drift_total` | counter | feature (`inboxes`, `custom_domains`, `seats`) | `TenantQuota` `Reconcile`: a count corrected from D1 by the hourly roll-up ([Billing › Reconciliation against D1](billing.md#reconciliation-against-d1)) |
+| `stripe_webhook_total` | counter | type (the Stripe event type), outcome (`applied`, `ignored_stale`, `ignored_erased`, `cancelled_after_erasure`, `duplicate`, or the `error:` code) | `fetch`: `POST /billing/stripe/webhook`, once per verified event ([Billing › Webhook endpoint](billing.md#webhook-endpoint)) |
+| `stripe_webhook_rejected_total` | counter | – | `fetch`: a Stripe webhook refused with `400 invalid_request` by signature verification ([W14](../edge-cases.md)) |
+| `stripe_api_errors_total` | counter | call (`checkout_create`, `checkout_retrieve`, `portal_create`, `subscriptions_list`, `subscription_cancel`) | worker: a Stripe API call that failed with a network error, a timeout or a non-`2xx` answer ([Billing › Stripe integration](billing.md#stripe-integration)) |
+| `ses_control_throttled_total` | counter | – | SES control-plane callers: SES answered `ThrottlingException` or `TooManyRequestsException` although `SesControl` granted the slot ([Domains on any DNS host §4.8](domain-connections.md#48-ses-api-rate-one-request-per-second)) |
 | `search_requests_total` | counter | mode, scope, result (`ok`, `degraded`, `partial`, code) | `fetch` |
 | `search_ms` | observation | mode, scope, fanout (`1`, `2-10`, `11-100`) | `fetch` |
 | `agentic_requests_total` | counter | status | `fetch` |
 | `agentic_ms`, `agentic_first_evidence_ms` | observation | – | `fetch` |
 | `ai_calls_total` | counter | purpose (`embed`, `rerank`, `triage`, `planner`, `markdown`), result | worker |
 | `index_jobs_total` | counter | kind, result | `pm-index` |
+| `vector_count_drift` | observation | – (the value is `index_count − Σ embedded_rows`) | Nightly reconciliation cron ([Search › Nightly reconciliation](search.md#66-nightly-reconciliation)) |
 | `triage_total` | counter | status | `pm-index` |
 | `job_steps_total` | counter | kind, step, result | JobRunner |
 | `erasure_ms` | observation | scope | JobRunner: `created_at` → completion |
@@ -290,6 +299,7 @@ the window (the Custom Alert "minimum event count").
 | Alert | Class | Condition | Severity | Runbook |
 |---|---|---|---|---|
 | `dlq:{queue}` | B | The oldest open `dlq_items` row of a queue is older than 15 minutes ([J8](../edge-cases.md)) | page | [DLQ growth](#dlq-growth) |
+| `vector_drift` | B | Tonight's and the previous night's reconciliation both put `drift_pct` more than 1 away from zero ([Search › Nightly reconciliation](search.md#66-nightly-reconciliation)) | ticket | Re-run the reconciliation; if the drift persists, start a `reembed` job for each affected tenant (`POST /v1/platform/jobs` with `{ "kind": "reembed", "tenant_id": … }`, and `identity_ids` to limit it to the identities whose `index_reconcile` rows show the gap; `platform:ops`). A `reindex` job rebuilds only the keyword index and does not touch Vectorize |
 | `bounce_rate:{domain_id}` | A | `bounces_total / recipients_submitted_total` > 2% over 1 h for a domain with ≥ 50 recipients | page | [Bounce spike](#bounce-spike) |
 | `complaint_rate:{domain_id}` | A | `complaints_total / recipients_submitted_total` > 0.1% over 24 h for a domain with ≥ 200 recipients | page | [Complaint spike](#complaint-spike) |
 | `inbound_reject_spike` | A | Anomaly detection on `inbound_received_total{result=rejected_unknown}`: spike, 15-minute evaluation window, 24 h baseline, minimum 50 events | ticket | [Domain failing](#domain-failing) (routing checks) |
@@ -303,12 +313,16 @@ the window (the Custom Alert "minimum event count").
 | `webhook_disabled:{webhook_id}` | B + C | Endpoint disabled with `failing` (`webhook.disabled` event) | ticket | [Integrator API down](#integrator-api-down) |
 | `provider_quota` | A | `provider_quota_errors_total` > 0 over 15 minutes: the first quota error ([G3](../edge-cases.md)) | page | [Quota exhausted](#quota-exhausted) |
 | `provider_quota_80` | B | Only when `PM_DAILY_SEND_QUOTA` is set: today's (UTC) `sends` in `usage_daily`, summed over live tenants, reach 80% of it ([G3](../edge-cases.md)) | ticket | [Quota exhausted](#quota-exhausted) |
-| `quota_warning` | C | `quota.warning` at 80% and 100% of a tenant or identity cap | – (tenant-facing) | [Quota exhausted](#quota-exhausted) |
+| `quota_warning` | C | `quota.warning` at 80% and 100% of a tenant or identity daily send cap | – (tenant-facing) | [Quota exhausted](#quota-exhausted) |
 | `domain_failing:{domain_id}` | B + C | Domain enters `failing` or `suspended` (`domain.failing`, `domain.suspended`) | ticket | [Domain failing](#domain-failing) |
 | `inbound_throttled` | A | `inbound_throttled_total` > 100 over 1 h: one or more senders exceed `inbound.per_sender_per_hour` and their excess is stored `throttled` ([D5](../edge-cases.md)) | ticket | [Abusive identity](#abusive-identity) (the affected mailbox's `rate_windows` rows name the sender; add a receive-block if it is abuse) |
 | `stripe_webhook_errors` | B | Only with `PM_BILLING=stripe`: at least one `billing_events` row with `outcome` starting `error:` received in the last hour (the detail lists each `type` and code) | ticket | [Billing design › Stripe webhook](billing.md#stripe-integration) (fix the endpoint's event list, or the customer mismatch) |
 | `mailbox_size:{identity_id}` | B | Mailbox SQLite size > 70% of 10 GB (7,516,192,768 bytes), reported by the mailbox's size check (at most hourly, after a write; [Data model › Mailbox notes](data-model.md#mailbox-notes)) | ticket | [Abusive identity](#abusive-identity) (archive or split) |
 | `abuse_pause:{identity_id}` | B + C | An identity paused with `abuse_threshold` (`identity.paused`) | ticket | [Abusive identity](#abusive-identity) |
+| `signup_ramp_review:{tenant_id}` | B | Only with `PM_BILLING=stripe`: the third failed daily evaluation of a new Free workspace's send ramp (audit `tenant.ramp_held`); nothing is suspended automatically ([Cloud sign-up › New-workspace send ramp](cloud-signup.md#101-new-workspace-send-ramp)) | ticket | [Abusive identity](#abusive-identity) (review the workspace's identities; suspend the tenant if it is abuse) |
+| `system_mail_blocked` | B | The Notifier's submit through the system identity was refused with `429 daily_cap_reached`, `409 identity_paused` or `409 domain_not_ready` (the code is in the detail); the items are kept and retried hourly ([Notifications §7](notifications.md#7-when-system-mail-cannot-be-sent)) | page | [Domain failing](#domain-failing) for `domain_not_ready`; otherwise read the system identity with a platform key and resume it or raise its `send_policy.daily_cap`. Sign-in and invitation mail is blocked by the same refusal |
+| `billing_cancel_failed:{tenant_id}` | B | Tenant erasure's `cancel_billing` step failed for the third time ([Privacy › Tenant scope](privacy.md#66-tenant-scope)) | page | [Erasure failure](#erasure-failure) (cancel the customer's subscriptions in the Stripe Dashboard; the step's next attempt then finds none and the erasure continues) |
+| `billing_cancelled_after_erasure:{tenant_id}` | B | A Stripe webhook for an erasing or erased workspace showed a live subscription, and the handler cancelled it ([Billing › Webhook handling](billing.md#webhook-endpoint)) | ticket | Check in the Stripe Dashboard that the subscription is canceled and that no invoice was paid after the workspace was deleted; refund any that was |
 | `erasure_failed:{erasure_id}` | B + C | Erasure request `failed` (`erasure.failed`) | page | [Erasure failure](#erasure-failure) |
 | `erasure_overdue:{erasure_id}` | B | Erasure still `running` 20 h after creation | page | [Erasure failure](#erasure-failure) |
 | `rpc_owner_mismatch` | B | `rpc_owner_mismatch_total` ≥ 1 | page | [Compromised key](#compromised-key) (treat as a security incident) |
@@ -318,7 +332,7 @@ the window (the Custom Alert "minimum event count").
 | `config_invalid` | A | `config_invalid_total` > 0 | page | `pmail doctor` |
 | `webhook_secret_unavailable` | A | `webhook_attempts_total{result=secret_unavailable}` > 0 over 15 minutes (a sealed secret no longer opens: wrong or rotated `PM_MASTER_KEY`, [Webhooks](webhooks.md#secrets)) | page | [Security › Rotation procedures](security.md#62-rotation-procedures) (`PM_MASTER_KEY`) |
 | `webhook_ssrf_blocked` | A | `webhook_ssrf_blocked_total` > 20 over 1 h | ticket | [Integrator API down](#integrator-api-down) (an endpoint's DNS now points at a blocked range) |
-| `notification_send_failures` | A | `notifications_failed_total` > 0 in each of 3 consecutive hours, or > 20 in one hour | ticket | [Domain failing](#domain-failing) for the platform domain first (system mail has no fallback, [Notifications §7](notifications.md#7-when-the-platform-domain-is-failing)), then [Email Sending outage](#email-sending-outage) |
+| `notification_send_failures` | A | `notifications_failed_total` > 0 in each of 3 consecutive hours, or > 20 in one hour | ticket | [Domain failing](#domain-failing) for the platform domain first (system mail has no fallback, [Notifications §7](notifications.md#7-when-system-mail-cannot-be-sent)), then [Email Sending outage](#email-sending-outage) |
 | SLO burn rules | A | Section 5.2 | page / ticket | The runbook of the failing path |
 
 ### 5.4 The state alert evaluator
@@ -339,10 +353,22 @@ The `* * * * *` cron runs `ops::alerts::evaluate`:
      are counted too, which only makes it fire earlier;
    - when SES is configured: `SELECT COUNT(*) FROM domains WHERE ses_region IS NOT NULL AND state <>
      'removed'`, plus one for the platform identity, against 9,000 (`ses_identities_90pct`);
-   - conditions reported by objects and crons since the last run (`mailbox_size`, `abuse_pause`,
-     `rpc_owner_mismatch`, `inbound_lost`, `ses_object_lost` from the inbound consumer, and
-     `ses_sending_paused` and `ses_rule_missing` from the 15-minute SES platform check, which reads
-     `GetAccount` and the receipt rule set): the reporting code writes an `alert.fired` audit row itself.
+   - conditions reported by objects and crons since the last run. The reporting code writes the
+     `alert.fired` audit row itself:
+
+     | Condition | Reported by, and writer of its `alert.fired` row |
+     |---|---|
+     | `mailbox_size` | The identity's mailbox, from its size check ([Data model › Mailbox notes](data-model.md#mailbox-notes)) |
+     | `abuse_pause` | The delivery-event consumer (`consumers/delivery.rs`), when its auto-pause update changed a row ([Outbound › Abuse auto-pause](outbound.md#abuse-auto-pause-fr-dlv-3)) |
+     | `rpc_owner_mismatch` | The Durable Object whose owner check failed ([Design conventions](index.md#5-internal-durable-object-rpc)) |
+     | `inbound_lost` | The global retention `staging` step (`inbound_lost_total`) and the `pm-inbound` consumer (`inbound_raw_missing_total`) |
+     | `ses_object_lost` | The `pm-inbound` consumer's SES source |
+     | `system_mail_blocked` | The Notifier |
+     | `billing_cancel_failed` | The tenant erasure job, on the third failed `cancel_billing` attempt |
+     | `billing_cancelled_after_erasure` | The Stripe webhook handler, when it cancels a live subscription of an erasing or erased workspace ([Billing › Webhook endpoint](billing.md#webhook-endpoint)) |
+     | `vector_drift` | The `*/15` cron's reconciliation drift evaluation, when this run's and the previous run's `drift_pct` are both more than 1 from zero ([Search › Nightly reconciliation](search.md#66-nightly-reconciliation)) |
+     | `signup_ramp_review` | The daily ramp evaluation (`crons/signup_ramp.rs`) |
+     | `ses_sending_paused`, `ses_rule_missing` | The 15-minute SES platform check, which reads `GetAccount` and the receipt rule set |
 2. Read the current state: for each alert key, the latest `audit_log` row with
    `action IN ('alert.fired', 'alert.resolved') AND target_id = <alert key>`.
 3. Transition, with pure rules in `core::slo`: a true condition on a key that is not firing writes
@@ -640,7 +666,14 @@ Every runbook ends by recording what was done in the incident log and checking t
    alone.
 3. **Remediate.** Rotate integrator secrets that may have been read through the key (webhook secrets
    with `rotate-secret`). Cancel queued sends made by the key (`POST …/cancel`). If the key was a
-   platform key, review every tenant. For `rpc_owner_mismatch`, treat it as a possible isolation bug:
+   platform key, review every tenant; if it was a partner key, review its partner's tenants
+   (`GET /v1/tenants?partner_id=`), and to contain the partner at once, suspend it
+   (`PATCH /v1/partners/{partner_id}` with `status: suspended`, a platform key): every key of the partner
+   and every API key of its tenants then gets `403 partner_suspended`, so nothing sends for those tenants,
+   their inbound mail is still stored, and deliveries to the partner's and its tenants' endpoints are held
+   until it is `active` again ([J13](../edge-cases.md)). Before reactivating, rotate the partner's keys
+   and check its endpoints' URLs, because held deliveries go out on reactivation. For
+   `rpc_owner_mismatch`, treat it as a possible isolation bug:
    capture the logged IDs and open a private security advisory.
 4. **Verify.** Requests with the old key return `401 key_revoked`.
 
@@ -648,8 +681,8 @@ Every runbook ends by recording what was done in the incident log and checking t
 
 1. **Diagnose.** `identity.paused` with `reason: abuse_threshold` carries the complaint and bounce
    metrics. Review recent outbound messages and recipients.
-2. **Mitigate.** Keep the identity paused (inbound continues). Resume only with a tenant or platform key
-   after the cause is fixed (`PATCH … {"status": "active"}`, audit-logged). For a whole tenant,
+2. **Mitigate.** Keep the identity paused (inbound continues). Resume only with a tenant, partner or platform key
+   (only a platform key on a tenant a partner's key created, [J17](../edge-cases.md)) after the cause is fixed (`PATCH … {"status": "active"}`, audit-logged). For a whole tenant,
    suspend it. For `mailbox_size` (above 70% of 10 GB), set `retention.message_days` for the tenant or
    split traffic across identities; raw MIME and attachments are already in R2.
 3. **Verify.** Rates stay below the thresholds for a week after resuming.
@@ -661,7 +694,9 @@ Every runbook ends by recording what was done in the incident log and checking t
 2. **Mitigate.** Fix the cause (for example a Vectorize or R2 outage), then submit the same erasure
    again (`POST /v1/erasure-requests` with the same scope and target). Erasure is idempotent; the new
    receipt shows what was still left. NFR-PRV-1 counts from the first request, so act within the
-   24-hour window.
+   24-hour window. For `billing_cancel_failed`, the job is still running: cancel the customer's
+   subscriptions in the Stripe Dashboard (immediately, without proration or refund) and the step's next
+   attempt finds none left; check `stripe_api_errors_total{call=subscription_cancel}` for the cause.
 3. **Verify.** The new request is `completed` (or `completed_with_holds`) with zero probe hits.
 
 ### Restore from PITR
@@ -739,8 +774,8 @@ set, the nightly copy limits the loss to objects created since the last run (RPO
 | `it::ops::slo_from_metrics` | Each SLO row of section 4 (NFR-REL-1 to NFR-REL-4, NFR-PERF-1 to NFR-PERF-6, NFR-PRV-1) is computed by the SLO evaluator from metric lines that a scripted flow emitted, with the expected good and total counts | section 4 |
 | `it::bench::send_api_p95` | 1,000 sends through the simulator in workerd: `send_api_ms` p95 ≤ 500 ms; reports the figure, CI warns above | NFR-PERF-1 |
 | `it::bench::queue_to_transport_p95` | 1,000 queued sends: `outbound_queue_to_transport_ms` p95 ≤ 60 s | NFR-PERF-2 |
-| `it::bench::hybrid_p95` | Hybrid search on the 50,000-message mailbox with the fake AI at the recorded Workers AI latencies: p95 ≤ 800 ms (the real figure comes from staging in M20) | NFR-PERF-4 |
-| `it::bench::tenant_fanout_p95` | Tenant search over 10 identities: p95 ≤ 1 s | NFR-PERF-5 |
+| `it::bench::hybrid_p95` | Hybrid search on the 50,000-message mailbox (bulk-seeded, nightly: [Testing § 6.9](testing.md#69-benchmarks)) with the fake AI at the recorded Workers AI latencies: p95 ≤ 800 ms (the real figure comes from staging in M20) | NFR-PERF-4 |
+| `it::bench::tenant_fanout_p95` | Tenant search over 10 identities (bulk-seeded, nightly): p95 ≤ 1 s | NFR-PERF-5 |
 | `it::bench::agentic_p95` | Agentic search with the scripted model at recorded latencies: p95 ≤ 8 s, first evidence ≤ 1.5 s | NFR-PERF-6 |
 | `live::slo::inbound_to_webhook` | On staging, Gmail and Outlook mail to a webhook endpoint over the live run: p95 ≤ 30 s, p99 ≤ 120 s | NFR-REL-3 |
 | `live::ops::idle_cost_review` | After a week of idling on staging, the Cloudflare usage report shows no compute beyond the cron and alarm invocations; recorded in the release notes | NFR-COST-1 |

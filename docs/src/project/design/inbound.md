@@ -1294,6 +1294,8 @@ outbound consumer sets this field. For a loopback pointer the consumer:
 | `it::inbound::d5_sender_throttle` | The 61st message in an hour from one sender is `throttled` ([D5](../edge-cases.md)) |
 | `core::classify::d6_*` | RFC 3834, lists, out-of-office, hop counter ([D6](../edge-cases.md), FR-IN-6) |
 | `it::inbound::d7_blocked_hidden` | Suppressed and receive-blocked senders stored `hidden`, no event ([D7](../edge-cases.md)) |
+| `it::inbound::receive_allow_skips_spam` | A sender on the tenant's receive-allow list (address or `@domain`) is not quarantined for its spam score, and is still quarantined when authentication fails (build plan M9, with the lists API) |
+| `it::inbound::nfr_rel1_no_loss_canary` | Under the J1, J2 and J7 fault injections, every message `email()` accepted carries a canary token, and once the queues drain each canary is found exactly once through the read API; `inbound_raw_missing_total` stays 0 (NFR-REL-1, build plan M7) |
 | `core::auth::d9_forged_ar_ignored` | A lower header with the trusted authserv-id, and any other authserv-id, are ignored ([D9](../edge-cases.md)) |
 | `it::inbound::e5_unsolicited_otp` | OTP mail without a `wait` in 30 minutes is quarantined `otp_unsolicited`; with one it is received and its code is released only to `wait` ([E5](../edge-cases.md), [E4](../edge-cases.md)) |
 | `core::refs::f5_*` | Plate normalisation and every pack kind ([F5](../edge-cases.md), FR-SRCH-4) |

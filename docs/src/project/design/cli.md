@@ -3,10 +3,10 @@
 Binding design for `pmail`, the command-line client: configuration, output and exit codes, `setup`,
 `setup ses`, `deploy`, `upgrade`, `doctor`, `destroy`, secret and signing-key rotation, dead-letter
 handling and the client-side behaviour of the mail and admin commands. It implements FR-CLI-1, FR-OPS-1
-to FR-OPS-3, FR-CON-7 and FR-BILL-12, build plan milestone M16, the CLI half of M17 (`dlq`), the
+to FR-OPS-3, FR-CON-7 and FR-BILL-12, build plan milestone M16, the CLI half of M17 (`dlq`, and `secrets rotate-master` in M17 Foundation), the
 `deploy --version` acceptance of M19, the CLI parts of FR-DOM-7 to FR-DOM-12 (M23: `domains add
 --method`, `domains update`, `domains probe`, `addresses test-forwarding`, `setup ses`), of FR-CON-8
-(M24: `waitlist invite`) and of FR-IDN-6 to FR-IDN-8 (M25: `identity-keys`, `assertions`, `http-sign`,
+(M24: `waitlist invite`), of FR-KEY-4 (M5: `partners`, `keys create --level partner`) and of FR-IDN-6 to FR-IDN-8 (M25: `identity-keys`, `assertions`, `http-sign`,
 `keys rotate web_bot_auth`, [Agent signing keys](agent-keys.md#7-api-mcp-and-cli)), and the edge-case
 rows H5, J8, J9 and N30 in the [edge-case register](../edge-cases.md).
 
@@ -47,7 +47,7 @@ crates/cli/src/
     migrate.rs         D1 migration runner (D1 query API, schema_migrations)
   commands/
     setup.rs setup_ses.rs deploy.rs upgrade.rs doctor.rs destroy.rs login.rs config.rs secrets.rs
-    dlq.rs jobs.rs waitlist.rs tenants.rs identities.rs addresses.rs domains.rs mail.rs threads.rs
+    dlq.rs jobs.rs waitlist.rs tenants.rs partners.rs identities.rs addresses.rs domains.rs mail.rs threads.rs
     messages.rs search.rs ask.rs triage.rs wait.rs quarantine.rs webhooks.rs keys.rs suppressions.rs
     lists.rs erasure.rs export.rs members.rs billing.rs usage.rs audit.rs mcp.rs
     identity_keys.rs assertions.rs http_sign.rs
@@ -164,16 +164,18 @@ request:
 | Argument | Accepts | Resolution |
 |---|---|---|
 | `--identity` | `idn_…`, or an address | An ID is used as is. An address is resolved with `GET /v1/identities/lookup?address=…` (case-insensitive; an IDN domain is converted to its A-label first) |
-| `--tenant` | `ten_…`, or a slug | An ID is used as is. A slug is resolved by paging `GET /v1/tenants` (platform keys) and matching `slug` exactly; a tenant key may only name its own tenant |
+| `--tenant` | `ten_…`, or a slug | An ID is used as is. A slug is resolved by paging `GET /v1/tenants` (platform and partner keys; a partner key sees only its own tenants) and matching `slug` exactly; a tenant key may only name its own tenant |
 | `--domain` (domain commands) | `dom_…`, or a domain name | Names are resolved by listing the tenant's domains (and the platform domain) |
 | webhook arguments | `whk_…` | IDs only |
+| `--partner`, partner arguments | `ptn_…` | IDs only |
 
 When a mail command needs an identity and none is given, the profile's `identity` is used; an
 identity key uses its own identity (from `GET /v1/me`); otherwise exit 2 with "Pass --identity".
 
 When a tenant-scoped command needs a tenant and none is given: a tenant or identity key uses its own
 tenant; a platform key uses the profile's `tenant`, else the **default tenant** (the one tenant with
-an empty `address_suffix`, created by `setup`). This is why
+an empty `address_suffix`, created by `setup`); a partner key uses the profile's `tenant`, else exits 2
+with "Pass --tenant", because no tenant is a partner's by default (the default tenant has no partner). This is why
 `pmail identities create --username bookings --display-name "Acme Car Hire"` works with the platform
 key that setup leaves in the profile. `GET /v1/me` is called at most once per invocation and cached for
 that invocation only.
@@ -182,7 +184,7 @@ Three commands never fall back to the default tenant. `jobs start` needs `--tena
 profile's `tenant` ([§18](#18-other-client-side-behaviour)). `usage` and `usage daily` with a platform
 key send `tenant_id` only from `--tenant` or the profile's `tenant`; without either the request carries
 none, and the API answers `400 invalid_request` (exit 7), because a platform key must name the workspace
-whose usage it reads.
+whose usage it reads. A partner key follows the same rule.
 
 ### 2.5 Cloudflare credentials
 
@@ -427,7 +429,7 @@ Each step prints `created`, `exists`, `updated` or `skipped` with the resource a
 | 7 | Email Routing on the mail domain | `GET /zones/{z}/email/routing`; if not enabled, delete foreign MX records when `--replace-mx` was accepted, then `POST /zones/{z}/email/routing/dns` `{"name": "{mail_domain}"}` (adds and locks the MX and SPF records); then `PATCH /zones/{z}/email/routing` `{"support_subaddress": true}` if it is not already `true` | Read first; each call only when the setting differs |
 | 8 | Ownership record | `GET /zones/{z}/dns_records?type=TXT&name.exact=_pylota-mail.{mail_domain}`; if absent, `POST /zones/{z}/dns_records` `{"type":"TXT","name":"_pylota-mail.{mail_domain}","content":"pm-verify={token}","ttl":1}` ([Identities, addresses and domains](identity-domains.md), step 4) | An existing `pm-verify=` value is reused as the token |
 | 9 | Email Sending on the mail domain | `GET /zones/{z}/email/sending/subdomains`; if no entry has `name == mail_domain`, `POST /zones/{z}/email/sending/subdomains` `{"name": "{mail_domain}"}`; then `PATCH /zones/{z}/email/sending/subdomains/{tag}` `{"drop_suppressed_recipients": false, "preview_enabled": false}` when either differs ([Outbound › G4](outbound.md#provider-suppressions-and-resending-g4), [Privacy](privacy.md#3-jurisdiction-and-residency)) | Found by name. Whether an apex is onboarded through this endpoint, and whether both fields are accepted by `PATCH`, are verified by spike S9; the fallback is the dashboard step printed by `doctor` |
-| 10 | Rate-limit namespace IDs | No call when `deploy/wrangler.toml` already holds an ID for each of the six bindings (`RL_API`, `RL_SEARCH`, `RL_AGENTIC`, `RL_SEND`, `RL_SIGNIN`, `RL_SIGN`). Otherwise list the account's scripts (`GET /accounts/{a}/workers/scripts`) and read each script's bindings (`GET /accounts/{a}/workers/scripts/{name}/settings`; verify at build time), collect every `ratelimit` binding's `namespace_id`, and pick the smallest unused integers from 1001 for the bindings that have none | Kept across re-runs through the rendered file ([Rust workspace §8](rust-workspace.md#8-generated-wranglertoml)); a file from an older release that lacks `RL_SIGNIN` or `RL_SIGN` gets one new ID for each missing binding |
+| 10 | Rate-limit namespace IDs | No call when `deploy/wrangler.toml` already holds an ID for each of the seven bindings (`RL_API`, `RL_SEARCH`, `RL_AGENTIC`, `RL_SEND`, `RL_SIGNIN`, `RL_SIGN`, `RL_PARTNER`). Otherwise list the account's scripts (`GET /accounts/{a}/workers/scripts`) and read each script's bindings (`GET /accounts/{a}/workers/scripts/{name}/settings`; verify at build time), collect every `ratelimit` binding's `namespace_id`, and pick the smallest unused integers from 1001 for the bindings that have none | Kept across re-runs through the rendered file ([Rust workspace §8](rust-workspace.md#8-generated-wranglertoml)); a file from an older release that lacks `RL_SIGNIN`, `RL_SIGN` or `RL_PARTNER` gets one new ID for each missing binding |
 | 11 | Render `deploy/wrangler.toml` | none ([§7](#7-rendering-wranglertoml)) | Deterministic; a re-run with the same inputs writes the same bytes |
 | 12 | D1 migrations | `POST /accounts/{a}/d1/database/{id}/query` per migration ([§8.5](#85-d1-migrations)) | `schema_migrations` records each applied version |
 | 13 | First deploy | `npx --yes wrangler@4.139.0 deploy --config <dir>/wrangler.toml` from the bundle directory. Creates the Worker `pylota-mail`, its Durable Object classes, queue consumers, cron triggers and the Custom Domain (two when the console host differs) | Skipped when `/health` already reports this version and the rendered file is unchanged since the last deploy ([§8.9](#89-no-op-redeploys)) |
@@ -439,7 +441,7 @@ Each step prints `created`, `exists`, `updated` or `skipped` with the resource a
 | 19 | Bootstrap key | D1 query API ([§6.5](#65-the-bootstrap-key)) | Skipped when the profile already holds a working platform key |
 | 20 | Platform domain row | D1 query API ([§6.6](#66-the-platform-domain-row)) | Upsert by `name` |
 | 21 | Default tenant | `GET /v1/tenants` (bootstrap key) and look for `address_suffix == ""`; if absent `POST /v1/tenants` with `Idempotency-Key: pmail-setup-default-tenant` and `{"slug":"default","name":"{tenant_name}","address_suffix":"","owner":{"email":"{owner_email}","name":"{owner_name}"}}` (`owner` omitted with `--no-console` and no `--owner-email`) | Found by suffix. The owner receives a sign-in link from the Worker ([Console design](console.md)) |
-| 22 | System identity | D1 query API: insert the `identities` row (`is_system = 1`, the default tenant, `username` and `display_name` from `PM_SYSTEM_FROM`, `owner_name = 'Operator'`, `owner_email` = `--owner-email` or `postmaster@{mail_domain}`, `send_policy_json = '{"daily_cap":50000}'`, `mailbox_do_id = ''`) and its `active` primary address on the platform domain, in one batch. The every-minute cron mints the mailbox and sends `Init` ([Identities, addresses and domains › The system identity](identity-domains.md#the-system-identity)) | Found by `is_system = 1`. A changed `PM_SYSTEM_FROM` adds the new address and promotes it through the API (bootstrap key); the old one retires as usual |
+| 22 | System identity | D1 query API: insert the `identities` row (`is_system = 1`, the default tenant, `username` and `display_name` from `PM_SYSTEM_FROM`, `owner_name = 'Operator'`, `owner_email` = `--owner-email` or `postmaster@{mail_domain}`, `send_policy_json = '{"daily_cap":50000}'`, `mailbox_do_id = ''`) and its `active` primary address on the platform domain, in one batch. The every-minute cron mints the mailbox and sends `Init` ([Identities, addresses and domains › The system identity](identity-domains.md#the-system-identity)) | Found by `is_system = 1`. A changed `PM_SYSTEM_FROM` inserts the new address as an `active` platform-domain alias in a D1 query API batch (setup's internal path: no reserved-name or role-name check, which the public `POST …/addresses` would apply to a name such as `noreply`), then promotes it through the API (bootstrap key); the old one retires as usual |
 | 23 | Mail test and `PM_TRUSTED_AUTHSERV_ID` | Run the `--mail-test` check of `doctor` ([§10](#10-doctor)) with the bootstrap key. Write the observed `Authentication-Results` authserv-id to `PM_TRUSTED_AUTHSERV_ID` in `deploy/wrangler.toml` and deploy once more (a variable change only) | Skipped when the rendered file already holds the observed value. A failed mail test is a warning: setup finishes, `PM_TRUSTED_AUTHSERV_ID` stays empty, and SPF-only alignment is treated as `unverified` until a re-run sets it ([Inbound › Authentication verdict](inbound.md#authentication-verdict)) |
 | 24 | Summary | `doctor` checks `dns.platform`, `routing.catch_all`, `sending.domains`, `sending.event_subscriptions`, `secrets`, `health` | Pure read |
 
@@ -704,9 +706,11 @@ repository's template with `--from-source`). The output is the file in
    observability come from the template. They include the `Q_DELIVERY` producer (used only by
    `POST /v1/platform/dlq/{dlq_id}/redrive` to republish dead-lettered delivery events), the six Durable
    Object bindings including `NOTIFY` (class `Notifier`, [Notifications §8](notifications.md#8-notifier-object)),
-   the six rate-limit bindings including `RL_SIGNIN` (10 requests per 60 s per client IP,
-   [Cloud sign-up §10](cloud-signup.md#10-abuse-and-safety-on-cloud)) and `RL_SIGN` (600 signing calls
-   per 60 s per identity, [Agent signing keys §6](agent-keys.md#6-permissions-limits-and-plans)), a
+   the seven rate-limit bindings including `RL_SIGNIN` (10 requests per 60 s per client IP,
+   [Cloud sign-up §10](cloud-signup.md#10-abuse-and-safety-on-cloud)), `RL_SIGN` (600 signing calls
+   per 60 s per identity, [Agent signing keys §6](agent-keys.md#6-permissions-limits-and-plans)) and
+   `RL_PARTNER` (10 tenant creations and invitations per 60 s per partner,
+   [Security § 10](security.md#10-rate-limiting-and-abuse)), a
    second Custom Domain route when
    `PM_CONSOLE_HOST` differs from `PM_API_HOST`, and, when `PM_BACKUP_BUCKET` is set, the `BACKUP` R2
    binding in the deployment's jurisdiction. Edits to them are not preserved; the renderer prints a
@@ -1075,7 +1079,9 @@ The procedure is [Security §6.2](security.md#62-rotation-procedures). The CLI's
 2. Generate `K2` (32 bytes, OS CSPRNG) and compute `kid(K2)` = first 8 bytes of `SHA-256(K2)`, lower-case
    hex ([Security §7.2](security.md#72-encryption-envelope)). Upload it with
    `wrangler secret put PM_MASTER_KEY_NEXT` (value on stdin).
-3. Poll every 60 s through the D1 query API until the count is 0:
+3. Poll every 60 s through the D1 query API until the count is 0. The query is built from the
+   sealed-column registry (`core::sealed`, [Security §7.2](security.md#72-encryption-envelope)), one term per
+   column; for v1.0 it reads:
 
    ```sql
    SELECT
@@ -1095,8 +1101,8 @@ The procedure is [Security §6.2](security.md#62-rotation-procedures). The CLI's
    + (SELECT COUNT(*) FROM oauth_states WHERE pkce_sealed NOT LIKE 'pm1.' || ?1 || '.%') AS remaining;
    ```
 
-   The columns are every value sealed under `PM_MASTER_KEY` ([Security §7.2](security.md#72-encryption-envelope)),
-   the same set the Worker's re-seal sweep covers.
+   The columns are every value sealed under `PM_MASTER_KEY`, the same registry the Worker's re-seal sweep
+   reads.
 
    printing the count each time. With `--resume`, `K2` is not known; the CLI reads the target `kid`
    from the most common `kid` among rows already re-sealed and asks for confirmation.
@@ -1237,7 +1243,7 @@ Output: `valid` (exit 0), or `invalid: <reason>` (exit 11) where reason is `no_m
    "stream": true}` and `Accept: text/event-stream` (needs `search:read` and `search:agentic`).
    Agentic search is scoped to an identity or a tenant, as the API defines it
    ([REST API › Search](../../reference/api.md#search)): `--tenant` sends the same body to
-   `POST /v1/tenants/{t}/search`, which needs a tenant or platform key with the same two permissions and
+   `POST /v1/tenants/{t}/search`, which needs a tenant, partner or platform key with the same two permissions and
    covers up to 100 identities (`422 scope_too_large`, exit 7, above that); an identity key gets
    `403 scope_denied` (exit 4). `search --mode agentic --tenant` is the same call without a stream.
 2. `sse.rs` reads events as defined in [Search §11.11](search.md#1111-streaming): lines `id:`,
@@ -1289,6 +1295,11 @@ answered · confidence 0.86 · 3 steps · 2.8 s
   `large_attachments: "link"`). Recipients take `Name <addr>` or `addr`.
 - **`keys create` and `webhooks create`** print the secret once. In human mode it is on its own line
   after the object, with "shown only once"; `--quiet` prints only the secret.
+- **`webhooks create --platform` and `--partner`** both call `POST /v1/webhooks`, whose endpoint scope
+  follows the key. The CLI first reads the key's level from `GET /v1/me`: `--platform` needs a platform
+  key and `--partner` a partner key; the other way round is exit 2 before any request. Without either
+  flag, the endpoint is a tenant endpoint of `--tenant` or of the tenant chosen as in
+  [§2.4](#24-resolving-names-to-ids).
 - **`messages raw` and `messages attachment`** write bytes to `--out <file>` (created with mode `0600`)
   or to stdout only when stdout is not a terminal; to a terminal they refuse, so binary or hostile
   bytes never reach it.
@@ -1317,14 +1328,28 @@ answered · confidence 0.86 · 3 steps · 2.8 s
 - **`waitlist invite --count N [--plan P]`** checks `N` is 1–500 before sending (exit 2 otherwise) and
   prints `Invited 50; 262 still waiting.` from `{ "invited", "waiting" }`
   ([Cloud sign-up §6.1](cloud-signup.md#61-before-launch-the-waitlist)).
+- **`partners create|list|get|update|delete`** call the five `/v1/partners` routes (platform key,
+  `partners:manage`; [REST API › Partners](../../reference/api.md#partners)). `create` sends `name` and,
+  when given, `default_billing_mode` (`--default-billing-mode`), `max_tenants` (`--max-tenants <n>`) and
+  `ramp_exempt` (`--ramp-exempt true|false`); `update` sends only the flags given (`--name`,
+  `--status active|suspended`, `--default-billing-mode`, `--max-tenants`, `--ramp-exempt`) and prints a
+  warning that suspending refuses every key of the partner and of its tenants at once and holds their
+  webhook deliveries, while their inbound mail is still stored. `delete` asks for confirmation unless
+  `--yes`; `409 partner_has_tenants` is exit 6 and prints `details.tenants` with the fix (erase those
+  tenants first). A partner key gets `403 permission_denied` on all five (exit 4).
+- **`keys create --level partner --partner <ptn_…>`** sends `level: "partner"` and `partner_id`, and no
+  tenant or identity: `--tenant` or `--identity` with `--level partner`, or `--partner` with another
+  level, is exit 2 before any request. Only a platform key may create one (a partner key gets
+  `403 key_scope_exceeded`, exit 4), and `platform:ops`, `partners:manage` or `identities:sign` in
+  `--permissions` comes back as `400 invalid_request` (`permission_not_allowed_for_level`, exit 7).
 - **`keys create`** needs `--permissions` at every level (least privilege is the default, not an
   option). A platform key has no implicit full set: `--level platform` without `--permissions` is exit 2
   before any request, with a message listing the permissions a platform key may hold (the API would
   answer `400 invalid_request`). The API also refuses, with `400 invalid_request` and
   `details.reason = "permission_not_allowed_for_level"` (exit 7), a permission the level cannot hold:
-  `identities:sign` on a platform key; `tenants:manage` and `platform:ops` below platform level; and
-  the tenant-only `members:read`, `members:manage`, `suppressions:manage`, `audit:read` and `usage:read`
-  on an identity key. `--save-profile <name>` writes the new key into that profile.
+  `identities:sign` on a platform or partner key; `platform:ops` and `partners:manage` below platform
+  level; `tenants:manage` on a tenant or identity key; and the tenant-only `members:read`,
+  `members:manage`, `suppressions:manage`, `audit:read` and `usage:read` on an identity key. `--save-profile <name>` writes the new key into that profile.
 - **Notification preferences** have no command: they belong to people, not keys, and are set only in the
   console ([Notifications §2](notifications.md#2-preferences)).
 
@@ -1344,7 +1369,8 @@ is not set up for the method" to exit 3 (`config`) instead of the API's exit 7:
   CLI prints `details.reason` with its fix (`ses_not_configured` and `ses_receiving_not_configured`:
   `pmail setup ses`; `subdomain_setup_disabled`: `PM_CF_SUBDOMAIN_SETUP = "on"`;
   `zone_creation_not_allowed`: the tenant policy `domains.allow_create_zone`; `ses_identity_limit`:
-  raise the SES limit; `method_not_supported`: another method).
+  raise the SES limit; `method_not_supported`: another method). `marketing_needs_ses` is never returned
+  by a domain create (it is a send refusal), so `domains add` does not map it.
 - `422 cf_token_required`: the deployment has no `PM_CF_API_TOKEN`. The fix is "set `PM_CF_API_TOKEN` on
   the deployment (`wrangler secret put PM_CF_API_TOKEN`), or, for a zone apex, run again with
   `--local-token`".
@@ -1500,7 +1526,7 @@ permission and is refused with `403`, exit 4):
 - Output: the response as indented JSON (`assertion`, `kid`, `expires_at`, `jwks_uri`); `--quiet` prints
   only the token, for `$(…)` in a script. The token is a short-lived credential for its audience: the
   CLI never writes it to a file or a log.
-- A paused identity, or one of a suspended tenant, is `409 identity_paused` (exit 6).
+- Suspended tenant → `403 tenant_suspended` (exit 4); paused identity → `409 identity_paused` (exit 6).
 
 **`assertions verify`** (no API key and no Cloudflare credentials):
 
@@ -1542,7 +1568,8 @@ verdict. JSON: `{ "valid": true, "kid", "claims": { … } }` or `{ "valid": fals
   `From`, `Signature-Input`, `Signature`, ready for `curl -H @file`; `--json` prints the response
   unchanged (`headers`, `expires_at`). The signature expires after `--expires-in` seconds, so it is made
   right before the request it signs.
-- Errors keep their API meaning: `422 web_bot_auth_disabled` (exit 7) while `PM_WEB_BOT_AUTH` is `off`;
+- Errors keep their API meaning: `403 tenant_suspended` (exit 4), checked first, for an identity of a
+  suspended tenant; `422 web_bot_auth_disabled` (exit 7) while `PM_WEB_BOT_AUTH` is `off`;
   `403 policy_denied` (exit 4) while the tenant policy `web_bot_auth.allowed` is `false`;
   `400 invalid_request` (exit 7) for a URL that is not `https`, an expiry outside 30–300 s or a non-ASCII
   component value; `409 identity_paused` (exit 6).
@@ -1559,7 +1586,8 @@ have no command: they are set only in the console ([Notifications §2](notificat
 
 | Command | Endpoint(s) |
 |---|---|
-| `tenants create\|list\|get\|update` | `POST /v1/tenants`; `GET /v1/tenants`; `GET /v1/tenants/{id}`; `PATCH /v1/tenants/{id}` |
+| `tenants create\|list\|get\|update` | `POST /v1/tenants`; `GET /v1/tenants` (`--partner` sends `partner_id`); `GET /v1/tenants/{id}`; `PATCH /v1/tenants/{id}` (platform or partner key, `tenants:manage`) |
+| `partners create\|list\|get\|update\|delete` | `POST /v1/partners`; `GET /v1/partners`; `GET /v1/partners/{id}`; `PATCH /v1/partners/{id}`; `DELETE /v1/partners/{id}` (platform key, `partners:manage`) |
 | `tenants suspend\|resume` | `PATCH /v1/tenants/{id}` `{"status":"suspended"\|"active"}` |
 | `identities create\|list\|get\|update` | `POST /v1/tenants/{t}/identities`; `GET /v1/tenants/{t}/identities` or `GET /v1/identities`; `GET /v1/identities/{id}`; `PATCH /v1/identities/{id}` |
 | `identities pause\|resume` | `PATCH /v1/identities/{id}` `{"status":"paused"\|"active"}` |
@@ -1581,9 +1609,9 @@ have no command: they are set only in the console ([Notifications §2](notificat
 | `triage list\|rerun` | `GET /v1/identities/{id}/threads?category=&needs_reply_gte=` (threads with their roll-up); `POST …/messages/{m}/triage` |
 | `wait` | `GET /v1/identities/{id}/wait` |
 | `quarantine list\|release` | `GET /v1/identities/{id}/quarantine`; `POST …/messages/{m}/release` |
-| `webhooks create\|list\|get\|update\|delete\|rotate\|test\|deliveries\|replay` | `POST /v1/webhooks` or `POST /v1/tenants/{t}/webhooks`; `GET` (both); `GET\|PATCH\|DELETE /v1/webhooks/{w}`; `POST …/rotate-secret`; `POST …/test`; `GET …/deliveries`; `POST …/replay` |
+| `webhooks create\|list\|get\|update\|delete\|rotate\|test\|deliveries\|replay` | `POST /v1/webhooks` (`--platform` with a platform key, `--partner` with a partner key) or `POST /v1/tenants/{t}/webhooks`; `GET` (both); `GET\|PATCH\|DELETE /v1/webhooks/{w}`; `POST …/rotate-secret`; `POST …/test`; `GET …/deliveries`; `POST …/replay` |
 | `webhooks verify` | none (offline, [§16](#16-webhooks-verify)) |
-| `keys create\|list\|get\|revoke` | `POST /v1/keys`; `GET /v1/keys`; `GET /v1/keys/{k}`; `DELETE /v1/keys/{k}` |
+| `keys create\|list\|get\|revoke` | `POST /v1/keys` (`--level partner --partner <ptn_…>`: platform key only); `GET /v1/keys`; `GET /v1/keys/{k}`; `DELETE /v1/keys/{k}` |
 | `keys rotate key_…` | `POST /v1/keys/{k}/rotate` (`keys:manage`) |
 | `keys rotate thread\|link\|cursor\|web_bot_auth` | `POST /v1/platform/keys/{purpose}/rotate`, `?revoke_previous=true` with `--revoke-previous` (platform key, `platform:ops`; [§12.2](#122-signing-keys-keys-rotate-threadlinkcursorweb_bot_auth)) |
 | `identity-keys list` | `GET /v1/identities/{id}/keys` (`identities:read`; [§18.5](#185-identity-keys-assertions-and-http-sign)) |
@@ -1597,12 +1625,12 @@ have no command: they are set only in the console ([Notifications §2](notificat
 | `lists list\|add\|remove` | `GET /v1/tenants/{t}/lists/{direction}/{kind}`; `PUT …/{entry}`; `DELETE …/{entry}` |
 | `erasure create\|get\|list` | `POST /v1/erasure-requests`; `GET /v1/erasure-requests/{id}`; `GET /v1/erasure-requests` |
 | `export create\|get` | `POST /v1/exports`; `GET /v1/exports/{id}` |
-| `members list\|invite\|remove` | `GET /v1/tenants/{t}/members` (`members:read`); `POST /v1/tenants/{t}/invitations`; `DELETE /v1/tenants/{t}/members/{user_id}` (`members:manage`, tenant or platform key) |
+| `members list\|invite\|remove` | `GET /v1/tenants/{t}/members` (`members:read`); `POST /v1/tenants/{t}/invitations`; `DELETE /v1/tenants/{t}/members/{user_id}` (`members:manage`, tenant, partner or platform key) |
 | `invitations revoke` | `DELETE /v1/tenants/{t}/invitations/{invitation_id}` (`members:manage`) |
 | `plans list` | `GET /v1/plans` (no key) |
-| `billing get\|set` | `GET\|PATCH /v1/tenants/{t}/billing` (platform key, `tenants:manage`) |
-| `usage` | `GET /v1/usage` (tenant and identity keys: their own workspace, no permission needed; platform keys: `usage:read` and `tenant_id` from `--tenant` or the profile, else `400 invalid_request`) |
-| `usage daily` | `GET /v1/usage/daily` (`usage:read`, platform or tenant key; a platform key passes `tenant_id` as for `usage`) |
+| `billing get\|set` | `GET\|PATCH /v1/tenants/{t}/billing` (`tenants:manage`; `get` also with a partner key on its own tenants, `set` platform key only) |
+| `usage` | `GET /v1/usage` (tenant and identity keys: their own workspace, no permission needed; platform and partner keys: `usage:read` and `tenant_id` from `--tenant` or the profile, else `400 invalid_request`) |
+| `usage daily` | `GET /v1/usage/daily` (`usage:read`, platform, partner or tenant key; a platform or partner key passes `tenant_id` as for `usage`) |
 | `audit` | `GET /v1/audit-events` |
 | `dlq list\|redrive` | `GET /v1/platform/dlq`; `POST /v1/platform/dlq/{dlq_id}/redrive` (platform key, `platform:ops`; [§13](#13-dlq)) |
 | `jobs start\|get` | `POST /v1/platform/jobs`; `GET /v1/platform/jobs/{job_id}` (platform key, `platform:ops`) |
@@ -1634,7 +1662,7 @@ have no command: they are set only in the console ([Notifications §2](notificat
 | `cli::setup::owner_email` | The default tenant is created with the owner; `--no-console` writes `PM_CONSOLE = "off"` | FR-CON-7 |
 | `cli::setup::billing_off` | Setup writes no `PM_BILLING`; the default tenant reports `billing: disabled` | FR-BILL-12 |
 | `cli::setup::secrets_never_written` | Generated secrets reach Wrangler only on stdin and appear in no file, argument or log unless `--print-secrets` | FR-OPS-1, [I5] |
-| `cli::setup::renders_optional_settings` | The rendered file has the `Q_DELIVERY` producer, the `NOTIFY` Durable Object binding (class `Notifier`), six rate-limit bindings including `RL_SIGNIN` and `RL_SIGN` (an older file gets an ID for each missing one), `PM_WEB_BOT_AUTH = "off"`, `PM_IDENTITY_KEY_OVERLAP_DAYS` and `PM_NOTIFICATIONS`, `PM_CONSOLE_HOST` (the API host, or `--console-host` with a second Custom Domain) and `PM_SIGNUP = "closed"`; `--daily-send-quota` writes `PM_DAILY_SEND_QUOTA`; `--backup-bucket` creates the bucket in the jurisdiction and binds it as `BACKUP` | FR-OPS-1, FR-CON-8 |
+| `cli::setup::renders_optional_settings` | The rendered file has the `Q_DELIVERY` producer, the `NOTIFY` Durable Object binding (class `Notifier`), seven rate-limit bindings including `RL_SIGNIN`, `RL_SIGN` and `RL_PARTNER` (an older file gets an ID for each missing one), `PM_WEB_BOT_AUTH = "off"`, `PM_IDENTITY_KEY_OVERLAP_DAYS` and `PM_NOTIFICATIONS`, `PM_CONSOLE_HOST` (the API host, or `--console-host` with a second Custom Domain) and `PM_SIGNUP = "closed"`; `--daily-send-quota` writes `PM_DAILY_SEND_QUOTA`; `--backup-bucket` creates the bucket in the jurisdiction and binds it as `BACKUP` | FR-OPS-1, FR-CON-8 |
 | `cli::setup::ses_idempotent_rerun` | Against a recorded AWS fake, every resource of §6.9 is created once and a second run reports `exists` for all and deploys nothing; an existing active rule set is never deactivated; both SNS topics end with `SignatureVersion = 2`; the HTTPS subscriptions come after the deploy | FR-DOM-8, FR-DOM-9 |
 | `cli::setup::ses_region_check` | A region that cannot receive is exit 2; a region outside the EU and the UK under `PM_JURISDICTION = "eu"` is exit 2 without `--allow-non-eu` and accepted with it, and `eu-west-2` (London) is accepted without it; no production access is exit 14 with the console steps and nothing created; Essentials prints a warning | FR-DOM-8, [N30] |
 | `cli::setup::ses_policy_and_key` | The IAM policy JSON is printed before it is applied and needs a confirmation or `--yes`; the access key reaches Wrangler only on stdin, appears in no file, argument, output or log, and is not created again when `PM_SES_ACCESS_KEY_ID` exists | FR-DOM-8, [I5] |
@@ -1666,6 +1694,7 @@ have no command: they are set only in the console ([Notifications §2](notificat
 | `cli::billing::plans_and_billing` | `plans list` sends no key; `billing set` sends only the flags given; `409 plan_managed_by_stripe` is exit 6 | FR-BILL-1 |
 | `cli::usage::daily` | `usage` reads `GET /v1/usage`; `usage daily` passes `from`, `to` and `tenant_id` to `GET /v1/usage/daily` and prints the `assertions` and `http_signatures` columns; a platform key without `--tenant` or a profile tenant sends no `tenant_id` (never the default tenant) and `400 invalid_request` is exit 7 | FR-BILL-11 |
 | `cli::keys::create_permissions_by_level` | `--level platform` without `--permissions` is exit 2 before any request, listing the allowed permissions; `identities:sign` on a platform key and a tenant-only permission on an identity key come back as `400 invalid_request` (`permission_not_allowed_for_level`), exit 7 | FR-KEY-2, FR-IDN-6 |
+| `cli::partners::lifecycle` | `partners create\|list\|get\|update\|delete` call their routes with only the flags given (`--max-tenants` and `--ramp-exempt` included); `delete` needs confirmation or `--yes`, and `409 partner_has_tenants` is exit 6 with the count; `keys create --level partner --partner ptn_…` sends `level` and `partner_id` only, `--tenant` with it (or `--partner` with another level) is exit 2 before any request, and `403 key_scope_exceeded` for a partner key is exit 4; a partner key without `--tenant` or a profile tenant is exit 2 on a tenant-scoped command, never the default tenant; `webhooks create --partner` with a platform key is exit 2 | FR-KEY-4 |
 | `cli::identity_keys::lifecycle` | `list`, `create` (`201` and `200` both exit 0), `rotate` (with and without a previous key) and `revoke` (confirmation or `--yes`; unknown kid exit 5; already retired exit 0) call their endpoints and never print key material | FR-IDN-6, [O2], [O3] |
 | `cli::assertions::create_and_verify` | `create` sends no `Idempotency-Key` and `--quiet` prints only the token; `verify` accepts a fresh token against the workerd harness with no API key, and exits 11 for a wrong audience, another issuer, an expired token, an unknown kid, `alg: none` and a paused identity (JWKS `404`); a JWKS network failure is exit 9; the JWKS URL is built from `--issuer`, never from the token | FR-IDN-7, [O1], [O4], [O5] |
 | `cli::http_sign::headers_and_errors` | Prints the four headers as `Name: value` lines in order, or the response with `--json`; `--component` adds only `@method`, `@path` or `@query`; `422 web_bot_auth_disabled` is exit 7 and `403 policy_denied` exit 4 | FR-IDN-8, [O9], [O13] |

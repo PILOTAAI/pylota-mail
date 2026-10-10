@@ -28,8 +28,8 @@ service, **Pylota Mail Cloud**, on the plans below.
    erasure returns a receipt with per-store counts and empty probe queries.
 7. **Real team seats.** Workspaces have members with roles, enforced seat counts and an audit log, on Cloud and
    when self-hosted.
-8. **Tested against the edge cases.** A public register of edge cases, each mapped to a named test, plus a MIME
-   conformance corpus and search-quality gates in CI.
+8. **Tested against the edge cases.** A public register of edge cases, each one the service owns mapped to a named
+   test, plus a MIME conformance corpus and search-quality gates in CI.
 
 ## What it does
 
@@ -62,7 +62,8 @@ You do not need a Rust toolchain unless you build from source.
 cargo install pylota-mail-cli --locked     # or download a prebuilt pmail from GitHub Releases
 export CLOUDFLARE_API_TOKEN=...            # permissions listed in docs/src/self-hosting.md
 pmail setup --account-id <account-id> --domain mail.example.com --mail-domain agents.example --jurisdiction eu
-pmail keys create --level platform --name first-key
+pmail keys create --level platform --name first-key \
+  --permissions tenants:manage,keys:manage,webhooks:manage   # full list: docs/src/self-hosting.md
 ```
 
 `--domain` is the API host. `--mail-domain` is the shared mail domain, and it must be a zone apex,
