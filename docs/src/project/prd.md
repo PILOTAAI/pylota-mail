@@ -297,6 +297,15 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
   `409 domain_not_dedicated` unless the request carries `"confirm_dedicated": true`. A tenant key **may**
   use it only when its policy has `domains.allow_create_zone: true`. `delegated_subdomain` **must** stay
   off unless `PM_CF_SUBDOMAIN_SETUP=on`, the Cloudflare account is Enterprise, and spike S10 has passed.
+- **FR-DOM-13** Onboarding **must never** take over, change or delete a provider object (a Cloudflare zone,
+  sending domain, routing setup or catch-all, or an SES identity) that the deployment did not create for
+  that tenant's domain: a tenant's add that finds one is refused with `409 domain_exists`. The deployment
+  **must** record the provider IDs it creates for each domain, and removal and cleanup **must** act on
+  those IDs only. Removing one mail domain **must not** stop mail to the other mail domains of its zone.
+- **FR-DOM-14** A domain that has never been verified **must** be removed 14 days after it was added, and
+  **must** be evictable by another tenant that proves control of its DNS with a claim record; a tenant
+  **may** hold at most 5 such domains. The answer to a name held by someone else **must** be the same
+  whoever holds it and in whatever state, so it reveals nothing about other tenants.
 
 ### 6.4 Inbound
 

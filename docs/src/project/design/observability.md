@@ -170,7 +170,7 @@ GROUP BY domain_id
 | `inbound_lost_total` | counter | – | Global retention `staging` step: a staging object still unrouted after its re-queue |
 | `inbound_raw_missing_total` | counter | – | `pm-inbound`: a pointer whose raw object is missing and whose message is not in the mailbox ([Inbound](inbound.md)) |
 | `inbound_orphan_raw_total`, `inbound_staged_unroutable_total` | counter | – | `email()` and `pm-inbound` ([Inbound](inbound.md)) |
-| `inbound_dropped_total` | counter | reason (`unknown_recipient`, `tenant_suspended`, `identity_gone`), source (`routing`, `ses`) | `email()`, `pm-inbound` ([Inbound](inbound.md)); on SES domains unknown recipients are dropped without a bounce ([Domains on any DNS host §4.6](domain-connections.md#46-retired-and-unknown-recipients)) |
+| `inbound_dropped_total` | counter | reason (`unknown_recipient`, `tenant_suspended`, `identity_gone`, `not_ses_domain`), source (`routing`, `ses`) | `email()`, `pm-inbound` ([Inbound](inbound.md)); on SES domains unknown recipients are dropped without a bounce ([Domains on any DNS host §4.6](domain-connections.md#46-retired-and-unknown-recipients)) |
 | `ses_sns_rejected_total` | counter | endpoint (`delivery` for `/hooks/ses`, `inbound` for `/hooks/ses/inbound`), reason (`version`, `signature`, `cert_host`, `topic`, `timestamp`) | Both SNS endpoints and the SQS backstop: a message refused with `403 invalid_signature` ([N1](../edge-cases.md)) |
 | `ses_auth_disagreement_total` | counter | check (`dkim`, `dmarc`) | `pm-inbound`: SES's verdict differs from our own check on the same message |
 | `ses_object_lost_total` | counter | – | `pm-inbound`: an S3 object was missing while its `ses_ingest` row was still `queued` ([N4](../edge-cases.md)) |
@@ -308,13 +308,17 @@ the window (the Custom Alert "minimum event count").
 | `ses_object_lost` | B | `ses_object_lost_total` > 0: an S3 object was deleted before every recipient was ingested ([N4](../edge-cases.md)) | page | [SES account and receiving](#ses-account-and-receiving) |
 | `ses_sending_paused` | B | The 15-minute SES platform check finds account sending paused. Every SES domain uses the fallback address meanwhile ([N10](../edge-cases.md)) | page | [SES account and receiving](#ses-account-and-receiving) |
 | `ses_rule_missing` | B | The 15-minute SES platform check finds the receipt rule set `PM_SES_RULE_SET` inactive or without the rule `pm-deliver` (only when SES receiving is configured) | page | [SES account and receiving](#ses-account-and-receiving) |
-| `ses_identities_90pct` | B | SES identities in the region reach 9,000, 90% of the 10,000 per Region ([quotas](https://docs.aws.amazon.com/ses/latest/dg/quotas.html), read 2026-10-09). Counted as `domains` rows with `ses_region` set and not `removed`, plus the platform identity. There is no `quota.warning` event for this | ticket | [SES account and receiving](#ses-account-and-receiving) |
+| `ses_identities_90pct` | B | SES identities in the region reach 9,000, 90% of the 10,000 per Region ([quotas](https://docs.aws.amazon.com/ses/latest/dg/quotas.html), read 2026-10-10). Counted as in [Domains on any DNS host § 4.3](domain-connections.md#43-dns_records): `domains` rows with `ses_region` set and not `removed`, plus onboarding journal rows that hold an SES identity, plus the platform identity, or the region's total from the daily `ListEmailIdentities` when that is larger. There is no `quota.warning` event for this | ticket | [SES account and receiving](#ses-account-and-receiving) |
+| `ses_rule_sync_failed` | B | `SesControl` could not make the `pm-retired-{n}` rules match a change set after three verified attempts; it keeps the change set and retries every 15 minutes ([N32](../edge-cases.md)) | ticket | [SES account and receiving](#ses-account-and-receiving) |
 | `webhook_failing:{webhook_id}` | B | `consecutive_failures` ≥ 10 on an enabled endpoint | ticket | [Integrator API down](#integrator-api-down) |
 | `webhook_disabled:{webhook_id}` | B + C | Endpoint disabled with `failing` (`webhook.disabled` event) | ticket | [Integrator API down](#integrator-api-down) |
 | `provider_quota` | A | `provider_quota_errors_total` > 0 over 15 minutes: the first quota error ([G3](../edge-cases.md)) | page | [Quota exhausted](#quota-exhausted) |
 | `provider_quota_80` | B | Only when `PM_DAILY_SEND_QUOTA` is set: today's (UTC) `sends` in `usage_daily`, summed over live tenants, reach 80% of it ([G3](../edge-cases.md)) | ticket | [Quota exhausted](#quota-exhausted) |
 | `quota_warning` | C | `quota.warning` at 80% and 100% of a tenant or identity daily send cap | – (tenant-facing) | [Quota exhausted](#quota-exhausted) |
 | `domain_failing:{domain_id}` | B + C | Domain enters `failing` or `suspended` (`domain.failing`, `domain.suspended`) | ticket | [Domain failing](#domain-failing) |
+| `platform_domain_failing` | B | The platform domain enters `failing`, or shows `dns_unresolvable` or `dnssec_bogus`: all system mail and every fallback send depend on it ([H9](../edge-cases.md)) | page | [Domain failing](#domain-failing) (the platform domain is never suspended; `POST /v1/domains/{id}/reprove` re-reads its zone) |
+| `domain_remove_failed:{domain_id}` | B | A `domain_remove` job is `failed` after 10 attempts on one step; the domain stays `removing` and the job restarts once a day ([H12](../edge-cases.md)) | ticket | [Domain failing](#domain-failing) (read the job's `last_error`; `DELETE /v1/domains/{id}` restarts it at once) |
+| `delivery_events_manual:{domain_id}` | B | A Cloudflare-transport domain with `sending` has no event subscription (`delivery_events: "manual"`); its sends use the platform address meanwhile ([H17](../edge-cases.md)) | ticket | Run `pmail domains subscribe <domain>` |
 | `inbound_throttled` | A | `inbound_throttled_total` > 100 over 1 h: one or more senders exceed `inbound.per_sender_per_hour` and their excess is stored `throttled` ([D5](../edge-cases.md)) | ticket | [Abusive identity](#abusive-identity) (the affected mailbox's `rate_windows` rows name the sender; add a receive-block if it is abuse) |
 | `stripe_webhook_errors` | B | Only with `PM_BILLING=stripe`: at least one `billing_events` row with `outcome` starting `error:` received in the last hour (the detail lists each `type` and code) | ticket | [Billing design › Stripe webhook](billing.md#stripe-integration) (fix the endpoint's event list, or the customer mismatch) |
 | `mailbox_size:{identity_id}` | B | Mailbox SQLite size > 70% of 10 GB (7,516,192,768 bytes), reported by the mailbox's size check (at most hourly, after a write; [Data model › Mailbox notes](data-model.md#mailbox-notes)) | ticket | [Abusive identity](#abusive-identity) (archive or split) |
@@ -344,7 +348,10 @@ The `* * * * *` cron runs `ops::alerts::evaluate`:
      `dlq_items` metric;
    - `webhook_endpoints` with `enabled = 1 AND consecutive_failures >= 10`, and those disabled with
      `failing` in the last minute;
-   - `domains` in `failing` or `suspended`;
+   - `domains` in `failing` or `suspended` (for the platform domain, also `dns_unresolvable` or
+     `dnssec_bogus` among its issues: `platform_domain_failing`); `domains` in `removing` whose last
+     `domain_remove` job is `failed`; Cloudflare-transport `domains` with `sending = 1`, no
+     `event_subscription_id` and not `removing` or `removed`;
    - `erasure_requests` with `status = 'failed'`, or `status = 'running'` and `created_at` older than
      20 h;
    - when `PM_DAILY_SEND_QUOTA` is set: `SELECT SUM(u.value) FROM usage_daily u JOIN tenants t ON
@@ -352,7 +359,9 @@ The `* * * * *` cron runs `ops::alerts::evaluate`:
      the quota. The roll-up runs every 15 minutes, so this alert can lag by up to 15 minutes; SES sends
      are counted too, which only makes it fire earlier;
    - when SES is configured: `SELECT COUNT(*) FROM domains WHERE ses_region IS NOT NULL AND state <>
-     'removed'`, plus one for the platform identity, against 9,000 (`ses_identities_90pct`);
+     'removed'`, plus the `domain_onboarding` rows whose journal holds an SES identity, plus one for the
+     platform identity, or the last daily `ListEmailIdentities` total when larger, against 9,000
+     (`ses_identities_90pct`);
    - conditions reported by objects and crons since the last run. The reporting code writes the
      `alert.fired` audit row itself:
 
@@ -369,6 +378,7 @@ The `* * * * *` cron runs `ops::alerts::evaluate`:
      | `vector_drift` | The `*/15` cron's reconciliation drift evaluation, when this run's and the previous run's `drift_pct` are both more than 1 from zero ([Search › Nightly reconciliation](search.md#66-nightly-reconciliation)) |
      | `signup_ramp_review` | The daily ramp evaluation (`crons/signup_ramp.rs`) |
      | `ses_sending_paused`, `ses_rule_missing` | The 15-minute SES platform check, which reads `GetAccount` and the receipt rule set |
+     | `ses_rule_sync_failed` | `SesControl`, after the third failed verification of a change set |
 2. Read the current state: for each alert key, the latest `audit_log` row with
    `action IN ('alert.fired', 'alert.resolved') AND target_id = <alert key>`.
 3. Transition, with pure rules in `core::slo`: a true condition on a key that is not firing writes
@@ -434,7 +444,9 @@ failure (FR-OPS-3). Output format and exit codes are defined in [CLI and setup](
 | `dlq` | Open `dlq_items` exist | `pmail dlq list` (`GET /v1/platform/dlq`) |
 | `quota` | Provider quota errors in the last 24 hours (Analytics Engine SQL API); `warn` when `PM_DAILY_SEND_QUOTA` is unset, and `warn` (never `fail`) when the operator's token lacks Account Analytics · Read, so the errors cannot be counted | [Quota exhausted](#quota-exhausted); the permission in [Deploy › step 2](../../self-hosting.md#2-create-a-cloudflare-api-token) |
 | `web_bot_auth` (when `PM_WEB_BOT_AUTH = "on"`; otherwise `skip`) | `GET /.well-known/http-message-signatures-directory` does not answer `200` with `Content-Type: application/http-message-signatures-directory+json`, lists no key or more than three, or lacks a valid `http-message-signatures-directory` signature for each listed key ([Agent signing keys §3.2](agent-keys.md#32-web-bot-auth-key-directory)) | `pmail keys rotate web_bot_auth`; [Deploy › Signed HTTP requests](../../self-hosting.md#signed-http-requests-web-bot-auth) |
-| `ses` (when `PM_SES_REGION` is set) | `GetAccount`: production access not enabled, or account sending paused; with SES receiving configured, the active receipt rule set is not `PM_SES_RULE_SET` or lacks `pm-deliver`; `PM_SES_REGION` cannot receive mail; the region holds 10,000 identities (new SES domains are refused with `ses_identity_limit`). `warn` at 9,000 or more identities (`ses_identities_90pct`), and when the region is outside the EU and the UK under `PM_JURISDICTION=eu` ([CLI › Doctor](cli.md#10-doctor)) | [SES account and receiving](#ses-account-and-receiving) |
+| `ses` (when `PM_SES_REGION` is set) | `GetAccount`: production access not enabled, or account sending paused; with SES receiving configured, the active receipt rule set is not `PM_SES_RULE_SET` or lacks `pm-deliver`; `PM_SES_REGION` cannot receive mail; the region holds 10,000 identities (new SES domains are refused with `ses_identity_limit`); a resource `setup ses` created no longer carries this deployment's `pylota-mail:api-host` tag, or `pm-deliver` writes to another bucket ([N31](../edge-cases.md)). `warn` at 9,000 or more identities (`ses_identities_90pct`), and when the region is outside the EU and the UK under `PM_JURISDICTION=eu` ([CLI › Doctor](cli.md#10-doctor)) | [SES account and receiving](#ses-account-and-receiving) |
+| `domains.orphans` | Never fails. `warn` for a `zone_claims` row still `pending` an hour after it was written, or a `domain_onboarding` row older than two hours: the hourly cleanup did not remove it ([Identities and domains › Cleanup after a failed add](identity-domains.md#cleanup-after-a-failed-add)) | Names the zone (when one was created after the claim) to delete in the dashboard if no domain uses it |
+| `routing.leftover_subdomains` (only if spike S9 showed that a subdomain's routing cannot be removed on its own) | Never fails. `warn` for a routing subdomain that no domain row names | The dashboard step: Email Routing › Settings › Subdomains |
 | `cloudflare.zones` | Never fails. Prints the account's zone count, and `warn`s above 1,000, because the zone limit of a non-Enterprise account is not documented ([Domains on any DNS host §3.2](domain-connections.md#32-nameservers)) | Ask Cloudflare to confirm the account's zone limit |
 | `security_txt` | `PM_SECURITY_CONTACT` unset (`warn`), or `Expires` within 30 days | Set the variable; upgrade |
 | `mail_test` (`--mail-test`) | A message from the platform domain to a platform address does not arrive within 120 s with `verdict: pass` | Prints the observed authserv-id for `PM_TRUSTED_AUTHSERV_ID` |

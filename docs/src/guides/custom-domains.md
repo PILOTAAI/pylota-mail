@@ -20,7 +20,7 @@ and how mail reaches and leaves your agents.
 | Your situation | Method | What you change |
 |---|---|---|
 | The domain is already on Cloudflare, in the same account as the deployment | `cloudflare_zone` | Nothing: Pylota Mail writes the records |
-| You have a new domain just for agents, such as `brightwell-agents.example` | `nameservers` | Two NS records at your registrar |
+| You have a new domain just for agents, such as `brightwell-agents.example` | `nameservers`, where the deployment offers it (Pylota Mail Cloud does not: use `dns_records`) | Two NS records at your registrar |
 | You want agents on a subdomain of your main domain, such as `agents.brightwell.example`. The main domain stays at its DNS host and keeps its mail | `dns_records` | One MX, three DKIM CNAMEs, two MAIL FROM records and an ownership TXT, at your DNS host |
 | You want agents to answer as your existing addresses (`bookings@brightwell.example`), and Google Workspace or Microsoft 365 stays your mail system | `send_only` (your mailbox forwards to the agent), or `smtp_relay` (the agent sends through your provider) | `send_only`: three DKIM CNAMEs, two MAIL FROM records and an ownership TXT, plus a forwarding rule per address. `smtp_relay`: an ownership TXT, plus SMTP credentials |
 | Your deployment runs on a Cloudflare Enterprise account and you want the simplest set-up for a subdomain | `delegated_subdomain` | NS records for the subdomain, at your DNS host |
@@ -40,11 +40,13 @@ How the methods compare:
 Not every deployment offers every method. The methods that use Amazon SES need the operator to have
 connected SES ([Deploy to Cloudflare › Connect Amazon SES](../self-hosting.md#connect-amazon-ses-optional)).
 `delegated_subdomain` needs a Cloudflare Enterprise account and the operator's opt-in, and a tenant key
-may use `nameservers` only when the operator allows it. When a method is not available, adding a domain
-with it fails with `422 transport_unavailable`, and `details.reason` says why. In v1.0, `dns_records`,
+may use `nameservers` only when the operator allows it. Pylota Mail Cloud offers neither `nameservers`
+nor `delegated_subdomain`: use `dns_records` for a new domain there. When a method is not available,
+adding a domain with it fails with `422 transport_unavailable`, and `details.reason` says why. In v1.0, `dns_records`,
 `smtp_relay` and `delegated_subdomain` depend on build-time spikes (S11, S12 and S10).
 
-A Cloudflare zone can have at most 30 mail domains (routing and sending together, including the apex).
+A Cloudflare zone can have at most 30 mail domains (routing and sending together, including the apex);
+the 31st is refused with `422 zone_domain_limit`.
 
 ## Before you start
 
@@ -141,6 +143,28 @@ Every method follows the same four steps: add, publish, verify, move identities.
 
 4. **Move identities onto it.** See [Move an identity to the new domain](#move-an-identity-to-the-new-domain).
 
+**Verify within 14 days.** A domain that has never been verified is removed 14 days after you added it
+(`domain.removed` with `reason: "unverified_expired"`; a reminder comes on day 12), and until it is
+verified another workspace that controls the domain's DNS can claim it. A workspace may hold 5 domains
+that are not yet verified (`422 unverified_domain_limit`).
+
+**Someone else already added your domain?** Adding it then fails with `409 domain_exists`. The answer is
+the same whoever holds the name, so it tells you nothing about them, but its `details.claim` is a TXT
+record for you:
+
+```json
+{ "error": { "code": "domain_exists", "retryable": false,
+  "details": { "claim": { "type": "TXT", "name": "_pylota-mail.agents.brightwell.example",
+                          "value": "pm-claim=4fq2…" } } } }
+```
+
+Publish that record at your DNS host and repeat the request with `"claim": true`
+(`pmail domains add … --claim`). If the other holder never verified the domain, it is removed, you get
+`409 domain_claim_pending` with `Retry-After` while that happens, and then the same request succeeds. A
+domain that another workspace has verified is not taken this way: ask the operator. The same `409` is
+returned when the deployment's Cloudflare or AWS account already holds a zone, sending domain or SES
+identity for the name that was not created for your workspace; such objects are never taken over.
+
 ## A domain already on Cloudflare: `cloudflare_zone`
 
 ```bash
@@ -181,8 +205,13 @@ that has no website and no other mail.
   If the zone is deleted, the domain becomes `removed` with reason `zone_expired`, and you can add it
   again.
 - A tenant key may use this method only if the operator allows it (tenant policy
-  `domains.allow_create_zone`); otherwise the request fails with `422 transport_unavailable`. Pylota Mail
-  Cloud allows it.
+  `domains.allow_create_zone`) and the deployment's Cloudflare token can create zones; otherwise the
+  request fails with `422 transport_unavailable`. Pylota Mail Cloud does not offer it.
+- A domain that is already a zone in the deployment's Cloudflare account is never taken over: the request
+  fails with `409 domain_exists`.
+- If your registrar still publishes a DS record for the domain (DNSSEC was on), Cloudflare cannot answer
+  for it after the nameserver change. The domain shows the issue `ds_record_present` until you remove the
+  DS record at the registrar.
 - If Cloudflare limits how many domains the account can add, the request fails with
   `429 upstream_rate_limited`; try again after the time in `Retry-After` (3 hours).
 
@@ -414,7 +443,9 @@ never received mail can be deleted; any other gets `409 address_in_use`.
 
 Every domain is checked every 15 minutes and after every change, with two independent DNS-over-HTTPS
 resolvers. One resolver's error or disagreement never changes the state
-([H7](../project/edge-cases.md)); a change needs two consecutive agreeing results.
+([H7](../project/edge-cases.md)); a change needs two consecutive agreeing results. If neither resolver can
+answer for 6 hours, the domain gets `dnssec_bogus` (DNSSEC validation fails, often a DS record left at the
+registrar) or `dns_unresolvable`, and becomes `failing`.
 
 | State | What it means | Sending | Events |
 |---|---|---|---|
@@ -455,7 +486,7 @@ Issues you may meet with the methods that keep DNS at your host:
 | `dkim_missing`, `ses_dkim_failed` (fail) | `dns_records`, `send_only`, `smtp_relay` with `inbound: ses` | A DKIM CNAME is missing or wrong, or SES could not verify it | Publish the three CNAMEs exactly as the `fix` says |
 | `mail_from_failed` (degraded) | `dns_records`, `send_only` | The `pm-bounce` MX or TXT is missing. DKIM still aligns, so sending continues | Publish both `pm-bounce` records |
 | `smtp_unaligned`, `smtp_from_rewritten` (degraded the first time, then fail) | `smtp_relay` | Your provider signs with its own domain, or changes the `From` address | Turn on DKIM for your domain at your provider; allow the agent addresses as senders |
-| `smtp_probe_timeout` (fail before the first pass; after it, degraded, then fail after three in a row) | `smtp_relay` | No probe arrived within 15 minutes | Check that the relay accepts and sends mail from `probe_from` |
+| `smtp_probe_timeout` (fail before the first pass; after it, degraded the first time, fail from the second in a row) | `smtp_relay` | No probe arrived within 15 minutes. With `p=reject`, an unaligned probe is rejected on arrival, so it looks like a timeout | Check that the relay accepts and sends mail from `probe_from`, and that it signs with DKIM for your domain |
 | `smtp_auth_failed`, `smtp_tls_required` (fail) | `smtp_relay` | The relay refused the login, or offered no TLS | Update the credentials with `pmail domains update` |
 
 The full list, per method, is in
@@ -509,9 +540,12 @@ pmail domains remove dom_01JA…
 
 Removal fails with `409 domain_in_use` while any address on the domain is `active` or `retiring`.
 Retire them first. Once removal starts (`202`), what Pylota Mail set up for the domain is deleted (the
-routing rules, the Email Sending onboarding and the event subscription, or the SES identity), and
-`domain.removed` is sent. Records you published at your own DNS host, and forwarding rules in your
-mailbox, stay until you remove them.
+routing rules and this domain's own routing records, the Email Sending onboarding and the event
+subscription, or the SES identity), and `domain.removed` is sent. Nothing Pylota Mail did not create for
+the domain is touched, and other mail domains in the same Cloudflare zone keep receiving. Records you
+published at your own DNS host, and forwarding rules in your mailbox, stay until you remove them. If the
+removal keeps failing (for example a Cloudflare outage), the domain stays `removing` and the removal is
+retried once a day; running `pmail domains remove` again retries it at once.
 
 ## DMARC alignment
 

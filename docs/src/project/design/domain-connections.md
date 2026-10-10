@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Requirements | FR-DOM-7 to FR-DOM-12 ([PRD](../prd.md)), and U4 (never send unauthenticated mail) |
-| Edge cases | [N1–N30](../edge-cases.md) |
+| Edge cases | [N1–N34](../edge-cases.md) |
 | Decision | [ADR 0008](../adr/0008-domains-on-any-dns-host.md) |
 | Code | `crates/core/src/{connect.rs, smtp.rs, sns.rs, ses.rs}`, `crates/worker/src/handlers/{domains.rs, hooks_ses.rs}`, `transport/{ses.rs, smtp.rs}`, `inbound/sources/{routing.rs, ses.rs}`, `consumers/inbound.rs`, `crons/ses_backstop.rs`, `domains/monitor.rs` |
 
@@ -33,7 +33,7 @@ method fixes the three properties:
 | `method` | Customer changes at their DNS host | `kind` | `inbound` | `transport` | Addresses on the domain | Deployment needs |
 |---|---|---|---|---|---|---|
 | `cloudflare_zone` | Nothing (the Worker writes the records) | `zone` | `routing` | `cloudflare` | Any (apex); at most 200 (subdomain) | `PM_CF_API_TOKEN` |
-| `nameservers` | Two NS records at the registrar, for a domain used only for mail | `zone` | `routing` | `cloudflare` | Any | `PM_CF_API_TOKEN` that can create zones; tenant policy `domains.allow_create_zone` |
+| `nameservers` | Two NS records at the registrar, for a domain used only for mail | `zone` | `routing` | `cloudflare` | Any | `PM_CF_API_TOKEN` that can create zones; tenant policy `domains.allow_create_zone`. Not offered on Pylota Mail Cloud ([ADR 0010](../adr/0010-cloud-in-the-existing-cloudflare-account.md)) |
 | `dns_records` | One MX, three DKIM CNAMEs, a MAIL FROM MX and TXT, the ownership TXT | `external` | `ses` | `ses` | Any, on an apex or a subdomain | SES with receiving ([4.3](#43-dns_records)) |
 | `send_only` | Three DKIM CNAMEs, a MAIL FROM MX and TXT, the ownership TXT. Their existing mailbox forwards to the agent | `external` | `forward` | `ses` | Any; each needs a forwarding rule in their mailbox | SES (sending only) |
 | `smtp_relay` | The ownership TXT, plus what their own mail provider already needs | `external` | `forward` or `ses` | `smtp` | Any | Relay credentials, and a passing alignment probe |
@@ -54,7 +54,7 @@ This table is in the [Custom domains guide](../../guides/custom-domains.md) in t
 | The customer wants | Method |
 |---|---|
 | A domain already on Cloudflare in this account | `cloudflare_zone` |
-| A new domain just for agents, such as `brightwell-agents.example` | `nameservers` (no AWS, every address works) |
+| A new domain just for agents, such as `brightwell-agents.example` | `nameservers` (no AWS, every address works), where the deployment offers it; otherwise `dns_records` |
 | Agents on a subdomain of their main domain, which stays at their DNS host and keeps its mail | `dns_records` on `agents.brightwell.example` |
 | Agents that answer as their existing addresses (`bookings@brightwell.example`) while Google Workspace or Microsoft 365 stays their mail system | `send_only`, with forwarding rules, or `smtp_relay` through their provider |
 | A Cloudflare Enterprise deployment that wants the simplest subdomain set-up | `delegated_subdomain` |
@@ -78,10 +78,14 @@ any zone.
 This is `create_zone` from [Creating a zone](identity-domains.md#creating-a-zone), opened to tenants and
 made safe for domains that are not empty.
 
-1. **Who may use it.** Platform keys always. Tenant and partner keys only when the tenant's policy has
+1. **Who may use it.** Platform keys, whenever the Worker's token can create zones (a refused create is
+   `422 transport_unavailable`, `zone_creation_not_allowed`). Tenant and partner keys only when the
+   tenant's policy also has
    `domains.allow_create_zone: true`; otherwise `422 transport_unavailable` with
-   `details.reason = "zone_creation_not_allowed"`. The default is `false` for self-hosted deployments, and
-   Pylota Mail Cloud sets it to `true`. For those keys the name must not be under the zone of
+   `details.reason = "zone_creation_not_allowed"`. The default is `false`, and Pylota Mail Cloud keeps it
+   `false`: Cloud runs in Pylota's existing Cloudflare account with a Worker token scoped to named zones,
+   which cannot create zones ([ADR 0010](../adr/0010-cloud-in-the-existing-cloudflare-account.md)). For
+   those keys the name must not be under the zone of
    `PM_PLATFORM_DOMAIN`, `PM_API_HOST` or `PM_CONSOLE_HOST`, nor under a zone created for another tenant
    (`403 scope_denied`, `details.reason = "zone_not_allowed"`,
    [Zone permission](identity-domains.md#zone-permission)).
@@ -89,16 +93,22 @@ made safe for domains that are not empty.
    deployment, which only manages mail records. Before creating the zone, the Worker queries both DoH
    resolvers for `A`, `AAAA` and `MX` at the name and for `CNAME`, `A` and `AAAA` at `www.{name}`. If any exist and the
    request lacks `"confirm_dedicated": true`, it refuses with `409 domain_not_dedicated`. `details.records`
-   lists what it found, and the fix says the website or mail on that domain would stop.
-3. **Create the zone:** `POST /zones` with `"type": "full"`. A `1105` error ("too many attempts to add a
+   lists what it found, and the fix says the website or mail on that domain would stop. A DS record at the
+   name gives the issue `ds_record_present` instead of a refusal
+   ([Creating a zone](identity-domains.md#creating-a-zone) step 1).
+3. **Never an existing zone.** A zone of that name already in the account is refused with the uniform
+   `409 domain_exists`, whatever its status, unless `zone_claims` holds it for this tenant. A pending
+   `zone_claims` row is written before the create, so two tenants can never race for one name, and the
+   zone is only ever deleted later through that claim
+   ([Creating a zone](identity-domains.md#creating-a-zone) steps 2–3, [H10](../edge-cases.md)).
+   **Create the zone:** `POST /zones` with `"type": "full"`. A `1105` error ("too many attempts to add a
    domain") becomes `429 upstream_rate_limited` with `Retry-After` and `details.retry_after` of 10800
    seconds (3 hours)
    ([cannot add domain](https://developers.cloudflare.com/dns/zone-setups/troubleshooting/cannot-add-domain/),
    read 2026-10-09) ([N22](../edge-cases.md)).
 4. **NS records.** The returned `name_servers` are the only records the customer sets: at their
    registrar, not at a DNS host. The domain is `pending`, with reminders at 24 hours, 72 hours and 7 days.
-   The zone is recorded in `zone_claims` for the tenant with the domain row, so it can never be used by
-   another tenant.
+   The zone's claim becomes `active` with the domain row, so it can never be used by another tenant.
 5. **Expiry ([N23](../edge-cases.md)).** A Free-plan zone that is not activated within 28 days is deleted
    by Cloudflare ([domain status](https://developers.cloudflare.com/dns/zone-setups/reference/domain-status/),
    read 2026-10-09). At day 21 the monitor sends a final `domain.reminder`. If the zone disappears, the
@@ -124,11 +134,12 @@ read 2026-10-09). The parent domain may stay at any DNS provider. **Spike S10** 
 Routing catch-all and Email Sending work on a child zone; no Cloudflare page says so either way.
 
 1. `POST /zones` with `"type": "full"` and the subdomain as the name, for example
-   `agents.brightwell.example`. The child zone may live in a different account from the parent
+   `agents.brightwell.example`, after the same existing-zone refusal and pending claim as `nameservers`
+   step 3. The child zone may live in a different account from the parent
    ([parent on full](https://developers.cloudflare.com/dns/zone-setups/subdomain-setup/setup/parent-on-full/),
    read 2026-10-09). For a tenant or partner key, the subdomain must not be under a deployment host's zone
-   or another tenant's claimed zone (`403 scope_denied`, `zone_not_allowed`); the new child zone is
-   recorded in `zone_claims` for the tenant with the domain row
+   or another tenant's claimed zone (`403 scope_denied`, `zone_not_allowed`); the new child zone's claim
+   becomes `active` for the tenant with the domain row
    ([Zone permission](identity-domains.md#zone-permission)).
 2. The records shown are the zone's `name_servers` as `NS` records for the subdomain, which the customer
    adds at their DNS host. No TXT is needed for a full child zone.
@@ -165,29 +176,40 @@ Each record carries `purpose` (`ownership`, `mx`, `dkim`, `return_path`, `spf`, 
 ### 4.2 Deployment set-up for SES
 
 `pmail setup ses --region eu-west-2` does this once, with the operator's local AWS credentials. It is
-idempotent and reads before it writes. `{prefix}` below is the `--prefix` flag, by default
-`pylota-mail-{AWS account ID}`, because S3 bucket names are global.
+idempotent and reads before it writes. `{dep}` below is the **deployment label**, the first 8 hex
+characters of `SHA-256(PM_API_HOST)`, which setup prints next to the API host. `{prefix}` is the
+`--prefix` flag, by default `pylota-mail-{AWS account ID}-{dep}`, because S3 bucket names are global.
+
+**Ownership tags (C7).** Every resource below that accepts tags is created with the tag
+`pylota-mail:api-host = {PM_API_HOST}`: the S3 bucket, both SNS topics, the SQS queue, the configuration
+set, the IAM user and the platform SES identity (every SES identity the Worker creates also carries it,
+[Identities and domains › No adoption](identity-domains.md#no-adoption-of-provider-objects)). Receipt rule
+sets and rules accept no tags; a rule belongs to the deployment whose bucket its S3 action writes to.
 
 | Step | Resource | Settings |
 |---|---|---|
 | 1 | Region check | `PM_SES_REGION` must be one of the 22 regions that receive mail ([endpoints](https://docs.aws.amazon.com/general/latest/gr/ses.html#ses_inbound_endpoints), read 2026-10-09). With `PM_JURISDICTION=eu` it must be in the EU or the UK (`eu-central-1`, `eu-west-1`, `eu-west-2` (London), `eu-south-1`, `eu-west-3`, `eu-north-1`) unless `--allow-non-eu`. For this check `eu` means "EU or UK", because the UK has an EU adequacy decision under the GDPR (European Commission [adequacy decisions](https://commission.europa.eu/law/law-topic/data-protection/international-dimension-data-protection/adequacy-decisions_en), renewed 19 December 2025, read 2026-10-09). It is not Cloudflare's `eu` jurisdiction, which means the EU only ([R2 data location](https://developers.cloudflare.com/r2/reference/data-location/), read 2026-10-09) |
 | 2 | Account checks | `GetAccount`: production access enabled (sandbox sends only to verified addresses, 200 a day). Setup prints the console steps to request it and stops if it is missing. It also warns when the account is on the Essentials plan ($0.16 per 1,000) and not à la carte ($0.10) ([pricing](https://aws.amazon.com/ses/pricing/), read 2026-10-09) |
-| 3 | S3 bucket `{prefix}-inbound` | Same region; block all public access; SSE-S3; lifecycle rule deleting `in/` after 14 days; bucket policy letting `ses.amazonaws.com` `s3:PutObject` on `in/*` only with `aws:SourceAccount` = the account and `aws:SourceArn` = the receipt rule |
-| 4 | SNS topic `pylota-mail-inbound` | `SignatureVersion = 2` (SHA-256). The default is 1 ([SetTopicAttributes](https://docs.aws.amazon.com/sns/latest/api/API_SetTopicAttributes.html), read 2026-10-09) |
+| 2a | Another deployment's resources ([N31](../edge-cases.md)) | Before anything is created: `DescribeActiveReceiptRuleSet` in the region; a rule `pm-deliver` whose S3 action writes to a bucket other than `{prefix}-inbound`, or to a bucket whose tag names another API host, means another deployment receives mail in this account and region, and setup stops. Then each resource of this table that already exists under its name must carry this deployment's tag; one with no tag or another host's tag is never reused or changed, and setup stops, naming it. The fix in both cases: use a separate AWS account (recommended for staging), or another region |
+| 3 | S3 bucket `{prefix}-inbound` | Same region; block all public access; SSE-S3; lifecycle rule deleting `in/` after 14 days; bucket policy letting `ses.amazonaws.com` `s3:PutObject` on `in/*` only with `aws:SourceAccount` = the account and `aws:SourceArn` = the receipt rule; the ownership tag |
+| 4 | SNS topic `pylota-mail-inbound` | `SignatureVersion = 2` (SHA-256). The default is 1 ([SetTopicAttributes](https://docs.aws.amazon.com/sns/latest/api/API_SetTopicAttributes.html), read 2026-10-09); the ownership tag |
 | 5 | HTTPS subscription | `https://{PM_API_HOST}/hooks/ses/inbound`, confirmed automatically by the Worker. Setup creates it only after it has deployed the Worker with the new topic ARNs, because the Worker confirms only its configured topic |
-| 6 | SQS queue `pylota-mail-inbound` | Subscribed to the same topic, message retention 14 days, SSE on. This is the backstop ([4.5](#45-inbound-through-ses)) |
+| 6 | SQS queue `pylota-mail-inbound` | Subscribed to the same topic, message retention 14 days, SSE on, the ownership tag. This is the backstop ([4.5](#45-inbound-through-ses)) |
 | 7 | Receipt rule set | The active rule set `PM_SES_RULE_SET` (default `pylota-mail`). If the account already has an active rule set, setup adds its rules to that set and never deactivates it. A region has one active rule set |
 | 8 | Rule `pm-deliver` | No recipient condition, so it applies to every verified identity ([concepts](https://docs.aws.amazon.com/ses/latest/dg/receiving-email-concepts.html), read 2026-10-09). `ScanEnabled: true`, `TlsPolicy: Optional`, one S3 action (bucket, prefix `in/`, the topic) |
-| 9 | Platform identity | Verifies the platform domain in SES through its Cloudflare zone, so `mailer-daemon@{platform domain}` can send the bounces in [4.6](#46-retired-and-unknown-recipients) |
-| 10 | Configuration set and events | As in [Outbound › Amazon SES](outbound.md#amazon-ses). Its SNS topic (`PM_SES_SNS_TOPIC_ARN`, for `/hooks/ses`) also gets `SignatureVersion = 2` |
-| 11 | IAM user `pylota-mail-worker` | One policy listing exactly: `ses:SendRawEmail`/`SendEmail`, `ses:CreateEmailIdentity`, `ses:GetEmailIdentity`, `ses:DeleteEmailIdentity`, `ses:PutEmailIdentityMailFromAttributes`, `ses:GetAccount`, receipt-rule read and update on the one rule set, `s3:GetObject` and `s3:DeleteObject` on `{bucket}/in/*`, `sqs:ReceiveMessage` and `sqs:DeleteMessage` on the queue. The access key goes into Worker secrets and is never written to disk |
+| 9 | Platform identity | Verifies the platform domain in SES through its Cloudflare zone, so `mailer-daemon@{platform domain}` can send the bounces in [4.6](#46-retired-and-unknown-recipients); created with the ownership tag |
+| 10 | Configuration set and events | As in [Outbound › Amazon SES](outbound.md#amazon-ses). Its SNS topic (`PM_SES_SNS_TOPIC_ARN`, for `/hooks/ses`) also gets `SignatureVersion = 2`; both carry the ownership tag |
+| 11 | IAM user `pylota-mail-worker-{dep}` | IAM user names are global to the account, so the name carries `{dep}`; the ownership tag. One policy listing exactly: `ses:SendRawEmail`/`SendEmail`, `ses:CreateEmailIdentity`, `ses:GetEmailIdentity`, `ses:DeleteEmailIdentity`, `ses:ListEmailIdentities`, `ses:TagResource` (tags given at create), `ses:PutEmailIdentityMailFromAttributes`, `ses:GetAccount`; for the retired-address rules of [4.6](#46-retired-and-unknown-recipients), `ses:DescribeActiveReceiptRuleSet`, `ses:DescribeReceiptRule`, `ses:CreateReceiptRule`, `ses:UpdateReceiptRule` and `ses:DeleteReceiptRule`; `s3:GetObject` and `s3:DeleteObject` on `{bucket}/in/*`; `sqs:ReceiveMessage` and `sqs:DeleteMessage` on the queue. The IAM action names follow the API operation names; which resource types each one can be limited to (for example the rule set's ARN) could not be read from the Service Authorization Reference on 2026-10-10 and is verified at build time, else the action is granted on `*`. The access key goes into Worker secrets and is never written to disk |
 
 The printed summary includes the policy JSON so an operator can review it before it is applied.
 
-**One deployment per AWS account and region.** A region has one active rule set, and `pm-deliver` has no
-recipient condition, so it matches every verified identity in the region. Two deployments in the same
-account and region (for example staging and production) would receive each other's mail and share the
-10,000-identity quota. Give each deployment its own AWS account, or its own region.
+**One deployment per AWS account and region, enforced.** A region has one active rule set, and
+`pm-deliver` has no recipient condition, so it matches every verified identity in the region. Two
+deployments in the same account and region (for example staging and production) would receive each
+other's mail and share the 10,000-identity quota, so step 2a refuses the second one. Give staging its own
+AWS account: a second region of the same account would work, but shares the account's sending reputation,
+suppression list and IAM. The bucket and IAM user names carry `{dep}`, and every resource carries the
+ownership tag, so even then no deployment ever reuses or changes another's resources.
 
 ### 4.3 `dns_records`
 
@@ -203,12 +225,19 @@ It needs SES with receiving configured (`PM_SES_INBOUND_TOPIC_ARN` set); without
    replace these". Until the old MX records are gone, health reports `mx_unexpected` (degraded), because
    mail is split between two systems ([N9](../edge-cases.md)).
 3. **Ownership TXT** generated.
-4. **SES identity.** `CreateEmailIdentity` with the domain and `ConfigurationSetName`.
-   `AlreadyExistsException` → `GetEmailIdentity` (same account: re-use). The three DKIM tokens and
-   `SigningHostedZone` give the CNAMEs. SES allows 10,000 verified identities per region, raised only
-   through the AWS account manager ([quotas](https://docs.aws.amazon.com/ses/latest/dg/quotas.html), read
-   2026-10-09). The count is the number of `domains` rows with `ses_region` set and not `removed`, plus
-   the platform identity. At 9,000 (90%) the operator alert `ses_identities_90pct` fires
+4. **SES identity.** `CreateEmailIdentity` with the domain, `ConfigurationSetName` and the two ownership
+   tags (`pylota-mail:api-host`, `pylota-mail:domain-id`). `AlreadyExistsException` → `GetEmailIdentity`,
+   re-used only when its tags name this deployment and this domain (a retried add); an identity created by
+   anyone else, another deployment in the same account included, is refused with the uniform
+   `409 domain_exists` and never changed ([No adoption](identity-domains.md#no-adoption-of-provider-objects)).
+   The three DKIM tokens and `SigningHostedZone` give the CNAMEs. SES allows 10,000 verified identities per
+   region, raised only through the AWS account manager ([quotas](https://docs.aws.amazon.com/ses/latest/dg/quotas.html),
+   read 2026-10-10). The count is the larger of two numbers: this deployment's identities (`domains` rows
+   with `ses_region` set and not `removed`, plus `domain_onboarding` rows whose journal holds an SES
+   identity, plus the platform identity), and the region's real total, which the 15-minute platform check
+   reads once a UTC day with `ListEmailIdentities` (`PageSize` up to 1,000, following `NextToken`; SES v2
+   API reference read 2026-10-10) through the token bucket, so identities left by a failed add or created
+   outside this deployment are counted too. At 9,000 (90%) the operator alert `ses_identities_90pct` fires
    ([Observability](observability.md)) and `pmail doctor` warns. At 10,000, creating a domain that needs
    an SES identity (`dns_records`, `send_only`, or `smtp_relay` with `inbound: ses`) fails with
    `422 transport_unavailable` and `details.reason = "ses_identity_limit"` ([N26](../edge-cases.md)).
@@ -354,16 +383,47 @@ accepts first and then runs rules, so the behaviour differs:
 | Retired address | SES sends a bounce, `550 5.1.6`, from `mailer-daemon@{platform domain}` | Rule `pm-retired-{n}`. The SES Bounce action "rejects the email by returning a bounce response to the sender" ([bounce action](https://docs.aws.amazon.com/ses/latest/dg/receiving-email-action-bounce.html), read 2026-10-09) |
 | Address of a suspended tenant | Held: the ledger row becomes `held` and the S3 object is kept. The every-minute backstop cron re-sends the pointer once the tenant is active again. After 5 days of suspension the row becomes `dropped`, without a bounce (`inbound_dropped_total{reason="tenant_suspended", source="ses"}`) | FR-TEN-3 answers a temporary failure for 5 days and then refuses. SES has already accepted the message, so holding it is the equivalent of the temporary failure, and a bounce would be backscatter. 5 days fit inside the 14-day lifecycle rule |
 | Any other address | Accepted by SES, then dropped by the Worker without a bounce. `inbound_dropped_total{reason="unknown_recipient", source="ses"}` | A bounce after acceptance goes to whatever sender address the message claims, which spam forges (backscatter). Dropping is the safe default ([N6](../edge-cases.md)) |
+| An address on a domain whose `inbound` is not `ses` (the platform domain, a Cloudflare-method domain that has a J5 failover identity, a `send_only` domain) | Dropped without a bounce: `inbound_dropped_total{reason="not_ses_domain", source="ses"}` ([N33](../edge-cases.md)) | `pm-deliver` has no recipient condition, so SES accepts mail for every verified identity in the region. Delivering it would bypass the SMTP-time rejects of Email Routing (unknown, retired and DMARC-failing mail) for domains that receive through Cloudflare |
 
 **Retired-address rules ([N7](../edge-cases.md), [N29](../edge-cases.md)).** When an address on an SES
-domain retires, the domain monitor adds it to the recipient list of the newest `pm-retired-{n}` rule, or
-creates the next rule when that one holds 500. Rules are inserted before `pm-deliver`. A rule set holds at
-most 200 rules ([quotas](https://docs.aws.amazon.com/ses/latest/dg/quotas.html), read 2026-10-09), so
+domain retires, it is added to the recipient list of the newest `pm-retired-{n}` rule, or to the next rule
+when that one holds 500 (the per-rule recipient limit). Rules sit before `pm-deliver`. A rule set holds at
+most 200 rules ([quotas](https://docs.aws.amazon.com/ses/latest/dg/quotas.html), read 2026-10-10), so
 Pylota Mail uses at most 150 retired rules (75,000 addresses per deployment). Beyond that, the oldest
-retired addresses are removed from the rules and their mail is dropped like an unknown address's. Rule
-updates are idempotent (read, merge, write) and retried by the monitor. `addresses.ses_bounce_rule` records
-the rule that holds each address. Tenant policy `inbound.ses_bounce_retired: false` drops mail to retired
-addresses instead of bouncing it.
+retired addresses are removed from the rules and their mail is dropped like an unknown address's.
+`addresses.ses_bounce_rule` records the rule that holds each address. Tenant policy
+`inbound.ses_bounce_retired: false` drops mail to retired addresses instead of bouncing it.
+
+**The API (C11).** Receipt rules exist only in the SES v1 ("classic") API: the Query API at
+`https://email.{region}.amazonaws.com/`, SigV4 with service name `ses` (verify the endpoint host at build
+time). The calls, from the [SES API reference](https://docs.aws.amazon.com/ses/latest/APIReference/), read
+2026-10-10:
+
+| Call | Use |
+|---|---|
+| `DescribeActiveReceiptRuleSet` | Read the active set's name and its rules in order, with each rule's `Recipients` |
+| `CreateReceiptRule` (`RuleSetName`, `Rule`, `After`) | Open the next `pm-retired-{n}`: `Enabled: true`, `Recipients`, `ScanEnabled: false`, `TlsPolicy: Optional`, and two actions: a bounce action (SMTP reply code `550`, status code `5.1.6`, a message, sender `mailer-daemon@{PM_PLATFORM_DOMAIN}`) then a stop action for the rule set. "`After`: the name of an existing rule after which the new rule is placed. If this parameter is null, the new rule is inserted at the beginning of the rule list." So `After` is the name of the rule just before `pm-deliver` in the order just read, and is omitted when `pm-deliver` is first. The action field names: verify at build time |
+| `UpdateReceiptRule` (`RuleSetName`, `Rule`) | Replace a rule whole, with its new `Recipients` list. The call has no version or condition, so a stale read-merge-write by two writers would lose one of them |
+| `DeleteReceiptRule` | Remove a `pm-retired-{n}` rule that became empty |
+
+**One writer.** So that no update is lost, the `SesControl` Durable Object
+([4.8](#48-ses-api-rate-one-request-per-second)) is the only writer of these rules. Every caller (the monitor when an address retires, the removal step
+`prune_retired_rules`, identity erasure, tenant erasure) sends it
+`SyncRetired { add: [address_id…], remove: [address_id…] }`, which it stores in its own SQLite queue
+before it answers; it then works the queue in its alarm, one change set at a time, with its own token for
+each call:
+
+1. `DescribeActiveReceiptRuleSet`; compute each rule's new `Recipients` from the change set and the rules
+   as read.
+2. `UpdateReceiptRule`, `CreateReceiptRule` or `DeleteReceiptRule` for each rule that changes.
+3. **Verify:** `DescribeActiveReceiptRuleSet` again. When every changed rule holds exactly the intended
+   recipients and the `pm-retired-{n}` rules are still before `pm-deliver`, write
+   `addresses.ses_bounce_rule` (the rule, or `NULL` for a removed address) in one D1 batch and drop the
+   change set. Otherwise repeat from step 1, at most three times; then keep the change set, re-arm in 15
+   minutes, and raise the alert `ses_rule_sync_failed` (ticket) ([N32](../edge-cases.md)).
+
+Callers that must wait (removal, erasure) poll `addresses.ses_bounce_rule` for their addresses rather than
+the rules themselves.
 
 ### 4.7 Outbound through SES
 
@@ -397,6 +457,7 @@ pub enum SesControlRequest {
     Init,                                        // first call after the cron minted the object
     Acquire { caller: SesCaller, deadline_ms: i64 },
     // → Granted { at_ms } | Busy { retry_after_ms }
+    SyncRetired { add: Vec<String>, remove: Vec<String> },   // address IDs; → Queued (§4.6)
 }
 pub enum SesCaller { Request, DomainCheck, PlatformCheck, RuleSync, Removal }
 ```
@@ -415,8 +476,9 @@ pub enum SesCaller { Request, DomainCheck, PlatformCheck, RuleSync, Removal }
 - **Singleton ID.** The object is created with `new_object_id` (so `PM_JURISDICTION` applies) and its ID
   is stored in D1 `platform_objects` under `name = 'ses_control'`. The every-minute cron mints it when SES
   is configured and the row is missing (`INSERT … ON CONFLICT (name) DO NOTHING`, then read back, as for
-  [monitor IDs](identity-domains.md#create)), then sends `Init`. It holds no personal data: its `meta` has
-  `schema_version` and `next_free_ms` only ([Data model §3](data-model.md#3-other-durable-objects)).
+  [monitor IDs](identity-domains.md#create)), then sends `Init`. Its `meta` has `schema_version` and
+  `next_free_ms`; its `rule_sync` table holds the queued `SyncRetired` change sets (address IDs only, no
+  addresses), deleted once verified ([Data model §3](data-model.md#3-other-durable-objects)).
 
 **Daily identity checks are spread across the day.** Each `DomainMonitor` of a domain with an SES
 identity runs its `GetEmailIdentity` check once a day at a fixed offset from 00:00 UTC:
@@ -498,7 +560,13 @@ domain has to pass a **probe** before it may send, and again every day ([N18](..
    or `smtp_from_rewritten` (fail) when the relay changed the `From` address.
 4. No probe arrives within 15 minutes: `smtp_probe_timeout`. Until the domain has passed its first probe
    this is `fail`, because the domain must never reach `healthy` or `degraded` without a pass. After a
-   pass, it is degraded the first time and fail after three in a row.
+   pass, it is degraded the first time and fail from the second in a row ([N34](../edge-cases.md)). A
+   timeout is treated like an unaligned result, not like a lost message, because the platform domain's
+   Email Routing rejects at SMTP time mail that fails the sender's DMARC policy ("incoming emails are
+   rejected if they fail authentication according to the sender's DMARC policy", Email Service
+   [postmaster](https://developers.cloudflare.com/email-service/reference/postmaster/), read 2026-10-10).
+   For a domain with `p=reject`, an unaligned probe therefore never arrives, and the relay may not even
+   report the rejection.
 5. **Record the result.** The `DomainMonitor` writes `domains.probe_last_at` and `probe_last_json`
    (`{result, dkim_d, dmarc, from_unchanged, at, failures_in_row, pending}`) in one D1 statement. The
    alignment-probe health check reads them on every 15-minute check
@@ -512,7 +580,7 @@ domain has to pass a **probe** before it may send, and again every day ([N18](..
 | Pass | 24 hours later | – (`ok` while the pass is under 26 hours old) |
 | First `smtp_unaligned` or `smtp_from_rewritten` in a row | 20 minutes later | degraded (sends continue for at most one retry) |
 | Second or later in a row | Every hour until a pass, or until the domain is suspended | fail |
-| `smtp_probe_timeout` | 20 minutes later; hourly from the third in a row | as in step 4 |
+| `smtp_probe_timeout` | 20 minutes later; hourly from the second in a row | as in step 4: before the first pass fail; after it degraded the first time, fail from the second |
 
 So two failed probes in a row (about 20 minutes apart) make the issue fail-level, and the state machine
 moves the domain to `failing` after its two agreeing checks: about 40 minutes from the first failure in
@@ -549,7 +617,7 @@ These rows add to [What each check verifies](identity-domains.md#what-each-check
 | SES DKIM CNAMEs | as above | Each CNAME points at `{token}.{SigningHostedZone}` | `dkim_missing` (fail) |
 | MAIL FROM | `transport = ses` with `mail_from_domain` set (`dns_records`, `send_only`). Not a Cloudflare-method domain sent through its J5 failover identity: that identity has no custom MAIL FROM (SES uses its default), so a failed-over domain never turns `degraded` for it | `MailFromAttributes.MailFromDomainStatus = SUCCESS`, and the MX and SPF at `pm-bounce.{domain}` match | `mail_from_failed` (degraded) ([N11](../edge-cases.md)) |
 | SES account | deployment, in `pmail doctor` and the 15-minute platform check | Production access enabled, sending not paused, the receipt rule set active and containing `pm-deliver` | `ses_sending_paused`, `ses_rule_missing` (platform alerts; every SES domain uses fallback while sending is paused) ([N10](../edge-cases.md)) |
-| Alignment probe | `transport = smtp` | Last probe (with the live values) passed within 26 hours | `smtp_unaligned`, `smtp_from_rewritten` (degraded for the first in a row, fail from the second; [§5.3](#53-proving-alignment-the-probe)); `smtp_probe_timeout` (fail before the first pass; after it degraded, then fail after three in a row) |
+| Alignment probe | `transport = smtp` | Last probe (with the live values) passed within 26 hours | `smtp_unaligned`, `smtp_from_rewritten` (degraded for the first in a row, fail from the second; [§5.3](#53-proving-alignment-the-probe)); `smtp_probe_timeout` (fail before the first pass; after it degraded the first time, fail from the second in a row) |
 | SMTP login | `transport = smtp` | The last send or probe authenticated | `smtp_auth_failed`, `smtp_tls_required` (fail) |
 | Parent delegation | `kind = delegated` | NS for the subdomain at the parent equal the zone's `name_servers` | `nameservers_changed` (ownership) |
 | Doubled names | `external` | No record exists at `{name}.{registrable domain}` that matches an expected value | `record_doubled_name` (degraded) with a fix telling the user to enter the `host` value only ([N17](../edge-cases.md)) |
@@ -608,7 +676,7 @@ storage until they arrive or expire (15 and 10 minutes).
 | `POST /v1/domains/{id}/probe` | `domains:write`. Runs the alignment probe now (`smtp` transport only); `202 { "probe_id": "prb_…" }`; at most once a minute per domain (`429 rate_limited`); the result arrives as a domain health change |
 | `POST /v1/identities/{identity_id}/addresses/{address_id}/test-forwarding` | `identities:write`. Domains with `inbound: forward` (`send_only`, `smtp_relay`); `202`; the result is in the address's `forwarding` |
 | Address object | Adds `forwarding` (`null` unless the domain uses `inbound: forward`, else `unverified`, `ok` or `failed`) and `forwarding_checked_at` |
-| `domain.removed` event | Gains `reason`: `requested` or `zone_expired` |
+| `domain.removed` event | Gains `reason`: `requested`, `zone_expired`, `evicted` (another tenant proved the DNS of a domain this tenant never verified) or `unverified_expired` (never verified within 14 days) ([Identities and domains › State machine](identity-domains.md#state-machine)) |
 | `POST /hooks/ses/inbound` | SNS endpoint for SES inbound notifications (topic `PM_SES_INBOUND_TOPIC_ARN`), outside the developer API, no API key. `POST /hooks/ses` keeps SES delivery events (topic `PM_SES_SNS_TOPIC_ARN`). Both accept only SNS signature version 2 and answer `403 invalid_signature` on any verification failure |
 
 New error codes:
@@ -621,6 +689,9 @@ New error codes:
 | 400 | `smtp_port_not_allowed` | `smtp.port` is not 465 or 587 (port 25 included) |
 | 422 | `smtp_tls_required` | The relay does not offer STARTTLS on 587 (or TLS on 465); credentials were not sent |
 | 422 | `smtp_auth_failed` | The relay answered `535` to `AUTH`. Also a domain health issue |
+| 409 | `domain_claim_pending` | A `claim: true` request proved the DNS; the previous unverified holder is being removed. Retry after `Retry-After` ([Identities and domains › Adding a domain](identity-domains.md#adding-a-domain)) |
+| 422 | `unverified_domain_limit` | The tenant already holds 5 domains that were never verified (`details.limit`) |
+| 422 | `zone_domain_limit` | The Cloudflare zone already holds 30 mail domains (`details.limit`) |
 
 `scope_denied` (403) gains `details.reason = "zone_not_allowed"`: a tenant or partner key named a zone
 its tenant may not use with `cloudflare_zone` or `replace_mx`, or a `nameservers` or
@@ -635,7 +706,8 @@ its tenant may not use with `cloudflare_zone` or `replace_mx`, or a `nameservers
 | `ses_receiving_not_configured` | `dns_records`, or `smtp_relay` with `inbound: ses`, without `PM_SES_INBOUND_TOPIC_ARN` (and bucket and queue) |
 | `ses_identity_limit` | The SES region already has 10,000 identities; creating a domain that needs one ([4.3](#43-dns_records)) |
 | `subdomain_setup_disabled` | `delegated_subdomain` while `PM_CF_SUBDOMAIN_SETUP` is not `on` |
-| `zone_creation_not_allowed` | `nameservers` by a tenant or partner key whose tenant's policy lacks `domains.allow_create_zone: true` |
+| `zone_creation_not_allowed` | `nameservers` by a tenant or partner key whose tenant's policy lacks `domains.allow_create_zone: true`, or (any key) a zone create that Cloudflare refused for the Worker token's scope (a token limited to named zones, as on Pylota Mail Cloud) |
+| `ses_identity_not_verified` | `PATCH transport: ses` while SES does not report the identity as verified for sending with DKIM `SUCCESS` (`details.dkim_status`) |
 | `method_not_supported` | The method does not support the operation: `PATCH transport` to a transport the method cannot use; `probe` when the transport is not `smtp`; `test-forwarding` without `inbound: forward` |
 | `marketing_needs_ses` | A `kind: marketing` send from a domain whose transport is `cloudflare`, the platform domain included ([Outbound › Policy pipeline](outbound.md#policy-pipeline), step 15, with the From address resolved at step 13): Cloudflare Email Service is for transactional mail only. A message accepted before its domain moved to `cloudflare` (or that would fall back to the platform domain) ends `rejected` with the send-failure reason `marketing_needs_ses` at transport time |
 
@@ -682,7 +754,7 @@ Sending, so a `dns_records` domain costs less to serve than one on a Cloudflare 
 | Spike | Must prove | Pass | Fallback |
 |---|---|---|---|
 | S10 Child zones | On an Enterprise account, a subdomain-setup child zone accepts Email Routing catch-all to the Worker and Email Sending onboarding, and both work end to end | Mail to any address at the child apex reaches `email()`; a send is DKIM-aligned | `delegated_subdomain` stays off; `dns_records` covers the case |
-| S11 SES receiving | Rule set, S3 action and topic as specified. The notification shape matches §4.5. S3 `GetObject` with SigV4 from a Worker. A 39 MB message ([N5](../edge-cases.md)). `user+tag@` routing. The retired-address bounce. The backstop picks up a message whose push failed | All pass in `eu-west-2` | `dns_records` and `smtp_relay` with `inbound: ses` do not ship in v1.0; `send_only` still does |
+| S11 SES receiving | Rule set, S3 action and topic as specified. The notification shape matches §4.5. S3 `GetObject` with SigV4 from a Worker. A 39 MB message ([N5](../edge-cases.md)). `user+tag@` routing. The retired-address bounce, with the rule created through the v1 Query API from a Worker (`CreateReceiptRule` with `After` placing it before `pm-deliver`, `UpdateReceiptRule` replacing its recipients, read back with `DescribeActiveReceiptRuleSet`). The backstop picks up a message whose push failed | All pass in `eu-west-2` | `dns_records` and `smtp_relay` with `inbound: ses` do not ship in v1.0; `send_only` still does |
 | S12 SMTP from a Worker | Ports 465 and 587 with `StartTls` against two real providers. The certificate host name is checked (a wrong-name certificate is refused). Timeouts and the uncertain window behave as in §5.2 | All pass | `smtp_relay` does not ship in v1.0 |
 
 ## 13. Options considered and not taken
@@ -706,7 +778,11 @@ Sending, so a `dns_records` domain costs less to serve than one on a Cloudflare 
 | `it::ses::object_lost` | Lifecycle-deleted object → ledger `lost`, alert ([N4](../edge-cases.md)) |
 | `it::ses::large_message_40mb` | A 39 MB message is ingested ([N5](../edge-cases.md)) |
 | `it::ses::unknown_recipient_dropped` | No bounce, metric incremented ([N6](../edge-cases.md)) |
-| `it::ses::retired_rule_sync` | Retire → address in `pm-retired-{n}`; 501st opens a new rule; cap 150 rules evicts the oldest ([N7](../edge-cases.md), [N29](../edge-cases.md)) |
+| `it::ses::retired_rule_sync` | Retire → address in `pm-retired-{n}`; 501st opens a new rule, created with `After` = the rule before `pm-deliver` (or no `After` when `pm-deliver` is first); cap 150 rules evicts the oldest ([N7](../edge-cases.md), [N29](../edge-cases.md)) |
+| `it::ses::retired_rule_single_writer` | Ten concurrent retirements on two domains and a removal's prune, against the recorded SES v1 fake: every change set goes through `SesControl`, no recipient is lost, `ses_bounce_rule` is written only after the read-back matches; a fake that drops one write is caught by the read-back, retried, and after three mismatches raises `ses_rule_sync_failed` and keeps the change set ([N32](../edge-cases.md)) |
+| `cli::setup::ses_foreign_resources` | Against the recorded AWS fake: an active rule set whose `pm-deliver` writes to another deployment's bucket stops `setup ses` with exit 14 before anything is created; an existing topic, queue, bucket or IAM user with another API host's tag (or none) stops it naming the resource, and nothing is changed; two deployments' default bucket and IAM user names differ by `{dep}` ([N31](../edge-cases.md)) |
+| `it::ses::non_ses_recipient_dropped` | An SES notification whose recipient is on the platform domain, on a routing domain with a J5 failover identity, or on a `send_only` domain is dropped without a bounce with `inbound_dropped_total{reason="not_ses_domain"}`, and no message is stored ([N33](../edge-cases.md)) |
+| `it::smtp::probe_timeout_after_pass` | After a pass, one `smtp_probe_timeout` is degraded and the second in a row is fail-level, so a relay whose unaligned probes the platform domain rejects at SMTP time (`p=reject`) makes the domain `failing` and sends fall back ([N34](../edge-cases.md)) |
 | `it::ses::h2_mail_from_spf_preflight` | `dns_records` and `send_only`: an existing SPF at `pm-bounce.{domain}` whose merge with `include:amazonses.com` needs 11 lookups → `400 spf_lookup_limit` with `details.lookups`, and no SES identity is created ([H2](../edge-cases.md)) |
 | `it::ses::verdict_mapping` | Virus `FAIL` quarantines, spam `FAIL` scores 0.9, SPF taken from SES, DKIM recomputed ([N27](../edge-cases.md)) |
 | `it::ses::cross_tenant_recipients` | One object with recipients in two tenants → two messages, no leakage ([N28](../edge-cases.md)) |
@@ -722,7 +798,7 @@ Sending, so a `dns_records` domain costs less to serve than one on a Cloudflare 
 | `it::domains::zone_create_rate_limited` | Cloudflare `1105` on zone create → `429 upstream_rate_limited`, `Retry-After: 10800` ([N22](../edge-cases.md)) |
 | `it::domains::zone_hold` | A zone-hold error on create → `409 zone_hold` ([N24](../edge-cases.md)) |
 | `it::domains::delegation_removed` | The parent's NS for a `delegated_subdomain` change → `nameservers_changed` → `suspended` ([N25](../edge-cases.md)) |
-| `it::domains::ses_identity_limit` | 9,000 identities → `ses_identities_90pct` alert and a doctor warning; 10,000 → `422 transport_unavailable` with `ses_identity_limit` for `dns_records`, `send_only` and `smtp_relay` with `inbound: ses`, while `cloudflare_zone` still succeeds ([N26](../edge-cases.md)) |
+| `it::domains::ses_identity_limit` | 9,000 identities → `ses_identities_90pct` alert and a doctor warning; 10,000 → `422 transport_unavailable` with `ses_identity_limit` for `dns_records`, `send_only` and `smtp_relay` with `inbound: ses`, while `cloudflare_zone` still succeeds. The count includes onboarding journal identities and, when `ListEmailIdentities` reports more identities in the region than this deployment holds, uses that number ([N26](../edge-cases.md)) |
 | `cli::setup::ses_region_check` | `pmail setup ses` refuses a region that cannot receive mail, and a region outside the EU and the UK under `PM_JURISDICTION=eu` unless `--allow-non-eu`; `eu-west-2` is accepted ([N30](../edge-cases.md)) |
 | `core::smtp::state_machine` | Every row of the client table, including no STARTTLS → refused before AUTH, `535` → auth failure, 5xx on one RCPT ([N14](../edge-cases.md), [N16](../edge-cases.md), [N20](../edge-cases.md)) |
 | `it::smtp::create_connect_check` | Domain create and `PATCH smtp`: port 25 → `400 smtp_port_not_allowed`; no STARTTLS → `422 smtp_tls_required` with no `AUTH` sent; `535` → `422 smtp_auth_failed`; nothing stored in each case ([N14](../edge-cases.md), [N16](../edge-cases.md)) |

@@ -201,6 +201,10 @@ They need:
 The CLI passes both to Wrangler through the child's environment, never as arguments. The permissions of
 this token, and of the Worker's own `PM_CF_API_TOKEN`, are in one table:
 [Deploy to Cloudflare › Create a Cloudflare API token](../../self-hosting.md#2-create-a-cloudflare-api-token).
+That table scopes Workers access per Worker: the first `setup` (which creates the Worker and its Custom
+Domains) runs with a first-run token holding Workers Admin at product scope, and every later command
+with a deploy token holding Workers Editor on `pylota-mail` only. When step 13 or 14 of setup fails with
+a Workers authorization error, the CLI's fix names the first-run token.
 
 The deployment directory is `./deploy` unless `--dir <path>` is given. It holds `wrangler.toml` and
 `.bundle/<version>/` (extracted releases). `deploy/wrangler.toml` doubles as setup's record of the
@@ -305,7 +309,7 @@ JSON mode prints strings exactly as the API returned them (JSON escaping makes t
 | 11 | `verification` | A release signature or checksum did not verify; `webhooks verify` found no valid signature; `assertions verify` found the assertion invalid |
 | 12 | `doctor_failed` | `doctor` reported at least one `fail` |
 | 13 | `timeout` | `wait` returned `timed_out: true`; a polling step (health, re-seal, erasure, SNS subscription confirmation) passed its deadline |
-| 14 | `aws` | During `setup ses` or `destroy --include-ses`: an AWS API call failed (including access denied), or the AWS account is not ready (SES production access missing; the console steps are printed) |
+| 14 | `aws` | During `setup ses` or `destroy --include-ses`: an AWS API call failed (including access denied), the AWS account is not ready (SES production access missing; the console steps are printed), or it holds another deployment's receipt rule or resources ([N31](../edge-cases.md)) |
 | 130 | `interrupted` | SIGINT or Ctrl-C |
 
 Exit codes are part of the CLI contract ([AGENTS.md](https://github.com/PILOTAAI/pylota-mail/blob/main/AGENTS.md):
@@ -549,17 +553,22 @@ the Cloudflare API and leaves the monitor ID empty; the Worker completes the row
 ```sql
 INSERT INTO domains (id, tenant_id, name, kind, method, inbound, zone_id, is_apex, routing_mode,
                      transport, reply_token, receiving, sending, state, state_changed_at,
-                     ownership_token, event_subscription_id, records_json, monitor_do_id,
-                     created_at, updated_at)
+                     ownership_token, event_subscription_id, records_json, expected_ns_json,
+                     provider_objects_json, monitor_do_id, created_at, updated_at)
 VALUES (?1, NULL, ?2, 'platform', 'platform', 'routing', ?3, 1, 'catch_all',
         'cloudflare', 'subaddress', 1, 1, 'pending', ?4,
-        ?5, ?6, ?7, '',
+        ?5, ?6, ?7, ?8, ?9, '',
         ?4, ?4)
-ON CONFLICT(name) DO UPDATE SET
+ON CONFLICT(name) WHERE state <> 'removed' DO UPDATE SET
   zone_id = excluded.zone_id, ownership_token = excluded.ownership_token,
   event_subscription_id = excluded.event_subscription_id,
-  records_json = excluded.records_json, updated_at = excluded.updated_at;
+  records_json = excluded.records_json, expected_ns_json = excluded.expected_ns_json,
+  provider_objects_json = excluded.provider_objects_json, updated_at = excluded.updated_at;
 ```
+
+`?8` is the zone's `name_servers` from `GET /zones/{zone_id}` (the baseline of the weekly NS check), and
+`?9` lists the routing, catch-all, sending and ownership-record objects setup created, with
+`created: true` (the platform domain is never removed through the API, but `destroy` uses the record).
 
 **Requirement on the Worker** (owned by [Identities, addresses and domains](identity-domains.md#the-platform-domain)):
 the `* * * * *` cron selects `SELECT id, kind FROM domains WHERE monitor_do_id = '' LIMIT 20`, mints a
@@ -613,7 +622,7 @@ this section decides the CLI's part. It runs after `setup`, against the deployme
 |---|---|---|
 | `--region` | – (required) | The SES region, `PM_SES_REGION` |
 | `--allow-non-eu` | off | Accept a region outside the EU and the UK when `PM_JURISDICTION = "eu"` ([N30](../edge-cases.md)) |
-| `--prefix` | `pylota-mail-{aws-account-id}` | Prefix of the inbound S3 bucket, `{prefix}-inbound`. The default holds the AWS account ID, so two accounts never choose the same bucket name |
+| `--prefix` | `pylota-mail-{aws-account-id}-{dep}` | Prefix of the inbound S3 bucket, `{prefix}-inbound`. The default holds the AWS account ID and the deployment label `{dep}` (the first 8 hex characters of `SHA-256(PM_API_HOST)`), so two accounts, or two deployments, never choose the same bucket name |
 | `--dir` | `./deploy` | Deployment directory; its `wrangler.toml` must exist (setup ran) |
 | `--yes` | off | Accept the IAM policy without the interactive review |
 
@@ -623,7 +632,9 @@ identity's DNS records. Like `setup`, it is idempotent and reads before it write
 resource up first, and creates or updates it only when it is missing or differs. Each step prints
 `created`, `exists`, `updated` or `skipped`.
 
-**Checks before anything is created** (each stops the command):
+**Checks before anything is created** (each stops the command). Every resource the command creates
+carries the tag `pylota-mail:api-host = {PM_API_HOST}` where the service accepts tags
+([Domains on any DNS host §4.2](domain-connections.md#42-deployment-set-up-for-ses)):
 
 1. `deploy/wrangler.toml` exists, and `GET https://{PM_API_HOST}/health` answers with the CLI's version
    (the Worker must confirm the SNS subscriptions later, and step 10 deploys). A different version stops
@@ -642,6 +653,15 @@ resource up first, and creates or updates it only when it is missing or differs.
    ($0.16 per 1,000 against $0.10 à la carte, SES pricing read 2026-10-09) it prints a warning and
    continues. How the plan is read from the account: verify at build time; if it cannot be read, the
    warning names both prices.
+4. **Another deployment ([N31](../edge-cases.md)).** `DescribeActiveReceiptRuleSet`: a rule `pm-deliver`
+   whose S3 action writes to a bucket other than `{prefix}-inbound`, or to a bucket whose
+   `pylota-mail:api-host` tag is not `PM_API_HOST`, stops the command with exit 14 ("another deployment
+   receives mail in this AWS account and region; use a separate AWS account"). Then each resource of the
+   steps below that already exists under its name (bucket, both topics, queue, configuration set, IAM user,
+   platform identity) is read with its tags: a missing tag or another host's tag stops the command with
+   exit 14, naming the resource. Nothing has been created or changed at that point. The tag-reading calls
+   per service (for example `GetBucketTagging`, `ListTagsForResource`, `ListQueueTags`, `ListUserTags`):
+   verify at build time.
 
 **Steps**, in order. The numbers in brackets are the rows of Domains on any DNS host §4.2.
 
@@ -653,7 +673,7 @@ resource up first, and creates or updates it only when it is missing or differs.
 | 4 | Receipt rule set and rule `pm-deliver` [7, 8] | An account that already has an active rule set keeps it: the rule is added to that set, and its name becomes `PM_SES_RULE_SET`. Otherwise the set `pylota-mail` is created and made active |
 | 5 | Configuration set, event destination and the delivery-events topic [10] | As in [Outbound › Amazon SES](outbound.md#amazon-ses). This topic, `PM_SES_SNS_TOPIC_ARN`, also gets `SignatureVersion = 2` |
 | 6 | Platform identity [9] | `CreateEmailIdentity` for the platform domain; its DKIM CNAMEs are written into the platform zone through the Cloudflare API (find, then create) |
-| 7 | IAM user `pylota-mail-worker` and its policy [11] | The policy JSON is printed for review first. Interactive runs ask before applying it; non-interactive runs need `--yes`, else exit 2. An existing policy that differs is shown as a diff |
+| 7 | IAM user `pylota-mail-worker-{dep}` and its policy [11] | The policy JSON is printed for review first. Interactive runs ask before applying it; non-interactive runs need `--yes`, else exit 2. An existing policy that differs is shown as a diff |
 | 8 | The Worker's access key | Only when `PM_SES_ACCESS_KEY_ID` is not among the Worker's secret names (Worker secrets are write-only, so an existing key is never read or replaced). `CreateAccessKey`, then `PM_SES_ACCESS_KEY_ID` and `PM_SES_SECRET_ACCESS_KEY` are piped to `wrangler secret put` on stdin and dropped from memory. They are never written to disk or printed; `--print-secrets` does not exist here |
 | 9 | Variables | Renders `deploy/wrangler.toml` ([§7](#7-rendering-wranglertoml)) with `PM_SES_REGION`, `PM_SES_INBOUND_BUCKET`, `PM_SES_INBOUND_TOPIC_ARN`, `PM_SES_INBOUND_QUEUE_URL`, `PM_SES_RULE_SET` and `PM_SES_SNS_TOPIC_ARN` under `[vars]`. These six are owned by `setup ses`: a re-run writes the values it found |
 | 10 | Deploy | `pmail deploy` ([§8](#8-deploy)), so the Worker reads the new variables. A re-run that changed nothing is a no-op ([§8.9](#89-no-op-redeploys)) |
@@ -673,7 +693,7 @@ receipt-rule-set calls, `CreateAccessKey` and the subscription status): verify a
 | 9 | The Worker's `/health` does not answer |
 | 10 | Wrangler (`secret put`, deploy) or a Cloudflare API call failed |
 | 13 | The SNS subscriptions were not confirmed within 5 minutes |
-| 14 | An AWS API call failed, or the account has no SES production access |
+| 14 | An AWS API call failed, the account has no SES production access, or the account and region hold another deployment's rule or resources (check 4) |
 | 130 | Interrupted |
 
 JSON mode prints `{ "region", "rule_set", "steps": [ { "step", "status", "resource", "id" } ],
@@ -976,7 +996,9 @@ Data sources:
 | `alerts` | `GET /v1/audit-events?action=alert.fired` and `?action=alert.resolved` with the profile's key (needs `audit:read`; `skip` without it) |
 | `dlq` | D1 `SELECT queue, COUNT(*) AS n, MIN(first_seen_at) AS oldest FROM dlq_items WHERE redriven_at IS NULL GROUP BY queue` |
 | `quota` | Workers Analytics Engine SQL API (`POST /accounts/{a}/analytics_engine/sql`; verify at build time) over the `provider_quota_errors_total` points of the last 24 hours ([Observability §3](observability.md#3-metrics)). `warn` when `PM_DAILY_SEND_QUOTA` is unset in the rendered file, with the fix `pmail setup --daily-send-quota <n>` (or set it under `[vars]` and `pmail deploy`). The SQL API needs Account Analytics · Read on the token (Cloudflare's SQL API page, read 2026-10-09); when the call is refused for a missing permission, the check is `warn`, not `fail`, with the fix naming that permission ([Deploy to Cloudflare › step 2](../../self-hosting.md#2-create-a-cloudflare-api-token)) |
-| `ses` | Only when `PM_SES_REGION` is set in the rendered file (otherwise `skip`); needs local AWS credentials ([§2.6](#26-aws-credentials); `skip` without them). `fail` when: SES `GetAccount` shows no production access, or sending paused; `PM_SES_INBOUND_TOPIC_ARN` is set and the active receipt rule set is not `PM_SES_RULE_SET` or does not contain `pm-deliver`; `PM_SES_REGION` is not a receiving region. `warn` when the region is outside the EU and the UK under `PM_JURISDICTION = "eu"` (only possible through `setup ses --allow-non-eu` or a hand edit, [N30](../edge-cases.md)). Identity count from D1, the same count the Worker uses: `SELECT COUNT(*) FROM domains WHERE ses_region IS NOT NULL AND state <> 'removed'`, plus 1 for the platform identity. At 9,000 or more, `warn` `ses_identities_90pct` ([N26](../edge-cases.md)); at 10,000, `fail` (new SES domains are refused with `transport_unavailable`, `ses_identity_limit`). SES allows 10,000 identities per region (SES quotas, read 2026-10-09). Field and call names beyond `GetAccount`: verify at build time |
+| `ses` | Only when `PM_SES_REGION` is set in the rendered file (otherwise `skip`); needs local AWS credentials ([§2.6](#26-aws-credentials); `skip` without them). `fail` when: SES `GetAccount` shows no production access, or sending paused; `PM_SES_INBOUND_TOPIC_ARN` is set and the active receipt rule set is not `PM_SES_RULE_SET` or does not contain `pm-deliver`; `PM_SES_REGION` is not a receiving region. `warn` when the region is outside the EU and the UK under `PM_JURISDICTION = "eu"` (only possible through `setup ses --allow-non-eu` or a hand edit, [N30](../edge-cases.md)). Identity count: the same count the Worker uses ([Domains on any DNS host §4.3](domain-connections.md#43-dns_records)), from D1 (`SELECT COUNT(*) FROM domains WHERE ses_region IS NOT NULL AND state <> 'removed'`, plus the `domain_onboarding` rows whose journal holds an SES identity, plus 1 for the platform identity) and from `ListEmailIdentities` with the local credentials, whichever is larger. `fail` also when a resource that `setup ses` created no longer carries this deployment's `pylota-mail:api-host` tag, or `pm-deliver` writes to another bucket ([N31](../edge-cases.md)). At 9,000 or more, `warn` `ses_identities_90pct` ([N26](../edge-cases.md)); at 10,000, `fail` (new SES domains are refused with `transport_unavailable`, `ses_identity_limit`). SES allows 10,000 identities per region (SES quotas, read 2026-10-09). Field and call names beyond `GetAccount`: verify at build time |
+| `domains.orphans` | D1 `zone_claims` rows still `pending` an hour after `created_at` and `domain_onboarding` rows older than two hours (the hourly cleanup should have removed both); for each pending claim, `GET /zones?name={zone_name}&account.id={a}`. `warn` per leftover, with the zone ID when a zone of that name was created after the claim, and the fix: delete that zone in the dashboard if no domain uses it ([Identities and domains › Cleanup after a failed add](identity-domains.md#cleanup-after-a-failed-add)) |
+| `routing.leftover_subdomains` | Only if spike S9 showed that a subdomain's routing cannot be removed on its own: each zone's routing subdomains (`GET /zones/{z}/email/routing/dns`, or the dashboard step S9 records) that no non-`removed` domain row names. `warn`, with the dashboard step (Email Routing › Settings › Subdomains) ([Identities and domains › Domain removal](identity-domains.md#domain-removal)) |
 | `cloudflare.zones` | `GET /zones?account.id={a}`: the number of zones in the account, always printed in the detail. Never `fail`; `warn` above 1,000, with the fix "ask Cloudflare to confirm the account's zone limit": the limit for a non-Enterprise account is not documented ([Domains on any DNS host §3.2](domain-connections.md#32-nameservers)) |
 | `security_txt` | `GET https://{api_host}/.well-known/security.txt` (`Expires`) and `PM_SECURITY_CONTACT` in the rendered file |
 | `web_bot_auth` | Only when `PM_WEB_BOT_AUTH = "on"` in the rendered file (otherwise `skip`). `GET https://{api_host}/.well-known/http-message-signatures-directory`, no key. `fail` unless it answers `200` with `Content-Type: application/http-message-signatures-directory+json`, lists one to three keys, and carries one `Signature-Input` and `Signature` member per listed key, with tag `http-message-signatures-directory`, that verifies with that key (`core::httpsig`; [Agent signing keys §3.2](agent-keys.md#32-web-bot-auth-key-directory)). The fix names the deploy step or the key rotation |
@@ -1037,19 +1059,23 @@ database or bucket.
    `--skip-erasure` is for a Worker that no longer answers.
 3. **Tear down remaining domains.** For each row left in `domains` (always the platform domain), the
    removal steps of [Identities, addresses and domains › Domain removal](identity-domains.md#domain-removal)
-   with the local token: literal rules, catch-all disabled, `DELETE /zones/{z}/email/routing/dns`
-   (unless `--keep-dns`), `DELETE /zones/{z}/email/sending/subdomains/{tag}`, the event subscription,
-   and the ownership TXT. SES identities are left to step 4.
+   with the local token, on the recorded provider objects only: literal rules, catch-all disabled, the
+   routing step (one name's records, or `DELETE /zones/{z}/email/routing/dns` only for the zone's last
+   routing domain at its apex; skipped with `--keep-dns`), `DELETE /zones/{z}/email/sending/subdomains/{tag}`,
+   the event subscription, and the ownership TXT. Rows are processed subdomains first, so each zone's apex
+   comes last. SES identities are left to step 4.
 4. **Amazon SES resources** (only with `--include-ses`; otherwise listed as above). With the local AWS
    credentials, in the reverse order of [§6.9](#69-setup-ses): the two HTTPS subscriptions; the Worker's
-   access key, then the IAM user `pylota-mail-worker` and its policy; the SES identities of every domain
+   access key, then the IAM user `pylota-mail-worker-{dep}` and its policy; the SES identities of every domain
    row that still has `ses_identity` (left by `--skip-erasure`) and the platform identity, with the
    platform identity's DKIM CNAMEs removed from its zone through the Cloudflare API; the configuration
    set, its event destination and the delivery-events topic; the receipt rule `pm-deliver`, and the rule
    set `pylota-mail` only when setup created it (an operator's own active rule set is kept, without the
    rule); the SQS queue and its subscription; the inbound SNS topic; the inbound S3 bucket, emptied
    first (it holds raw mail for at most 14 days). Each step reads first and treats AWS's not-found error
-   as done; any other AWS error is exit 14, and a re-run continues. Operation names beyond those cited in
+   as done; any other AWS error is exit 14, and a re-run continues. A resource whose
+   `pylota-mail:api-host` tag names another deployment, or an SES identity whose tags do not name this
+   one, is never deleted: it is listed and skipped. Operation names beyond those cited in
    [Domains on any DNS host §4.2](domain-connections.md#42-deployment-set-up-for-ses): verify at build
    time.
 5. **Delete the Worker:** `npx --yes wrangler@4.139.0 delete --name pylota-mail`. Wrangler describes
@@ -1391,12 +1417,17 @@ The CLI never falls back to the local token on its own.
    than `422 cf_token_required` is handled as usual.
 3. On `cf_token_required`: run steps 1–8 of
    [Identities, addresses and domains › Kind `zone`](identity-domains.md#kind-zone) with the local token
-   (including the existing-MX and SPF preflights, with `--replace-mx` as the explicit opt-in).
+   (including the existing-MX and SPF preflights, with `--replace-mx` as the explicit opt-in), recording
+   each object it creates, and each existing one it uses as `created: false`, in the shape of
+   `provider_objects_json` ([No adoption](identity-domains.md#no-adoption-of-provider-objects): this is a
+   platform operation, so an existing sending domain or routing setup is used, never deleted later).
 4. Insert the row through the D1 query API (`POST /accounts/{a}/d1/database/{id}/query`), with the
    account ID of step 1: the database is the one named `pylota-mail` in that account, found by name as
    in setup step 2, or the `database_id` of `<dir>/wrangler.toml` when that file exists. The statement
    is the one of [§6.6](#66-the-platform-domain-row) with `tenant_id`, `kind = 'zone'`,
-   `method = 'cloudflare_zone'`, `inbound = 'routing'` and `state = 'pending'`. The Worker's cron hook
+   `method = 'cloudflare_zone'`, `inbound = 'routing'`, `state = 'pending'`, `expected_ns_json` (the
+   zone's `name_servers`) and `provider_objects_json`, after checking that no non-`removed` row has the
+   name. The Worker's cron hook
    mints the monitor, starts verification and emits `domain.created`. An apex uses the catch-all, so no
    literal rules are needed.
 5. Steps the Cloudflare API cannot do (spike S9) are printed as dashboard steps, and `doctor` checks
@@ -1417,6 +1448,7 @@ A Cloudflare API or D1 failure in steps 3 and 4 is exit 10; every step reads fir
 | `--no-receiving`, `--no-sending` | `receiving: false`, `sending: false` | always |
 | `--replace-mx` | `replace_mx: true` | `cloudflare_zone` (apex), `dns_records` |
 | `--confirm-dedicated` | `confirm_dedicated: true` | `nameservers` |
+| `--claim` | `claim: true` | always |
 | `--inbound forward\|ses` | `inbound` | `smtp_relay` (required) |
 | `--smtp-host`, `--smtp-port 465\|587`, `--smtp-username` | `smtp.host`, `smtp.port`, `smtp.username` | `smtp_relay` (required) |
 | `--smtp-password-stdin` | `smtp.password` | `smtp_relay` (required) |
@@ -1436,7 +1468,9 @@ A Cloudflare API or D1 failure in steps 3 and 4 is exit 10; every step reads fir
   `nameservers` and `delegated_subdomain` the records are the `NS` values to set at the registrar or
   DNS host. `--json` prints the response unchanged.
 - Errors keep their API meaning: `409 domain_not_dedicated` (exit 6) prints `details.records` and the
-  fix `--confirm-dedicated`; `429 upstream_rate_limited` (exit 8) prints the retry time.
+  fix `--confirm-dedicated`; `409 domain_exists` (exit 6) with `details.claim` prints the TXT record to
+  publish and the fix `--claim`; `409 domain_claim_pending` (exit 6) prints the retry time;
+  `429 upstream_rate_limited` (exit 8) prints the retry time.
   `422 transport_unavailable` and `422 cf_token_required` are the two exceptions to the API's exit code:
   exit 3, with the fixes listed in [§18.1](#181-domains-add-without-pm_cf_api_token).
 
