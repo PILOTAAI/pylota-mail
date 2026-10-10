@@ -886,7 +886,7 @@ CREATE TABLE platform_objects (
   `counterparty_hash` ([Privacy § 11](privacy.md#11-what-remains-after-deletion)).
   `exports.identity_id` is written by `POST /v1/exports` and returned in the export object;
   `erasure_requests.completed_at` and `status` are also read by an export's `complete` step
-  ([Privacy § 6.11](privacy.md#611-exports-and-copies-in-flight-i9)).
+  ([Privacy § 6.11](privacy.md#611-exports-and-copies-in-flight-i11)).
 
 ## 2. `IdentityMailbox` Durable Object (SQLite)
 

@@ -797,7 +797,7 @@ idempotent:
    then `DELETE …/suppressions/{suppression_id}` for each entry that is not `read_only` (Cloudflare's own
    `policy` entries cannot be deleted; [Manage suppressions](https://developers.cloudflare.com/email-service/configuration/suppressions/),
    read 2026-10-10). Our hashed `suppressions` rows are unaffected ([Privacy § 2](privacy.md#2-data-inventory),
-   [I10](../edge-cases.md)).
+   [I12](../edge-cases.md)).
 5. `delete_subscription`: delete the event subscription by `event_subscription_id`.
 6. `delete_ses_identity` (when `ses_identity` is set): `DELETE /v2/email/identities/{domain}`; on a
    `zone` or `delegated` domain, also delete the three DKIM CNAMEs that onboarding published through the

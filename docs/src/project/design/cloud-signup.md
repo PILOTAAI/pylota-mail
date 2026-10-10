@@ -45,9 +45,9 @@ customer's mail. Cloud keeps `PM_QUARANTINE_KEY_RELEASE=off`, and Pylota's tenan
 `quarantine.key_release: true`, so Pylota's app can release held mail through its key
 ([Configuration › Tenant policy](../../reference/configuration.md#tenant-policy)). Amazon SES for Cloud runs
 in `eu-west-2` (London), decided on 2026-10-09. Cloud also sets `PM_BACKUP_BUCKET = "pylota-mail-backup"`
-(the nightly blob copy, [ADR 0011](../adr/0011-plan-items-changed-for-v1.md)), `PM_ALERT_EMAIL` to the
+(the nightly blob copy, [ADR 0016](../adr/0016-plan-items-changed-for-v1.md)), `PM_ALERT_EMAIL` to the
 owner's address and `PM_HEARTBEAT_KEY_ID`, and runs the heartbeat workflow, because one person operates
-it ([ADR 0010](../adr/0010-solo-operator.md)).
+it ([ADR 0015](../adr/0015-solo-operator.md)).
 
 `PM_CONSOLE_HOST` defaults to `PM_API_HOST`, so a self-hosted deployment keeps one hostname. When the two
 differ, the router answers console paths only on the console host and API paths only on the API host;

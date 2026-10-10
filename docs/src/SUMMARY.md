@@ -68,5 +68,5 @@
   - [0007 Agentic search with verified citations](project/adr/0007-agentic-search.md)
   - [0008 Domains on any DNS host](project/adr/0008-domains-on-any-dns-host.md)
   - [0009 Local MCP protocol types](project/adr/0009-local-mcp-protocol-types.md)
-  - [0010 One person builds and operates Pylota Mail Cloud](project/adr/0010-solo-operator.md)
-  - [0011 Plan items that v1.0 defers or does differently](project/adr/0011-plan-items-changed-for-v1.md)
+  - [0015 One person builds and operates Pylota Mail Cloud](project/adr/0015-solo-operator.md)
+  - [0016 Plan items that v1.0 defers or does differently](project/adr/0016-plan-items-changed-for-v1.md)

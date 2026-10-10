@@ -1,4 +1,4 @@
-# 0010 One person builds and operates Pylota Mail Cloud
+# 0015 One person builds and operates Pylota Mail Cloud
 
 | | |
 |---|---|
@@ -61,7 +61,7 @@ Every control that relied on a second person is replaced by a mechanical one:
 ## Consequences
 
 - Release does not wait on a person who does not exist; every control can be checked by CI or by a
-  test (`live::ops::fresh_deploy_rehearsal`, `it::ops::j23_alert_channels`, `it::ops::j24_auto_containment`,
+  test (`live::ops::fresh_deploy_rehearsal`, `it::ops::j32_alert_channels`, `it::ops::j33_auto_containment`,
   `live::ops::heartbeat_workflow`).
 - Containment can stop legitimate traffic (a partner's whole fleet, a tenant's sends). Every rule pages,
   writes an audit row and is undone by one platform-key call; the thresholds sit above the alert

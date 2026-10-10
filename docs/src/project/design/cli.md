@@ -1691,7 +1691,7 @@ reached, and every step can be re-run.
 | `cli::setup::order` | The recorded call order matches §6.3; the catch-all `PUT` comes after the first deploy, the secrets and a `200` health | FR-OPS-1 |
 | `cli::setup::h5_existing_mx` | Foreign MX records stop setup without `--replace-mx`; with it they are deleted before routing is enabled | [H5] |
 | `cli::setup::not_apex` | A subdomain or a zone in another account is refused with the zone's name | FR-OPS-1 |
-| `cli::setup::lifecycle_merge` | Existing R2 lifecycle rules are kept; the 15-day staging rule and the 1-day multipart-abort rule are added or replaced | FR-OPS-1, [J7](../edge-cases.md), [I11](../edge-cases.md) |
+| `cli::setup::lifecycle_merge` | Existing R2 lifecycle rules are kept; the 15-day staging rule and the 1-day multipart-abort rule are added or replaced | FR-OPS-1, [J7](../edge-cases.md), [I13](../edge-cases.md) |
 | `cli::setup::bootstrap_key` | The inserted key authenticates against the workerd harness and holds every permission except `identities:sign`; the decision table of §6.5 holds, including refusal when keys exist, and every pepper upload happens in step 14 | FR-OPS-1, FR-KEY-2 |
 | `cli::setup::owner_email` | The default tenant is created with the owner; `--no-console` writes `PM_CONSOLE = "off"` | FR-CON-7 |
 | `cli::setup::billing_off` | Setup writes no `PM_BILLING`; the default tenant reports `billing: disabled` | FR-BILL-12 |

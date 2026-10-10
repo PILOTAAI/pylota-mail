@@ -93,7 +93,7 @@ Pylota's own experience showed the cost of these gaps:
 - Bulk marketing campaigns. Marketing mail is supported per message with consent and unsubscribe
   headers, but there are no list-management or campaign features.
 - Scheduled send and server-side drafts (planned for v1.1).
-- OAuth 2.1 for the MCP endpoint (planned for v1.1; v1.0 uses API keys as bearer tokens; [ADR 0011](adr/0011-plan-items-changed-for-v1.md)).
+- OAuth 2.1 for the MCP endpoint (planned for v1.1; v1.0 uses API keys as bearer tokens; [ADR 0016](adr/0016-plan-items-changed-for-v1.md)).
 - Running on platforms other than Cloudflare Workers.
 
 ### Unique selling propositions
@@ -626,7 +626,7 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
 
 - Pylota cut over from AgentMail. Every operator has four identities, inbound mail works end to end,
   and none of the edge-case register's `S` rows fails in production for 30 days.
-- A fresh agent session deploys from the self-hosting page alone, with no help, inside 15 minutes of hands-on time (measured by the M20 rehearsal, [ADR 0010](adr/0010-solo-operator.md)).
+- A fresh agent session deploys from the self-hosting page alone, with no help, inside 15 minutes of hands-on time (measured by the M20 rehearsal, [ADR 0015](adr/0015-solo-operator.md)).
 - Agents in Pylota's eval suite find and cite the right email in at least 90% of mail-retrieval tasks.
 - Zero duplicate sends attributed to retries.
 

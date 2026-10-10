@@ -696,8 +696,8 @@ also needs S11; without it, `smtp_relay` ships with `inbound: forward` only. `cl
 
 **Implements:** FR-PRV-1–6, FR-IDN-4, NFR-PRV-1, and partner deletion after its tenants' erasure (FR-KEY-4).
 
-**Acceptance:** F6, I1–I7, I9–I11 (`it::erasure::i9_inflight_copies`,
-`it::erasure::i10_provider_suppressions`, `it::jobs::i11_finalise_on_fail_and_cancel`), the tenant-scope hold behaviour of I2
+**Acceptance:** F6, I1–I7, I11–I13 (`it::erasure::i11_inflight_copies`,
+`it::erasure::i12_provider_suppressions`, `it::jobs::i13_finalise_on_fail_and_cancel`), the tenant-scope hold behaviour of I2
 (`it::erasure::i2_hold_tenant_scope`, with the global job's `held_erasures` step), the staging lifetime of
 J7 (`it::inbound::j7_staging_outlives_dlq`, with the 15-day lifecycle rule and the daily re-queue of the
 `staging` step), batched D1 deletes (`it::erasure::batched_deletes`), the `reparse` job that J3 starts (J3 itself is accepted with M17 Completion,
@@ -829,11 +829,11 @@ M17 is accepted in two halves, without renumbering ([Dependency graph](#dependen
   `it::ops::restore_replays_changes`, `it::ops::restore_rebuilds_ledger`, `it::erasure::i6_reapply_by_hash`,
   `cli::ops::sqldump_parses_export`, `cli::ops::restore_replay_diff`, `cli::ops::freeze_unfreeze`, and the
   restore runbook that `live::ops::restore_drill` runs in M20.
-- NFR-OPS-3 and the solo-operator controls ([ADR 0010](adr/0010-solo-operator.md)): alert email and the
-  heartbeat (J23: `it::ops::j23_alert_channels`, `it::ops::heartbeat_missing`), automatic containment
-  (J24: `it::ops::j24_auto_containment`), `job_failed:{kind}` (`it::ops::job_failed_alerts`), the
-  per-domain bounce and complaint state alerts (`it::ops::domain_rate_state_alerts`), capacity (J21:
-  `it::ops::j21_d1_capacity`, J22: `it::ops::j22_vector_capacity`), `GET /v1/platform/status`
+- NFR-OPS-3 and the solo-operator controls ([ADR 0015](adr/0015-solo-operator.md)): alert email and the
+  heartbeat (J32: `it::ops::j32_alert_channels`, `it::ops::heartbeat_missing`), automatic containment
+  (J33: `it::ops::j33_auto_containment`), `job_failed:{kind}` (`it::ops::job_failed_alerts`), the
+  per-domain bounce and complaint state alerts (`it::ops::domain_rate_state_alerts`), capacity (J30:
+  `it::ops::j30_d1_capacity`, J31: `it::ops::j31_vector_capacity`), `GET /v1/platform/status`
   (`it::ops::platform_status`), `cli::erasure::retry`, and the audit of platform- and partner-key mail
   reads (`it::security::mail_reads_audited`). The heartbeat workflow runs against staging in M20
   (`live::ops::heartbeat_workflow`).
@@ -1144,7 +1144,7 @@ the ones marked manual there need a person in a browser and run with `cargo xtas
     commands and dashboard steps the page asks a person to do, excluding waiting on Cloudflare) is at
     most 15 minutes. The session is recorded (its transcript and timings go in the release notes), and
     every question it had to guess is fixed in the page before the release
-    ([ADR 0010](adr/0010-solo-operator.md)). A paid external tester following the same page is an
+    ([ADR 0015](adr/0015-solo-operator.md)). A paid external tester following the same page is an
     optional extra, not a requirement.
 13. Measured on staging: the heartbeat workflow (`live::ops::heartbeat_workflow`); NFR-REL-3
     (`live::slo::inbound_to_webhook`), NFR-PERF-4 with the real models
