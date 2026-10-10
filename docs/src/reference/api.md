@@ -1621,7 +1621,7 @@ and revoking are audit-logged (`key.create`, `key.revoke`).
 | `thread` | `identity_id`, `thread_id` | Every message in the thread |
 | `counterparty` | `counterparty_address` | Every message to or from that address, in every identity of the tenant |
 | `identity` | `identity_id` | The whole mailbox and the identity's signing keys. Its addresses and key IDs are tombstoned |
-| `tenant` | none | Everything in the tenant, every identity's signing keys included (their key IDs are tombstoned). Then the tenant is marked `erased` |
+| `tenant` | none | Everything in the tenant, every identity's signing keys included (their key IDs are tombstoned). Then the tenant is marked `erased`, once no held thread remains |
 
 Held threads are skipped and listed in the receipt (FR-PRV-4): an erasure request is never refused
 because of a hold (it never returns `423 legal_hold`). The request's `status` is `queued`, `running`,

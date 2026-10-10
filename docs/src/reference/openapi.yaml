@@ -5022,7 +5022,7 @@ paths:
         | `thread` | `identity_id`, `thread_id` | Every message in the thread |
         | `counterparty` | `counterparty_address` | Every message to or from that address, in every identity of the tenant |
         | `identity` | `identity_id` | The whole mailbox. Its addresses are tombstoned |
-        | `tenant` | none | Everything in the tenant. Then the tenant is marked `erased` |
+        | `tenant` | none | Everything in the tenant. Then the tenant is marked `erased`, once no held thread remains |
 
         A failing step is retried automatically until `deadline_at` − 4 hours (20 hours after the first
         request); then the request ends `failed`, and submitting it again restarts it.

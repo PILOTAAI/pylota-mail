@@ -783,8 +783,8 @@ signing tools of M25 (`mail_sign_assertion`, `mail_sign_http_request`).
 (alert rules, pure), `handlers/platform.rs`
 (the platform API: `GET /v1/platform/dlq`, `POST /v1/platform/dlq/{dlq_id}/redrive`,
 `POST /v1/platform/jobs`, `GET /v1/platform/jobs/{job_id}`, `POST /v1/platform/keys/{purpose}/rotate`, all
-`platform:ops`; and in M17 Completion `GET /v1/platform/status` (`audit:read`),
-`PUT /v1/platform/switches`, `POST /v1/platform/identities/{identity_id}/restore` and
+`platform:ops`; `GET /v1/platform/status` (`audit:read`), whose `master_key` block lands in M17
+Foundation and the rest in M17 Completion; and in M17 Completion `PUT /v1/platform/switches`, `POST /v1/platform/identities/{identity_id}/restore` and
 `POST /v1/platform/erasure-requests/{erasure_id}/reapply`),
 `ops/{alert_email.rs, containment.rs, switches.rs, freeze.rs, restore.rs, capacity.rs}` (the restore
 tooling: the freeze, mailbox PITR externs on `Storage::as_raw()` and the `restore_reconcile` job),

@@ -163,7 +163,7 @@ GROUP BY domain_id
 | `http_requests_total` | counter | route, method, status_class, code | `fetch` |
 | `http_ms` | observation | route | `fetch` |
 | `rate_limited_total` | counter | bucket | `fetch` |
-| `inbound_received_total` | counter | result: `accepted`, `staged`, `rejected_unknown`, `rejected_retired`, `rejected_suspended`, `tempfail_suspended`, `tempfail_storage` | `email()` |
+| `inbound_received_total` | counter | result: `accepted`, `staged`, `rejected_unknown`, `rejected_retired`, `rejected_suspended`, `tempfail_suspended`, `tempfail_storage`, `tempfail_frozen` (a restore freeze; excluded from NFR-REL-2 like suspensions) | `email()` |
 | `inbound_r2_retries_total` | counter | – | `email()` |
 | `inbound_processed_total` | counter | outcome: `stored`, `deduplicated`, `quarantined`, `hidden`, `throttled`, `dsn_applied`, `parse_degraded` | `pm-inbound` |
 | `inbound_ingest_ms` | observation | – | `pm-inbound`: `received_at` → commit |
@@ -370,7 +370,7 @@ The `* * * * *` cron runs `ops::alerts::evaluate`:
      row revoked or missing (`heartbeat_missing`);
    - every 15th run (every 15 minutes): capacity. D1's size is the `meta.size_after` that D1 returns with
      every query result ([D1 result object](https://developers.cloudflare.com/d1/worker-api/return-object/),
-     read 2026-10-10), taken from the evaluator's own write; the vector count is `index_count` on the
+     read 2026-10-10), taken from the result of the evaluator's own tenant-count query below; the vector count is `index_count` on the
      latest `index_reconcile` summary row; the namespace count is
      `SELECT COUNT(*) FROM tenants WHERE status <> 'erased'`. The three values are kept in the `alert_fired`
      detail and shown by `GET /v1/platform/status`; the automatic rules of section 5.6 that depend on
@@ -974,7 +974,9 @@ The tooling is built by M17 Completion ([Build plan](../build-plan.md#m17--obser
    D1 restore cannot undo it. Tenants are **not** suspended: suspension pauses identities, and the
    outbound consumer cancels the queued sends of a paused identity. While frozen:
    - `email()` throws before it reads anything, so every sending server gets a temporary failure and
-     retries later (the [J1](../edge-cases.md) mechanism); nothing is accepted that a restore could lose;
+     retries later (the [J1](../edge-cases.md) mechanism; counted as `tempfail_frozen`, which the
+     NFR-REL-2 SLI and the `inbound_tempfail` alert leave out); nothing is accepted that a restore could
+     lose;
    - `POST /hooks/ses`, `POST /hooks/ses/inbound` and `POST /billing/stripe/webhook` answer `503`, so SNS
      and Stripe retry; the SQS backstop cron does nothing, and S3 keeps raw SES mail for up to 14 days;
    - every API and console request answers `503 unavailable` (`details.reason = "frozen"`,

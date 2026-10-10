@@ -468,9 +468,10 @@ rotated with `wrangler secret put`, as described in
 
 ## Platform operations
 
-Platform keys with `platform:ops`. These commands call the
-[platform API](api.md#platform-operations) only; they need no Cloudflare credentials. Every call is
-audit-logged.
+Platform keys with `platform:ops` (`ops status`: `audit:read`). These commands call the
+[platform API](api.md#platform-operations) only and need no Cloudflare credentials, except
+`ops freeze`, `ops unfreeze` and `ops restore d1`, which also use your Cloudflare token. Every call that
+changes something is audit-logged.
 
 ### `dlq list`
 

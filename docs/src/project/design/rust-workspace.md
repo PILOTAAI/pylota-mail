@@ -324,6 +324,13 @@ pub struct Config {
     pub security_contact: Option<String>, pub log_level: LogLevel,
     pub default_policy: serde_json::Value, pub cf_account_id: Option<String>,
     pub daily_send_quota: Option<u32>, pub backup_bucket: Option<String>,
+    pub alert_email: Option<String>,       // PM_ALERT_EMAIL, else the mailto: of PM_SECURITY_CONTACT
+                                           // (observability.md § 5.5)
+    pub heartbeat_key_id: Option<String>,  // PM_HEARTBEAT_KEY_ID (observability.md § 5.5)
+    pub frozen: bool,                      // PM_FREEZE = "on" (observability.md › Restore from PITR)
+    pub frozen_since: Option<String>,      // PM_FREEZE_SINCE, written by pmail ops freeze
+    pub eval_rest: bool,                   // PM_EVAL_REST = "on", honoured only with PM_ENV = local
+                                           // (testing.md § 9.2)
     pub ses_inbound: Option<SesInbound>,   // PM_SES_INBOUND_{BUCKET,TOPIC_ARN,QUEUE_URL}; Some only when all three are set
     pub ses_rule_set: String,              // PM_SES_RULE_SET
     pub cf_subdomain_setup: bool,          // PM_CF_SUBDOMAIN_SETUP = "on"
@@ -937,7 +944,8 @@ dataset = "pylota_mail_metrics"
 | `cargo xtask fuzz --target <t> --time <s>` | Runs `cargo +nightly fuzz run <t> -- -max_total_time=<s>` in `fuzz/` |
 | `cargo xtask openapi` | Generates `openapi.json` from `api-types` and compares it semantically with `docs/src/reference/openapi.yaml` |
 | `cargo xtask gen-unicode` | Regenerates `crates/core/src/address/confusables_table.rs` from the pinned UTS #39 data files checked into `crates/core/data/` |
-| `cargo xtask eval-search`, `eval-agentic`, `eval-triage` | Quality gates on the golden set (build plan M18) |
+| `cargo xtask eval-setup` | Deletes and recreates the `pm-mail-chunks-eval` index in the evaluation account and waits until it answers ([Testing § 9.2](testing.md#92-running)) |
+| `cargo xtask eval-search`, `eval-agentic`, `eval-triage` | Quality gates on the golden set (build plan M18): three runs each, scored by the median ([Testing § 9.3](testing.md#93-metrics-and-gates)) |
 | `cargo xtask release --version <v>` | Builds the Worker, then writes `dist/pylota-mail-worker-<v>.tar.gz` containing `build/index.js`, `build/index_bg.wasm`, `build/worker/shim.mjs`, `migrations/d1/*.sql`, `deploy/wrangler.toml.tmpl` and `VERSION`; collects the CLI binaries built by the CI matrix; writes `dist/SHA256SUMS` (`<sha256 hex>␠␠<filename>` per line). It does not sign: the signing key never enters CI ([Security › Supply chain](security.md#11-supply-chain)). Verification by `pmail deploy` is specified in [CLI and setup](cli.md) |
 | `cargo xtask release sign <tag>` | Run by the owner on their own machine with the offline minisign key: downloads `SHA256SUMS` and every listed file from the draft release, checks each checksum and `gh attestation verify` (provenance naming `release.yml` on that tag), then writes the detached signature `SHA256SUMS.sig` and uploads it to the draft release |
 
