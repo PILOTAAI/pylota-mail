@@ -69,6 +69,9 @@ Applies to domains connected with `smtp_relay`.
 |---|---|
 | Request body | 7 MiB (a 5 MiB message after base64 decoding, plus JSON) |
 | Requests per API key | 600 per minute |
+| Requests per tenant, all its tenant and identity keys together (`RL_TENANT`) | 1,800 per minute (`429 rate_limited`, `details.bucket: "tenant"`) |
+| Requests per partner, all its partner keys together (`RL_PARTNER_API`) | 1,800 per minute (`429 rate_limited`, `details.bucket: "partner"`) |
+| Active API keys | 100 tenant and identity keys per tenant, 10 partner keys per partner; revoked and expired keys do not count (`422 key_limit_reached`). Platform keys are not capped |
 | Search per key | 120 per minute |
 | Agentic search per key | 20 per minute. Tenant daily cap 500 by default |
 | Sends per identity | 120 per minute. Daily caps from policy |

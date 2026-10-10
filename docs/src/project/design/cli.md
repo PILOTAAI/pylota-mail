@@ -1543,13 +1543,16 @@ Checks an assertion offline, the way a verifier should, by calling the SDK's `ve
    except for `localhost`, `127.0.0.1` and `[::1]` (exit 2 otherwise).
 3. The header must have `alg: EdDSA` and `typ: agent-assertion+jwt`; `iss` must equal the issuer.
    Only then is `{iss}/.well-known/jwks/{sub}.json` fetched, without an `Authorization` header and
-   after checking that `sub` is a well-formed identity ID. A key URL inside the token is never used.
+   after checking that `sub` matches `^idn_[0-9A-HJKMNP-TV-Z]{26}$` (`malformed` otherwise, with no
+   request); the fetch follows no redirect and accepts only `application/jwk-set+json`
+   ([O27](../edge-cases.md)). A key URL inside the token is never used.
 4. The key whose `kid` matches verifies the Ed25519 signature; `aud` must equal `--audience`; `nbf` and
    `exp` are checked against `--now` or the clock, allowing 60 seconds of skew.
-5. Replay (step 6 of §4.3) needs state across calls, so the CLI does not check it; it prints `jti` and
+5. Replay (step 7 of §4.3) needs state across calls, so the CLI does not check it; it prints `jti` and
    `exp` for a caller that keeps a replay cache.
 
-Output: `valid` and the claims (`sub`, `email`, `name`, `org`, `aud`, `exp`, `jti`, `kid`), exit 0; or
+Output: `valid` and the claims (`sub`, `email`, `aud`, `exp`, `jti`, `kid`, and `unverified.name` and
+`unverified.org` labelled as unverified), exit 0; or
 `invalid: <reason>`, exit 11 (`verification`, [§3.4](#34-exit-codes)), where reason is `malformed`,
 `unsupported_algorithm`, `issuer_mismatch`, `identity_not_found` (the JWKS answered `404`: the identity is
 unknown, paused, suspended or deleted), `unknown_kid`, `bad_signature`, `audience_mismatch`, `expired` or

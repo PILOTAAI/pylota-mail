@@ -500,9 +500,11 @@ pub trait MailSender {
 }
 
 // Rate limiting (bindings RL_*) ---------------------------------------------------------
-#[derive(Clone, Copy)] pub enum RlBucket { Api, Search, Agentic, Send, SignIn, Sign, Partner }
+#[derive(Clone, Copy)] pub enum RlBucket { Api, Search, Agentic, Send, SignIn, Sign, Partner, Tenant, PartnerApi }
 // SignIn: RL_SIGNIN, keyed by client IP. Sign: RL_SIGN, keyed by identity ID (assertions and HTTP signatures)
 // Partner: RL_PARTNER, keyed by partner ID (tenant creation and invitations by partner keys)
+// Tenant: RL_TENANT, keyed by tenant ID (every request of a tenant or identity key; Security § 10)
+// PartnerApi: RL_PARTNER_API, keyed by partner ID (every request of a partner key)
 pub trait RateLimiter { async fn allow(&self, bucket: RlBucket, key: &str) -> PResult<bool>; }
 
 // DNS over HTTPS ------------------------------------------------------------------------
@@ -525,6 +527,18 @@ pub struct HttpResponse { pub status: u16, pub headers: Vec<(String, String)>, p
                           pub body_truncated: bool }
 pub enum HttpError { Timeout, Dns, Tls, Connect, Other(String) }
 pub trait HttpClient { async fn send(&self, req: HttpRequest) -> Result<HttpResponse, HttpError>; }
+
+// Analytics Engine (binding METRICS) -------------------------------------------------------
+pub struct DataPoint { pub indexes: [String; 1], pub blobs: Vec<String>, pub doubles: Vec<f64> }
+pub trait Metrics { fn write(&self, point: DataPoint); }            // writeDataPoint: no await, never fails the
+                                                                     // request; a refused write is counted in
+                                                                     // metrics_dropped_total (Observability § 3)
+
+// Work after the response (ctx.waitUntil) ----------------------------------------------------
+pub trait Background {
+    fn wait_until(&self, fut: impl Future<Output = ()> + 'static);  // last_used_at writes, metrics flushes; the
+                                                                     // future logs its own errors
+}
 
 // Outbound TCP (Workers connect(); used only by the smtp_relay transport) ---------------------
 #[derive(Clone, Copy)] pub enum TlsMode { Implicit, StartTls }   // port 465 | port 587; never plain text
@@ -579,12 +593,47 @@ Implementation notes:
   runs at most four SMTP sends at once. Certificate and host-name checking is spike S12. The fake is a
   scripted SMTP peer.
 
+**The `Platform` bundle.** Logic is generic over one bundle, so handlers and objects name a single type
+parameter instead of a dozen traits:
+
+```rust
+// crates/platform/src/lib.rs
+pub trait Platform: 'static {
+    type Clock: Clock; type Rng: Rng; type Ids: Ids; type Db: ControlDb; type Objects: ObjectClient;
+    type Blobs: BlobStore; type Queues: QueueProducer; type Ai: Ai; type Vectors: VectorIndex;
+    type Mail: MailSender; type Limits: RateLimiter; type Dns: Dns; type Http: HttpClient;
+    type Tcp: TcpConnect; type Metrics: Metrics; type Background: Background;
+    fn clock(&self) -> &Self::Clock;   // … one accessor per associated type, same names in snake case
+    fn config(&self) -> &Config;       // section 6.1, read once per isolate
+    fn secrets(&self) -> &Secrets;
+}
+// platform::cf::CfPlatform (wasm32 only) implements it over the Env of one invocation; it is built by the
+// glue for every fetch, email, queue, scheduled and alarm call. platform::fakes::FakePlatform implements it
+// natively for worker-logic tests, and platform::itest's decorators wrap CfPlatform under itest-hooks.
+```
+
 ### 6.3 Durable Object classes
 
-`worker` defines six classes, each a thin shell around a logic module that only sees platform traits:
+`worker` defines six classes, each a thin shell around a logic module that only sees platform traits. The
+Worker itself implements `WorkerApp`, which the glue calls for each event:
 
 ```rust
 // crates/platform/src/cf/glue.rs
+pub struct HttpRequestIn { pub method: String, pub url: String, pub headers: Vec<(String, String)>,
+                           pub body: Option<JsBuffer>, pub cf_connecting_ip: Option<String> }
+pub struct HttpResponseOut { pub status: u16, pub headers: Vec<(String, String)>, pub body: Vec<u8> }
+pub struct EmailIn { pub from: String, pub to: String, pub headers: Vec<(String, String)>,
+                     pub raw: JsBuffer, pub raw_size: u64 }      // set_reject is EmailOutcome::Reject
+pub enum EmailOutcome { Accept, Reject { smtp: String }, TempFail } // TempFail: the glue throws (Inbound)
+pub struct ScheduledIn { pub cron: String, pub scheduled_time_ms: i64 }
+
+pub trait WorkerApp: Sized + 'static {
+    fn new(platform: CfPlatform) -> Self;                          // once per invocation
+    async fn fetch(&self, req: HttpRequestIn) -> HttpResponseOut;
+    async fn email(&self, msg: EmailIn) -> EmailOutcome;
+    async fn queue(&self, queue: QueueName, batch: Vec<Incoming<serde_json::Value>>); // acks or retries each
+    async fn scheduled(&self, ev: ScheduledIn);
+}
 pub trait ObjectApp: Sized + 'static {
     fn new(state: CfObjectState, platform: CfPlatform) -> Self;
     async fn fetch(&self, req: HttpRequestIn) -> HttpResponseOut;   // decodes RpcEnvelope, checks the owner,
@@ -880,6 +929,14 @@ simple = { limit = 600, period = 60 }
 name = "RL_PARTNER"                            # keyed by partner ID; tenant creation and invitations
 namespace_id = "{1007}"                        # by partner keys (Security § 10)
 simple = { limit = 10, period = 60 }
+[[ratelimits]]
+name = "RL_TENANT"                             # keyed by tenant ID; every request of a tenant or identity key
+namespace_id = "{1008}"
+simple = { limit = 1800, period = 60 }
+[[ratelimits]]
+name = "RL_PARTNER_API"                        # keyed by partner ID; every request of a partner key
+namespace_id = "{1009}"
+simple = { limit = 1800, period = 60 }
 
 [triggers]
 crons = ["* * * * *", "*/15 * * * *"]
@@ -919,13 +976,16 @@ dataset = "pylota_mail_metrics"
   runs `cargo install worker-build --version 0.8.7 --locked` and `worker-build --release` in
   `crates/worker` before `wrangler deploy`.
 - The rate-limiting `namespace_id` values are positive integers unique within the account; setup picks
-  six unused ones and keeps them across re-runs. Rate-limit bindings need Wrangler 4.36.0 or later.
+  one unused value per `RL_*` binding (nine) and keeps them across re-runs. Rate-limit bindings need
+  Wrangler 4.36.0 or later. The Worker cannot read a binding's `simple.limit`, so each limit is also a
+  constant in `worker::ratelimit`, sent as `RateLimit-Limit`; `xtask::ratelimit_limits_match_template`
+  fails when a constant and the template differ ([Security § 10](security.md#10-rate-limiting-and-abuse)).
 
 ## 9. `xtask`
 
 | Command | Does |
 |---|---|
-| `cargo xtask build-worker` | Runs `worker-build --release` (0.8.7) in `crates/worker`. Then measures `build/index.js` + `build/index_bg.wasm`: gzip level 9 total must be ≤ 10,485,760 bytes (NFR-SEC-2) and uncompressed ≤ 64 MiB, else it fails. Prints a size table by crate (from `twiggy`-style name-section data in a non-stripped copy) and warns above 8 MiB compressed |
+| `cargo xtask build-worker` | Runs `worker-build --release` (0.8.7) in `crates/worker` with three build-time values in the environment: `PM_BUILD_VERSION` (the workspace version, or the tag without its `v` in a release), `PM_BUILD_COMMIT` (`git rev-parse --short=7 HEAD`) and `PM_BUILD_DATE` (the UTC date of `SOURCE_DATE_EPOCH` when set, which `xtask release` sets to the tagged commit's time, otherwise today). `crates/worker/build.rs` passes them to the compiler with `cargo:rustc-env` and `cargo:rerun-if-env-changed`, defaulting to `CARGO_PKG_VERSION`, `unknown` and `1970-01-01` for native and test builds. `/health` reads `version` and `commit` from them, and `security.txt` computes `Expires` as `PM_BUILD_DATE` plus 365 days. Then measures `build/index.js` + `build/index_bg.wasm`: gzip level 9 total must be ≤ 10,485,760 bytes (NFR-SEC-2) and uncompressed ≤ 64 MiB, else it fails. Prints a size table by crate (from `twiggy`-style name-section data in a non-stripped copy) and warns above 8 MiB compressed |
 | `cargo xtask check-layering` | The checks in section 2: rules 1, 2 and 4 from `cargo metadata`, rule 3 (tokio only under `worker`, with no features; no `gethostname` or `hickory-resolver`) from `cargo tree` on the wasm32 graph without dev-dependencies |
 | `cargo xtask itest` | Builds the Worker with the `itest-hooks` cargo feature, renders `deploy/wrangler.itest.toml` (same bindings, local resources, `PM_ENV = "local"`, test secrets, the fake-server URL and test token), starts the fake server on `127.0.0.1:8798`, applies D1 migrations with `--local --persist-to target/itest/state`, starts `npx --yes wrangler@4.139.0 dev --local --port 8799 --persist-to target/itest/state --test-scheduled --config deploy/wrangler.itest.toml`, waits for `GET /health`, then runs `cargo test -p pylota-mail-worker --features itest-hooks --test it -- --test-threads=1` with `PM_ITEST_URL`. Email events are injected through the local email-event endpoint that `wrangler dev` provides, and cron and alarm time through its scheduled-event endpoint and the `/__test/alarm` hook. Fault injection (R2 failure, D1 failure, transport outcomes) uses `PM_ENV = "local"`-only test hooks compiled behind `itest-hooks`, never in release bundles. The full sequence and the fakes are in [Testing › What cargo xtask itest does](testing.md#61-what-cargo-xtask-itest-does). From M21 on it then runs the Playwright browser suite against the same Worker ([Testing › Browser suite](testing.md#68-browser-suite-browser)); `--suite it` or `--suite browser` runs one of the two |
 | `cargo xtask live [--manual]` | Runs `cargo test -p pylota-mail-worker --features live --test live -- --test-threads=1` against staging ([Testing › Live suite](testing.md#10-live-end-to-end-suite-live)). `--manual` runs only the tests marked manual, which pause for a person's browser steps and record the results |
@@ -1043,16 +1103,21 @@ on (build plan M16). It is native only (never compiled to wasm) and depends only
   ```
 
   `verify_assertion` (1) decodes the header and accepts only `alg: "EdDSA"` with
-  `typ: "agent-assertion+jwt"`; (2) requires `iss` to be one of `trusted_issuers`; (3) fetches
-  `{iss}/.well-known/jwks/{sub}.json` (cached for at most 5 minutes, refetched once on an unknown `kid`)
-  and picks the key whose `kid` matches; (4) verifies the Ed25519 signature over the JWS signing input;
-  (5) checks `aud`, `nbf` and `exp` with the leeway; (6) records `jti` until `exp` and rejects a repeat.
+  `typ: "agent-assertion+jwt"`; (2) requires `iss` to be one of `trusted_issuers`; (3) requires `sub` to
+  match `^idn_[0-9A-HJKMNP-TV-Z]{26}$` (`Malformed` otherwise, before any request), because `sub` is not
+  yet verified and a value with `/`, `..` or `?` would point the fetch at another path of the issuer;
+  (4) fetches `{iss}/.well-known/jwks/{sub}.json` with redirects off (`reqwest` `redirect::Policy::none()`;
+  a `3xx` is `Jwks(…)`), accepts only a `200` whose `Content-Type` media type is
+  `application/jwk-set+json`, caches it for at most 5 minutes, refetches once on an unknown `kid`, and
+  picks the key whose `kid` matches; (5) verifies the Ed25519 signature over the JWS signing input;
+  (6) checks `aud`, `nbf` and `exp` with the leeway; (7) records `jti` until `exp` and rejects a repeat.
   `AgentAssertion` holds the claims of [§4.2](agent-keys.md#42-token). `pmail assertions verify` uses it.
 
 Tests: `sdk::coverage::every_operation` (above), `sdk::errors::envelope_round_trip` (every `ErrorCode`
 of [Errors](../../reference/errors.md) decodes with its `retryable` flag), `it::assertions::sdk_verifies`
-(the verifier accepts a fresh token and rejects a wrong audience, an expired token, an unknown kid and
-`alg: none`), and the M16 integration tests that call every method against the workerd harness.
+(the verifier accepts a fresh token and rejects a wrong audience, an expired token, an unknown kid,
+`alg: none`, a `sub` that is not an identity ID and a redirected or mistyped JWKS answer), and the M16
+integration tests that call every method against the workerd harness.
 
 ## 12. Tests
 

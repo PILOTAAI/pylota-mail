@@ -170,7 +170,11 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
   that receive through SES, which accepts mail before the Worker sees it, inbound mail is held for the same
   five days and then dropped without a bounce (FR-DOM-9).
 - **FR-KEY-1** API keys **must** be scoped at one of four levels: `platform`, `partner`, `tenant` or `identity`.
-  Each key holds a list of permissions. A key can never create a key wider than itself.
+  Each key holds a list of permissions. A key can never create, read, rotate or revoke a key wider than
+  itself. The one exception: a platform or partner key **may** grant `identities:sign`, which it cannot
+  hold, to a tenant or identity key it mints, and the grant is audit-logged. Deleting a workspace (a
+  tenant-scope erasure) **must** need its own permission, `tenants:erase`, which a workspace admin and the
+  keys an admin mints never hold.
 - **FR-KEY-2** Key secrets **must** be shown once, stored only as a keyed hash, support expiry, and
   support rotation with an overlap window. No stored record, an idempotency record included, **may** hold
   a secret: an idempotent replay of a response that carried one returns it without the secret
@@ -191,6 +195,12 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
   still stored. A partner **must not** be deletable while it has a tenant that is not erased, and deletion
   **must** keep the row (soft delete), so a tenant's `partner_id` never changes
   ([REST API › Partners](../reference/api.md#partners), [Security › Partner keys](design/security.md#partner-keys)).
+- **FR-KEY-5** A key **must** record the console user behind it, if any, and keys minted from it **must**
+  inherit that record. Removing that person from a workspace **must** revoke their keys of that workspace,
+  and lowering their role **must** revoke those holding a permission the new role lacks. However many keys
+  one tenant or one partner mints, its request rate **must** stay bounded by a shared per-tenant or
+  per-partner limit, and the number of its active keys by a cap
+  ([Security › Who minted a key](design/security.md#who-minted-a-key), [Security § 10](design/security.md#10-rate-limiting-and-abuse)).
 
 ### 6.2 Identities and addresses
 

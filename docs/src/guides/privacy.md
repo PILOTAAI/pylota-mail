@@ -175,8 +175,8 @@ recovery codes are stored encrypted.
 ## What agents and notifications disclose
 
 **Agent assertions.** An [agent assertion](agents.md#agent-assertions) shows its audience, the service
-it was made for, the identity's address, display name and workspace name, and whether a person is
-accountable for the identity (`accountable_human`). That is its purpose. It never contains the owner's
+it was made for, the identity's address, and, marked `unverified`, its display name, workspace name and
+whether a person is accountable for the identity (`accountable_human`). That is its purpose. It never contains the owner's
 name, address or any other personal data of the owner. A
 [signed HTTP request](agents.md#signed-http-requests) shows the identity's address to the site, in its
 `From` header. Neither tokens nor signatures are stored or logged; only daily counts are kept.

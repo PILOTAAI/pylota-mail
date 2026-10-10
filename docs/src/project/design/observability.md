@@ -111,6 +111,7 @@ template in [Rust workspace](rust-workspace.md#8-generated-wranglertoml).
 | `alert_fired`, `alert_resolved` | error / info | Alert evaluator transitions (the audit actions are `alert.fired` and `alert.resolved`) |
 | `rpc_owner_mismatch` | error | Durable Object owner check failed ([Design conventions](index.md#5-internal-durable-object-rpc)) |
 | `config_invalid` | error | Required variable or secret missing or malformed |
+| `rpc_intent_stuck` | warn | A Durable Object call recorded in `rpc_intents` is still failing more than an hour after its D1 change: `tenant_id`, `identity_id`, `detail` = `init` or the event type, `code` ([Design conventions § 9](index.md#9-durable-object-calls-after-a-d1-change)) |
 | `secrets_reseal_progress` | info | Master-key rotation sweep ([Security](security.md#62-rotation-procedures)) |
 | `identity_key_changed` | info | An identity key was created (explicitly or on first signing), rotated or revoked: `identity_id`, `key_id` or `user_id` of the actor, `detail` = `create`, `rotate` or `revoke`; never key material ([Agent signing keys](agent-keys.md)) |
 | `signature_minted` | info | An agent assertion or HTTP signature was minted: `identity_id`, `key_id`, `detail` = `assertion` or `http_signature`. Never the token, the signature, the audience, `ext`, the URL or the headers ([Security › Logging rules](security.md#12-logging-rules)) |
@@ -406,8 +407,11 @@ API, so it works from any tool that can call that API.
   ([Domains on any DNS host §11](domain-connections.md#11-privacy-and-jurisdiction)).
 - `200 {"status": "degraded", …}` when the Worker runs with a feature off because its configuration is
   incomplete: `"ses": "sns_topic_missing"` (SES credentials and region set, `PM_SES_SNS_TOPIC_ARN`
-  missing: the SES transport is off) or `"billing": "stripe_secrets_missing"` (`PM_BILLING=stripe`
-  without its secrets: billing is not started) ([Rust workspace › Startup rules](rust-workspace.md#61-errors-and-configuration)).
+  missing: the SES transport is off), `"billing": "stripe_secrets_missing"` (`PM_BILLING=stripe`
+  without its secrets: billing is not started) or `"cf_api_token": "missing"` (a Cloudflare REST fallback
+  is in use without `PM_CF_API_TOKEN`, [Rust workspace §7](rust-workspace.md#7-wasm-bindgen-externs))
+  ([Rust workspace › Startup rules](rust-workspace.md#61-errors-and-configuration)). The `Health` schema
+  of `openapi.yaml` lists these fields.
 - `503` with the error envelope (`unavailable`) when the configuration is invalid (a required variable
   or secret is missing or malformed, or an optional variable is malformed; `config_invalid` is logged
   with the variable's name, and the body's `details.config_invalid` names it). Every other handler

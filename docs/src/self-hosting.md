@@ -224,7 +224,8 @@ setup, it finds nothing to change and exits without deploying.
 
 ```bash
 pmail keys create --level platform --name first-key --permissions \
-tenants:manage,partners:manage,platform:ops,keys:manage,identities:read,identities:write,domains:read,\
+tenants:manage,tenants:erase,partners:manage,platform:ops,keys:manage,identities:read,identities:write,\
+domains:read,\
 domains:write,messages:read,messages:send,messages:write,attachments:read,search:read,search:agentic,\
 quarantine:review,webhooks:read,webhooks:manage,erasure:manage,suppressions:manage,usage:read,\
 audit:read,members:read,members:manage
@@ -233,7 +234,8 @@ audit:read,members:read,members:manage
 A platform key must list its permissions; there is no implicit full set. This one holds every permission
 a platform key may hold, so it can create every other key and run `pmail doctor --mail-test`. Setup's
 summary prints this command for you. (`identities:sign` is not in it: platform keys cannot sign as an
-identity.)
+identity. A platform key can still grant `identities:sign` to the tenant and identity keys it creates,
+so agents can sign on a deployment without the console.)
 
 This call authenticates with the short-lived **bootstrap key** that `pmail setup` stored in your CLI
 profile. Setup is the only moment the CLI knows `PM_KEY_PEPPER` (it generated it), so it mints that one

@@ -75,7 +75,10 @@ CREATE TABLE tenants (
   suspended_at     INTEGER,
   suspended_by     TEXT CHECK (suspended_by IN ('platform','partner')),  -- who suspended it; NULL while not
                                                            -- suspended. A partner key cannot lift 'platform'
-  address_suffix   TEXT NOT NULL,                          -- '' (default tenant) or '.' || slug
+  address_suffix   TEXT NOT NULL,                          -- '' (the default tenant only) or '.' followed by
+                                                           -- 2–32 of [a-z0-9-], starting with a letter or digit
+                                                           -- (openapi AddressSuffix); defaults to '.' || slug,
+                                                           -- and a workspace may choose another (Cloud sign-up § 7)
   timezone         TEXT NOT NULL DEFAULT 'UTC',            -- IANA name
   policy_json      TEXT NOT NULL,                          -- TenantPolicy (see configuration.md)
   policy_ceilings_json TEXT NOT NULL DEFAULT '{}',         -- lower-only policy fields a platform key set, with
@@ -100,7 +103,7 @@ CREATE TABLE tenants (
   created_at       INTEGER NOT NULL,
   updated_at       INTEGER NOT NULL
 );
-CREATE UNIQUE INDEX tenants_suffix ON tenants(address_suffix) WHERE address_suffix <> '';
+CREATE UNIQUE INDEX tenants_suffix ON tenants(address_suffix);   -- '' included: one default tenant only
 CREATE INDEX tenants_partner ON tenants(partner_id) WHERE partner_id IS NOT NULL;
 
 CREATE TABLE domains (
@@ -241,6 +244,10 @@ CREATE TABLE api_keys (
   mode              TEXT NOT NULL CHECK (mode IN ('live','test')),
   permissions_json  TEXT NOT NULL,                         -- array of permission strings
   created_by_key_id TEXT,
+  created_by_user_id TEXT REFERENCES users(id),            -- usr_: the person behind the key (console mint, or
+                                                           -- copied from the parent key); NULL otherwise
+  created_by_role   TEXT CHECK (created_by_role IN ('owner','admin')),  -- that person's role when it was set;
+                                                           -- 'owner' lets a tenant key hold tenants:erase
   expires_at        INTEGER,
   revoked_at        INTEGER,
   last_used_at      INTEGER,                               -- updated at most once per minute
@@ -252,6 +259,7 @@ CREATE TABLE api_keys (
 );
 CREATE INDEX api_keys_tenant ON api_keys(tenant_id);
 CREATE INDEX api_keys_partner ON api_keys(partner_id) WHERE partner_id IS NOT NULL;
+CREATE INDEX api_keys_creator ON api_keys(tenant_id, created_by_user_id) WHERE created_by_user_id IS NOT NULL;
 
 CREATE TABLE webhook_endpoints (
   id                     TEXT PRIMARY KEY,                 -- whk_
@@ -383,6 +391,27 @@ CREATE TABLE exports (
   expires_at    INTEGER,                                   -- download available for 7 days
   created_at    INTEGER NOT NULL
 );
+
+-- Durable Object calls that must follow a D1 change (Design conventions § 9): written in the same D1 batch as
+-- the change, deleted once the call succeeds; the every-minute cron re-sends the rest.
+CREATE TABLE rpc_intents (
+  id          TEXT PRIMARY KEY,                            -- deterministic: '{request_id}:{target_id}:{op}', or
+                                                           -- '{request_id}:{identity_id}:{event_type}' per identity
+  class       TEXT NOT NULL CHECK (class IN ('quota','mailbox')),
+  object_id   TEXT NOT NULL,                               -- tenants.quota_do_id or identities.mailbox_do_id
+  tenant_id   TEXT NOT NULL REFERENCES tenants(id),
+  identity_id TEXT,                                        -- mailbox intents
+  op          TEXT NOT NULL CHECK (op IN ('init','emit_event')),
+  body_json   TEXT NOT NULL,                               -- the request body (InitMailbox, EmitEvent, …): IDs and
+                                                           -- a thin event payload, never message content
+  occurred_at INTEGER NOT NULL,                            -- the D1 change time: the event time, and the time part
+                                                           -- of the derived event ID
+  attempts    INTEGER NOT NULL DEFAULT 0,
+  next_at     INTEGER NOT NULL,                            -- occurred_at + 60 s, then backoff (Design § 9)
+  created_at  INTEGER NOT NULL
+);
+CREATE INDEX rpc_intents_due ON rpc_intents(next_at);
+CREATE INDEX rpc_intents_tenant ON rpc_intents(tenant_id);
 
 -- Idempotency for non-mail POSTs (mail sends are idempotent inside the mailbox).
 CREATE TABLE idempotency_records (
@@ -737,7 +766,8 @@ CREATE TABLE platform_objects (
 - **Signing keys.** `signing_keys` holds the keyring for thread tokens ([Threading](threading.md#24-key-rotation)),
   signed links ([Security › Signed links](security.md#73-signed-links)) and search cursors
   ([Search › Cursors](search.md#58-cursors-and-as_of-pinning)). `link` signs download links, console
-  sign-in, invitation and session tokens and OAuth state hashes; it no longer signs cursors. The Worker
+  sign-in, invitation and session tokens and OAuth state hashes; it no longer signs cursors. `cursor` signs
+  search cursors and list cursors ([REST API › Pagination](../../reference/api.md#pagination)). The Worker
   creates the first key of each purpose on first use (`INSERT … ON CONFLICT DO NOTHING`, then a re-read,
   so two isolates racing end with one key).
   `POST /v1/platform/keys/{purpose}/rotate` inserts a new current key and sets `verify_until` on the old
@@ -792,6 +822,20 @@ CREATE TABLE platform_objects (
   release is not stored on the message, which goes back to `received`: its actor is in the
   `quarantine.release` audit row and in the `message.released` event (`released_by_key_id`, or
   `released_by_user_id` for a console release).
+- **Key provenance.** `api_keys.created_by_user_id` and `created_by_role` are written by `POST /v1/keys`:
+  from the session for a console mint, and copied from the calling key otherwise
+  ([Security › Who minted a key](security.md#who-minted-a-key)). `created_by_role` is read by `POST /v1/keys`
+  (a tenant key may hold `tenants:erase` only when it is `owner`) and rewritten on a role change;
+  `created_by_user_id` is read by member removal and role changes, which revoke the person's keys in the
+  same batch (`api_keys_creator`), and returned in the API key object.
+- **RPC intents.** `rpc_intents` rows are written in the D1 batch of tenant creation (`init` of the
+  `TenantQuota`), identity creation (`init` of the mailbox, carrying `identity.created`), identity updates,
+  pauses and resumes, tenant suspension and resumption (one `emit_event` per identity paused or resumed)
+  and identity-key changes (the `identity.key_*` events). The handler deletes its rows once the calls
+  succeed; the every-minute cron (`crons/intents.rs`) re-sends due rows in `occurred_at` order per object
+  and deletes each on success, or when the object answers that it is erased
+  ([Design conventions § 9](index.md#9-durable-object-calls-after-a-d1-change)). Tenant erasure deletes the
+  tenant's rows with its other D1 rows.
 - **Partners.** `partners` rows are written by `POST /v1/partners` and changed by
   `PATCH /v1/partners/{partner_id}` (platform keys with `partners:manage`,
   [REST API › Partners](../../reference/api.md#partners)); they are never deleted. `status` is read by
@@ -862,7 +906,7 @@ equivalent) so that the message, the index and the outbox commit together.
 -- mailbox schema v1
 PRAGMA foreign_keys = ON;
 
-CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 -- keys: schema_version, tenant_id, identity_id, created_at, erased ('0'|'1'),
 --       event_seq, fts_analyzer_version, embed_model,
 --       size_bytes, size_checked_at  pragma page_count * page_size, refreshed at most hourly after a write
@@ -880,7 +924,7 @@ CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 --                       expire lazily and reconciliation is event-driven, so neither has an alarm.
 -- parser_version is a column of messages (and a core constant), not a meta key.
 
-CREATE TABLE threads (
+CREATE TABLE IF NOT EXISTS threads (
   seq                INTEGER PRIMARY KEY,                  -- per mailbox; used in thread tokens
   id                 TEXT NOT NULL UNIQUE,                 -- thr_
   subject            TEXT NOT NULL,                        -- normalised subject of the first message
@@ -901,9 +945,9 @@ CREATE TABLE threads (
   needs_reply        REAL,
   urgency            INTEGER
 );
-CREATE INDEX threads_last ON threads(last_at DESC);
+CREATE INDEX IF NOT EXISTS threads_last ON threads(last_at DESC);
 
-CREATE TABLE messages (
+CREATE TABLE IF NOT EXISTS messages (
   rowid               INTEGER PRIMARY KEY,                 -- FTS rowid
   id                  TEXT NOT NULL UNIQUE,                -- msg_
   thread_seq          INTEGER NOT NULL REFERENCES threads(seq),
@@ -965,15 +1009,15 @@ CREATE TABLE messages (
   parser_version      INTEGER,
   metadata_json       TEXT NOT NULL DEFAULT '{}'
 );
-CREATE INDEX messages_thread   ON messages(thread_seq, received_at);
-CREATE INDEX messages_rfcid    ON messages(rfc_message_id);
-CREATE INDEX messages_provider ON messages(provider_message_id);
-CREATE INDEX messages_hash     ON messages(raw_sha256);
-CREATE INDEX messages_time     ON messages(received_at DESC);
-CREATE INDEX messages_from     ON messages(from_address);
-CREATE INDEX messages_status   ON messages(direction, status);
+CREATE INDEX IF NOT EXISTS messages_thread   ON messages(thread_seq, received_at);
+CREATE INDEX IF NOT EXISTS messages_rfcid    ON messages(rfc_message_id);
+CREATE INDEX IF NOT EXISTS messages_provider ON messages(provider_message_id);
+CREATE INDEX IF NOT EXISTS messages_hash     ON messages(raw_sha256);
+CREATE INDEX IF NOT EXISTS messages_time     ON messages(received_at DESC);
+CREATE INDEX IF NOT EXISTS messages_from     ON messages(from_address);
+CREATE INDEX IF NOT EXISTS messages_status   ON messages(direction, status);
 
-CREATE TABLE deliveries (                                  -- per-recipient outbound status
+CREATE TABLE IF NOT EXISTS deliveries (                    -- per-recipient outbound status
   message_rowid   INTEGER NOT NULL REFERENCES messages(rowid) ON DELETE CASCADE,
   address         TEXT NOT NULL,
   field           TEXT NOT NULL CHECK (field IN ('to','cc','bcc')),
@@ -988,7 +1032,7 @@ CREATE TABLE deliveries (                                  -- per-recipient outb
   PRIMARY KEY (message_rowid, address)
 );
 
-CREATE TABLE attachments (
+CREATE TABLE IF NOT EXISTS attachments (
   id            TEXT PRIMARY KEY,                          -- att_
   message_rowid INTEGER NOT NULL REFERENCES messages(rowid) ON DELETE CASCADE,
   filename      TEXT,                                      -- sanitised: no path, ≤ 255 bytes
@@ -1006,29 +1050,29 @@ CREATE TABLE attachments (
                                      'type_mismatch','encrypted_document')),
   scan_status   TEXT NOT NULL DEFAULT 'skipped' CHECK (scan_status IN ('skipped','pending','clean','infected','error'))
 );
-CREATE INDEX attachments_message ON attachments(message_rowid);
+CREATE INDEX IF NOT EXISTS attachments_message ON attachments(message_rowid);
 
-CREATE TABLE labels (
+CREATE TABLE IF NOT EXISTS labels (
   message_rowid INTEGER NOT NULL REFERENCES messages(rowid) ON DELETE CASCADE,
   label         TEXT NOT NULL,                             -- ^[a-z0-9][a-z0-9_:-]{0,63}$
   PRIMARY KEY (message_rowid, label)
 );
-CREATE INDEX labels_label ON labels(label);
+CREATE INDEX IF NOT EXISTS labels_label ON labels(label);
 
 -- Keyword index. Contentless (text lives in messages); snippets are built in Rust.
-CREATE VIRTUAL TABLE fts USING fts5(
+CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(
   subject, participants, body_new, body_full, attachments, refs,
   content = '', contentless_delete = 1,
   tokenize = 'unicode61 remove_diacritics 2'
 );
 -- Fuzzy fallback over short fields only (bounded size).
-CREATE VIRTUAL TABLE fts_tri USING fts5(
+CREATE VIRTUAL TABLE IF NOT EXISTS fts_tri USING fts5(
   subject, participants, refs,
   content = '', contentless_delete = 1,
   tokenize = 'trigram'
 );
 
-CREATE TABLE refs (
+CREATE TABLE IF NOT EXISTS refs (
   message_rowid INTEGER NOT NULL REFERENCES messages(rowid) ON DELETE CASCADE,
   kind          TEXT NOT NULL,                             -- uk_plate, pcn, invoice, order, amount, phone,
                                                            -- email, domain, date, custom:<name> (custom:booking)
@@ -1036,10 +1080,10 @@ CREATE TABLE refs (
   source        TEXT NOT NULL,                             -- subject | body | att:<att_id>:<page>
   PRIMARY KEY (message_rowid, kind, value, source)
 );
-CREATE INDEX refs_kind_value ON refs(kind, value);
-CREATE INDEX refs_value      ON refs(value);
+CREATE INDEX IF NOT EXISTS refs_kind_value ON refs(kind, value);
+CREATE INDEX IF NOT EXISTS refs_value      ON refs(value);
 
-CREATE TABLE contacts (
+CREATE TABLE IF NOT EXISTS contacts (
   address         TEXT PRIMARY KEY,
   name            TEXT,
   domain          TEXT NOT NULL,
@@ -1049,9 +1093,9 @@ CREATE TABLE contacts (
   outbound_count  INTEGER NOT NULL DEFAULT 0,
   last_thread_seq INTEGER
 );
-CREATE INDEX contacts_domain ON contacts(domain);
+CREATE INDEX IF NOT EXISTS contacts_domain ON contacts(domain);
 
-CREATE TABLE idempotency (
+CREATE TABLE IF NOT EXISTS idempotency (
   key_hash      TEXT PRIMARY KEY,                          -- hex SHA-256 of the Idempotency-Key header
   fingerprint   TEXT NOT NULL,                             -- sha256(operation, target, canonical body)
   operation     TEXT NOT NULL,
@@ -1061,7 +1105,7 @@ CREATE TABLE idempotency (
   expires_at    INTEGER NOT NULL                           -- created_at + 30 days
 );
 
-CREATE TABLE outbox (                                      -- transactional event outbox
+CREATE TABLE IF NOT EXISTS outbox (                        -- transactional event outbox
   seq          INTEGER PRIMARY KEY,                        -- per-identity event sequence
   event_id     TEXT NOT NULL UNIQUE,                       -- evt_
   type         TEXT NOT NULL,
@@ -1069,9 +1113,9 @@ CREATE TABLE outbox (                                      -- transactional even
   occurred_at  INTEGER NOT NULL,
   dispatched_at INTEGER                                    -- set once queued to pm-webhooks
 );
-CREATE INDEX outbox_pending ON outbox(dispatched_at) WHERE dispatched_at IS NULL;
+CREATE INDEX IF NOT EXISTS outbox_pending ON outbox(dispatched_at) WHERE dispatched_at IS NULL;
 
-CREATE TABLE chunks (                                      -- semantic index bookkeeping
+CREATE TABLE IF NOT EXISTS chunks (                        -- semantic index bookkeeping
   vector_id     TEXT PRIMARY KEY,                          -- {msg_id}:{n} or {msg_id}:a{k}:{n} (≤ 64 bytes)
   message_rowid INTEGER NOT NULL REFERENCES messages(rowid) ON DELETE CASCADE,
   attachment_id TEXT,
@@ -1083,9 +1127,9 @@ CREATE TABLE chunks (                                      -- semantic index boo
   status        TEXT NOT NULL CHECK (status IN ('pending','embedded','failed','deleting')),
   updated_at    INTEGER NOT NULL
 );
-CREATE INDEX chunks_status ON chunks(status);
+CREATE INDEX IF NOT EXISTS chunks_status ON chunks(status);
 
-CREATE TABLE verifications (                               -- codes and links for wait / sign-ups
+CREATE TABLE IF NOT EXISTS verifications (                 -- codes and links for wait / sign-ups
   message_rowid INTEGER NOT NULL REFERENCES messages(rowid) ON DELETE CASCADE,
   kind          TEXT NOT NULL CHECK (kind IN ('code','link')),
   value         TEXT NOT NULL,
@@ -1094,7 +1138,7 @@ CREATE TABLE verifications (                               -- codes and links fo
   consumed_at   INTEGER                                    -- first released by wait; purged 1 h later
 );
 
-CREATE TABLE rate_windows (                                -- inbound per-sender throttle (D5)
+CREATE TABLE IF NOT EXISTS rate_windows (                  -- inbound per-sender throttle (D5)
   sender      TEXT NOT NULL,
   window_start INTEGER NOT NULL,
   count       INTEGER NOT NULL,
@@ -1122,7 +1166,7 @@ CREATE TABLE rate_windows (                                -- inbound per-sender
 
 ```sql
 -- DomainMonitor
-CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 -- keys (every key the object reads or writes):
 --   schema_version   applied schema (Design § 4, rule 6)
 --   domain_id, tenant_id  owner, written by Init and checked on every request (Design § 4)
@@ -1143,18 +1187,18 @@ CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 -- object keeps no copy of them.
 -- Probe and forwarding-test tokens live only here, never in D1; the result is written to
 -- domains.probe_last_at / probe_last_json or addresses.forwarding / forwarding_checked_at.
-CREATE TABLE checks (
+CREATE TABLE IF NOT EXISTS checks (
   id           INTEGER PRIMARY KEY,
   at           INTEGER NOT NULL,
   resolver     TEXT NOT NULL,                              -- cloudflare-doh | google-doh
   results_json TEXT NOT NULL,                              -- [{record, expected, observed, ok}]
   outcome      TEXT NOT NULL CHECK (outcome IN ('pass','degraded','fail','ownership_changed','error'))
 );                                                         -- keeps the last 500 rows
-CREATE TABLE outbox (seq INTEGER PRIMARY KEY, event_id TEXT NOT NULL UNIQUE, type TEXT NOT NULL,
+CREATE TABLE IF NOT EXISTS outbox (seq INTEGER PRIMARY KEY, event_id TEXT NOT NULL UNIQUE, type TEXT NOT NULL,
                      payload_json TEXT NOT NULL, occurred_at INTEGER NOT NULL, dispatched_at INTEGER);
 
 -- JobRunner
-CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 -- keys (every key the object reads or writes):
 --   schema_version   applied schema (Design § 4, rule 6)
 --   job_id, kind, tenant_id  written by Start; tenant_id is the owner checked on every request (Design § 4)
@@ -1164,7 +1208,7 @@ CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 --   zip_cd:{n}       export ZIP central-directory entries of batch n, until finalise (Privacy § 9.1)
 --   alarm:step, alarm:outbox  pending wake-ups (Design § 4, rule 5)
 -- Job status lives in D1 jobs.status, and attempts are per step (steps.attempts).
-CREATE TABLE steps (
+CREATE TABLE IF NOT EXISTS steps (
   name        TEXT PRIMARY KEY,                            -- e.g. list_r2, delete_vectors, wipe_mailbox
   status      TEXT NOT NULL CHECK (status IN ('pending','running','done','failed','skipped')),
   cursor      TEXT,                                        -- resume point
@@ -1173,11 +1217,11 @@ CREATE TABLE steps (
   last_error  TEXT,
   updated_at  INTEGER NOT NULL
 );
-CREATE TABLE outbox (seq INTEGER PRIMARY KEY, event_id TEXT NOT NULL UNIQUE, type TEXT NOT NULL,
+CREATE TABLE IF NOT EXISTS outbox (seq INTEGER PRIMARY KEY, event_id TEXT NOT NULL UNIQUE, type TEXT NOT NULL,
                      payload_json TEXT NOT NULL, occurred_at INTEGER NOT NULL, dispatched_at INTEGER);
 
 -- TenantQuota
-CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 -- keys (every key the object reads or writes; nothing is kept in the key-value API):
 --   schema_version          applied schema (Design § 4, rule 6)
 --   tenant_id               owner, written by QuotaRequest::Init and checked on every request (Security § 5.2)
@@ -1194,7 +1238,7 @@ CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 --                           NotifierRequest::UsageThreshold is sent; read before sending the next one
 --   alarm:holds             earliest holds.expires_at (Billing › Settle, extend and expiry)
 --   alarm:reset             earliest allowances.resets_at (Billing › Monthly reset)
-CREATE TABLE counters (
+CREATE TABLE IF NOT EXISTS counters (
   metric TEXT NOT NULL,                                    -- daily caps: sends, sends:idn_..., agentic,
                                                            --   warned:{metric}:{80|100} (sends caps only);
                                                            -- usage: usage:{inbound|outbound|sends|triage|
@@ -1209,14 +1253,14 @@ CREATE TABLE counters (
   value  INTEGER NOT NULL,
   PRIMARY KEY (metric, window)
 );
-CREATE TABLE allowances (                                  -- plan + top-ups for the current period
+CREATE TABLE IF NOT EXISTS allowances (                    -- plan + top-ups for the current period
   feature    TEXT PRIMARY KEY CHECK (feature IN ('inboxes','sends','triage','custom_domains','storage_gb','seats')),
   granted    INTEGER,                                      -- NULL = unlimited (exempt / disabled)
   used       INTEGER NOT NULL DEFAULT 0,                   -- consumed this period (or current count)
   held       INTEGER NOT NULL DEFAULT 0,                   -- units in open holds
   resets_at  INTEGER                                       -- NULL for counts that never reset
 );
-CREATE TABLE holds (
+CREATE TABLE IF NOT EXISTS holds (
   id         TEXT PRIMARY KEY,                             -- hld_
   feature    TEXT NOT NULL,
   units      INTEGER NOT NULL,
@@ -1224,7 +1268,7 @@ CREATE TABLE holds (
   expires_at INTEGER NOT NULL,                             -- created or last extended + 10 minutes; the alarm releases it
   UNIQUE (feature, ref)
 );
-CREATE TABLE outcomes (                                    -- sliding windows for abuse thresholds
+CREATE TABLE IF NOT EXISTS outcomes (                      -- sliding windows for abuse thresholds
   identity_id TEXT NOT NULL,
   seq         INTEGER NOT NULL,
   outcome     TEXT NOT NULL CHECK (outcome IN ('delivered','bounced','complained','other')),
@@ -1233,11 +1277,11 @@ CREATE TABLE outcomes (                                    -- sliding windows fo
 );                                                         -- keeps the last 1,000 per identity
 
 -- SesControl (one per deployment, only with SES; Domains on any DNS host § 4.8)
-CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 -- keys: schema_version; next_free_ms (the earliest time the next SES control-plane call may start)
 
 -- Notifier (one per tenant; Notifications § 8). Holds user, identity and message IDs and counts, never mail content.
-CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 -- keys (every key the object reads or writes):
 --   schema_version   applied schema (Design § 4, rule 6)
 --   tenant_id        owner, written by NotifierRequest::Init and checked on every request (Design § 5)
@@ -1246,7 +1290,7 @@ CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 --   alarm:daily      the next 09:00 in the tenant's time zone (tenants.timezone): the needs_person email,
 --                    daily new_mail emails and the digest of capped items (kind digest)
 --   prefs_cache_at   when the cached notification_prefs of the workspace were last read from D1
-CREATE TABLE pending (                                     -- items waiting for their window
+CREATE TABLE IF NOT EXISTS pending (                       -- items waiting for their window
   user_id           TEXT NOT NULL,                         -- usr_
   kind              TEXT NOT NULL CHECK (kind IN ('usage','new_mail','needs_person','account','digest')),
   ref               TEXT NOT NULL DEFAULT '-',             -- new_mail: the identity ID (inbox); usage:
@@ -1263,8 +1307,8 @@ CREATE TABLE pending (                                     -- items waiting for 
                                                            -- (hourly, for at most 24 hours)
   PRIMARY KEY (user_id, kind, ref)
 );
-CREATE INDEX pending_due ON pending(due_at);
-CREATE TABLE held (                                        -- new_mail with filter = needs_reply: waiting for triage
+CREATE INDEX IF NOT EXISTS pending_due ON pending(due_at);
+CREATE TABLE IF NOT EXISTS held (                          -- new_mail with filter = needs_reply: waiting for triage
   message_id  TEXT NOT NULL,                               -- msg_
   identity_id TEXT NOT NULL,                               -- idn_ (the inbox)
   user_id     TEXT NOT NULL,                               -- usr_ of a person with that filter following the inbox
@@ -1272,8 +1316,8 @@ CREATE TABLE held (                                        -- new_mail with filt
   PRIMARY KEY (message_id, user_id)
 );                                                         -- deleted on message.triaged (counted if needs_reply >= 0.5,
                                                            -- else dropped), at until (counted), or on MemberRemoved
-CREATE INDEX held_until ON held(until);
-CREATE TABLE windows (                                     -- last send, for the 10-minute rule of instant mode
+CREATE INDEX IF NOT EXISTS held_until ON held(until);
+CREATE TABLE IF NOT EXISTS windows (                       -- last send, for the 10-minute rule of instant mode
   user_id      TEXT NOT NULL,
   kind         TEXT NOT NULL,
   ref          TEXT NOT NULL DEFAULT '-',                  -- as pending.ref
@@ -1281,7 +1325,7 @@ CREATE TABLE windows (                                     -- last send, for the
                                                            -- rows older than 1 day are deleted by the daily alarm
   PRIMARY KEY (user_id, kind, ref)
 );
-CREATE TABLE sent (                                        -- per-day counters for the caps (50 per person, 200 per
+CREATE TABLE IF NOT EXISTS sent (                          -- per-day counters for the caps (50 per person, 200 per
   day     TEXT NOT NULL,                                   -- workspace); YYYY-MM-DD in the tenant's time zone
   user_id TEXT NOT NULL,                                   -- usr_, or '*' for the workspace total
   count   INTEGER NOT NULL,

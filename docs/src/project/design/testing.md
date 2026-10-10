@@ -158,7 +158,11 @@ As defined in [Rust workspace](rust-workspace.md#9-xtask), plus the details belo
 2. Render `deploy/wrangler.itest.toml`: the production bindings, local resources, `PM_ENV = "local"`,
    `PM_PLATFORM_DOMAIN = "agents.example"`, `PM_API_HOST = "localhost"`,
    `PM_CONSOLE_HOST = "console.localhost"` (the test client sends that `Host` header on console paths),
-   `PM_SIGNUP = "open"`, `PM_WEB_BOT_AUTH = "on"` (local only: the S13 gate applies to real deployments), the SES variables (`PM_SES_REGION = "eu-west-2"`, `PM_SES_INBOUND_*`) and the
+   `PM_SIGNUP = "open"` with the four values it requires (`PM_TERMS_URL = "https://agents.example/terms"`,
+   `PM_PRIVACY_URL = "https://agents.example/privacy"`, `PM_DPA_URL = "https://agents.example/dpa"` and
+   `PM_TERMS_VERSION = "itest-1"`; without them the configuration is `config_invalid`,
+   [Rust workspace § 6.1](rust-workspace.md#61-errors-and-configuration)), `PM_WEB_BOT_AUTH = "on"`
+   (local only: the S13 gate applies to real deployments), the SES variables (`PM_SES_REGION = "eu-west-2"`, `PM_SES_INBOUND_*`) and the
    Google, GitHub and Stripe client settings naming resources on the fake server, random test secrets
    written to `.dev.vars` in a temporary directory, `PM_ITEST_FAKES_URL = "http://127.0.0.1:8798"`, a random
    `PM_ITEST_TOKEN`, queue consumers with `max_batch_timeout = 1`, and no `AI` or `VECTORS` binding (both
@@ -174,7 +178,11 @@ As defined in [Rust workspace](rust-workspace.md#9-xtask), plus the details belo
 5. Seed exactly what `pmail setup` writes in steps 19–22 ([CLI and setup §6.3](cli.md#63-steps)), in the
    same way:
    - one platform key (step 19, the bootstrap key) with `wrangler d1 execute --local`; the harness knows
-     `PM_KEY_PEPPER` because it generated it;
+     `PM_KEY_PEPPER` because it generated it. The bootstrap key expires after 24 hours, which tests that
+     advance the fake clock pass, so the harness at once uses it to mint, through `POST /v1/keys`, a
+     platform key with every platform-level permission and no `expires_at`, and runs the suite with that
+     key. Tenant and identity keys that sign are minted from it with `identities:sign` granted
+     ([Security §4.6](security.md#46-creating-keys-fr-key-1));
    - the platform domain row for `agents.example` (step 20) with `wrangler d1 execute --local`, with
      `records_json` matching the DNS fake's zone for it and `monitor_do_id = ''`. Until M13 builds the
      `DomainMonitor`, the row is written with `state = 'healthy'`. From M13 it is written `pending`, as
@@ -356,11 +364,12 @@ created B, and C was created by a platform key, so it has no partner. A's domain
 zone of `PM_PLATFORM_DOMAIN`.
 
 "Every permission valid at that level" follows [Security §4.6](security.md#46-creating-keys-fr-key-1):
-a tenant key holds every permission except `tenants:manage`, `partners:manage` and `platform:ops`, so it holds
-`identities:sign`; an identity key holds the same set without the tenant-only permissions
-(`members:read`, `members:manage`, `suppressions:manage`, `audit:read`, `usage:read`), plus
-`usage:read` implicitly for its own workspace. A partner key holds every permission except
-`platform:ops`, `partners:manage` and `identities:sign`.
+a tenant key holds every permission except `tenants:manage`, `partners:manage`, `platform:ops` and
+`tenants:erase` (which only the workspace owner's keys hold; the fixture mints keys through the API), so it
+holds `identities:sign`, granted by the platform key that mints it; an identity key holds the same set
+without the tenant-only permissions (`members:read`, `members:manage`, `suppressions:manage`,
+`audit:read`, `usage:read`), plus `usage:read` implicitly for its own workspace. A partner key holds every
+permission except `platform:ops`, `partners:manage` and `identities:sign`, so it holds `tenants:erase`.
 
 **Attacker key classes** (each with full permissions for its level):
 
@@ -382,7 +391,12 @@ identities; the scope check answers before any signing rule, so they give the sa
 ID of the same type. It asserts:
 
 1. The status is `404` with the route's `*_not_found` code, or `403 scope_denied` for a route above the
-   key's level on its own tenant, or `401` for revoked and expired keys.
+   key's level on its own tenant, or `401` for revoked and expired keys, or `403 permission_denied` when
+   the control call gets the same body. The last case is a route needing a permission the key's level
+   can never hold (`tenants:manage` for a tenant key), or `foreign_permissions` on
+   `GET /v1/tenants/{tenant_id}`: section 5.2 of Security checks permissions, `foreign_permissions`
+   included, before it resolves the owner, comparing the path's tenant ID with the key's own without a
+   D1 read, so a foreign ID and a random one get the same `403`. Any other `403` fails the test.
 2. The attack response equals the control response byte for byte, except `request_id` and the
    `Request-Id` and `RateLimit-*` headers (indistinguishability).
 3. No side effect: D1 row counts for A, A's mailbox state (via a platform key), A's outbox and A's
@@ -586,7 +600,19 @@ lines from the source tree (including generated `conf::` names), and fails when:
 - a `P0` requirement has no test with it in `Covers:` (PRD release criterion 1);
 - a `Covers:` line names an unknown row or requirement.
 
-It prints the traceability matrix as Markdown into the CI summary.
+It also collects every test named in a design page's Tests table, and every test named in a milestone's
+acceptance.
+
+**Landed milestones.** A file `MILESTONES` at the repository root lists the milestones that have landed,
+one ID per line; each milestone's pull request adds its own line. Until `M20` is listed, `trace` checks
+only what has landed: the tests named in the acceptance of each listed milestone (directly, through a
+wildcard, or through an edge row its acceptance lists) must exist, and only those `P0` requirements whose
+tests are named there need one. Rows and requirements of later milestones are printed as `pending` and
+do not fail. Once `M20` is listed (and always in `release.yml`), the full check above runs, and every test
+named in a design page's Tests table must exist too. So the required `trace` check is green on every
+milestone's pull request and complete at release.
+
+It prints the traceability matrix as Markdown into the CI summary, with the milestone of each row.
 
 ### 11.3 How rows are exercised
 
@@ -606,7 +632,7 @@ It prints the traceability matrix as Markdown into the CI summary.
 | J7 | `d1.query` fault on the directory lookup |
 | J8 | Forced dead-letter delivery (a consumer fault beyond `max_retries`); fake clock for the 15-minute alert |
 | J9 | `/__test/mailbox-schema` |
-| J10–J19 | The two partners of the attack-suite fixture (section 7), each with a partner key and a partner endpoint, and the webhook receiver fake; `restart_runtime_with` setting `PM_QUARANTINE_KEY_RELEASE=off` for J16; fake clock for the 15-minute delivery hold of J13 and the `RL_PARTNER` minute of J18; concurrent tenant creations for J18; the abuse auto-pause driven by simulator complaints for J17 |
+| J10–J22 | The two partners of the attack-suite fixture (section 7), each with a partner key and a partner endpoint, and the webhook receiver fake; `restart_runtime_with` setting `PM_QUARANTINE_KEY_RELEASE=off` for J16; fake clock for the 15-minute delivery hold of J13 and the `RL_PARTNER` minute of J18; concurrent tenant creations for J18; the abuse auto-pause driven by simulator complaints for J17; keys of every level and a seeded owner's key for J20; the `do.call` fault on the first `Init` or `EmitEvent` and cron runs through the scheduled endpoint for J21; several tenant and partner keys sending in one minute, and concurrent mints, for J22 |
 | L1–L4 | Test tenants with the real simulator and loopback paths |
 | B1, C7, J5 | Live (B1 and J5 also need real providers). C7 has an `it::` part too, and J5's API part is `it::domains::transport_patch` |
 | N1–N7, N10, N11, N26–N29 | SNS push and SQS fakes; S3 fake with `NoSuchKey`; SES fake identity, account and receipt-rule state; a generated 39 MB message for N5; seeded domain rows for the identity count |
@@ -618,7 +644,7 @@ It prints the traceability matrix as Markdown into the CI summary.
 | W24–W26 | Stripe fake and signed webhook payloads; the return page's refresh loop |
 | W27, W28, W30 | Fake clock (TOTP steps, key rotation plus 8 days, the 7-day ramp); the `*/15` cron through the scheduled endpoint at 03:00 UTC for the daily ramp evaluation |
 | W29, W31–W34 | Plain requests; W33 sends two concurrent creates |
-| O1–O13 | Fake clock for `verify_until` and signature expiry; the Rust SDK verifier run against the JWKS served by workerd; tenant policy per test; `restart_runtime_with` for `PM_WEB_BOT_AUTH=off` (O9); `restart_runtime_with` setting the secret `PM_MASTER_KEY_NEXT` for O8 |
+| O1–O13, O27, O28 | Signing keys minted by the harness's platform key with `identities:sign` granted; fake clock for `verify_until` and signature expiry; concurrent first signs from one test (O28); a recording HTTP client under the SDK verifier, to prove no request for a crafted `sub` (O27); the Rust SDK verifier run against the JWKS served by workerd; tenant policy per test; `restart_runtime_with` for `PM_WEB_BOT_AUTH=off` (O9); `restart_runtime_with` setting the secret `PM_MASTER_KEY_NEXT` for O8 |
 | O14–O26 | Fake clock for the 2-minute hold, the 10-minute windows, the hourly and 09:00 runs, time-zone changes and the 24-hour cooldowns; `/__test/alarm` with class `notifier`; notification emails observed like console sign-in mail; `/__test/delivery-event` for a hard bounce on one (O17); the DNS fake for a `failing` platform domain (O25); `restart_runtime_with` for `PM_BILLING=off` (O23) |
 
 ### 11.4 Coverage
@@ -657,7 +683,7 @@ GitHub Actions are pinned to full commit SHAs and each job declares least-privil
 
 | Test | Proves |
 |---|---|
-| `xtask::trace_detects_missing_test` | A fixture register naming a non-existent test fails `cargo xtask trace` |
+| `xtask::trace_detects_missing_test` | A fixture register naming a non-existent test fails `cargo xtask trace`; with a `MILESTONES` file that lists only `M5`, a missing test of an `M9` row is `pending` and passes, and the same file with `M9` added fails |
 | `xtask::itest_refuses_release_hooks` | `cargo xtask build-worker` fails when `itest-hooks` is enabled or the bundle contains `/__test/` |
 | `it::harness::hooks_need_token` | Hooks without `x-pm-test-token` return `404` |
 | `it::harness::no_internet_egress` | A request to an unregistered host fails with `HttpError::Connect` |

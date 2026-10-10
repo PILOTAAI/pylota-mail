@@ -22,7 +22,24 @@ List endpoints take `limit` (default 25, max 100) and `cursor`. They return:
 { "data": [ ... ], "next_cursor": "c_01J9..." }
 ```
 
-`next_cursor` is `null` on the last page. Cursors are opaque and expire after 24 hours.
+`next_cursor` is `null` on the last page. Cursors are opaque to clients and expire after 24 hours. Every
+list uses one format (search keeps its own, [Search › Cursors](../project/design/search.md#58-cursors-and-as_of-pinning)):
+
+- **Order.** Each list returns rows newest first by its keyset: `created_at DESC`, then the row's ID
+  `DESC` (`kid` for the identity-key list). The cursor holds the keyset values of the last row returned,
+  and the next page takes rows strictly below them, so a row inserted or deleted between two pages never
+  shifts the others.
+- **Encoding.** `next_cursor = "c_" ‖ kid ‖ base64url_nopad(payload ‖ tag)`, where `kid` is the kid of
+  the current `signing_keys` key of purpose `cursor` (the key search cursors use), `payload` is the
+  compact JSON `{"v":1,"r":"<operationId>","f":"<filter hash>","k":["<created_at>","<id>"],"t":<issued_at ms>}`
+  and `tag = HMAC-SHA256(cursor key {kid}, "pm-list-cursor-v1\0" ‖ payload)[..16]`. `f` is the first
+  16 bytes, hex, of SHA-256 over the operation's path parameters, its filter query parameters in name
+  order and the calling key's ID, so a cursor works only for the list, filters and key that produced it.
+  The domain-separation prefix keeps list and search cursors apart although they share a key.
+- **Errors.** Bad base64, an unknown kid (neither the current cursor key nor one inside its 24-hour
+  verify window after a rotation), a bad tag, another operation or another filter hash:
+  `400 invalid_request` with `details.errors[0].path = "cursor"`. Older than 24 hours:
+  `410 cursor_expired`.
 
 ### Idempotency
 
@@ -58,13 +75,17 @@ See [Sending and safe retries](../guides/sending.md#safe-retries).
 | Bucket | Default | Scope |
 |---|---|---|
 | All requests | 600 per minute | per API key |
+| All requests of a tenant's keys together (binding `RL_TENANT`) | 1,800 per minute | per tenant, across all its tenant and identity keys |
+| All requests of a partner's partner keys together (binding `RL_PARTNER_API`) | 1,800 per minute | per partner, across all its partner keys |
 | Search (`keyword`, `semantic`, `hybrid`, related messages, contacts) | 120 per minute | per API key |
 | Agentic search | 20 per minute | per API key, plus a daily tenant cap |
 | Send (accepted into queue) | 120 per minute | per identity, plus daily caps from policy |
 | Signing (agent assertions and HTTP signatures together, binding `RL_SIGN`) | 600 per minute | per identity |
 | Tenant creation and invitations by partner keys (binding `RL_PARTNER`) | 10 per minute, together | per partner, across all its keys |
 
-Every authenticated response includes `RateLimit-Limit`, the limit of the bucket that applied, per period.
+Every authenticated response includes `RateLimit-Limit`: on a `429`, the limit of the bucket that refused
+(`details.bucket` names it: `key`, `tenant`, `partner`, `search`, `agentic`, `send`, `sign` or
+`partner_create`); otherwise the limit of the route's per-key bucket.
 A `429 rate_limited` also includes `Retry-After` and `RateLimit-Reset`, both the seconds to the end of the
 bucket's current period (other `429` codes, such as `daily_cap_reached`, set `Retry-After` to their own
 wait). There is no `RateLimit-Remaining`: Cloudflare's rate-limiting
@@ -78,7 +99,7 @@ A key holds a list of permissions. Every endpoint below names the one it needs.
 |---|---|
 | `tenants:manage` | Create, update and suspend tenants, and their billing accounts. Platform keys, for every tenant; partner keys, for the tenants their partner's keys created, without changing billing ([Partners](#partners)) |
 | `identities:read`, `identities:write` | Read, and create, update, pause or delete identities and addresses, and test forwarding; read, and create, rotate or revoke [identity signing keys](#identity-keys-and-signatures). Deleting an identity also needs `erasure:manage`, because it starts an identity-scope erasure |
-| `identities:sign` | Mint agent assertions and Web Bot Auth HTTP signatures as an identity. Tenant and identity keys (an identity key only for its own identity); platform and partner keys cannot hold it |
+| `identities:sign` | Mint agent assertions and Web Bot Auth HTTP signatures as an identity. Tenant and identity keys (an identity key only for its own identity); platform and partner keys cannot hold it, but can grant it to the tenant and identity keys they mint |
 | `domains:read`, `domains:write` | Read, and add, update, verify, probe or remove domains |
 | `messages:read` | Threads, messages, raw MIME, deliveries |
 | `messages:send` | Send, reply, reply-all, forward, cancel |
@@ -90,7 +111,8 @@ A key holds a list of permissions. Every endpoint below names the one it needs.
 | `webhooks:read` | Read webhook endpoints and their deliveries |
 | `webhooks:manage` | Create, change, test, rotate and delete webhook endpoints, and replay. Includes `webhooks:read` |
 | `keys:manage` | API keys within the caller's scope. A partner key manages only tenant and identity keys of its own tenants |
-| `erasure:manage` | Erasure requests, legal holds, exports |
+| `erasure:manage` | Erasure requests, legal holds, exports. A `tenant`-scope erasure request also needs `tenants:erase` |
+| `tenants:erase` | Delete the workspace: a `tenant`-scope erasure request, together with `erasure:manage`. Platform keys, partner keys for their own tenants, and tenant keys that the workspace owner minted in the console (or that descend from one); never admins or their keys ([Security › Who minted a key](../project/design/security.md#who-minted-a-key)) |
 | `suppressions:manage` | Suppressions and allow or block lists |
 | `usage:read` | Plan, allowances and usage figures. Every tenant and identity key holds it implicitly for its own workspace, without listing it. Platform and partner keys must hold it explicitly and pass `tenant_id` |
 | `audit:read` | Audit log |
@@ -123,12 +145,14 @@ lists one its level cannot hold with `400 invalid_request` and
 | `platform:ops`, `partners:manage` | platform |
 | `tenants:manage` | platform, partner |
 | `members:read`, `members:manage`, `suppressions:manage`, `audit:read`, `usage:read` | platform, partner, tenant (an identity key holds `usage:read` implicitly for its own workspace, but cannot list it) |
-| `identities:sign` | tenant, identity |
+| `tenants:erase` | platform, partner, and a tenant key minted by the workspace owner's console session or by a key descended from one (otherwise `details.reason = "permission_owner_only"`) |
+| `identities:sign` | tenant, identity (platform and partner keys may grant it without holding it) |
 | Every other permission | platform, partner, tenant, identity |
 
 There are no wildcard permissions and no implicit full set: every key, platform and partner keys included,
 holds the permissions listed when it was created, plus the implicit `usage:read` of tenant and identity keys. A
-`POST /v1/keys` without `permissions`, or with an empty list, returns `400 invalid_request`.
+`POST /v1/keys` without `permissions`, or with an empty list, returns `400 invalid_request`. A key can never
+create, read, rotate or revoke a key wider than itself ([API keys](#api-keys--keysmanage)).
 
 ### The console and billing routes
 
@@ -154,7 +178,8 @@ answer only on `PM_CONSOLE_HOST`, and the API host `PM_API_HOST` serves exactly:
 - signed links, `/v1/links/*`;
 - the provider hooks, `/hooks/*`, and `/billing/stripe/webhook`.
 
-Anything else returns `404`. No cookie is set or read on the API host
+Anything else returns `404 route_not_found`, as does a path that is no route at all; a route called with a
+method it does not have returns `405 method_not_allowed` with an `Allow` header. No cookie is set or read on the API host
 ([Cloud sign-up › Hostnames](../project/design/cloud-signup.md#2-hostnames)).
 
 ### Errors
@@ -182,8 +207,19 @@ The code catalogue is in [Errors](errors.md).
 
 ### `GET /health`
 
-No auth. Returns `{ "status": "ok", "version": "1.0.0", "commit": "abc1234", "env": "production" }`.
-`env` is `PM_ENV`. With an invalid configuration it returns `503 unavailable`.
+No auth. Returns `200` with `{ "status": "ok", "version": "1.0.0", "commit": "abc1234", "env": "production" }`.
+`env` is `PM_ENV`; `version` and `commit` are compiled into the release bundle. When SES is configured,
+the body also has `ses_region` (the value of `PM_SES_REGION`).
+
+- **Degraded.** When the Worker serves with a feature turned off by its configuration, `status` is
+  `degraded`, still with `200`, and one field per feature names why: `ses` (`sns_topic_missing`: SES
+  credentials without `PM_SES_SNS_TOPIC_ARN`, so the SES transport is off), `billing`
+  (`stripe_secrets_missing`: `PM_BILLING=stripe` without its secrets, so billing has not started) and
+  `cf_api_token` (`missing`: a Cloudflare REST fallback is in use without `PM_CF_API_TOKEN`). Absent
+  fields are healthy.
+- **Invalid configuration.** A missing required variable or secret, or a malformed optional one, returns
+  `503 unavailable` with `details.config_invalid` naming the variable, as every other route does
+  ([Rust workspace › Startup rules](../project/design/rust-workspace.md#61-errors-and-configuration)).
 
 ### `GET /openapi.json`
 
@@ -266,8 +302,10 @@ key cannot call this route (`403 permission_denied`: it can never hold `tenants:
   one partner cannot spend the shared sending reputation or AI budget.
 - **Operator enforcement stays.** `suspended_by` records who suspended the tenant; a partner key that sets
   `status: "active"` on a tenant a platform key suspended gets `403 scope_denied`
-  (`details.field: "status"`). A value a platform key sets on a lower-only field becomes that field's
-  ceiling for partner keys ([J17](../project/edge-cases.md)).
+  (`details.field: "status"`). `status: "suspended"` on a tenant that is already suspended changes
+  nothing (`suspended_by` and `suspended_at` stay), so a partner cannot take over a platform suspension and
+  then lift it; a platform key's suspension replaces a partner's. A value a platform key sets on a
+  lower-only field becomes that field's ceiling for partner keys ([J17](../project/edge-cases.md)).
 - **Erasing and erased tenants.** Once a tenant is `erasing` or `erased`, only the erasure job changes its
   status: a platform key gets `409 tenant_erased`, and any other key gets `404 tenant_not_found` here and
   on every other write to the tenant ([I8](../project/edge-cases.md)).
@@ -354,9 +392,11 @@ the `partner_id`; only a platform key rotates or revokes one:
 
 ```json
 { "name": "pylota-backend", "level": "partner", "partner_id": "ptn_01JA…",
-  "permissions": ["tenants:manage", "keys:manage", "webhooks:manage", "quarantine:review", "usage:read",
-                  "identities:read", "identities:write", "domains:read", "domains:write", "messages:read",
-                  "messages:send", "messages:write", "attachments:read", "search:read", "members:manage"] }
+  "permissions": ["tenants:manage", "tenants:erase", "keys:manage", "webhooks:manage", "quarantine:review",
+                  "usage:read", "audit:read", "identities:read", "identities:write", "domains:read",
+                  "domains:write", "messages:read", "messages:send", "messages:write", "attachments:read",
+                  "search:read", "search:agentic", "erasure:manage", "suppressions:manage",
+                  "members:manage"] }
 ```
 
 A partner key acts only on the tenants its partner's keys created, with `tenant_id` or a resource ID,
@@ -365,11 +405,17 @@ exactly as a platform key does:
 | Permission | What a partner key can do with it |
 |---|---|
 | `tenants:manage` | Create tenants (each gets the partner's `partner_id` and `default_billing_mode`; at most `max_tenants`), list, read, update and suspend its own, and read their billing accounts. It never changes a billing account or sends `billing` (`403 scope_denied`), raises a lower-only policy field above its ceiling, sets a platform-only one, or lifts a platform suspension |
-| `keys:manage` | Mint, list, rotate and revoke tenant and identity keys of its own tenants. Never a partner or platform key (`403 key_scope_exceeded`) |
+| `keys:manage` | Mint, list, rotate and revoke tenant and identity keys of its own tenants, granting them `identities:sign` when their agents sign (it cannot hold it itself). Never a partner or platform key (`404 key_not_found` for an existing one, `403 key_scope_exceeded` to mint one), and never a key wider than itself |
+| `tenants:erase`, `erasure:manage` | Delete one of its tenants (`POST /v1/erasure-requests` with `scope: "tenant"`), which [`DELETE /v1/partners/{partner_id}`](#delete-v1partnerspartner_id) needs first, and the other erasure scopes |
 | `webhooks:manage`, `webhooks:read` | Partner endpoints (`POST /v1/webhooks` makes one, with `scope: "partner"`), which receive only its own tenants' events, and its tenants' endpoints ([Webhooks](#webhooks)) |
 | `quarantine:review` | See and release its tenants' quarantined mail; release by key follows the tenant's `quarantine.key_release` ([Release](#post-v1identitiesidentity_idmessagesmessage_idrelease--quarantinereview)) |
 | `usage:read` | Read one of its tenants' usage, with `tenant_id` |
-| Every other tenant-level permission | The same as a platform key, on its own tenants: identities and their addresses and signing keys (not `identities:sign`), domains, mail, search, erasure (a `tenant` scope included), suppressions and lists, audit, members |
+| Every other tenant-level permission | The same as a platform key, on its own tenants: identities and their addresses and signing keys (not `identities:sign`), domains, mail, search, suppressions and lists, audit, members |
+
+The example lists what Pylota's backend uses: tenant creation and deletion, keys for its operators'
+agents, webhooks, quarantine release, usage and the audit log of its tenants (`audit:read`, which
+[`GET /v1/audit-events`](#get-v1audit-events--auditread) needs), identities and domains, mail and search
+(agentic included), erasure requests for its operators' data subjects, suppressions and lists, and members.
 
 A partner key can never hold `platform:ops`, `partners:manage` or `identities:sign`, and never reaches
 `/v1/platform/*`, `/v1/partners/*`, the platform's webhook endpoints, or any partner or platform key, its
@@ -400,9 +446,14 @@ tenant's caps: with the default `tenant_daily_send_cap` of 5,000, at most 125,00
   "signature": { "text": "Acme Car Hire · 0113 496 0000" },
   "domain_id": "dom_01J9…",
   "client_id": "acme:bookings",
+  "send_policy": { "daily_cap": 300 },
   "metadata": { "operator_id": "op_123" }
 }
 ```
+
+- `send_policy` (optional) sets the identity's own send policy at creation, as `PATCH` does later. For any
+  key but a platform key, a `daily_cap` above the tenant's effective `identity_daily_send_cap` gets
+  `403 scope_denied` with `details.field: "send_policy.daily_cap"`, and nothing is created.
 
 - `username`: stored lower case as `^[a-z0-9][a-z0-9._-]{0,23}$`. The request value is checked by the
   username rules, not by a schema pattern, so each failure has its own code: a reserved or confusable name
@@ -441,7 +492,15 @@ retired or out-of-scope addresses.
 
 ### `GET /v1/identities/{identity_id}` — `identities:read`
 
+Returns the identity in any status, `deleting` and `deleted` included; once erased, a `deleted` identity
+has its personal fields scrubbed (`display_name` empty, `owner` and `signature` `null`, `metadata` `{}`,
+[Privacy § 6.5](../project/design/privacy.md#65-identity-scope-fr-idn-4)).
+
 ### `PATCH /v1/identities/{identity_id}` — `identities:write`
+
+On a `deleting` or `deleted` identity this returns `404 identity_not_found` and changes nothing, like every
+other write by identity ID except the legal-hold routes, which stay usable on a `deleting` identity
+([Privacy § 6.5](../project/design/privacy.md#65-identity-scope-fr-idn-4)).
 
 Updatable: `display_name`, `purpose`, `owner`, `signature`, `metadata`, `send_policy`, and `status`
 (`active` | `paused`). Setting `status: "active"` on an identity paused for `abuse_threshold` needs a
@@ -452,7 +511,9 @@ tenant's effective `identity_daily_send_cap` needs a platform key (`403 scope_de
 
 ### `DELETE /v1/identities/{identity_id}` — `identities:write` and `erasure:manage`
 
-Returns `202` with an [Erasure request](#erasure-request-object) of scope `identity`. The identity's
+Returns `202` with an [Erasure request](#erasure-request-object) of scope `identity`. A second `DELETE` of
+a `deleting` or `deleted` identity starts nothing and returns `200` with the identity's existing
+identity-scope erasure request (the same `era_` ID). The identity's
 addresses are tombstoned and can never be assigned to another identity. Its
 [signing keys](#identity-keys-and-signatures) are deleted and their key IDs tombstoned, so a deleted key ID
 is never published again ([O7](../project/edge-cases.md)). While the identity is `deleting` or `deleted`,
@@ -575,7 +636,8 @@ design is in [Agent signing keys](../project/design/agent-keys.md); the integrat
 - Creating, rotating and revoking keys is audit-logged (`identity_key.create`, `identity_key.rotate`,
   `identity_key.revoke`) and emits `identity.key_created`, `identity.key_rotated` or
   `identity.key_revoked` ([Webhook events](events.md#identities-and-addresses)).
-- Signing needs `identities:sign`, which platform and partner keys cannot hold. Both signing endpoints count against
+- Signing needs `identities:sign`, which platform and partner keys cannot hold (they can grant it to the
+  tenant and identity keys they mint). Both signing endpoints count against
   the signing rate limit (600 a minute per identity, `429 rate_limited` over it), ignore
   `Idempotency-Key`, and store nothing but a daily count (`assertions` and `http_signatures` in
   [`GET /v1/usage/daily`](#get-v1usagedaily--usageread-platform-partner-or-tenant-key)). Signing is not metered
@@ -617,8 +679,10 @@ nothing. A thumbprint found among the key tombstones is never reused: a new seed
 No body. Makes a new key `active` at once and moves the previous active key to `retiring`, with
 `verify_until` set to now plus `PM_IDENTITY_KEY_OVERLAP_DAYS` (default 7 days). The retiring key stays
 in the JWK Set and no longer signs, so an assertion signed just before the rotation still verifies until
-then ([O2](../project/edge-cases.md)). With no active key, it creates the first one and `previous` is
-`null`. Emits `identity.key_rotated`. Returns `200`:
+then ([O2](../project/edge-cases.md)). With no active key (none yet, or the active key was revoked), it
+creates one, `previous` is `null` and it emits `identity.key_created`; otherwise it emits
+`identity.key_rotated`. Two concurrent creations end with one active key
+([O28](../project/edge-cases.md)). Returns `200`:
 
 ```json
 {
@@ -678,7 +742,7 @@ Mints an agent assertion: a JWT signed with the identity's active key. Each call
 | `audience` | Required. 1–256 characters of printable ASCII: a URL or an identifier the verifier expects. Becomes `aud` ([O4](../project/edge-cases.md)) |
 | `expires_in` | 60–600 seconds, default 300 ([O5](../project/edge-cases.md)) |
 | `nonce` | Optional, 1–128 characters of printable ASCII, copied into the token for the verifier's own challenge |
-| `ext` | Optional object, at most 2 KB as JSON, placed under the `ext` claim. Its members cannot use a registered or Pylota claim name (`iss`, `sub`, `aud`, `iat`, `nbf`, `exp`, `jti`, `email`, `email_verified`, `name`, `org`, `accountable_human`, `ai_agent`, `nonce`, `ext`) ([O6](../project/edge-cases.md)) |
+| `ext` | Optional object, at most 2 KB as JSON, placed under the `ext` claim. Its members cannot use a registered or Pylota claim name (`iss`, `sub`, `aud`, `iat`, `nbf`, `exp`, `jti`, `email`, `email_verified`, `unverified`, `ai_agent`, `nonce`, `ext`) ([O6](../project/edge-cases.md)) |
 
 Returns `201`:
 
@@ -695,17 +759,21 @@ The token's header is `{"alg":"EdDSA","typ":"agent-assertion+jwt","kid":"<thumbp
 { "iss": "https://mail.example.com", "sub": "idn_01J9Z3K8V4QW7X2M5N6P8R0T1Y",
   "aud": "https://portal.supplier.example", "iat": 1791547200, "nbf": 1791547200, "exp": 1791547500,
   "jti": "01M4G8HMG0Z6G25EVAN36PQG0H", "email": "bookings.acme@agents.example", "email_verified": true,
-  "name": "Acme Car Hire", "org": "Acme Car Hire", "accountable_human": true, "ai_agent": true,
-  "nonce": "b3f1c2d47a9e", "ext": { "booking_ref": "BK-2291" } }
+  "unverified": { "name": "Acme Car Hire", "org": "Acme Car Hire", "accountable_human": true },
+  "ai_agent": true, "nonce": "b3f1c2d47a9e", "ext": { "booking_ref": "BK-2291" } }
 ```
 
-- `iss` is `https://{PM_API_HOST}`, `sub` the identity ID, `jti` a new ULID, `email` the identity's
-  primary address, `name` its display name and `org` the workspace name.
-- `accountable_human` is `true` when the identity has an accountable owner. The owner's name and address
+- `iss` is `https://{PM_API_HOST}`, `sub` the identity ID, `jti` a new ULID and `email` the identity's
+  primary address. These are what the deployment vouches for.
+- `unverified` holds what the workspace says about itself, which the deployment does not check: `name`
+  (the identity's display name), `org` (the workspace name) and `accountable_human` (`true` when the
+  identity has owner fields set). A verifier must not grant access on them. The owner's name and address
   are never in the token.
 - The token is never stored or logged. A verifier checks it as in
   [Agents › Verifying an assertion](../guides/agents.md#verifying-an-assertion): `alg` and `typ`, an
-  issuer it trusts, the key from `{iss}/.well-known/jwks/{sub}.json` (cached for at most 5 minutes), the
+  issuer it trusts, `sub` matching `^idn_[0-9A-HJKMNP-TV-Z]{26}$` before any fetch, the key from
+  `{iss}/.well-known/jwks/{sub}.json` (no redirects, `application/jwk-set+json` only, cached for at most
+  5 minutes), the
   signature, `aud`, `nbf` and `exp` with 60 seconds of skew, and `jti` against replays
   ([Agent signing keys § 4.3](../project/design/agent-keys.md#43-how-a-verifier-checks-it)).
 
@@ -1573,9 +1641,18 @@ suppression needs `"confirm_complaint_removal": true` in the body and is audit-l
 ```
 
 The new key's level, tenant, identity and permissions must all lie within the caller's own, otherwise
-`403 key_scope_exceeded`. A tenant key's `mode` follows its tenant; platform and partner keys are `live`.
-Returns `201` with `"secret": "pmk_live_…"`, shown only once: an idempotent replay returns the body with
-`"secret_replayed": false` instead ([Idempotency](#idempotency)).
+`403 key_scope_exceeded`. The one exception: a platform or partner key may grant `identities:sign`, which
+it cannot hold, to a tenant or identity key it mints; the `key.create` audit row records it in
+`details.granted_without_holding`. A tenant key's `mode` follows its tenant; platform and partner keys are
+`live`. Returns `201` with `"secret": "pmk_live_…"`, shown only once: an idempotent replay returns the
+body with `"secret_replayed": false` instead ([Idempotency](#idempotency)).
+
+- **Who minted it.** `created_by_user_id` in the key object is the console user behind the key: the person
+  whose console session minted it, copied to every key minted with that key. It is `null` for keys minted
+  by a platform or partner key with no person behind it. Removing that person from the workspace, or
+  lowering their role, revokes their keys ([Members](#members)).
+- **Limits.** A tenant has at most 100 active (neither revoked nor expired) tenant and identity keys, and a
+  partner at most 10 partner keys: the next mint gets `422 key_limit_reached` with `details.limit`.
 
 - **Partner keys.** `level: "partner"` needs `partner_id` and no `tenant_id` or `identity_id`, and only
   a platform key may ask for it ([Partner keys](#partner-keys)); an unknown partner is
@@ -1589,18 +1666,34 @@ Returns `201` with `"secret": "pmk_live_…"`, shown only once: an idempotent re
   caller is, otherwise `400 invalid_request` with `details.reason = "permission_not_allowed_for_level"`: `platform:ops` and
   `partners:manage` only on platform keys; `tenants:manage` only on platform and partner keys;
   `members:read`, `members:manage`, `suppressions:manage`, `audit:read` and `usage:read` never on
-  identity keys; `identities:sign` never on platform or partner keys.
-- Both checks come before the scope check, so a refused permission is `400`, not `403`.
+  identity keys; `identities:sign` never on platform or partner keys; `tenants:erase` never on identity
+  keys.
+- `tenants:erase` on a tenant key needs a caller whose `created_by_role` is `owner` (the workspace owner's
+  console session, or a key it minted): otherwise `400 invalid_request` with
+  `details.reason = "permission_owner_only"`. Admins and the keys they mint can never delete the workspace.
+- These checks come before the scope check, so a refused permission is `400`, not `403`.
 
 ### `GET /v1/keys` · `GET /v1/keys/{key_id}` · `DELETE /v1/keys/{key_id}`
 
-`DELETE` revokes the key immediately. A partner key lists and reaches only tenant and identity keys of
-its own tenants; a partner or platform key ID, its own included, is `404 key_not_found` to it. Minting
-and revoking are audit-logged (`key.create`, `key.revoke`).
+`DELETE` revokes the key immediately. Minting and revoking are audit-logged (`key.create`, `key.revoke`).
+
+Reading, revoking and rotating a key follow two rules ([J20](../project/edge-cases.md)):
+
+- **Reach.** A platform key reaches every key; a partner key, the tenant and identity keys of its own
+  tenants (a partner or platform key ID, its own included, is `404 key_not_found` to it); a tenant key, the
+  keys of its tenant; an identity key, only the identity keys of its own identity. A key out of reach is
+  `404 key_not_found`, like a missing one.
+- **Not wider.** The target's level must be at most the caller's, and each of its permissions one the
+  caller holds (or, for a platform or partner caller, `identities:sign`). Otherwise
+  `403 key_scope_exceeded`, and nothing is changed or returned. A key always passes for itself.
+
+`GET /v1/keys` lists only the keys that pass both rules.
 
 ### `POST /v1/keys/{key_id}/rotate`
 
 `{ "overlap_hours": 24 }` (0–168). Returns a new secret. The old one keeps working until the overlap ends.
+The caller must reach the key and not be narrower than it, as above, so no key can obtain a wider key's
+secret.
 
 ---
 
@@ -1619,7 +1712,7 @@ and revoking are audit-logged (`key.create`, `key.revoke`).
 | `thread` | `identity_id`, `thread_id` | Every message in the thread |
 | `counterparty` | `counterparty_address` | Every message to or from that address, in every identity of the tenant |
 | `identity` | `identity_id` | The whole mailbox and the identity's signing keys. Its addresses and key IDs are tombstoned |
-| `tenant` | none | Everything in the tenant, every identity's signing keys included (their key IDs are tombstoned). Then the tenant is marked `erased` |
+| `tenant` | none | Everything in the tenant, every identity's signing keys included (their key IDs are tombstoned). Then the tenant is marked `erased`. Needs `tenants:erase` as well as `erasure:manage` (`403 permission_denied` with `details.required: ["tenants:erase"]` otherwise) |
 
 Held threads are skipped and listed in the receipt (FR-PRV-4): an erasure request is never refused
 because of a hold (it never returns `423 legal_hold`). The request's `status` is `queued`, `running`,
@@ -1791,7 +1884,10 @@ workspace creation (`owner` in `POST /v1/tenants`) or by an ownership transfer i
 ### `DELETE /v1/tenants/{tenant_id}/invitations/{invitation_id}` · `DELETE /v1/tenants/{tenant_id}/members/{user_id}` — `members:manage`
 
 Revokes an invitation, or removes a member and ends their sessions. Returns `204`. The owner cannot be
-removed (`409 owner_required`).
+removed (`409 owner_required`). Removing a member also revokes, in the same step, every key of the
+workspace whose `created_by_user_id` is that person, each with a `key.revoke` audit row
+(`details.reason: "creator_removed"`); a role change in the console revokes those holding a permission
+the new role lacks ([W36](../project/edge-cases.md)).
 
 ---
 

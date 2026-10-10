@@ -135,8 +135,9 @@ are changed only by the track that owns them, as listed per milestone.
 rule of their own:
 
 - `quota/mod.rs`, the `TenantQuota` object. M5 creates it with every `QuotaRequest` variant already
-  answered by a stub (below), and declares the billing types the stub needs to compile (`Feature`,
-  `BillingMode`, `Allowances`, the `Hold` and `SetPlan` payloads and the `Held` and `Denied` answers), so
+  answered by a stub (below), and declares every type the interface uses (`Feature`, `BillingMode`,
+  `Allowances`, `Outcome`, `CapScope`, `QuotaWarning`, `Held`, `Denied`, `AllowanceRow` and one answer
+  type per request), all written out in [Outbound › TenantQuota](design/outbound.md#tenantquota), so
   later milestones replace the behaviour of the variants they own and never change a signature: M9
   (`Reserve`, `Release`, `RecordOutcome`), M11 (`CountAgentic`), M22 (the allowance variants, through
   `billing/quota.rs`), M24 (`OutcomeRates`) and M26 (the `NotifierRequest::UsageThreshold` hook).
@@ -153,6 +154,16 @@ rule of their own:
   tables have writers by then; M21 (`console`), M22 (`billing_events`), M23 (`ses_ingest`), M24
   (`signup`) and M25 (`identity_keys`) each add their own step and its test. If M23 or M25 lands before
   M14, M14 writes that step, and the milestone's test runs once M14 has landed.
+- `deploy/wrangler.toml.tmpl` and the `export_worker!` call in `crates/worker/src/lib.rs`. M5 writes
+  both whole: every binding of [Configuration › Bindings](../reference/configuration.md#bindings) (the
+  six Durable Object namespaces, the queues, the nine `RL_*` bindings, Vectorize, Workers AI, Email
+  Sending, Analytics Engine and the crons) and all six Durable Object classes in the one `v1` migration tag,
+  each class a stub until its milestone: an `ObjectApp` that answers `Init` by storing the owner and
+  everything else with `internal_error`. `TenantQuota` is M5's own stub (below). Later milestones replace
+  a stub class and add consumers and cron jobs; none adds a binding or a class: `IdentityMailbox` in M6,
+  `JobRunner` a stub in M6 and real in M14, `DomainMonitor` and `SesControl` in M13 (`SesControl`'s SES
+  calls in M23), `Notifier` in M26. A queue whose consumer is not built yet has no producer either, so it
+  receives nothing.
 - `crates/core/src/sealed.rs`, the registry of columns sealed under `PM_MASTER_KEY`. M17 Foundation
   creates it with the columns written by then (`signing_keys.ciphertext`); each milestone that writes a
   sealed column adds its entry and its case in `it::secrets::master_key_rotation`: M8 (webhook secrets),
@@ -211,9 +222,12 @@ fake for a spike's real provider.
   validates its glue against the real runtime, and M4 extends it to the other handlers and the Durable
   Object classes. The size check runs and passes, and from here on enforces NFR-SEC-2 on every pull
   request: the compressed bundle stays ≤ 10 MiB (`xtask::size_budget`).
-- CI runs these jobs: fmt, clippy, native tests, wasm build, `cargo deny check`, `mdbook build docs`.
+- CI runs these jobs: fmt, clippy, native tests, wasm build, `cargo deny check` (with `deny.toml`'s
+  `[graph] targets` and licence exception of [Security § 11](design/security.md#11-supply-chain)),
+  `mdbook build docs`, and `trace`, which reads the `MILESTONES` file M0 creates with the line `M0`
+  ([Testing § 11.2](design/testing.md#112-cargo-xtask-trace)), so it checks only landed milestones.
 - A CI check fails if any crate other than `platform` depends on `worker`
-  (`cargo xtask check-layering`).
+  (`cargo xtask check-layering`), proved by `xtask::check_layering_rejects_worker_dep`.
 
 ---
 
@@ -237,6 +251,12 @@ shipped), plus a written result.
 | S11 SES receiving | Rule set, S3 action and topic as specified; the notification shape, including the `objectKey` form; S3 `GetObject` with SigV4 from a Worker; a 39 MB message ([N5](edge-cases.md)); `user+tag@` routing; the retired-address bounce; the backstop picks up a message whose push failed | All pass in `eu-west-2` | `dns_records` and `smtp_relay` with `inbound: ses` do not ship in v1.0; `send_only` still does |
 | S12 SMTP from a Worker | Ports 465 and 587 with `StartTls` against two real providers; the certificate host name is checked (a wrong-name certificate is refused); timeouts and the uncertain window behave as designed | All pass | `smtp_relay` does not ship in v1.0 |
 | S13 Web Bot Auth format | A request signed by `core::httpsig` with the deployment key (`Signature-Agent` as a quoted structured-field string; `Signature-Input` covering `@authority`, `signature-agent` and `from`, with `tag="web-bot-auth"`, `keyid` = the JWK thumbprint, `created`, `expires` and a 64-byte nonce), sent to `https://crawltest.com/cdn-cgi/web-bot-auth`, which answers `401` for a well-formed message with an unknown key, `200` for a known key that verifies and `400` otherwise ([Web Bot Auth](https://developers.cloudflare.com/bots/reference/bot-verification/web-bot-auth/), read 2026-10-09). Needs no Cloudflare account | `401` before the key directory is registered (well-formed, unknown key), never `400` | Signed HTTP requests stay off in v1.0: `PM_WEB_BOT_AUTH` cannot be turned on ([Agent signing keys](design/agent-keys.md#5-signed-http-requests-web-bot-auth)). Agent assertions are unaffected |
+
+**S1 writes the entry glue.** S1 needs the `email`, `queue`, `scheduled` and Durable Object exports
+(constructor, `fetch`, `alarm`) that the M0 glue lacks, so S1 writes the full `platform::export_worker!`
+and `platform::cf::glue` in `crates/platform` (not under `spikes/`), with one throwaway Durable Object
+class. M4 keeps that code and hardens it: the `WorkerApp` and `ObjectApp` traits, error handling, fakes
+and tests.
 
 **Gate:** every spike has a written result. Design documents are updated where a fallback was taken.
 
@@ -289,14 +309,19 @@ FR-SRCH-3/4/8 (verifier), FR-TRI-2, FR-DOM-4/5 (the pure state machine).
 
 ## M4 · Platform crate
 
-**Files:** `crates/platform/src/{lib.rs, clock.rs, rng.rs, d1.rs, durable.rs, r2.rs, queues.rs, ai.rs, vectorize.rs (extern), email.rs, ratelimit.rs, dns.rs (DoH), http.rs, fakes/}`.
+**Files:** `crates/platform/src/{lib.rs, clock.rs, rng.rs, d1.rs, durable.rs, r2.rs, queues.rs, ai.rs, vectorize.rs (extern), email.rs, ratelimit.rs, dns.rs (DoH), http.rs, tcp.rs, metrics.rs (Analytics Engine), background.rs (waitUntil), config.rs, fakes/, cf/glue.rs}`
+(the glue S1 wrote, hardened).
 
-**Implements:** the trait set in [Rust workspace and platform](design/rust-workspace.md), with
-Cloudflare implementations and in-memory fakes for native tests.
+**Implements:** the trait set and the `Platform` bundle in [Rust workspace and platform](design/rust-workspace.md),
+with Cloudflare implementations and in-memory fakes for native tests; `WorkerApp`, `ObjectApp`,
+`HttpRequestIn` and `CfPlatform` (§6.3); `export_worker!` for the `fetch`, `email`, `queue` and
+`scheduled` handlers and six Durable Object classes; `Config` with the startup rules (§6.1).
 
 **Acceptance:**
 
 - Each trait has a fake used by native tests in `worker` logic modules.
+- `platform::config::startup_rules` (every row of the startup rules) and
+  `platform::ids::monotonic_within_ms`.
 - The DoH resolver parses the JSON answers from both configured resolvers. A test uses canned
   responses for TXT, MX, NS and CNAME, including NXDOMAIN and SERVFAIL.
 - Only this crate depends on `worker`, enforced by `check-layering`.
@@ -305,14 +330,20 @@ Cloudflare implementations and in-memory fakes for native tests.
 
 ## M5 · Worker base: routing, auth, tenants, keys
 
-**Files:** `crates/worker/src/{lib.rs, router.rs, auth.rs, errors.rs, ratelimit.rs, request_id.rs, keyring.rs, handlers/{meta.rs, tenants.rs, partners.rs, keys.rs, audit.rs}, db/{mod.rs, tenants.rs, partners.rs, keys.rs, audit.rs, idempotency.rs, signing_keys.rs}, quota/mod.rs}`,
+**Files:** `crates/worker/src/{lib.rs, router.rs, auth.rs, errors.rs, ratelimit.rs, request_id.rs, keyring.rs, rpc.rs, log.rs, metrics.rs, handlers/{meta.rs, tenants.rs, partners.rs, keys.rs, audit.rs}, db/{mod.rs, tenants.rs, partners.rs, keys.rs, audit.rs, idempotency.rs, signing_keys.rs, intents.rs}, crons/{mod.rs, intents.rs}, objects/stubs.rs, quota/mod.rs}`,
 `crates/core/src/{keys.rs, crypto.rs}` (key format and the sealing envelope, pure)
 (`TenantQuota` as a stub class that answers every `QuotaRequest` variant, see below),
+`deploy/wrangler.toml.tmpl` whole and the `export_worker!` call with the six classes, five of them stubs
+([Shared files](#dependency-graph)); `ratelimit.rs` holds the compiled-in limit of every `RL_*` binding;
+`log.rs` and `metrics.rs` are minimal writers (the typed log line with no free-text field, and the
+`event = "metric"` line plus the Analytics Engine data point) that M17 Foundation extends with the
+catalogued labels and the alert evaluator, so M5 can already log and count; `crons/intents.rs` re-sends
+the `rpc_intents` rows ([Design conventions § 9](design/index.md#9-durable-object-calls-after-a-d1-change)),
 `migrations/d1/0001_init.sql` (every D1 table and index in [Data model](design/data-model.md), including those that
 later milestones use: the console, billing, sign-up and domain-method tables and columns),
 `crates/worker/tests/` harness (`cargo xtask itest`).
 
-**Implements:** FR-TEN-1/2/3, FR-KEY-1/2/3/4, NFR-SEC-1 (the cross-tenant suite), the error envelope, rate limits, request IDs,
+**Implements:** FR-TEN-1/2/3, FR-KEY-1/2/3/4/5, NFR-SEC-1 (the cross-tenant suite), the error envelope, rate limits, request IDs,
 idempotency for non-mail POSTs, and the thread and link keyring (`signing_keys`, created on first use;
 [Security](design/security.md#62-rotation-procedures)).
 
@@ -339,11 +370,21 @@ request: M6 the identity and address routes, M7 the message, thread and quaranti
 endpoint routes, and M13 the domain routes, with M13 also adding the `foreign_zone` case
 ([H8](edge-cases.md)).
 
+**Keys** ([Security §4.5–§4.6](design/security.md#45-rotation)): the reach and not-wider checks on reading,
+rotating and revoking a key (J20); the `identities:sign` grant by platform and partner keys; the
+`tenants:erase` permission and the owner-only rule on tenant keys (`created_by_role`; the console session
+that writes `owner` lands in M21, so M5 tests the rule with a key row seeded as an owner's); the
+`created_by_user_id` and `created_by_role` columns, copied from the calling key on every mint (the
+revocation on member removal and role change lands with the member routes in M21); the active-key caps
+and the `RL_TENANT` and `RL_PARTNER_API` buckets (J22); `404 route_not_found` and
+`405 method_not_allowed` in the router.
+
 **Tenants without owner or billing behaviour.** `POST /v1/tenants` accepts `owner` and `billing` as
 [REST API](../reference/api.md) specifies, validates them, and stores them: the owner's `users` and
 `members` rows and the `billing_accounts` row. Nothing acts on them yet. The owner's sign-in link is sent
 once M21 lands, and plan checks run once M22 lands; until then holds always succeed, as in billing mode
-`disabled`. Each tenant gets its `TenantQuota` object (`quota_do_id`, then `QuotaRequest::Init`).
+`disabled`. Each tenant gets its `TenantQuota` object (`quota_do_id`, an `rpc_intents` row in the tenant's
+D1 batch, then `QuotaRequest::Init`; a lost `Init` is re-sent by `crons/intents.rs`, J21).
 `notify_do_id` is written as `''` until M26 mints a `Notifier` with the tenant row; from M26 the
 every-minute cron also mints one for each row still at `''`
 ([Data model](design/data-model.md#1-d1-control-plane)).
@@ -363,37 +404,58 @@ well-formed answer. Later milestones replace behaviour, never a signature:
 | `CountAgentic` | Counts `agentic` for the day and `usage:agentic`; always `Ok { used }` | M11: the tenant daily cap (`CapReached`) |
 | `RecordUsage` | Adds to `usage:{metric}` for the current UTC day | final |
 | `ForgetIdentity` | Deletes the identity's `outcomes` rows and `sends:{identity_id}` counters | final |
-| `Hold` | Always grants (`Held`), as in billing mode `disabled` | M22: allowances and holds |
-| `Settle`, `Extend`, `Adjust`, `SetPlan`, `SetMeasured`, `Reconcile` | No-ops that answer `Ok` | M22 |
-| `GetUsage` | The usage counters, with no allowances (`billing: disabled`) | M22 |
+| `Hold` | Always grants (`HoldAnswer::Held`, `remaining: None`) and counts the units in `allowances.held`, as in billing mode `disabled` | M22: allowances and holds |
+| `Settle`, `Adjust` | `Settle` moves `consume` units of the hold to `allowances.used` and releases the rest; `Adjust` adds `delta` to `used` (never below 0). No limit is checked | M22 |
+| `Extend`, `SetPlan`, `SetMeasured`, `Reconcile` | No-ops that answer `()` | M22 |
+| `GetUsage` | `UsageAnswer` with mode `Disabled`, no period, and one row per feature with `granted: None` and the `used` and `held` counts its holds keep | M22 |
 
 **Acceptance:**
 
-- `it::auth::*`: unknown, expired and revoked keys; missing permission; key scope exceeded.
-- A cross-tenant suite skeleton: for every registered route, a key from another tenant gets an
-  indistinguishable `404`. The suite enumerates the router table, so a new route without a test fails.
-- `it::keys::j6_revoke_rotate`, with `GET /v1/audit-events?actor_key_id=`.
+- Authentication ([Security § 13](design/security.md#13-tests)): `it::auth::unknown_key_uniform`,
+  `it::auth::status_after_secret_match`, `it::auth::rotation_overlap`, `it::auth::last_used_throttle`
+  and `it::auth::missing_permission`.
+- Keys: `it::keys::scope_exceeded` (creation and the management of existing keys, J20),
+  `it::keys::permission_level_rules` (its `GET /v1/usage` part is added in M22, with that route),
+  `it::keys::j6_revoke_rotate` with `GET /v1/audit-events?actor_key_id=` (J6), and J22
+  (`it::auth::j22_tenant_aggregate_limits`). The owner-only part of W35 (`tenants:erase` refused on a
+  tenant key minted by any caller but an owner's key) runs here with a seeded owner's key; W35 is
+  accepted in M21.
+- Routing and isolation: `it::routes::unknown_route_and_method`, `it::security::route_table_complete`,
+  `it::security::body_scope_ignored`, `it::security::rpc_owner_mismatch`,
+  `it::security::response_headers`, `worker::db::no_formatted_sql` and
+  `xtask::ratelimit_limits_match_template`. A cross-tenant suite skeleton: for every registered route, a
+  key from another tenant gets an indistinguishable `404` (or the same `403` as its control call). The
+  suite enumerates the router table, so a new route without a test fails.
 - The keyring creates one key per purpose under concurrency and opens it with `PM_MASTER_KEY`
-  (`core::keys::format_round_trip`, `core::crypto::envelope_round_trip`).
-- Idempotent `POST /v1/tenants` replays and conflicts; `owner` and `billing` are stored but send no mail
-  and change no limit; the tenant's `TenantQuota` answers `Init`, refuses a mismatched owner, and answers
-  every other variant as the stub table says (a worker-logic test sends each one).
+  (`it::keyring::one_key_per_purpose_concurrent`, `core::keys::format_round_trip`,
+  `core::crypto::envelope_round_trip`).
+- Tenants: `it::tenants::create_idempotent_replay` (replays and conflicts; `owner` and `billing` are
+  stored but send no mail and change no limit); the tenant's `TenantQuota` answers `Init`, refuses a
+  mismatched owner, and answers every other variant as the stub table says
+  (`worker::quota::stub_answers_every_variant`, a worker-logic test that sends each one); the
+  `TenantQuota` part of J21 (`it::intents::j21_init_retried` for the tenant: a lost `Init` is re-sent
+  by the cron; its mailbox part lands in M6, which accepts J21).
 - `/health`, `/v1/me`, `/openapi.json` and `/.well-known/security.txt` are served (the last as
-  [Security](design/security.md) specifies, from `PM_SECURITY_CONTACT`).
-- J6 (`it::keys::j6_revoke_rotate`, above).
-- Partners (FR-KEY-4): `it::partners::routes_and_audit`; `it::partners::policy_caps_lower_only` (its
+  [Security](design/security.md) specifies, from `PM_SECURITY_CONTACT`:
+  `it::security::well_known_security_txt`), with the build-time version, commit and date.
+- Partners (FR-KEY-4): `it::partners::routes_and_audit` (its `PATCH /v1/tenants/{own}/billing` case is
+  added in M22, which builds that route); `it::partners::policy_caps_lower_only` (its
   `send_policy.daily_cap` cases are added in M6 with the identity routes); J10
   (`it::partners::j10_foreign_partner_not_found`, and the `foreign_partner` class of
   `it::security::cross_tenant_matrix`, for this milestone's routes); J11
-  (`it::keys::j11_partner_key_limits`); J18 (`it::partners::j18_partner_limits`: `max_tenants` and
-  `RL_PARTNER`); a partner key's requests counted in `RL_API` by key ID (`it::auth::rate_limited`). The
-  authentication part of J13 runs here (`it::partners::j13_suspended_partner`: partner and tenant keys
-  refused with `403 partner_suspended`); J13 is accepted in M9, once inbound storage (M7), held deliveries
-  (M8) and the send path (M9) exist. The `suspended_by` and ceiling parts of J17 run here too; J17 is
-  accepted in M9 with its abuse-pause part. The key part of J19 (`POST /v1/keys` and key rotation) runs
-  here; J19 is accepted in M8 with the webhook secrets. `DELETE /v1/partners/{partner_id}` ships here with
-  its `409 partner_has_tenants` and soft delete; J12 is accepted in M14, because its test erases the
-  partner's tenant first.
+  (`it::keys::j11_partner_key_limits`); a partner key's requests counted in `RL_API` by key ID
+  (`it::auth::rate_limited`, whose `RL_SIGN` case is added in M25 with the signing routes).
+  Parts of four rows run here and the rows are accepted later, as for J13: J18's `max_tenants` race and
+  its `RL_PARTNER` count of tenant creations run here (`it::partners::j18_partner_limits`); its
+  erased-tenant case runs once M14 can erase a tenant and its invitation case once M21 builds
+  invitations, and J18 is accepted in M21. The authentication part of J13 runs here
+  (`it::partners::j13_suspended_partner`: partner and tenant keys refused with `403 partner_suspended`);
+  J13 is accepted in M9, once inbound storage (M7), held deliveries (M8) and the send path (M9) exist. The
+  `suspended_by` and ceiling parts of J17 run here too, the partner's no-op suspension of a
+  platform-suspended tenant included; J17 is accepted in M9 with its abuse-pause part. The key part of J19
+  (`POST /v1/keys` and key rotation) runs here; J19 is accepted in M8 with the webhook secrets.
+  `DELETE /v1/partners/{partner_id}` ships here with its `409 partner_has_tenants` and soft delete; J12
+  is accepted in M14, because its test erases the partner's tenant first.
 - NFR-SEC-1: the cross-tenant suite (`it::security::cross_tenant_matrix`), with its `foreign_partner`
   class, finds 0 cross-tenant reads or writes. Every later milestone extends it with its routes, and it
   must stay at 0.
@@ -411,14 +473,24 @@ through `handlers/<area>.rs` plus one registration line, reviewed by Track 1.
 
 ## M6 · Identities, addresses, platform domain (Track 1)
 
-**Files:** `handlers/{identities.rs, addresses.rs (list and get; the platform address is created with
-the identity), domains.rs (platform domain read only)}`, `db/{identities.rs, addresses.rs, domains.rs}`,
-`mailbox/mod.rs` (IdentityMailbox shell with schema-on-wake), `mailbox/outbox.rs` (the transactional
+**Files:** `handlers/{identities.rs, addresses.rs (the list, `GET /v1/identities/{identity_id}/addresses`;
+there is no get-by-ID route, and an address is also read in its Identity object; the platform address is
+created with the identity), domains.rs (platform domain read only)}`, `db/{identities.rs, addresses.rs, domains.rs}`,
+`mailbox/mod.rs` (the `IdentityMailbox` class, replacing M5's stub, with schema-on-wake),
+`mailbox/schema/v1.sql` (every mailbox table of [Data model §2](design/data-model.md#2-identitymailbox-durable-object-sqlite),
+all of them now, each statement idempotent with `IF NOT EXISTS` as
+[Design conventions §4](design/index.md#4-durable-object-transactions) rule 6 requires; later milestones
+fill the tables and never add one before v1.0), `mailbox/outbox.rs` (the transactional
 outbox, its dispatch alarm, the `event_index` writes and the `pm-webhooks` producer;
 [Webhooks and events](design/webhooks.md#transactional-outbox)), `webhooks/envelope.rs` (the event
 envelope builder, the `WebhookJob` queue message and the `identity_*` and `address_*` payload builders,
 which the outbox needs before M8 exists; M8 imports it), `jobs/mod.rs` as a `JobRunner` stub (below), and
-the system identity's mailbox minting in the every-minute cron.
+the system identity's mailbox minting in the every-minute cron. Hooks in M5's files, which Track 1 owns
+too: the mailbox `init` and `emit_event` intents in `handlers/identities.rs`, and in
+`handlers/tenants.rs` the `identity.paused` and `identity.resumed` intents of a tenant suspension
+([Design conventions § 9](design/index.md#9-durable-object-calls-after-a-d1-change)); the `inboxes` hold
+in identity create and the `Adjust −1` in identity delete, against M5's `TenantQuota` stub, which grants
+every hold until M22 ([Identities and domains › Create](design/identity-domains.md#create), step 6).
 
 **Implements:** FR-IDN-1–4, FR-ADR-5–7, FR-DOM-1 (platform), the outbox and event index, and the system
 identity ([Identities and domains](design/identity-domains.md#the-system-identity)). FR-ADR-1–4 (several
@@ -431,7 +503,11 @@ stub that accepts `JobRequest::Start` and runs no step, so the job stays `queued
 `deleting`. M14 replaces the stub with the real `JobRunner`, whose every-minute restart of jobs left
 `queued` picks these up.
 
-**Acceptance:** A5, A12, J9, the identity and address routes added to J10's matrix
+**Acceptance:** A5, A12, J9 (`it::mailbox::j9_migration_on_wake`, including a migration rerun after a
+lost `schema_version` write), J21 (`it::intents::j21_init_retried`, its mailbox part, and
+`it::intents::j21_identity_event_retried`), `it::identities::deleting_and_deleted_routes`, the
+`inboxes` hold taken and settled on create and adjusted on delete (asserted on the stub's counters), the
+identity and address routes added to J10's matrix
 (`it::security::cross_tenant_matrix`, `it::partners::j10_foreign_partner_not_found`), the
 `send_policy.daily_cap` cases of `it::partners::policy_caps_lower_only`, plus `identity.created`, `identity.updated`,
 `identity.paused` and `identity.resumed` events that reach the outbox, `event_index` and a `pm-webhooks`
@@ -446,7 +522,7 @@ and the promote, retire and rollback flows in M13 (they need a tenant domain).
 
 ## M7 · Inbound (Track 1)
 
-**Files:** `email.rs` (handler), `consumers/inbound.rs`, `mailbox/{ingest.rs, threads.rs, messages.rs, attachments.rs, schema/v1.sql}`,
+**Files:** `email.rs` (handler), `consumers/inbound.rs`, `mailbox/{ingest.rs, threads.rs, messages.rs, attachments.rs}` (on M6's `schema/v1.sql`),
 `handlers/{threads.rs, messages.rs, quarantine.rs, wait.rs}`, `consumers/index.rs` (attachment text only at
 this stage), `crates/api-types/src/internal/index_job.rs` (the whole `IndexJob` enum, so M10 and M12 only
 fill in their arms).
@@ -596,7 +672,8 @@ The `triage` hold of consumer step 2 ([Triage § 1.1](design/triage.md#11-consum
 ## M13 · Domains (after M7 and M9; SES depends on S8)
 
 **Files:** `domains/{mod.rs, cloudflare_api.rs, ses_api.rs, ses_control.rs (SesControl DO, the SES
-token bucket), records.rs, monitor.rs (DomainMonitor DO), fallback.rs}`,
+token bucket), records.rs, monitor.rs (DomainMonitor DO), fallback.rs}` (the two classes replace M5's
+stubs; their bindings exist since M5),
 `handlers/domains.rs` (full for `cloudflare_zone`, including `PATCH /v1/domains/{domain_id}` for the
 transport), `handlers/addresses.rs` (aliases on tenant domains, promote, retire and rollback),
 `crons/retire.rs`, `transport/ses.rs`, `consumers/ses_events.rs` (the `POST /hooks/ses` SNS endpoint), and
@@ -691,7 +768,7 @@ also needs S11; without it, `smtp_relay` ships with `inbound: forward` only. `cl
 
 ## M14 · Privacy (after M9, M10)
 
-**Files:** `jobs/{mod.rs (JobRunner DO), erasure.rs, retention.rs, export.rs, reembed.rs, reparse.rs, reindex.rs, backup.rs}`,
+**Files:** `jobs/{mod.rs (JobRunner DO, replacing M6's stub), erasure.rs, retention.rs, export.rs, reembed.rs, reparse.rs, reindex.rs, backup.rs}`,
 `handlers/{erasure.rs, exports.rs, holds.rs}`, `crons/retention.rs`.
 
 **Implements:** FR-PRV-1–6, FR-IDN-4, NFR-PRV-1, and partner deletion after its tenants' erasure (FR-KEY-4).
@@ -703,7 +780,8 @@ this is O7), J12 (a partner whose tenants are all erased can be deleted, softly,
 `it::partners::j12_delete_with_tenants`), I8 (writes to an `erasing` or `erased` tenant refused for
 non-platform keys, reads kept for its partner key, a second tenant-scope erasure answered `200` or
 `409 tenant_erased`, and the tenant's idempotency records deleted by `tenant_id`:
-`it::erasure::i8_erasing_tenant_frozen`), the optional backup copy (`it::retention::backup_copy`), and
+`it::erasure::i8_erasing_tenant_frozen`), J18's erased-tenant case (an `erased` tenant frees its place
+under `max_tenants`, in `it::partners::j18_partner_limits`), the optional backup copy (`it::retention::backup_copy`), and
 `it::logs::i5_no_content_in_logs`, which greps captured Worker logs for any test-message body string and
 any test address. NFR-PRV-1: in a time-controlled harness every erasure scope completes within 24 hours,
 and a step that keeps failing still produces a receipt (`it::erasure::step_retry_and_fail`). Tenant scope
@@ -772,7 +850,8 @@ signing tools of M25 (`mail_sign_assertion`, `mail_sign_http_request`).
 
 ## M17 · Observability and operations (Track 3)
 
-**Files:** `crates/worker/src/{log.rs, metrics.rs}`, `ops/alerts.rs`, `consumers/dlq.rs`, `crates/core/src/slo.rs`
+**Files:** `crates/worker/src/{log.rs, metrics.rs}` (extending the minimal writers M5 created),
+`ops/alerts.rs`, `consumers/dlq.rs`, `crates/core/src/slo.rs`
 (alert rules, pure), `handlers/platform.rs`
 (the platform API: `GET /v1/platform/dlq`, `POST /v1/platform/dlq/{dlq_id}/redrive`,
 `POST /v1/platform/jobs`, `GET /v1/platform/jobs/{job_id}`, `POST /v1/platform/keys/{purpose}/rotate`, all
@@ -786,8 +865,8 @@ M17 is accepted in two halves, without renumbering ([Dependency graph](#dependen
 
 **Acceptance, M17 Foundation** (Track 3's first pull request; it merges before M7, M8 and M9):
 
-- The log and metrics writer (`log.rs`, `metrics.rs`): `event = "metric"` lines with the catalogued
-  labels, and log scrubbing (part of I5).
+- The log and metrics writer (`log.rs`, `metrics.rs`, created minimal in M5 and extended here):
+  `event = "metric"` lines with the catalogued labels, and log scrubbing (part of I5).
 - The alert table (the [alert list](design/observability.md#53-alert-list) as data in `ops/alerts.rs`:
   each alert's key, class, severity and runbook) and the state alert evaluator
   ([Observability §5.4](design/observability.md#54-the-state-alert-evaluator)): `core::slo::alert_state_machine`
@@ -855,7 +934,13 @@ including identity-key management on the identity page ([Agent signing keys §6]
 
 **Acceptance:**
 
-- Edge rows W9, W10, W15–W18.
+- Edge rows W9, W10, W15–W18, W35 (`it::keys::w35_tenant_erase_owner_only`, and the tenant-erasure row
+  of `it::console::w18_role_and_scope`: the owner's session principal holds `tenants:erase`, an admin's
+  never) and W36 (`it::members::w36_removed_member_keys_revoked`: the console's key form records the
+  person and role, and removal, leaving and role changes revoke their keys).
+- J18 (`it::partners::j18_partner_limits`), accepted here with its invitation case, which counts in
+  `RL_PARTNER` with tenant creations; its `max_tenants` part runs from M5 and its erased-tenant case from
+  M14.
 - Every console route works with JavaScript disabled, checked by the browser suite
   (`browser::console::no_js`, Playwright with `javaScriptEnabled: false`), which `cargo xtask itest` runs
   from this milestone on ([Testing §2](design/testing.md#2-test-layers)).
@@ -886,6 +971,10 @@ console pages `plan.rs`. No migration: `billing_accounts` and `billing_events` a
 **Acceptance:**
 
 - Edge rows W1–W8, W11–W14, W19.
+- The parts of M5's tests that need this milestone's routes: the `GET /v1/usage` part of
+  `it::keys::permission_level_rules` (implicit `usage:read` for tenant and identity keys; a platform key
+  needs it listed and `tenant_id`) and the `PATCH /v1/tenants/{own}/billing` case of
+  `it::partners::routes_and_audit` (`403 scope_denied` for a partner key).
 - Every metered action is wired to a hold and a settlement, checked by a table test that lists each metering
   point. A new metered action without a row fails.
 - A Stripe test-mode run (CLI `stripe trigger` fixtures recorded as JSON) covers checkout completed,
@@ -954,8 +1043,8 @@ and recorded in the design before the OAuth code is written ([Cloud sign-up §4]
 **Files:** `crates/core/src/{jwk.rs, jwt.rs, httpsig.rs}` (RFC 7638 and RFC 8037 thumbprints and JWS,
 RFC 9421 signature bases, pure), `handlers/{identity_keys.rs, assertions.rs, http_signatures.rs,
 well_known.rs}`, `db/identity_keys.rs`, `keyring.rs` (the `web_bot_auth` purpose: a 43-character
-thumbprint kid, `public_jwk`, the 7-day directory overlap), the `RL_SIGN` binding in the `wrangler.toml`
-template, `crates/sdk/src/assertions.rs` (`verify_assertion`), CLI `pmail identity-keys
+thumbprint kid, `public_jwk`, the 7-day directory overlap), the use of the `RL_SIGN` binding (in the
+template since M5), `crates/sdk/src/assertions.rs` (`verify_assertion`), CLI `pmail identity-keys
 list|create|rotate|revoke`, `pmail assertions create|verify` and `pmail http-sign`; no migration
 (`identity_keys`, `key_tombstones` and the `signing_keys` columns are in `0001_init.sql`). Route
 registrations go through Track 1 as usual.
@@ -979,6 +1068,11 @@ and the cross-tenant suite's new routes (NFR-SEC-1).
 
 **Acceptance:**
 
+- O27 (`it::assertions::sdk_verifies` with its crafted-`sub`, redirect and content-type cases) and O28
+  (`it::identity_keys::o28_concurrent_first_sign_and_revoke_active`); the `RL_SIGN` case of
+  `it::auth::rate_limited` (the 601st signing call in a minute for one identity); tenant and identity keys
+  minted by a platform key and by a partner key with `identities:sign` granted sign successfully (the
+  grant cases of `it::keys::permission_level_rules` and `it::keys::j11_partner_key_limits`).
 - Edge rows O1–O13, with the tests named in the register: `core::httpsig::signature_base_rfc9421` (O10),
   `it::identity_keys::{lazy_create_and_rotate, revoke_removes_from_jwks, paused_withdraws_jwks}` (O2, O3,
   O1), `it::assertions::claims_and_limits` (O4–O6), `it::secrets::rotate_master_reseals_identity_keys`
@@ -1014,8 +1108,9 @@ assertion half of the milestone ships unchanged.
 **Files:** `crates/worker/src/notify/{mod.rs, notifier.rs (the Notifier Durable Object), compose.rs,
 prefs.rs, unsubscribe.rs}`, `crates/core/src/notify.rs` (windows, caps, schedules across time zones, and
 rendering that takes no mail content, pure), `crates/worker/src/console/pages/notifications.rs`
-(`/console/settings/notifications` and the unsubscribe pair), the `NOTIFY` binding and the `Notifier`
-class in the `wrangler.toml` template and `export_worker!`, and `tenants.notify_do_id` minted with the
+(`/console/settings/notifications` and the unsubscribe pair), the `Notifier` class replacing M5's stub
+(the `NOTIFY` binding and the class name are in the template and `export_worker!` since M5), and
+`tenants.notify_do_id` minted with the
 tenant row, plus a `Notifier` minted by the every-minute cron for each tenant still at
 `notify_do_id = ''` (those created before M26, setup's default tenant included;
 [Configuration › Bindings](../reference/configuration.md#bindings)); no migration (`notification_prefs` and the
@@ -1112,7 +1207,8 @@ the ones marked manual there need a person in a browser and run with `cargo xtas
     (the hybrid figure of `it::bench::hybrid_p95` repeated against staging), NFR-OPS-2
     (`live::ops::restore_drill`) and NFR-COST-1 (`live::ops::idle_cost_review` after a week of idling).
     NFR-REL-2 and NFR-REL-4 are read from the SLO dashboard over the live run.
-14. Agent keys: an assertion minted on staging verifies with `pmail assertions verify` against staging's
+14. Agent keys: an assertion minted on staging, with a tenant key that the staging platform key minted
+    with `identities:sign` granted, verifies with `pmail assertions verify` against staging's
     JWKS, and stops verifying within 5 minutes of pausing the identity (`live::assertions::verify_then_pause`).
     With S13 passed and `PM_WEB_BOT_AUTH=on`, a signed request to
     `https://crawltest.com/cdn-cgi/web-bot-auth` returns `401` (the directory is not registered on

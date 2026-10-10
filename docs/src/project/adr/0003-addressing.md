@@ -32,9 +32,11 @@ used, so `bookings@a.example` and `bookings@b.example` reach the same agent.
    `550 5.1.1` (indistinguishable), retired ones `550 5.1.6`, suspended tenants a temporary failure for up to 5
    days, then `550 5.2.1`.
 3. **Platform addresses** are `{username}{tenant.address_suffix}@{platform}`, for example
-   `bookings.acme@agents.example`. The suffix is `.` + the tenant slug; only the default tenant may have
-   an empty suffix. Username plus suffix is at most 40 characters, leaving room for a thread token in a
-   64-character local part.
+   `bookings.acme@agents.example`. The suffix is `.` followed by 2–32 characters of `[a-z0-9-]`; it
+   defaults to `.` + the tenant slug, and a workspace may choose another when it is created (amended
+   2026-10-10 to match the API contract, `AddressSuffix` in `openapi.yaml`). Suffixes are unique across
+   the deployment, and only the default tenant may have an empty suffix. Username plus suffix is at
+   most 40 characters, leaving room for a thread token in a 64-character local part.
 4. **Tenant domains.** Kind `zone` (same Cloudflare account): an apex uses a catch-all; a subdomain uses
    one literal routing rule per address (at most 200), and an address stays `pending` until its rule
    exists. Kind `external` (DNS elsewhere): the tenant's mail system forwards to the identity's platform

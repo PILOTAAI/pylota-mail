@@ -1615,7 +1615,8 @@ can create every other key (`setup` prints this command for you):
 
 ```bash
 pmail keys create --level platform --name first-key --permissions \
-tenants:manage,partners:manage,platform:ops,keys:manage,identities:read,identities:write,domains:read,\
+tenants:manage,tenants:erase,partners:manage,platform:ops,keys:manage,identities:read,identities:write,\
+domains:read,\
 domains:write,messages:read,messages:send,messages:write,attachments:read,search:read,search:agentic,\
 quarantine:review,webhooks:read,webhooks:manage,erasure:manage,suppressions:manage,usage:read,\
 audit:read,members:read,members:manage
@@ -1630,9 +1631,9 @@ A partner key for an integrator such as Pylota, created with a platform key:
 
 ```bash
 pmail keys create --level partner --partner ptn_01JA2B3C4D5E6F7G8H9J0K1M2N --name pylota-backend \
-  --permissions tenants:manage,keys:manage,webhooks:manage,quarantine:review,usage:read,identities:read,\
-identities:write,domains:read,domains:write,messages:read,messages:send,messages:write,attachments:read,\
-search:read,members:manage
+  --permissions tenants:manage,tenants:erase,keys:manage,webhooks:manage,quarantine:review,usage:read,\
+audit:read,identities:read,identities:write,domains:read,domains:write,messages:read,messages:send,\
+messages:write,attachments:read,search:read,search:agentic,erasure:manage,suppressions:manage,members:manage
 ```
 
 ### `keys list` and `keys get`
@@ -1733,9 +1734,10 @@ published until it resumes.
 
 ### `assertions create`
 
-Mints an agent assertion: a JWT signed with the identity's key, naming the identity's address, display
-name and workspace, for one audience. Needs `identities:sign` on a tenant or identity key (platform and
-partner keys cannot hold it).
+Mints an agent assertion: a JWT signed with the identity's key, naming the identity's address (and,
+marked `unverified`, its display name and workspace), for one audience. Needs `identities:sign` on a
+tenant or identity key (platform and partner keys cannot hold it, but can grant it to the keys they
+create).
 
 ```text
 pmail assertions create --identity <identity> --audience <audience> [--expires-in <60-600>]

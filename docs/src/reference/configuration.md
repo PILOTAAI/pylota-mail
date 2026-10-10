@@ -30,6 +30,8 @@ There are three layers:
 | `AI` | Workers AI | – | Embeddings, rerank, triage, planner, `toMarkdown` |
 | `EMAIL` | `send_email` | – | No address restrictions; the Worker enforces policy |
 | `RL_API` | Rate limiting | – | 600 per 60 s, keyed by API key ID |
+| `RL_TENANT` | Rate limiting | – | 1,800 per 60 s, keyed by tenant ID: every request made with a tenant or identity key of the tenant, on top of `RL_API` ([Security § 10](../project/design/security.md#10-rate-limiting-and-abuse)) |
+| `RL_PARTNER_API` | Rate limiting | – | 1,800 per 60 s, keyed by partner ID: every request made with a partner key of the partner, on top of `RL_API` |
 | `RL_SEARCH` | Rate limiting | – | 120 per 60 s, keyed by API key ID |
 | `RL_AGENTIC` | Rate limiting | – | 20 per 60 s, keyed by API key ID |
 | `RL_SEND` | Rate limiting | – | 120 per 60 s, keyed by identity ID |

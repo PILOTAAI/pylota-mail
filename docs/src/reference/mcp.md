@@ -528,9 +528,10 @@ characters: the service's challenge, copied into the token), `ext` (an object of
 ```
 
 The token's header is `{"alg":"EdDSA","typ":"agent-assertion+jwt","kid":…}`. Its claims name the
-identity (`sub`, `email`, `email_verified`, `name`), the workspace (`org`), the deployment (`iss`), the
-`aud`, `iat`, `nbf`, `exp` and a new `jti`, and say `ai_agent: true` and whether there is an
-`accountable_human`; `nonce` and `ext` are copied in when given. The owner's name and address are never
+identity (`sub`, `email`, `email_verified`), the deployment (`iss`), the `aud`, `iat`, `nbf`, `exp` and a
+new `jti`, and say `ai_agent: true`; `unverified` carries what the workspace says about itself (`name`,
+`org`, `accountable_human`), which the deployment does not check; `nonce` and `ext` are copied in when
+given. The owner's name and address are never
 included. Each call returns a new token, which is never stored or logged; there is nothing to replay,
 so the tool takes no `idempotency_key`. Send the token only to its audience. More in
 [Agents › Agent assertions](../guides/agents.md#agent-assertions).

@@ -259,7 +259,7 @@ An **API key** has a level, a mode and a list of permissions:
 | `tenant` | Its own tenant: all its identities, domains and webhooks |
 | `identity` | Its own identity. It can also read the tenant's domains and webhooks if it holds the matching `:read` permission |
 
-- A key can never create a key wider than itself (`403 key_scope_exceeded`).
+- A key can never create, read, rotate or revoke a key wider than itself (`403 key_scope_exceeded`).
 - Scope always comes from the key, never from the request body. A resource outside the key's scope
   returns `404`, exactly as if it did not exist.
 - Keys look like `pmk_live_<lookup>_<secret>` or `pmk_test_…`. A key's mode follows its tenant.

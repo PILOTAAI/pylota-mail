@@ -23,7 +23,7 @@ Items the documentation does not confirm are marked "verify at build time" with 
 
 | State | Event | Guard | Action | Next |
 |---|---|---|---|---|
-| – | `POST …/identities` | Valid body; username free; `client_id` new | Insert identity and addresses (D1 batch); `MailboxRequest::Init`; `identity.created` | `active` |
+| – | `POST …/identities` | Valid body; username free; `client_id` new | `inboxes` hold; insert identity, addresses and the mailbox `init` intent (D1 batch); `MailboxRequest::Init`, which emits `identity.created` | `active` |
 | – | `POST …/identities` with a known `client_id` | Same `client_fingerprint` | Return `200` with the existing identity; call `Init` again (idempotent, repairs a lost first call) | unchanged |
 | – | `POST …/identities` with a known `client_id` | Different fingerprint | `409 client_id_conflict` | – |
 | `active` | `PATCH status: paused` | `identities:write` | `pause_reason = 'manual'`; `identity.paused` | `paused` |
@@ -33,6 +33,9 @@ Items the documentation does not confirm are marked "verify at build time" with 
 | `paused` (`tenant_suspended`) | Tenant resumed | – | `identity.resumed` | `active` |
 | `active`, `paused` | `DELETE` | `identities:write` and `erasure:manage` | Tombstone and remove every address; create the identity-scope erasure ([Privacy](privacy.md)) | `deleting` |
 | `deleting` | Erasure completed with no holds left | – | `identity.deleted`, once, from the erasure job's outbox with `identity_id` set ([Privacy § 6.5](privacy.md#65-identity-scope-fr-idn-4)) | `deleted` |
+| `deleting`, `deleted` | `DELETE` again | `identities:write` and `erasure:manage` | None: `200` with the existing identity-scope erasure request (the same `era_` ID) | unchanged |
+| `deleting`, `deleted` | `PATCH`, or any other write by identity ID | – | `404 identity_not_found`, nothing changes. The legal-hold routes are the exception: they stay usable on a `deleting` identity ([Privacy § 6.5](privacy.md#65-identity-scope-fr-idn-4)) | unchanged |
+| any | `GET /v1/identities/{identity_id}` | `identities:read` | Returns the identity with its status; a `deleted` identity shows the fields its erasure scrubbed | unchanged |
 
 A paused identity still receives and stores mail (FR-IDN-3). Every send needs an accountable human
 (`owner_name` and `owner_email`, FR-IDN-2); the check is in the send policy pipeline.
@@ -112,21 +115,44 @@ normal outbound pipeline.
    `pending`. Each address is checked against `addresses_address` (`409 address_taken`) and against
    `address_tombstones` ([Tombstones](#tombstones-a5)).
 5. `mailbox_do_id = objects.new_object_id(Mailbox)`.
-6. One D1 `batch`: `INSERT INTO identities …`, `INSERT INTO addresses …` (one or two rows),
-   `INSERT INTO audit_log …` (`identity.create`).
-7. `MailboxRequest::Init { tenant_id, identity_id, created_at }`, which writes the owner into `meta` and
-   emits `identity.created` once. If it fails, the request returns `503 unavailable`; the client retries
-   with the same `client_id`, and the replay path calls `Init` again.
-8. `201` with the Identity object.
+6. **`inboxes` hold.** `QuotaRequest::Hold { feature: Inboxes, units: 1, ref: <new idn_ ID>, gates: [StorageGb] }`
+   to the tenant's `TenantQuota` ([Plans, metering and billing › What the Worker meters](billing.md#what-the-worker-meters)).
+   `Denied` → `402 billing_limit` (`details.feature: "inboxes"`), and nothing is written. Until M22 the
+   M5 stub grants every hold, as in billing mode `disabled`, so M6 wires this step and M22 changes only
+   the answer.
+7. One D1 `batch`: `INSERT INTO identities …`, `INSERT INTO addresses …` (one or two rows),
+   `INSERT INTO audit_log …` (`identity.create`), and the `rpc_intents` row of the mailbox's `init`,
+   whose body is the `InitMailbox` with the `identity.created` payload built from these rows
+   ([Design conventions § 9](index.md#9-durable-object-calls-after-a-d1-change)). A failed batch settles
+   the hold with `consume: 0`; a committed one with `consume: 1`.
+8. `MailboxRequest::Init(InitMailbox)`, which writes the owner into `meta` and emits `identity.created`
+   once; on success the intent row is deleted. If the call fails, the identity still exists: the request
+   returns `201`, and the every-minute cron re-sends the intent until the mailbox accepts it
+   ([J21](../edge-cases.md)). A replay with the same `client_id` also calls `Init` again, which is
+   harmless.
+9. `201` with the Identity object.
 
 ### Updates, pause and tenant suspension
 
-`PATCH /v1/identities/{id}` updates D1, then sends `MailboxRequest::EmitEvent` with `identity.updated`
-(`changed` = field names), `identity.paused` or `identity.resumed`. Suspending a tenant
-(`PATCH /v1/tenants/{id}` with `status: suspended`) sets `tenants.suspended_at` and `suspended_by`
-(`platform` or `partner`, from the calling key's level; a partner key cannot resume a tenant whose
-`suspended_by` is `platform`, `403 scope_denied`) and, in the same D1 batch, pauses every `active` identity with `pause_reason = 'tenant_suspended'`; resuming reverses only
-those. Each identity then gets its event.
+`PATCH /v1/identities/{id}` updates D1 and, in the same batch, writes an `rpc_intents` row for the event:
+`identity.updated` (`changed` = field names), `identity.paused` or `identity.resumed`. After the commit it
+sends `MailboxRequest::EmitEvent` with the intent's derived `event_id`; a failed call is re-sent by the
+every-minute cron, and the outbox stores the event once ([Design conventions § 9](index.md#9-durable-object-calls-after-a-d1-change),
+[J21](../edge-cases.md)).
+
+Suspending a tenant (`PATCH /v1/tenants/{id}` with `status: suspended`) sets `tenants.suspended_at` and
+`suspended_by` (`platform` or `partner`, from the calling key's level) and, in the same D1 batch, pauses
+every `active` identity with `pause_reason = 'tenant_suspended'` and writes one `identity.paused` intent
+per identity it paused (`INSERT INTO rpc_intents … SELECT … FROM identities`); resuming reverses only those
+identities, with one `identity.resumed` intent each. Each identity then gets its event through its
+mailbox. Who suspended is kept ([J17](../edge-cases.md)):
+
+- A partner key cannot resume a tenant whose `suspended_by` is `platform` (`403 scope_denied`,
+  `details.field = "status"`).
+- `status: "suspended"` on a tenant that is already suspended changes nothing, whoever sends it, except
+  that a platform key's suspension replaces a partner's: `suspended_by` becomes `platform` and
+  `suspended_at` is kept. A partner's suspension never replaces a platform's, so a partner cannot turn a
+  platform suspension into its own and lift it. No identity is paused twice and no event is repeated.
 
 ### Delete (FR-IDN-4, A13)
 
@@ -856,6 +882,9 @@ forwarded).
 | `core::address::a12_local_part_budget` | Username plus suffix over 40 → `local_part_too_long` ([A12](../edge-cases.md)) |
 | `core::address::skeleton_vectors` | Fold vectors from UTS #39 test data for ASCII-prototype entries |
 | `it::identities::client_id_idempotent` | Replay returns `200` and the same identity; a changed body returns `client_id_conflict` (FR-IDN-1) |
+| `it::intents::j21_init_retried` | With the `do.call` fault armed for the first `Init`, `POST /v1/tenants` and `POST …/identities` still answer `201`; a call to the new `TenantQuota` or mailbox in the meantime gets `503 unavailable`; one every-minute cron run initialises both, deletes the two `rpc_intents` rows and emits exactly one `identity.created`; a second run sends nothing ([J21](../edge-cases.md), [Design conventions § 9](index.md#9-durable-object-calls-after-a-d1-change)) |
+| `it::intents::j21_identity_event_retried` | With the `do.call` fault armed, an identity `PATCH`, a pause, a resume and a tenant suspension commit and answer as usual; cron runs then emit each `identity.updated`, `identity.paused` and `identity.resumed` exactly once, with the event ID derived from its intent, in `occurred_at` order per identity; a duplicate re-send leaves one outbox row; an intent for an erased mailbox is deleted ([J21](../edge-cases.md)) |
+| `it::identities::deleting_and_deleted_routes` | On a `deleting` and on a `deleted` identity: `GET` returns it with its status; `PATCH` gets `404 identity_not_found` and changes nothing; a second `DELETE` returns `200` with the same `era_` ID and starts no job; the hold routes still work on the `deleting` one (FR-IDN-4) |
 | `it::identities::a5_tombstone_blocks_reuse` | A deleted identity's address cannot be created by any tenant ([A5](../edge-cases.md)) |
 | `it::identities::a13_delete_then_reply_rejected` | After delete, mail to its addresses gets `550 5.1.1` ([A13](../edge-cases.md), FR-IDN-4) |
 | `it::addresses::a11_newer_pending_replaces` | A second pending address on a domain replaces the first ([A11](../edge-cases.md)) |

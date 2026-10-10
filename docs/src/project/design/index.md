@@ -100,7 +100,9 @@ pub struct ApiError {
 ```
 
 - `core` returns domain errors (`AddressError`, `PolicyError`, `QueryError`, …). Each has one
-  `impl From<…> for ApiError` in `api-types`, so a rule and its error code are defined together.
+  `impl From<…> for ApiError` next to the error type in `core`, so a rule and its error code are defined
+  together. The impls live in `core` because `core` depends on `api-types` and `api-types` depends on
+  nothing of ours: `api-types` cannot name a `core` type.
 - `platform` returns `PlatformError { kind, binding, detail }`. `detail` is a short machine string and
   never contains content or clear-text addresses. The worker maps it:
 
@@ -163,7 +165,10 @@ callback throws, and forbids `BEGIN`/`SAVEPOINT` inside `sql.exec()`
    exponential backoff from 2 seconds, up to six times
    ([Alarms](https://developers.cloudflare.com/durable-objects/api/alarms/), read 2026-10-09).
 6. **Schema on wake.** Each object applies its migrations on first access in a transaction, guarded by
-   `meta.schema_version` ([J9](../edge-cases.md)).
+   `meta.schema_version` ([J9](../edge-cases.md)). Every statement of a migration is idempotent
+   (`CREATE TABLE IF NOT EXISTS`, `CREATE INDEX IF NOT EXISTS`, `CREATE VIRTUAL TABLE IF NOT EXISTS`, and
+   `INSERT OR IGNORE` for seeded `meta` keys), so a migration that ran but whose `schema_version` write was
+   lost runs again without an error.
 7. **Limits.** Durable Object SQLite allows 100 bound parameters per statement, 100 KB statements and
    2 MB per row or value ([limits](https://developers.cloudflare.com/durable-objects/platform/limits/),
    read 2026-10-09). Designs that store text cap it below those limits (see
@@ -190,7 +195,8 @@ pub struct RpcEnvelope<T> {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum MailboxRequest {
-    Init(InitMailbox),                       // identity created: stores owner in meta, emits identity.created
+    Init(InitMailbox),                       // identity created: stores the owner (from the envelope) in meta,
+                                             // emits identity.created once (section 9)
     Ingest(IngestInput),                     // inbound.md
     Reparse(ReparseInput),                   // inbound.md, J3
     AttachmentTextReady(AttachmentText),     // inbound.md
@@ -206,6 +212,22 @@ pub enum MailboxRequest {
     GetEvents(GetEvents),                    // webhooks.md delivery and replay
     // Read, search, triage, label and erasure operations are added by their designs.
 }
+pub struct InitMailbox {
+    pub created_at: i64,               // identities.created_at; written to meta.created_at
+    pub created_event: EmitEvent,      // identity.created, built by the handler from the rows its D1 batch wrote
+}
+pub struct EmitEvent {
+    pub event_id: String,              // evt_…, derived from the rpc_intents row (section 9), so a re-sent call
+                                       // is absorbed by the outbox's ON CONFLICT (event_id) DO NOTHING
+    pub event_type: String,            // identity.created | identity.updated | identity.paused | identity.resumed |
+                                       // identity.key_created | identity.key_rotated | identity.key_revoked
+    pub occurred_at: i64,              // the D1 change time, kept across retries
+    pub data: serde_json::Value,       // built by webhooks/envelope.rs (the identity_* builders) from D1 rows;
+                                       // thin, never message content
+}
+// The object appends the event to its outbox (webhooks.md › Appending) with Some(event_id), so the same
+// event_id is stored once and its sequence is taken once.
+
 // DomainRequest, JobRequest, QuotaRequest, SesControlRequest (domain-connections.md § 4.8) and
 // NotifierRequest (notifications.md § 3) follow the same pattern, and each starts with an
 // `Init` variant that stores the owner in the object's `meta` (QuotaRequest: outbound.md › TenantQuota).
@@ -285,6 +307,50 @@ Rules for every consumer:
 Logs never contain message bodies, subjects, attachment content or clear-text addresses (FR-PRV-6).
 Addresses that must be correlated are logged as `HMAC-SHA256(PM_HASH_KEY, address)` truncated to 16 hex
 characters. See [Observability](observability.md).
+
+### 9. Durable Object calls after a D1 change
+
+Some Durable Object calls must follow a D1 change, and a call made after the commit can fail: the Worker
+can die, or the object can be overloaded. Without a record the object would stay without an owner (a
+`TenantQuota` or a mailbox whose `Init` was lost accepts nothing else), or an identity event would be lost.
+Each such call is therefore written down first, in the D1 table `rpc_intents`
+([Data model](data-model.md#1-d1-control-plane)), in the **same D1 batch** as the change:
+
+| Change (handler) | Intent | Call |
+|---|---|---|
+| Tenant created (`handlers/tenants.rs`, M5) | `quota` · `init` | `QuotaRequest::Init { tenant_id }` |
+| Identity created (`handlers/identities.rs`, M6) | `mailbox` · `init` | `MailboxRequest::Init(InitMailbox)`, carrying `identity.created` |
+| Identity updated, paused or resumed (M6) | `mailbox` · `emit_event` | `MailboxRequest::EmitEvent` with `identity.updated`, `identity.paused` or `identity.resumed` |
+| Tenant suspended or resumed (`handlers/tenants.rs`; M6 adds this to the M5 handler) | one `mailbox` · `emit_event` per identity paused or resumed, inserted with `INSERT … SELECT` from `identities` | `identity.paused` (`reason: tenant_suspended`) or `identity.resumed` |
+| Identity key created, rotated or revoked (`handlers/identity_keys.rs`, M25) | `mailbox` · `emit_event` | `identity.key_created`, `identity.key_rotated` or `identity.key_revoked` |
+
+1. **Write.** The intent's `id` is deterministic (`{request_id}:{target_id}:{op}`, or
+   `{request_id}:{identity_id}:{event_type}`), and `body_json` holds the request. An event's ID is derived
+   from it like the platform events' IDs ([Webhooks › Platform events](webhooks.md#platform-events)): a
+   ULID whose time is `occurred_at` and whose random part is the first 10 bytes of
+   `HMAC-SHA256(PM_HASH_KEY, "intent:" + id)`. So every attempt sends the same `event_id`.
+2. **Call.** After the commit the handler makes the calls and deletes each intent whose call succeeded.
+   Before its own call to an object, it sends that object's older intents still pending, oldest first,
+   so a mailbox appends an identity's events in the order of their D1 changes and a later
+   `identity.updated` never overtakes an earlier one.
+   A failed call does not fail the request: the change is committed, and the answer is the normal one
+   (`201` for a create). Until the object is initialised, a call to it is answered
+   `503 unavailable` (retryable).
+3. **Repair.** The every-minute cron (`crons/intents.rs`) reads up to 100 rows with `next_at ≤ now`,
+   oldest `occurred_at` first, sends them one object at a time in that order, deletes each that succeeds,
+   and otherwise sets `attempts + 1` and `next_at = now + min(60 s × 2^attempts, 15 min)`. An object that
+   answers that it is erased (`identity_not_found` from an erased mailbox, or a tenant that is `erasing` or
+   `erased`) also deletes the row. A row is never dropped otherwise, and a row older than one hour is
+   logged as `rpc_intent_stuck` at each retry.
+4. **Idempotence.** `Init` from the same owner is a no-op that answers `Ok` (another owner is refused, as
+   section 5 says), and the mailbox emits `identity.created` once, from the first `Init` it accepts.
+   `EmitEvent` appends with its `event_id`, which the outbox stores once. A repeat is therefore harmless,
+   and an event is emitted exactly once into the outbox, from where delivery is at least once (section 6).
+
+The `Notifier` is not in this table: it is minted by the every-minute cron for any tenant still at
+`notify_do_id = ''` ([Notifications](notifications.md#8-notifier-object)). Tests:
+`it::intents::j21_init_retried` and `it::intents::j21_identity_event_retried`
+([Identities and domains › Tests](identity-domains.md#tests), [J21](../edge-cases.md)).
 
 ## Spikes
 

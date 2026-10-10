@@ -29,14 +29,17 @@ info:
     - **Hosts.** The console answers on `PM_CONSOLE_HOST`, which defaults to `PM_API_HOST`. When the two
       differ, console paths answer only on `PM_CONSOLE_HOST`, and the API host `PM_API_HOST` serves only
       the REST API (`/v1/*`), MCP (`/mcp`), `/openapi.json`, `/health`, `/.well-known/*`, signed links
-      (`/v1/links/*`), `/hooks/*` and `/billing/stripe/webhook`; anything else returns `404`, and no
-      cookie is set or read on the API host.
+      (`/v1/links/*`), `/hooks/*` and `/billing/stripe/webhook`; anything else returns
+      `404 route_not_found`, and no cookie is set or read on the API host. A route called with a method
+      it does not have returns `405 method_not_allowed` with an `Allow` header.
     - **Format.** JSON (`application/json; charset=utf-8`). Times are RFC 3339 UTC strings. Sizes are bytes.
     - **IDs** are a type prefix, an underscore and a 26-character upper-case Crockford base32 ULID
       (`ten_ idn_ adr_ dom_ thr_ msg_ att_ whk_ dlv_ evt_ key_ era_ exp_ job_ aud_ req_ usr_ inv_ dlq_ hld_ prb_ ptn_`).
     - **Pagination.** List endpoints take `limit` (default 25, max 100) and `cursor`, and return
       `{ "data": [...], "next_cursor": "…" | null }`. Cursors are opaque and expire after 24 hours
-      (`410 cursor_expired`).
+      (`410 cursor_expired`). A list cursor is keyset-based (`created_at`, then `id`, newest first),
+      MACed under the deployment's cursor key and bound to the operation, its filters and the calling key;
+      one used elsewhere, altered, or signed by an unknown key is `400 invalid_request` (path `cursor`).
     - **Idempotency.** `Idempotency-Key` is required on send, reply, reply-all and forward (except on a
       dry run, `dry_run=true`, where it is optional and never recorded), and optional on every other
       `POST` except four (`x-idempotency: none`), which ignore it and never record it: the two signing
@@ -164,8 +167,11 @@ paths:
       tags: [Meta]
       summary: Health check
       description: >-
-        No authentication. Reports that the Worker is serving, with its version, commit and `env`
-        (`PM_ENV`). With an invalid configuration it returns `503 unavailable`.
+        No authentication. Reports that the Worker is serving, with its version and commit (compiled into
+        the release bundle) and `env` (`PM_ENV`). `status` is `degraded`, still with `200`, when a feature
+        is off because of the configuration; a field per feature (`ses`, `billing`, `cf_api_token`) says
+        why. A missing required variable or secret, or a malformed optional one, returns
+        `503 unavailable` with `details.config_invalid` naming the variable.
       security: []
       x-rate-limit-buckets: []
       x-idempotency: none
@@ -177,13 +183,59 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Health'}
+              examples:
+                ok:
+                  value:
+                    status: ok
+                    version: '1.0.0'
+                    commit: abc1234
+                    env: production
+                degraded:
+                  value:
+                    status: degraded
+                    version: '1.0.0'
+                    commit: abc1234
+                    env: production
+                    ses: sns_topic_missing
+        '405':
+          description: Any method other than `GET` on this path. `Allow` lists `GET`.
+          x-error-codes: [method_not_allowed]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            Allow:
+              description: The methods this path has.
+              schema: {type: string}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
               example:
-                status: ok
-                version: '1.0.0'
-                commit: abc1234
-                env: production
+                error:
+                  code: method_not_allowed
+                  message: This path does not accept POST.
+                  retryable: false
+                  fix: Use one of the methods in the Allow header.
+                  request_id: req_01J9Z4K8V4QW7X2M5N6P8R0T1Y
         '500': {$ref: '#/components/responses/InternalError'}
-        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+        '503':
+          description: >-
+            The configuration is invalid: a required variable or secret is missing or malformed, or an
+            optional variable is malformed. `details.config_invalid` names it. Every other route answers
+            `503 unavailable` too until the configuration is fixed.
+          x-error-codes: [unavailable]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+              example:
+                error:
+                  code: unavailable
+                  message: The deployment's configuration is invalid.
+                  retryable: true
+                  fix: Set PM_DOH_RESOLVERS to exactly two https URLs and redeploy.
+                  request_id: req_01J9Z4K8V4QW7X2M5N6P8R0T1Y
+                  details:
+                    config_invalid: PM_DOH_RESOLVERS
 
   /openapi.json:
     servers:
@@ -912,6 +964,10 @@ paths:
       operationId: getIdentity
       tags: [Identities]
       summary: Get an identity
+      description: >-
+        Returns the identity in any status, `deleting` and `deleted` included. Once its erasure has run, a
+        `deleted` identity has its personal fields scrubbed (empty `display_name`, `owner` and `signature`
+        `null`, `metadata` `{}`).
       x-required-permission: ['identities:read']
       x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
@@ -941,7 +997,9 @@ paths:
         `identity_paused` (FR-IDN-3). Setting `status: "active"` on an identity paused for
         `abuse_threshold` needs a platform, partner or tenant key and is audit-logged; on a tenant a
         partner's key created it needs a platform key. A `send_policy.daily_cap` above the tenant's
-        effective `identity_daily_send_cap` needs a platform key.
+        effective `identity_daily_send_cap` needs a platform key. A `deleting` or `deleted` identity returns
+        `404 identity_not_found` and is not changed, as on every write by identity ID except the legal-hold
+        routes.
       x-required-permission: ['identities:write']
       x-key-levels: [platform, partner, tenant, identity]
       x-permission-notes: >-
@@ -983,7 +1041,9 @@ paths:
         Starts an identity-scope erasure (FR-IDN-4). The identity's addresses are tombstoned and can never
         be assigned to another identity; later mail to them gets `550 5.1.1`. Its signing keys are deleted
         and their key IDs tombstoned, so they are never published again ([O7]). While the identity is
-        `deleting` or `deleted`, signing and its JWK Set return `404 identity_not_found`.
+        `deleting` or `deleted`, signing and its JWK Set return `404 identity_not_found`. A second `DELETE`
+        of a `deleting` or `deleted` identity starts nothing and returns `200` with its existing
+        identity-scope erasure request.
       x-required-permission: ['identities:write', 'erasure:manage']
       x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
@@ -991,6 +1051,14 @@ paths:
       responses:
         '202':
           description: The erasure request of scope `identity`.
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErasureRequest'}
+        '200':
+          description: The identity was already `deleting` or `deleted`; its existing identity-scope erasure request, unchanged.
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
@@ -1460,9 +1528,10 @@ paths:
         Creates a new `active` key at once and moves the previous active key to `retiring`, with
         `verify_until` = now + `PM_IDENTITY_KEY_OVERLAP_DAYS` (default 7 days). The retiring key stays in
         the JWK Set and does not sign, so an assertion signed just before the rotation still verifies until
-        then ([O2]); new assertions use the new key. With no active key, it creates the first one and
-        `previous` is `null`. No body. Emits `identity.key_rotated`; the audit action is
-        `identity_key.rotate`. Available while the identity is paused; a `deleting` or `deleted` identity
+        then ([O2]); new assertions use the new key. With no active key (none yet, or the active key was
+        revoked), it creates one, `previous` is `null` and it emits `identity.key_created`; otherwise it
+        emits `identity.key_rotated`. Concurrent creations end with one active key ([O28]). No body. The
+        audit action is `identity_key.rotate`. Available while the identity is paused; a `deleting` or `deleted` identity
         returns `404 identity_not_found`.
       x-required-permission: ['identities:write']
       x-key-levels: [platform, partner, tenant, identity]
@@ -1600,9 +1669,11 @@ paths:
         - **Header**: `{"alg":"EdDSA","typ":"agent-assertion+jwt","kid":"<thumbprint>"}`.
         - **Claims**: `iss` (`https://{PM_API_HOST}`), `sub` (the identity ID), `aud` (the requested
           audience), `iat` and `nbf` (now), `exp` (now + `expires_in`), `jti` (a new ULID), `email` (the
-          identity's primary address), `email_verified` (`true`), `name` (the display name), `org` (the
-          workspace name), `accountable_human` (`true` when the identity has an accountable owner; the
-          owner's name and address are never included), `ai_agent` (`true`), and `nonce` and `ext` when given.
+          identity's primary address), `email_verified` (`true`), `unverified` (an object of statements the
+          workspace made and the deployment does not check: `name`, the display name; `org`, the workspace
+          name; `accountable_human`, `true` when the identity has owner fields set; a verifier must not grant
+          access on them, and the owner's name and address are never included), `ai_agent` (`true`), and
+          `nonce` and `ext` when given.
         - **Not stored.** Each call mints a new token, so `Idempotency-Key` is ignored and never recorded.
           The token is never stored or logged; only a count is kept (`usage_daily` metric `assertions`).
           Signing is not metered against any plan allowance.
@@ -4791,8 +4862,10 @@ paths:
       summary: Create an API key
       description: >-
         The new key's level, tenant, identity and permissions must all lie within the caller's own,
-        otherwise `403 key_scope_exceeded` (FR-KEY-1). A tenant or identity key's `mode` follows its tenant;
-        platform and partner keys are `live`.
+        otherwise `403 key_scope_exceeded` (FR-KEY-1). The one exception: a platform or partner key may grant
+        `identities:sign`, which it cannot hold, to a tenant or identity key it mints; the `key.create`
+        audit row records it in `details.granted_without_holding`. A tenant or identity key's `mode` follows
+        its tenant; platform and partner keys are `live`.
         The response carries `secret` (`pmk_live_…` or `pmk_test_…`), **shown only once**; only a keyed
         hash is stored (FR-KEY-2).
 
@@ -4803,14 +4876,22 @@ paths:
           and `partners:manage` on any key but a platform key; `tenants:manage` on a tenant or identity key;
           `members:read`, `members:manage`, `suppressions:manage`, `audit:read` and `usage:read` on an
           identity key (an identity key holds `usage:read` implicitly for its own workspace's
-          `GET /v1/usage`); `identities:sign` on a platform or partner key. The table is under `Permission`.
+          `GET /v1/usage`); `identities:sign` on a platform or partner key; `tenants:erase` on an identity
+          key. The table is under `Permission`.
+        - **Owner-only permission.** `tenants:erase` on a tenant key needs a caller whose
+          `created_by_role` is `owner` (the workspace owner's console session, or a key it minted):
+          otherwise `400 invalid_request` with `details.reason = "permission_owner_only"`.
         - **Partner keys** (FR-KEY-4). `level: partner` needs `partner_id` and no `tenant_id` or
           `identity_id`, and only a platform key may ask for it (an unknown partner is
           `404 partner_not_found`); other levels refuse `partner_id`. A partner key mints only `tenant` and
           `identity` keys of the tenants its partner's keys created; a `partner` or `platform` key, or another
           tenant, is `403 key_scope_exceeded`.
-        - **Order.** These two checks run first; the scope check (`403 key_scope_exceeded`) comes after them.
-          Minting is audit-logged (`key.create`, with `level` and, for a partner key, `partner_id`).
+        - **Order.** These checks run first; the scope check (`403 key_scope_exceeded`) comes after them,
+          then the active-key cap: at most 100 active tenant and identity keys per tenant and 10 partner
+          keys per partner (`422 key_limit_reached`). Minting is audit-logged (`key.create`, with `level`
+          and, for a partner key, `partner_id`).
+        - **Who minted it.** `created_by_user_id` is the console user whose session minted the key, copied
+          to every key minted with it; removing that person, or lowering their role, revokes their keys.
       x-required-permission: ['keys:manage']
       x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
@@ -4844,7 +4925,8 @@ paths:
             The request is invalid (`details.errors[]` holds `{path, message}`): for example `permissions`
             missing or empty, or `tenant_id` or `identity_id` missing for the level. A permission the new
             key's level cannot hold is `invalid_request` with `details.reason =
-            "permission_not_allowed_for_level"`.
+            "permission_not_allowed_for_level"`; `tenants:erase` from a caller that is not the workspace
+            owner's session or one of its keys, `details.reason = "permission_owner_only"`.
           x-error-codes: [invalid_request, invalid_idempotency_key]
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
@@ -4865,8 +4947,8 @@ paths:
                         message: identities:sign cannot be held by a platform key
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403':
-          description: The key lacks `keys:manage`, the target is out of scope, the new key would be wider than the caller, or the partner is suspended.
-          x-error-codes: [permission_denied, scope_denied, key_scope_exceeded, tenant_suspended, partner_suspended]
+          description: The key lacks `keys:manage`, the target is out of scope, the new key would be wider than the caller, or the partner is suspended. A suspended tenant does not stop key management.
+          x-error-codes: [permission_denied, scope_denied, key_scope_exceeded, partner_suspended]
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
           content:
@@ -4875,6 +4957,25 @@ paths:
         '404': {$ref: '#/components/responses/NotFound'}
         '409': {$ref: '#/components/responses/IdempotencyConflict'}
         '413': {$ref: '#/components/responses/PayloadTooLarge'}
+        '422':
+          description: >-
+            The tenant already has 100 active tenant and identity keys, or the partner 10 partner keys
+            (`details.limit`). Revoked and expired keys do not count.
+          x-error-codes: [key_limit_reached]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+              example:
+                error:
+                  code: key_limit_reached
+                  message: This tenant already has 100 active API keys.
+                  retryable: false
+                  fix: Revoke keys you no longer use, then create the new one.
+                  request_id: req_01J9Z4K8V4QW7X2M5N6P8R0T1Y
+                  details:
+                    limit: 100
         '429': {$ref: '#/components/responses/TooManyRequests'}
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
@@ -4883,8 +4984,9 @@ paths:
       tags: [Keys]
       summary: List API keys
       description: >-
-        Keys within the caller's scope (never with secrets). A partner key lists only tenant and identity
-        keys of its own tenants.
+        Keys the caller may read (never with secrets): those it reaches and is not narrower than, as for
+        `GET /v1/keys/{key_id}`. A partner key lists only tenant and identity keys of its own tenants; an
+        identity key, only identity keys of its own identity.
       x-required-permission: ['keys:manage']
       x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
@@ -4916,6 +5018,15 @@ paths:
       operationId: getKey
       tags: [Keys]
       summary: Get an API key
+      description: >-
+        The key, never with its secret.
+        Two checks apply to the target key ([J20]). **Reach:** a platform key reaches every key; a partner
+        key, the tenant and identity keys of its own tenants; a tenant key, the keys of its tenant; an
+        identity key, only the identity keys of its own identity. A key out of reach is
+        `404 key_not_found`, like a missing one. **Not wider:** the target's level must be at most the
+        caller's and each of its permissions one the caller holds (or, for a platform or partner caller,
+        `identities:sign`); otherwise `403 key_scope_exceeded` and nothing is changed or returned. A key
+        always passes for itself.
       x-required-permission: ['keys:manage']
       x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
@@ -4930,7 +5041,7 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/ApiKey'}
         '401': {$ref: '#/components/responses/Unauthorized'}
-        '403': {$ref: '#/components/responses/Forbidden'}
+        '403': {$ref: '#/components/responses/KeyManageForbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
         '429': {$ref: '#/components/responses/TooManyRequests'}
         '500': {$ref: '#/components/responses/InternalError'}
@@ -4939,7 +5050,15 @@ paths:
       operationId: revokeKey
       tags: [Keys]
       summary: Revoke an API key
-      description: Revokes the key immediately. Later requests with it get `401 key_revoked`.
+      description: >-
+        Revokes the key immediately. Later requests with it get `401 key_revoked`.
+        Two checks apply to the target key ([J20]). **Reach:** a platform key reaches every key; a partner
+        key, the tenant and identity keys of its own tenants; a tenant key, the keys of its tenant; an
+        identity key, only the identity keys of its own identity. A key out of reach is
+        `404 key_not_found`, like a missing one. **Not wider:** the target's level must be at most the
+        caller's and each of its permissions one the caller holds (or, for a platform or partner caller,
+        `identities:sign`); otherwise `403 key_scope_exceeded` and nothing is changed or returned. A key
+        always passes for itself.
       x-required-permission: ['keys:manage']
       x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
@@ -4951,7 +5070,7 @@ paths:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
         '401': {$ref: '#/components/responses/Unauthorized'}
-        '403': {$ref: '#/components/responses/Forbidden'}
+        '403': {$ref: '#/components/responses/KeyManageForbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
         '429': {$ref: '#/components/responses/TooManyRequests'}
         '500': {$ref: '#/components/responses/InternalError'}
@@ -4966,7 +5085,15 @@ paths:
       summary: Rotate an API key
       description: >-
         Issues a new secret for the same key and returns it once. The old secret keeps working until the
-        overlap ends (0–168 hours, default 24).
+        overlap ends (0–168 hours, default 24). Because the response carries the secret, no key may rotate
+        a key wider than itself.
+        Two checks apply to the target key ([J20]). **Reach:** a platform key reaches every key; a partner
+        key, the tenant and identity keys of its own tenants; a tenant key, the keys of its tenant; an
+        identity key, only the identity keys of its own identity. A key out of reach is
+        `404 key_not_found`, like a missing one. **Not wider:** the target's level must be at most the
+        caller's and each of its permissions one the caller holds (or, for a platform or partner caller,
+        `identities:sign`); otherwise `403 key_scope_exceeded` and nothing is changed or returned. A key
+        always passes for itself.
       x-required-permission: ['keys:manage']
       x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
@@ -4992,7 +5119,7 @@ paths:
               schema: {$ref: '#/components/schemas/ApiKeyCreated'}
         '400': {$ref: '#/components/responses/BadRequest'}
         '401': {$ref: '#/components/responses/Unauthorized'}
-        '403': {$ref: '#/components/responses/Forbidden'}
+        '403': {$ref: '#/components/responses/KeyManageForbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
         '409': {$ref: '#/components/responses/IdempotencyConflict'}
         '413': {$ref: '#/components/responses/PayloadTooLarge'}
@@ -5022,13 +5149,16 @@ paths:
         | `identity` | `identity_id` | The whole mailbox. Its addresses are tombstoned |
         | `tenant` | none | Everything in the tenant. Then the tenant is marked `erased` |
 
-        A `tenant` request for a tenant that is already `erasing` returns the existing request with `200`
-        (the same `era_` ID) and starts nothing; for an `erased` tenant it returns `409 tenant_erased`. Any
+        A `tenant` request also needs `tenants:erase` (`403 permission_denied` with
+        `details.required = ["tenants:erase"]` otherwise), which workspace admins and the keys they mint never
+        hold ([W35]). A `tenant` request for a tenant that is already `erasing` returns the existing request
+        with `200` (the same `era_` ID) and starts nothing; for an `erased` tenant it returns
+        `409 tenant_erased`. Any
         other erasure request naming an `erasing` or `erased` tenant, like every write to such a tenant,
         gets `404 tenant_not_found` from a non-platform key.
       x-required-permission: ['erasure:manage']
       x-key-levels: [platform, partner, tenant, identity]
-      x-permission-notes: An identity key can only erase within its own identity (`message`, `thread` and `identity` scopes). `counterparty` needs a tenant, partner or platform key; `tenant` needs a platform key, the partner key of the tenant's own partner, or the tenant's own key.
+      x-permission-notes: An identity key can only erase within its own identity (`message`, `thread` and `identity` scopes). `counterparty` needs a tenant, partner or platform key; `tenant` needs a platform key, the partner key of the tenant's own partner, or the tenant's own key, and in every case `tenants:erase` as well as `erasure:manage`.
       x-rate-limit-buckets: [api]
       x-idempotency: optional
       parameters:
@@ -7626,8 +7756,9 @@ components:
       name: tenant_id
       in: query
       description: >-
-        Platform and partner keys only (a partner key, one of its own tenants). Restrict to one tenant. Other
-        keys are always restricted to their own tenant.
+        Restrict to one tenant. A platform key may name any tenant; a partner key, one of its own tenants;
+        a tenant or identity key, only its own (a list is always restricted to it). A tenant outside the
+        key's scope returns `404 tenant_not_found`, never an empty page, as for a missing tenant.
       schema: {$ref: '#/components/schemas/TenantId'}
     IdempotencyKeySend:
       name: Idempotency-Key
@@ -7994,6 +8125,23 @@ components:
               request_id: req_01J9Z4K8V4QW7X2M5N6P8R0T1Y
               details:
                 required: 'messages:send'
+    KeyManageForbidden:
+      description: >-
+        As `Forbidden`, plus `key_scope_exceeded` when the target key is wider than the caller: a higher
+        level, or a permission the caller does not hold ([J20]).
+      x-error-codes: [permission_denied, scope_denied, key_scope_exceeded, partner_suspended]
+      headers:
+        Request-Id: {$ref: '#/components/headers/Request-Id'}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+          example:
+            error:
+              code: key_scope_exceeded
+              message: This key cannot manage a key that holds permissions it does not hold.
+              retryable: false
+              fix: Use a key that holds every permission of the target key, or a key of a higher level.
+              request_id: req_01J9Z4K8V4QW7X2M5N6P8R0T1Y
     SendForbidden:
       description: >-
         As `Forbidden`, plus `test_mode_recipient` when a test tenant sends outside `*@simulator.invalid`
@@ -8008,8 +8156,9 @@ components:
       description: >-
         The resource does not exist **or** is outside the key's scope (deliberately indistinguishable). A
         `404` always carries one of this service's own codes; a `404` without this envelope came from
-        something else and must not be read as "already deleted".
-      x-error-codes: [tenant_not_found, identity_not_found, address_not_found, domain_not_found, thread_not_found, message_not_found, attachment_not_found, webhook_not_found, key_not_found, erasure_not_found, export_not_found, suppression_not_found, list_entry_not_found, member_not_found, invitation_not_found, job_not_found, dlq_item_not_found, partner_not_found]
+        something else and must not be read as "already deleted". `route_not_found` means the path is no
+        route on this host, which says nothing about any resource.
+      x-error-codes: [route_not_found, tenant_not_found, identity_not_found, address_not_found, domain_not_found, thread_not_found, message_not_found, attachment_not_found, webhook_not_found, key_not_found, erasure_not_found, export_not_found, suppression_not_found, list_entry_not_found, member_not_found, invitation_not_found, job_not_found, dlq_item_not_found, partner_not_found]
       headers:
         Request-Id: {$ref: '#/components/headers/Request-Id'}
       content:
@@ -8586,6 +8735,8 @@ components:
         - job_not_found
         - dlq_item_not_found
         - partner_not_found
+        - route_not_found
+        - method_not_allowed
         - idempotency_conflict
         - request_in_progress
         - client_id_conflict
@@ -8626,6 +8777,7 @@ components:
         - agentic_disabled
         - address_limit_reached
         - webhook_limit_reached
+        - key_limit_reached
         - web_bot_auth_disabled
         - billing_limit
         - rate_limited
@@ -8665,7 +8817,7 @@ components:
         |---|---|
         | `tenants:manage` | Create, update and suspend tenants, and their billing accounts. Platform keys, for every tenant; partner keys, for the tenants their partner's keys created, without changing billing |
         | `identities:read`, `identities:write` | Read, and create, update, pause or delete identities and addresses, and test forwarding; read, and create, rotate or revoke identity signing keys. Deleting an identity also needs `erasure:manage`, because it starts an identity-scope erasure |
-        | `identities:sign` | Mint agent assertions and Web Bot Auth HTTP signatures as an identity. Tenant and identity keys (an identity key only for its own identity); platform and partner keys cannot hold it |
+        | `identities:sign` | Mint agent assertions and Web Bot Auth HTTP signatures as an identity. Tenant and identity keys (an identity key only for its own identity); platform and partner keys cannot hold it, but may grant it to the tenant and identity keys they mint |
         | `domains:read`, `domains:write` | Read, and add, update, verify, probe or remove domains |
         | `messages:read` | Threads, messages, raw MIME, deliveries |
         | `messages:send` | Send, reply, reply-all, forward, cancel |
@@ -8677,7 +8829,8 @@ components:
         | `webhooks:read` | Read webhook endpoints and their deliveries |
         | `webhooks:manage` | Create, change, test, rotate and delete webhook endpoints, and replay. Includes `webhooks:read` |
         | `keys:manage` | API keys within the caller's scope. A partner key manages only tenant and identity keys of its own tenants |
-        | `erasure:manage` | Erasure requests, legal holds, exports |
+        | `erasure:manage` | Erasure requests, legal holds, exports. A `tenant`-scope erasure request also needs `tenants:erase` |
+        | `tenants:erase` | Delete the workspace (a `tenant`-scope erasure request, with `erasure:manage`). Platform keys, partner keys for their own tenants, and tenant keys minted by the workspace owner's console session or by a key descended from one |
         | `suppressions:manage` | Suppressions and allow or block lists |
         | `usage:read` | Plan, allowances and usage figures. Every tenant and identity key holds it implicitly for its own workspace; platform and partner keys must hold it explicitly and pass `tenant_id` |
         | `audit:read` | Audit log |
@@ -8694,10 +8847,12 @@ components:
         | `platform:ops`, `partners:manage` | platform |
         | `tenants:manage` | platform, partner |
         | `members:read`, `members:manage`, `suppressions:manage`, `audit:read`, `usage:read` | platform, partner, tenant |
-        | `identities:sign` | tenant, identity |
+        | `tenants:erase` | platform, partner, and tenant keys minted by the workspace owner or its keys (otherwise `details.reason = "permission_owner_only"`) |
+        | `identities:sign` | tenant, identity (platform and partner keys may grant it without holding it) |
         | Every other permission | platform, partner, tenant, identity |
       enum:
         - 'tenants:manage'
+        - 'tenants:erase'
         - 'partners:manage'
         - 'identities:read'
         - 'identities:write'
@@ -8773,7 +8928,26 @@ components:
       properties:
         status:
           type: string
-          enum: [ok]
+          description: >-
+            `ok`, or `degraded` when a feature is off because of the configuration; the fields below name
+            it.
+          enum: [ok, degraded]
+        ses:
+          type: string
+          description: Present when the SES transport is off because `PM_SES_SNS_TOPIC_ARN` is missing.
+          enum: [sns_topic_missing]
+        billing:
+          type: string
+          description: Present when `PM_BILLING=stripe` lacks `PM_STRIPE_SECRET_KEY` or `PM_STRIPE_WEBHOOK_SECRET`, so billing has not started.
+          enum: [stripe_secrets_missing]
+        cf_api_token:
+          type: string
+          description: Present when a Cloudflare REST fallback is in use (a spike S6 result) and `PM_CF_API_TOKEN` is not set.
+          enum: [missing]
+        ses_region:
+          type: string
+          description: '`PM_SES_REGION`, present when SES is configured, so anyone can see where AWS processes mail.'
+          examples: [eu-west-2]
         version:
           type: string
           description: The deployed release, for example `1.0.0`.
@@ -9754,6 +9928,12 @@ components:
           minLength: 1
           description: Makes the create idempotent within the tenant.
           examples: ['acme:bookings']
+        send_policy:
+          description: >-
+            The identity's own send policy, as on update. From any key but a platform key, a `daily_cap` above
+            the tenant's effective `identity_daily_send_cap` gets `403 scope_denied` with
+            `details.field = "send_policy.daily_cap"`, and nothing is created.
+          $ref: '#/components/schemas/IdentitySendPolicy'
         metadata: {$ref: '#/components/schemas/Metadata'}
     IdentityUpdateRequest:
       type: object
@@ -11823,7 +12003,7 @@ components:
 
     ApiKey:
       type: object
-      required: [id, name, level, mode, partner_id, tenant_id, identity_id, permissions, expires_at, revoked_at, last_used_at, created_at]
+      required: [id, name, level, mode, partner_id, tenant_id, identity_id, permissions, created_by_user_id, expires_at, revoked_at, last_used_at, created_at]
       properties:
         id: {$ref: '#/components/schemas/KeyId'}
         name:
@@ -11857,6 +12037,14 @@ components:
           type: [string, 'null']
           format: date-time
           description: Updated at most once a minute.
+        created_by_user_id:
+          description: >-
+            The console user behind the key: the person whose console session minted it, copied to every key
+            minted with it. `null` for a key minted by a platform or partner key with no person behind it.
+            Removing that person from the workspace, or lowering their role, revokes the key ([W36]).
+          oneOf:
+            - $ref: '#/components/schemas/UserId'
+            - type: 'null'
         created_at:
           type: string
           format: date-time
@@ -12807,7 +12995,7 @@ components:
             registered or Pylota claim name, so a claim the service sets is never overwritten ([O6]).
           propertyNames:
             not:
-              enum: [iss, sub, aud, iat, nbf, exp, jti, email, email_verified, name, org, accountable_human, ai_agent, nonce, ext]
+              enum: [iss, sub, aud, iat, nbf, exp, jti, email, email_verified, unverified, ai_agent, nonce, ext]
           examples:
             - booking_ref: BK-2291
     AssertionResponse:
@@ -12819,8 +13007,9 @@ components:
           type: string
           description: >-
             The token, a compact JWS (RFC 7519) with header `{"alg":"EdDSA","typ":"agent-assertion+jwt","kid":…}`
-            and the claims `iss`, `sub`, `aud`, `iat`, `nbf`, `exp`, `jti`, `email`, `email_verified`, `name`,
-            `org`, `accountable_human`, `ai_agent`, and `nonce` and `ext` when given.
+            and the claims `iss`, `sub`, `aud`, `iat`, `nbf`, `exp`, `jti`, `email`, `email_verified`,
+            `unverified` (`name`, `org`, `accountable_human`: set by the workspace, not checked), `ai_agent`,
+            and `nonce` and `ext` when given.
           pattern: '^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$'
         kid: {$ref: '#/components/schemas/IdentityKeyKid'}
         expires_at:

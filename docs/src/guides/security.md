@@ -25,13 +25,18 @@ Every request is authenticated with an API key: `Authorization: Bearer pmk_live_
 
 A key also holds a list of permissions ([REST API › Permissions](../reference/api.md#permissions)).
 Both must allow a request. A key can never create a key wider than itself in level, tenant, identity
-or permissions (`403 key_scope_exceeded`) ([FR-KEY-1](../project/prd.md#61-tenancy-and-access)).
+or permissions, nor read, rotate or revoke one (`403 key_scope_exceeded`)
+([FR-KEY-1](../project/prd.md#61-tenancy-and-access)). Keys minted in the console are traced to the
+person who minted them and are revoked when that person leaves the workspace.
 
 Some permissions belong to particular levels. `platform:ops` and `partners:manage` are for platform keys
 only, and `tenants:manage` for platform and partner keys. `members:read`, `members:manage`,
 `suppressions:manage`, `audit:read` and `usage:read` cannot be listed on identity keys (an identity key
 still reads its own workspace's `GET /v1/usage`, as every tenant and identity key does).
-`identities:sign` cannot be held by platform or partner keys. Creating a key that
+`identities:sign` cannot be held by platform or partner keys, but they can grant it to the tenant and
+identity keys they create (the audit log records the grant). `tenants:erase`, which deleting a workspace
+needs, is held by platform keys, partner keys and only those tenant keys the workspace owner created in
+the console; never by an admin or a key an admin created. Creating a key that
 lists a permission its level cannot hold is refused with `400 invalid_request` and
 `details.reason: "permission_not_allowed_for_level"`. Creating a platform key also needs an explicit,
 non-empty `permissions` list (`400 invalid_request` without one): there is no implicit full set.

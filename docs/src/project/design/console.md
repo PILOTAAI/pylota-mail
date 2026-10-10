@@ -109,8 +109,8 @@ role's session principal holds, so the same checks run as for an API key.
 
 | Role | Permission set of the session principal |
 |---|---|
-| `owner` | Every tenant-level permission: `identities:read`, `identities:write`, `identities:sign`, `domains:read`, `domains:write`, `messages:read`, `messages:send`, `messages:write`, `attachments:read`, `search:read`, `search:agentic`, `quarantine:review`, `webhooks:read`, `webhooks:manage`, `keys:manage`, `erasure:manage`, `suppressions:manage`, `usage:read`, `audit:read`, `members:read`, `members:manage`; plus the console-only owner rights: billing, ownership transfer, deleting the workspace, and the workspace settings below |
-| `admin` | The owner's tenant-level permissions (`identities:sign` included), without the console-only owner rights. Its `erasure:manage` covers every scope except `tenant`: the console's tenant-erasure route also checks `role = owner` |
+| `owner` | Every tenant-level permission: `identities:read`, `identities:write`, `identities:sign`, `domains:read`, `domains:write`, `messages:read`, `messages:send`, `messages:write`, `attachments:read`, `search:read`, `search:agentic`, `quarantine:review`, `webhooks:read`, `webhooks:manage`, `keys:manage`, `erasure:manage`, `tenants:erase`, `suppressions:manage`, `usage:read`, `audit:read`, `members:read`, `members:manage`; plus the console-only owner rights: billing, ownership transfer, deleting the workspace, and the workspace settings below |
+| `admin` | The owner's tenant-level permissions (`identities:sign` included) except `tenants:erase`, without the console-only owner rights. Its `erasure:manage` covers every scope except `tenant`, which needs `tenants:erase` in the console's tenant-erasure route as in the API, so neither an admin nor a key an admin mints can delete the workspace ([W35](../edge-cases.md)) |
 | `member` | `identities:read`, `domains:read`, `messages:read`, `messages:write`, `attachments:read`, `search:read`, `search:agentic`, `quarantine:review`, `usage:read`, `members:read` |
 | `viewer` | `identities:read`, `domains:read`, `messages:read`, `attachments:read`, `search:read`, `usage:read`, `members:read` |
 
@@ -126,7 +126,10 @@ Rules:
   API keys that sign as an identity; members and viewers cannot. The level rules of
   [Security §4.6](security.md#46-creating-keys-fr-key-1) apply as in the API: an identity-level key never
   carries a tenant-only permission (`members:read`, `members:manage`, `suppressions:manage`,
-  `audit:read`, `usage:read`), so the key form does not offer them for that level.
+  `audit:read`, `usage:read`), so the key form does not offer them for that level. Each key minted here
+  records the person and their role (`api_keys.created_by_user_id` and `created_by_role`); only the owner's
+  form offers `tenants:erase`, on tenant-level keys
+  ([Security › Who minted a key](security.md#who-minted-a-key)).
 - **Tenant policy** is changed with a platform key, or with the partner key of the workspace's partner,
   as in the API (`PATCH /v1/tenants/{id}` needs `tenants:manage`). The settings page shows the effective
   policy read-only, `quarantine.key_release` included.
@@ -395,12 +398,17 @@ and releases their seats; acceptance also checks `expires_at`, so a late click n
 ## Members
 
 **Changing a role** (owner or admin, sensitive) updates `members.role` and emits `member.role_changed`.
-It takes effect on the person's next request, because the role is read on every request.
+It takes effect on the person's next request, because the role is read on every request. In the same D1
+batch, every key of the workspace whose `created_by_user_id` is that person and that holds a permission
+the new role lacks is revoked (`key.revoke`, `details.reason = "creator_role_changed"`); their other keys
+get the new `created_by_role` ([W36](../edge-cases.md)).
 
 **Removing a member** (owner or admin, sensitive; `DELETE /v1/tenants/{id}/members/{user_id}`) and
 **leaving** run one D1 batch: delete the `members` row, delete the person's `notification_prefs` rows
-for this workspace, revoke every session of that user whose active workspace is this one, write the
-audit row and the `member.removed` event. Then the seat is released with `Adjust −1`; if that call is
+for this workspace, revoke every session of that user whose active workspace is this one, revoke every
+key of the workspace whose `created_by_user_id` is that user (a `key.revoke` audit row each,
+`details.reason = "creator_removed"`, [W36](../edge-cases.md)), write the audit row and the
+`member.removed` event. Then the seat is released with `Adjust −1`; if that call is
 lost, the hourly reconciliation corrects the count. After the batch the handler calls
 `NotifierRequest::MemberRemoved { user_id }` on the workspace's Notifier, which drops the person's
 pending notifications in this workspace, so nothing more is sent to them about it ([O19](../edge-cases.md),
@@ -423,7 +431,8 @@ WHERE tenant_id = ?1 AND user_id = ?3 AND role = 'admin'
 Both statements change one row, or neither does (the target is not an admin): then the request returns
 `400 invalid_request` ("the new owner must be an admin of this workspace") and the workspace still has
 its owner. The batch also writes the audit row
-`member.ownership_transfer` and two `member.role_changed` events. Stripe's customer email does not change;
+`member.ownership_transfer` and two `member.role_changed` events, and applies the role-change rule above to
+the former owner, now an admin: their keys holding `tenants:erase` are revoked. Stripe's customer email does not change;
 the new owner can update it in the Customer Portal. After the batch commits, the handler sends the
 `account` email ([Account emails](#account-emails)).
 

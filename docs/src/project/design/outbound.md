@@ -1106,14 +1106,49 @@ pub enum QuotaRequest {
            // consume + keep ≤ held units; keep stays held for a deferred retry (SMTP 4xx recipients);
            // the rest is released
     Extend { feature: Feature, r#ref: String, until: i64 },     // a send waiting in transport back-off
-    // … and Adjust, SetPlan, SetMeasured, Reconcile, GetUsage, used by billing only
+    Adjust { feature: Feature, delta: i64, r#ref: String },     // a count went down (identity deleted, …)
+    SetPlan { mode: BillingMode, granted: Allowances, period_start: i64, period_end: i64, catalog_hash: String },
+    SetMeasured { storage_bytes: u64 },                          // hourly roll-up
+    Reconcile { inboxes: u32, custom_domains: u32, seats: u32, read_at: i64 },
+    GetUsage,
 }
 pub enum UsageMetric { Inbound, Outbound, Search, AiNeurons, Assertions, HttpSignatures }
+pub enum Feature { Inboxes, Sends, Triage, CustomDomains, StorageGb, Seats }
+pub enum BillingMode { Metered, Exempt, Disabled }
+pub enum Outcome { Delivered, Bounced, Complained, Other }
+pub enum CapScope { Identity, Tenant }
 pub struct SendsHold { pub units: u32, pub r#ref: String, pub gates: Vec<Feature> }  // ref = msg_ ID
-// Reserve → Ok { identity_used, tenant_used, warnings: Vec<QuotaWarning>, held: Option<Held> }
-//         | Denied { feature, granted, used, resets_at, first_in_period }   → 402 billing_limit
-//         | CapReached { scope: "identity" | "tenant", resets_at: i64 }      → 429 daily_cap_reached
+pub struct Allowances {                    // `granted` per feature for SetPlan; None = unlimited (exempt, disabled,
+    pub inboxes: Option<u32>, pub sends: Option<u32>, pub triage: Option<u32>,   // or a plan value of null)
+    pub custom_domains: Option<u32>, pub storage_gb: Option<u32>, pub seats: Option<u32>,
+}
+pub struct QuotaWarning { pub scope: CapScope, pub threshold: u8 /* 80 | 100 */, pub used: u32, pub cap: u32 }
+pub struct Held { pub hold_id: String, pub remaining: Option<u32> }   // None = unlimited
+pub struct Denied { pub feature: Feature, pub granted: u32, pub used: u32, pub resets_at: Option<i64>,
+                    pub first_in_period: bool }                        // → 402 billing_limit
+pub struct AllowanceRow { pub feature: Feature, pub granted: Option<u32>, pub used: u32, pub held: u32,
+                          pub remaining: Option<u32>, pub resets_at: Option<i64> }
+
+// Answers. Each request has one answer type; the caller names it in ObjectClient::call::<QuotaRequest, A>.
+// Init, Release, RecordOutcome, ForgetIdentity, Settle, Extend, Adjust, SetPlan, SetMeasured, Reconcile → ()
+pub enum ReserveAnswer {
+    Ok { identity_used: u32, tenant_used: u32, warnings: Vec<QuotaWarning>, held: Option<Held> },
+    Denied(Denied),
+    CapReached { scope: CapScope, resets_at: i64 },                      // → 429 daily_cap_reached
+}
+pub enum HoldAnswer { Held(Held), Denied(Denied) }
+pub enum CountAgenticAnswer { Ok { used: u32 }, CapReached { resets_at: i64 } } // → 429 agentic_budget_exhausted
+pub struct RecordUsageAnswer { pub day: String /* UTC YYYY-MM-DD */, pub total: u64 } // usage:{metric} after adding n
+pub struct OutcomeRatesAnswer { pub outcomes: u64, pub bounced: u64, pub complained: u64 }
+pub struct UsageAnswer {                   // GetUsage: what GET /v1/usage renders (Billing)
+    pub mode: BillingMode,
+    pub period_start: Option<i64>, pub period_end: Option<i64>,   // None before the first SetPlan
+    pub allowances: Vec<AllowanceRow>,     // one row per Feature; granted None and remaining None when unlimited
+}
 ```
+
+This listing is the frozen interface the build plan's M5 stub declares: every variant, payload and answer
+type above exists from M5, and later milestones change behaviour only.
 
 `Reserve` runs in one transaction. With `hold`, it first takes the `sends` hold exactly as `Hold` does
 ([Plans, metering and billing › Hold](billing.md#hold)); a denial returns `Denied` and writes nothing

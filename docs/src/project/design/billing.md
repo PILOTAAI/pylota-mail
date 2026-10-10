@@ -168,9 +168,10 @@ design adds the `allowances` and `holds` tables from the
 [data model](data-model.md#3-other-durable-objects) and these requests:
 
 ```rust
-// Declared in crates/worker/src/quota/mod.rs by the M5 stub, with the types they carry (Feature,
-// BillingMode, Allowances, and the Held and Denied answers), so the stub compiles and answers every
-// variant; crates/worker/src/billing/quota.rs implements their behaviour in M22 without changing them.
+// Declared in crates/worker/src/quota/mod.rs by the M5 stub, with the types they carry and their answer
+// types (Feature, BillingMode, Allowances, Held, Denied, HoldAnswer, UsageAnswer; all written out in
+// Outbound › TenantQuota), so the stub compiles and answers every variant;
+// crates/worker/src/billing/quota.rs implements their behaviour in M22 without changing them.
 pub enum Feature { Inboxes, Sends, Triage, CustomDomains, StorageGb, Seats }
 
 Hold     { feature: Feature, units: u32, r#ref: String, gates: Vec<Feature> },
