@@ -2,14 +2,14 @@
 
 Binding for implementation. This page lets a workspace change its own tenant policy, inside the limits
 that the deployment, the platform operator and, for a partner's tenant, the partner have set. The owner
-decided on 2026-10-10 that workspace owners can edit their own policy ([ADR 0010](../adr/0010-workspace-policy-self-service.md));
+decided on 2026-10-10 that workspace owners can edit their own policy ([ADR 0011](../adr/0011-workspace-policy-self-service.md));
 before that, only a platform key or the tenant's partner key could change it, so a Cloud customer needed a
 support request to the operator to shorten retention or add a booking-number pattern.
 
 | | |
 |---|---|
 | Requirements | FR-TEN-4 (this page), FR-KEY-4, FR-CON-2, FR-CON-5, FR-CON-6; and the tenant choices it makes possible: FR-PRV-2, FR-TRI-1, FR-TRI-2, FR-SRCH-4, FR-OUT-10, FR-IN-8 |
-| Edge cases | [J14](../edge-cases.md), [J20](../edge-cases.md)–[J24](../edge-cases.md) |
+| Edge cases | [J14](../edge-cases.md), [J23](../edge-cases.md)–[J27](../edge-cases.md) |
 | Code | `crates/core/src/policy.rs` (`check_write`, `effective`, the field table; pure), `crates/worker/src/policy/{mod.rs, write.rs, view.rs}`, `handlers/tenants.rs` (the two `/policy` routes, and the `policy` of `POST /v1/tenants` and `PATCH /v1/tenants/{tenant_id}`), `crates/worker/src/auth/people.rs` (decisions reserved for people), `console/pages/policy.rs` |
 | Tables | D1 `tenants` (`policy_json`, `policy_ceilings_json`, `partner_ceilings_json`, `policy_version`), `audit_log`, `event_index` ([Data model](data-model.md#1-d1-control-plane)) |
 | Contracts | `GET` and `PATCH /v1/tenants/{tenant_id}/policy` and the `policy:write` permission ([REST API › Tenants](../../reference/api.md#tenants)); the field classes ([Configuration › Who may change a field](../../reference/configuration.md#who-may-change-a-field)); the event `tenant.policy_updated` ([Webhook events](../../reference/events.md#workspaces-members-and-billing)) |
@@ -54,8 +54,8 @@ has no entry.
 |---|---|---|
 | Platform-only | `web_bot_auth.allowed`, `domains.allow_create_zone`, `domains.cloudflare_zones` | `403 scope_denied`, `details.reason = "not_writable"` |
 | Platform or own partner | `quarantine.key_release` | `403 scope_denied`, `details.reason = "not_writable"` ([J14](../edge-cases.md)) |
-| Lower-only | The 16 fields of the configuration table, and `accounts.require_approval` | At most its **workspace ceiling**; above it `403 scope_denied`, `details.reason = "above_ceiling"`, `details.ceiling`, `details.ceiling_source` ([J20](../edge-cases.md)) |
-| Guard | `send_allowlist_only`, `quarantine.on_auth_fail`, `quarantine.spam_threshold`, `quarantine.unsolicited_otp` | Any value as a person; a key may only tighten, unless keys may take decisions reserved for people ([§3](#3-decisions-reserved-for-people), [J22](../edge-cases.md)) |
+| Lower-only | The 16 fields of the configuration table, and `accounts.require_approval` | At most its **workspace ceiling**; above it `403 scope_denied`, `details.reason = "above_ceiling"`, `details.ceiling`, `details.ceiling_source` ([J23](../edge-cases.md)) |
+| Guard | `send_allowlist_only`, `quarantine.on_auth_fail`, `quarantine.spam_threshold`, `quarantine.unsolicited_otp` | Any value as a person; a key may only tighten, unless keys may take decisions reserved for people ([§3](#3-decisions-reserved-for-people), [J25](../edge-cases.md)) |
 | Free | Every other field | Any valid value |
 
 **Workspace ceiling.** For a lower-only field, the loosest value a workspace writer may set is the strictest
@@ -69,7 +69,7 @@ of:
 
 `details.ceiling_source` names the one that decided (`deployment`, `platform` or `partner`; on a tie, the
 first in that order). A partner key is bounded by the first two only, as before; its own partner ceiling
-never binds it ([J23](../edge-cases.md)).
+never binds it ([J26](../edge-cases.md)).
 
 **Which value is looser.** For numbers, the higher one, as in the partner rules (a higher abuse threshold
 pauses later; longer retention keeps more). For the switches `auto_reply.allowed`,
@@ -114,7 +114,7 @@ strict as the tenant's current effective value: `true` for `send_allowlist_only`
 `quarantine.on_auth_fail` and `quarantine.unsolicited_otp`, and a value at or below the current
 `quarantine.spam_threshold` (a lower threshold quarantines more). A tightening is always accepted. Any other
 value loosens: accepted when `key_may_decide` is true, otherwise `403 permission_denied` with
-`details.reason = "person_required"` and `details.field` ([J22](../edge-cases.md)). Guard fields have no
+`details.reason = "person_required"` and `details.field` ([J25](../edge-cases.md)). Guard fields have no
 ceilings: a person in the console may set any value, and platform and partner keys write them freely, as
 before. A partner that wants a guard field fixed for its tenants gives neither `policy:write` nor the owner
 or admin role to anyone who should not change it.
@@ -160,7 +160,7 @@ write to an `erasing` or `erased` tenant from a non-platform key (`404 tenant_no
 
    A D1 batch runs as one transaction, so the three statements see the same row. When the `UPDATE`
    changed no row (`meta.changes = 0`), another write won: re-read and repeat from step 2, at most three
-   attempts in all, then `503 unavailable` (retryable) ([J24](../edge-cases.md)).
+   attempts in all, then `503 unavailable` (retryable) ([J27](../edge-cases.md)).
 6. **After commit**, queue the event's `Fanout` ([Webhooks › Platform events](webhooks.md#platform-events);
    the every-minute outbox sweep is the safety net) and return the view of [§5](#5-the-api).
 
@@ -250,10 +250,10 @@ becomes that tenant's partner ceiling, so:
 | Test | Proves | Covers |
 |---|---|---|
 | `core::policy::workspace_write_table` (table test over `FIELDS`) | For each field and each writer (platform, partner, workspace key, workspace person), `check_write` gives the class's outcome: platform-only and `quarantine.key_release` refused to workspace writers with `not_writable`; a lower-only field accepted at its ceiling and refused one step above it with `above_ceiling` and the right `ceiling_source` (deployment, platform, partner, and the order on ties); `accounts.require_approval` treated with `false` as looser; `null` checked as the default; the first refused path in sorted order reported; every field of `TenantPolicy` has a `FIELDS` entry | FR-TEN-4, §2 |
-| `it::policy::j20_workspace_ceilings` | Through `PATCH …/policy` with a tenant key holding `policy:write`: lowering `tenant_daily_send_cap`, `retention.raw_days` and an `abuse` threshold, and turning off `triage.enabled`, are accepted; raising one above the deployment default, or turning on a switch the default has off, gets `403 scope_denied` with `details.field`, `reason = "above_ceiling"`, `ceiling` and `ceiling_source = "deployment"`, and nothing is stored even when other fields of the write are valid; after a platform key sets 200, the tenant key may set 200 and not 201 (`ceiling_source = "platform"`); a free field (`search.custom_refs`, `retention.message_days`) is accepted; `GET …/policy` reports the same ceilings | [J20](../edge-cases.md) |
-| `it::policy::j21_workspace_field_classes` | A tenant key with `policy:write` writing `web_bot_auth.allowed`, `domains.allow_create_zone`, `domains.cloudflare_zones` or `quarantine.key_release` gets `403 scope_denied` with `details.field` and `reason = "not_writable"`; a tenant key without `policy:write` gets `403 permission_denied` on both `/policy` routes; minting an identity key with `policy:write` gets `400 invalid_request` (`permission_not_allowed_for_level`); a partner key of another partner gets `404 tenant_not_found` | [J21](../edge-cases.md), [J14](../edge-cases.md) |
-| `it::policy::j22_guard_fields_need_person` | With `PM_QUARANTINE_KEY_RELEASE=off` and no `quarantine.key_release`, a tenant key setting `quarantine.on_auth_fail` or `quarantine.unsolicited_otp` to `false`, raising `quarantine.spam_threshold`, or setting `send_allowlist_only` to `false` gets `403 permission_denied` with `reason = "person_required"` and `details.field`; lowering `spam_threshold` and setting the switches to `true` are accepted; with `quarantine.key_release: true`, or with `PM_QUARANTINE_KEY_RELEASE=on`, the same key loosens them; a console owner loosens them after re-authentication | [J22](../edge-cases.md) |
-| `it::policy::j23_partner_ceiling` | A partner key sets `tenant_daily_send_cap` 1,000 on its tenant (at creation, and again by `PATCH`): a tenant key of that tenant may set 800, then 1,000, and gets `403 scope_denied` with `ceiling_source = "partner"` at 1,001; the partner key itself may set 2,000 (bounded only by the deployment default and the platform ceiling); a partner `null` removes the partner ceiling and resets the value; a tenant without a partner is never bound by `partner_ceilings_json` | [J23](../edge-cases.md) |
-| `it::policy::j24_concurrent_writes` | Two writes racing on one tenant (a partner key and a tenant key, and two console saves): both commit in some order with no lost field, `policy_version` rises by two, each has one audit row and one event row; a fault-injected stream of version changes makes the request fail after three attempts with `503 unavailable` and stores nothing; a console save with a stale `policy_version` stores nothing and shows the notice | [J24](../edge-cases.md) |
+| `it::policy::j23_workspace_ceilings` | Through `PATCH …/policy` with a tenant key holding `policy:write`: lowering `tenant_daily_send_cap`, `retention.raw_days` and an `abuse` threshold, and turning off `triage.enabled`, are accepted; raising one above the deployment default, or turning on a switch the default has off, gets `403 scope_denied` with `details.field`, `reason = "above_ceiling"`, `ceiling` and `ceiling_source = "deployment"`, and nothing is stored even when other fields of the write are valid; after a platform key sets 200, the tenant key may set 200 and not 201 (`ceiling_source = "platform"`); a free field (`search.custom_refs`, `retention.message_days`) is accepted; `GET …/policy` reports the same ceilings | [J23](../edge-cases.md) |
+| `it::policy::j24_workspace_field_classes` | A tenant key with `policy:write` writing `web_bot_auth.allowed`, `domains.allow_create_zone`, `domains.cloudflare_zones` or `quarantine.key_release` gets `403 scope_denied` with `details.field` and `reason = "not_writable"`; a tenant key without `policy:write` gets `403 permission_denied` on both `/policy` routes; minting an identity key with `policy:write` gets `400 invalid_request` (`permission_not_allowed_for_level`); a partner key of another partner gets `404 tenant_not_found` | [J24](../edge-cases.md), [J14](../edge-cases.md) |
+| `it::policy::j25_guard_fields_need_person` | With `PM_QUARANTINE_KEY_RELEASE=off` and no `quarantine.key_release`, a tenant key setting `quarantine.on_auth_fail` or `quarantine.unsolicited_otp` to `false`, raising `quarantine.spam_threshold`, or setting `send_allowlist_only` to `false` gets `403 permission_denied` with `reason = "person_required"` and `details.field`; lowering `spam_threshold` and setting the switches to `true` are accepted; with `quarantine.key_release: true`, or with `PM_QUARANTINE_KEY_RELEASE=on`, the same key loosens them; a console owner loosens them after re-authentication | [J25](../edge-cases.md) |
+| `it::policy::j26_partner_ceiling` | A partner key sets `tenant_daily_send_cap` 1,000 on its tenant (at creation, and again by `PATCH`): a tenant key of that tenant may set 800, then 1,000, and gets `403 scope_denied` with `ceiling_source = "partner"` at 1,001; the partner key itself may set 2,000 (bounded only by the deployment default and the platform ceiling); a partner `null` removes the partner ceiling and resets the value; a tenant without a partner is never bound by `partner_ceilings_json` | [J26](../edge-cases.md) |
+| `it::policy::j27_concurrent_writes` | Two writes racing on one tenant (a partner key and a tenant key, and two console saves): both commit in some order with no lost field, `policy_version` rises by two, each has one audit row and one event row; a fault-injected stream of version changes makes the request fail after three attempts with `503 unavailable` and stores nothing; a console save with a stale `policy_version` stores nothing and shows the notice | [J27](../edge-cases.md) |
 | `it::policy::policy_updated_event_and_audit` | Every policy write (platform and partner `PATCH /v1/tenants/{tenant_id}`, `PATCH …/policy` by each level, a console save) writes one `tenant.policy_update` row with `fields`, number and boolean `changes` only, `level` and `via`, and one `tenant.policy_updated` `event_index` row in the same batch; `POST /v1/tenants` writes neither; from M8 the event is delivered to the tenant's, its partner's and platform endpoints and never to another partner's | §7 |
 | `it::console::policy_page` | Every role sees the page; only owner and admin get the form; a save needs re-authentication, sends only changed fields, writes an audit row with `actor_user_id`; a field above its ceiling is refused with its `fix` shown; a retention decrease first shows the confirmation page and writes nothing until `confirm_deletion` is posted; the page works with JavaScript off | §6, FR-CON-5 |

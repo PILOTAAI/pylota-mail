@@ -279,7 +279,7 @@ key cannot call this route (`403 permission_denied`: it can never hold `tenants:
 - **Every policy write** goes through the same checks as `PATCH …/policy` below: it is a compare-and-set
   (`503 unavailable` after three lost attempts), writes the audit row `tenant.policy_update` and emits
   `tenant.policy_updated`. A lower-only value a partner key sets also becomes that field's partner ceiling
-  for the tenant's own keys and people ([J23](../project/edge-cases.md)).
+  for the tenant's own keys and people ([J26](../project/edge-cases.md)).
 
 ### `GET /v1/tenants/{tenant_id}/policy` · `PATCH /v1/tenants/{tenant_id}/policy` — `policy:write`
 
@@ -293,18 +293,18 @@ merge, `null` resets a field, arrays replace) and checks each field sent by the 
 - a lower-only field may be set at most to its workspace ceiling, the strictest of the deployment default,
   the platform ceiling and the partner ceiling; above it, `403 scope_denied` with `details.field`,
   `details.reason = "above_ceiling"`, `details.ceiling` and `details.ceiling_source`
-  ([J20](../project/edge-cases.md), [J23](../project/edge-cases.md));
+  ([J23](../project/edge-cases.md), [J26](../project/edge-cases.md));
 - a guard field (`send_allowlist_only`, `quarantine.on_auth_fail`, `quarantine.spam_threshold`,
   `quarantine.unsolicited_otp`) may only be tightened, unless API keys may take decisions reserved for
   people on this tenant (`PM_QUARANTINE_KEY_RELEASE=on`, or the tenant's `quarantine.key_release: true`);
   otherwise `403 permission_denied` with `details.field` and `details.reason = "person_required"`
-  ([J22](../project/edge-cases.md));
+  ([J25](../project/edge-cases.md));
 - platform-only fields and `quarantine.key_release` get `403 scope_denied` with `details.field` and
-  `details.reason = "not_writable"` ([J21](../project/edge-cases.md), [J14](../project/edge-cases.md)).
+  `details.reason = "not_writable"` ([J24](../project/edge-cases.md), [J14](../project/edge-cases.md)).
 
 One refused field refuses the whole write. Concurrent writes never lose one another: a write that keeps
 losing the compare-and-set gets `503 unavailable` (retryable) after three attempts
-([J24](../project/edge-cases.md)). Both methods return the policy view; `GET` changes nothing:
+([J27](../project/edge-cases.md)). Both methods return the policy view; `GET` changes nothing:
 
 ```json
 { "tenant_id": "ten_01J9…", "policy_version": 7,

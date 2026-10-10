@@ -71,5 +71,5 @@
   - [0007 Agentic search with verified citations](project/adr/0007-agentic-search.md)
   - [0008 Domains on any DNS host](project/adr/0008-domains-on-any-dns-host.md)
   - [0009 Local MCP protocol types](project/adr/0009-local-mcp-protocol-types.md)
-  - [0010 Workspace policy self-service](project/adr/0010-workspace-policy-self-service.md)
-  - [0011 Service sign-up ledger](project/adr/0011-service-sign-up-ledger.md)
+  - [0011 Workspace policy self-service](project/adr/0011-workspace-policy-self-service.md)
+  - [0012 Service sign-up ledger](project/adr/0012-service-sign-up-ledger.md)

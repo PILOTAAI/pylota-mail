@@ -416,9 +416,9 @@ well-formed answer. Later milestones replace behaviour, never a signature:
 - NFR-SEC-1: the cross-tenant suite (`it::security::cross_tenant_matrix`), with its `foreign_partner`
   class, finds 0 cross-tenant reads or writes. Every later milestone extends it with its routes, and it
   must stay at 0.
-- Workspace policy (FR-TEN-4): `core::policy::workspace_write_table`; J20 (`it::policy::j20_workspace_ceilings`),
-  J21 (`it::policy::j21_workspace_field_classes`), J22 (`it::policy::j22_guard_fields_need_person`), J23
-  (`it::policy::j23_partner_ceiling`), J24 (`it::policy::j24_concurrent_writes`) and
+- Workspace policy (FR-TEN-4): `core::policy::workspace_write_table`; J23 (`it::policy::j23_workspace_ceilings`),
+  J24 (`it::policy::j24_workspace_field_classes`), J25 (`it::policy::j25_guard_fields_need_person`), J26
+  (`it::policy::j26_partner_ceiling`), J27 (`it::policy::j27_concurrent_writes`) and
   `it::policy::policy_updated_event_and_audit` (the `event_index` row here; its delivery to the tenant's,
   partner's and platform endpoints is asserted once M8 lands); the two `/policy` routes join the
   cross-tenant matrix.

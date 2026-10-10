@@ -3,7 +3,7 @@
 Binding for implementation. Agents may create accounts at third-party services with their identity's
 address only with per-account approval by a person or the operator's own system, through a ledger (plan
 decision D7, accepted by the owner, and designed for v1.0 on 2026-10-10;
-[ADR 0011](../adr/0011-service-sign-up-ledger.md)). An agent records that it wants an account at a service;
+[ADR 0012](../adr/0012-service-sign-up-ledger.md)). An agent records that it wants an account at a service;
 an operator approves or rejects it; and, where the tenant's policy requires approval, a verification code
 or link from a service reaches the agent only when an approved ledger entry matches the mail.
 
