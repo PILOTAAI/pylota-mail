@@ -4,7 +4,7 @@
 |---|---|
 | Status | Accepted |
 | Date | 2026-10-09 |
-| Deciders | Pylota engineering, owner direction of 2026-10-09 |
+| Deciders | The owner (TREFT LTD), direction of 2026-10-09 |
 | Related | FR-DOM-7 to FR-DOM-12, U4; [Domains on any DNS host](../design/domain-connections.md); [Identities, addresses and domains](../design/identity-domains.md); spikes S10, S11, S12 |
 
 ## Context

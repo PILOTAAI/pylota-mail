@@ -62,7 +62,7 @@ configured. The `ses_ingest` ledger in D1 passes each SES pointer to `pm-inbound
 | `fetch` | HTTPS to the API host, and to the console host when `PM_CONSOLE_HOST` differs | On the API host: REST API `/v1/*`, MCP `/mcp`, `/openapi.json`, `/health`, `/.well-known/*` (the security contact, identity JWKS and the Web Bot Auth key directory), signed links `/v1/links/*`, the SNS endpoints `/hooks/ses` (SES delivery events) and `/hooks/ses/inbound` (SES inbound notifications), and the Stripe webhook `/billing/stripe/webhook`. On the console host: `/console/*` |
 | `email` | Email Routing, for domains with `inbound = routing` | Looks up the recipient, writes raw mail to R2, queues a pointer, and rejects unknown or retired addresses |
 | `queue` | Ten Cloudflare queues: five work queues and their five dead-letter queues | Inbound processing, outbound transport, delivery events, webhook delivery, indexing, triage, dead-letter recording. The SES backstop is an SQS queue in AWS, polled by `scheduled`, not one of these |
-| `scheduled` | Cron (every minute and every 15 minutes) | Every minute: address retirement, the platform-event outbox sweep, restarting queued jobs, the state-alert evaluator, draining the SES backstop queue. Every 15 minutes: domain health scheduling, retention, usage roll-up, the master-key re-seal sweep, the SES account check, the nightly backup job |
+| `scheduled` | Cron (every minute and every 15 minutes) | Every minute: address retirement, the platform-event outbox sweep, restarting queued jobs, the state-alert evaluator (with alert email and the automatic containment rules), the master-key re-seal sweep, draining the SES backstop queue. Every 15 minutes: domain health scheduling, retention, usage roll-up, the SES account check, the capacity checks, the nightly backup job. While `PM_FREEZE = "on"` they do nothing ([Observability › Restore from PITR](design/observability.md#restore-from-pitr)) |
 | Durable Object `alarm` | Alarms set by each object | State machines: domain health, jobs, outbox dispatch, in each mailbox the transport-claim, dispatch-retry, lock and reconciliation work for its own sends, and in each tenant's `Notifier` the notification windows and the daily 09:00 run |
 
 ### Inbound sources and outbound transports
@@ -138,14 +138,14 @@ t/{tenant_id}/i/{identity_id}/m/{message_id}/a/{attachment_id}.md      extracted
 t/{tenant_id}/i/{identity_id}/out/{message_id}.eml                     composed outbound MIME
 t/{tenant_id}/i/{identity_id}/out/{message_id}/a/{attachment_id}       outbound attachment
 t/{tenant_id}/exports/{export_id}.zip
-inbound-staging/{yyyy}/{mm}/{dd}/{ulid}.eml                            before routing resolves (≤ 24 h)
-inbound-staging/ses/{key}                                              SES object copied from S3 (≤ 24 h)
+inbound-staging/{yyyy}/{mm}/{dd}/{ulid}.eml                            before routing resolves (≤ 15 days)
+inbound-staging/ses/{key}                                              SES object copied from S3 (≤ 15 days)
 ```
 
 R2 has no versioning, point-in-time recovery or replication (R2 S3 API compatibility page, last updated
 2026-07-31, read 2026-10-09). Its durability protects blobs against infrastructure loss, not against a
 bug that deletes them. For that, an optional nightly job copies new `t/` objects to a second bucket
-(`PM_BACKUP_BUCKET`, off by default); retention and erasure delete from both
+(`PM_BACKUP_BUCKET`, off by default, on for Pylota Mail Cloud); retention and erasure delete from both
 ([Privacy › R2 backup copy](design/privacy.md#54-optional-r2-backup-copy)).
 
 The full schema is in [Data model](design/data-model.md).

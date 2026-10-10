@@ -4,7 +4,7 @@
 |---|---|
 | Status | Accepted |
 | Date | 2026-10-10 |
-| Deciders | Pylota engineering |
+| Deciders | The owner (TREFT LTD) |
 | Related | FR-KEY-1, FR-KEY-4, FR-BILL-1; [Security › Creating keys](../design/security.md#46-creating-keys-fr-key-1) and [Partner keys](../design/security.md#partner-keys); [REST API › Partners](../../reference/api.md#partners); edge rows J10–J18 |
 
 ## Context

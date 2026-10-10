@@ -1092,7 +1092,13 @@ cannot delete an object this deployment did not create for this tenant (FR-DOM-1
 4. `disable_sending` (when `sending.created`): `DELETE /zones/{zone_id}/email/sending/subdomains/{tag}`
    (this also removes its DNS records, which stay locked for as long as the sending domain exists: Email
    Service [locked DNS records](https://developers.cloudflare.com/email-service/configuration/domains/),
-   read 2026-10-10; routing still active elsewhere is unaffected).
+   read 2026-10-10; routing still active elsewhere is unaffected). First, Cloudflare's suppressions scoped to
+   this sending domain, which hold clear recipient addresses, are deleted: every page of
+   `GET /accounts/{account_id}/email/sending/suppressions?scope_type=sending_domain&scope_value={domain}`,
+   then `DELETE …/suppressions/{suppression_id}` for each entry that is not `read_only` (Cloudflare's own
+   `policy` entries cannot be deleted; [Manage suppressions](https://developers.cloudflare.com/email-service/configuration/suppressions/),
+   read 2026-10-10). Our hashed `suppressions` rows are unaffected ([Privacy § 2](privacy.md#2-data-inventory),
+   [I12](../edge-cases.md)).
 5. `delete_subscription`: delete the event subscription by `event_subscription_id`.
 6. `delete_ses_identity` (when `ses_identity.created`): `DELETE /v2/email/identities/{domain}`; then
    `DELETE /zones/{zone_id}/dns_records/{id}` for each of `ses_identity.dkim_record_ids`.

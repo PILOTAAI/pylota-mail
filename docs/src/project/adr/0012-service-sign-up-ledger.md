@@ -4,7 +4,7 @@
 |---|---|
 | Status | Accepted |
 | Date | 2026-10-10 |
-| Deciders | Pylota engineering; the owner (plan decision D7, and "Design it for v1.0", 2026-10-10) |
+| Deciders | The owner (TREFT LTD): plan decision D7, and "Design it for v1.0" (2026-10-10) |
 | Related | FR-IDN-10, FR-IN-5, FR-CON-6; [Service sign-up ledger](../design/service-accounts.md); [Inbound › Verification codes](../design/inbound.md#verification-codes-and-unsolicited-otp-e5); edge rows E5, E9–E14 |
 
 ## Context

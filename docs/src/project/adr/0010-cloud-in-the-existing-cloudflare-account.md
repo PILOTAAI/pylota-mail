@@ -4,7 +4,7 @@
 |---|---|
 | Status | Accepted |
 | Date | 2026-10-10 |
-| Deciders | Owner decision of 2026-10-10 ("shared, tightened"; D10 reaffirmed) |
+| Deciders | The owner (TREFT LTD), decision of 2026-10-10 ("shared, tightened"; D10 reaffirmed) |
 | Related | FR-DOM-2, FR-DOM-7, FR-DOM-12, FR-DOM-13; [Identities and domains › Cloudflare API token permissions](../design/identity-domains.md#cloudflare-api-token-permissions); [Deploy › Create a Cloudflare API token](../../self-hosting.md#2-create-a-cloudflare-api-token); [ADR 0008](0008-domains-on-any-dns-host.md); edge cases H8, H10, H11 |
 
 ## Context

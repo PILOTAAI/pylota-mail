@@ -4,7 +4,7 @@
 |---|---|
 | Status | Accepted |
 | Date | 2026-10-09 |
-| Deciders | Pylota engineering |
+| Deciders | The owner (TREFT LTD) |
 | Related | FR-TEN-1, FR-SRCH-2, FR-PRV-1, FR-PRV-3, NFR-COST-1; [Data model](../design/data-model.md); [Privacy](../design/privacy.md); spikes S3, S6 |
 
 ## Context

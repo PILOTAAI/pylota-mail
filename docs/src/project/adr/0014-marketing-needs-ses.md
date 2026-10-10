@@ -4,7 +4,7 @@
 |---|---|
 | Status | Accepted |
 | Date | 2026-10-10 |
-| Deciders | Pylota engineering |
+| Deciders | The owner (TREFT LTD) |
 | Related | FR-OUT-8, FR-DOM-10, FR-DOM-11; [Outbound › Policy pipeline](../design/outbound.md#policy-pipeline) step 15; [Domains on any DNS host](../design/domain-connections.md); edge row G9; [ADR 0008](0008-domains-on-any-dns-host.md) |
 
 ## Context

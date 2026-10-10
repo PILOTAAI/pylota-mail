@@ -4,7 +4,7 @@
 |---|---|
 | Status | Accepted |
 | Date | 2026-10-10 |
-| Deciders | Pylota engineering; the owner (decision of 2026-10-10: "Owners can edit") |
+| Deciders | The owner (TREFT LTD), decision of 2026-10-10 ("Owners can edit") |
 | Related | FR-TEN-4, FR-KEY-4, FR-CON-6; [Workspace policy](../design/workspace-policy.md); [Configuration › Who may change a field](../../reference/configuration.md#who-may-change-a-field); [Security › Partner keys](../design/security.md#partner-keys) |
 
 ## Context

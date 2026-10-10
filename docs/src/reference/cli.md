@@ -96,7 +96,9 @@ other pages link here.
 | [`deploy`](#deploy), [`upgrade`](#upgrade) | Applies D1 migrations, deploys with Wrangler, and manages Vectorize index generations |
 | [`doctor`](#doctor) | The Cloudflare checks: DNS, routing, sending, event subscriptions, bindings, secret names, dead-letter items, quota and the zone count |
 | [`destroy`](#destroy) | Disables routing, tears down the platform domain, deletes the Worker, the storage and the D1 database |
-| [`secrets rotate-master`](#secrets-rotate-master) | Uploads the new master key and follows the re-seal through D1 |
+| [`secrets rotate-master`](#secrets-rotate-master) | Writes the new master key into the free slot and switches the Worker to it (the re-seal is followed through the API) |
+| [`ops freeze`, `ops unfreeze`](#ops-freeze-and-ops-unfreeze) | Changes `PM_FREEZE` and redeploys the deployed version |
+| [`ops restore d1`](#ops-restore) | Exports, restores (D1 Time Travel) and re-applies changes to the D1 database |
 | [`domains add --local-token`](#domains-add) | Onboards a zone apex itself, when the deployment has no `PM_CF_API_TOKEN`, and registers it in D1 |
 | [`domains subscribe`](#domains-subscribe) | Creates a domain's Email Sending event subscription and records it in D1 |
 
@@ -110,7 +112,8 @@ other pages link here.
   (Workers Admin at product scope); every later command works with a deploy token that holds Workers
   Editor on the Worker `pylota-mail` only, and `destroy` needs Workers Admin on that Worker.
 - Every other command needs only an API key, including the platform operations (`dlq`,
-  `keys rotate thread|link|cursor|web_bot_auth`, `jobs`, `waitlist invite`). `assertions verify` and
+  `keys rotate thread|link|cursor|web_bot_auth`, `jobs`, `waitlist invite`, `ops status`, `ops switch`,
+  `ops restore mailbox|reconcile`). `assertions verify` and
   `webhooks verify` need neither a key nor a token.
 
 ## Global flags
@@ -168,6 +171,7 @@ Errors print the API's error envelope: in human mode as `error: <code> (<status>
 | 12 | `doctor` found at least one failure |
 | 13 | Timed out: `wait` returned nothing, or a polling step passed its deadline |
 | 14 | `setup ses` or `destroy --include-ses`: an AWS API call failed, or the AWS account has no SES production access |
+| 15 | A precondition is not met: `secrets rotate-master` with an unfinished rotation (use `--resume`) or within 30 days of the last re-seal (use `--discard-previous`), or `ops restore d1` while the deployment is not frozen |
 | 130 | Interrupted (Ctrl-C) |
 
 ## Naming identities and tenants
@@ -391,8 +395,8 @@ pass  mail_test                    delivered in 6 s, verdict pass; authserv-id: 
 
 Some checks only warn:
 
-- `secrets` warns while `PM_MASTER_KEY_NEXT` is set, which means a `secrets rotate-master` did not
-  finish.
+- `secrets` warns while a `secrets rotate-master` has not finished re-sealing (run it again with
+  `--resume` to follow it).
 - `quota` warns when `PM_DAILY_SEND_QUOTA` is not set, and when your Cloudflare token lacks Account
   Analytics · Read, which it needs to read the quota errors
   ([Self-hosting › step 2](../self-hosting.md#2-create-a-cloudflare-api-token)).
@@ -451,31 +455,31 @@ pmail destroy --confirm agents.example
 
 ### `secrets rotate-master`
 
-Rotates `PM_MASTER_KEY` without downtime: uploads a new key as `PM_MASTER_KEY_NEXT`, waits until the
-Worker has re-sealed every stored secret with it, then makes it `PM_MASTER_KEY`.
+Rotates the master key without downtime. The key has two slots: the command writes a new key into the
+slot that is not in use, switches the Worker to it, and waits while the Worker re-seals every stored
+secret with it (about 500 a minute). The previous key stays in its slot, so a D1 restore from the last
+30 days can still open what it sealed.
 
 ```text
-pmail secrets rotate-master [--resume] [--dir <path>]
+pmail secrets rotate-master [--resume] [--discard-previous] [--yes] [--dir <path>]
 ```
 
-`--resume` continues an interrupted rotation. Identity signing keys and the Web Bot Auth key are re-sealed
-with everything else; their public keys do not change. The thread, link, cursor and Web Bot Auth signing
-keys are rotated with
+`--resume` follows an interrupted rotation to its end; nothing is generated again. A second rotation
+within 30 days of the end of the previous rotation's re-seal is refused (exit 15) unless `--discard-previous` is given (after a suspected
+leak of the previous key), because it would overwrite the key that a restore to before the last rotation
+needs. Needs your Cloudflare token and a platform key with `audit:read`. Identity signing keys and the
+Web Bot Auth key are re-sealed with everything else; their public keys do not change. The thread, link,
+cursor and Web Bot Auth signing keys are rotated with
 [`keys rotate thread|link|cursor|web_bot_auth`](#keys-rotate-threadlinkcursorweb_bot_auth). `PM_CF_API_TOKEN` and the SES keys are
 rotated with `wrangler secret put`, as described in
 [Security](../project/design/security.md#62-rotation-procedures).
 
-```bash
-pmail secrets rotate-master
-```
-
----
-
 ## Platform operations
 
-Platform keys with `platform:ops`. These commands call the
-[platform API](api.md#platform-operations) only; they need no Cloudflare credentials. Every call is
-audit-logged.
+Platform keys with `platform:ops` (`ops status`: `audit:read`). These commands call the
+[platform API](api.md#platform-operations) only and need no Cloudflare credentials, except
+`ops freeze`, `ops unfreeze` and `ops restore d1`, which also use your Cloudflare token. Every call that
+changes something is audit-logged.
 
 ### `dlq list`
 
@@ -594,6 +598,64 @@ pmail waitlist invite --count 50 --plan developer
 ```text
 Invited 50; 262 still waiting.
 ```
+
+### `ops status`
+
+Shows the deployment's operational state from `GET /v1/platform/status` (a platform key with
+`audit:read`): whether it is frozen, the switches, whether an alert email address is configured, the
+firing alerts, the master-key slots with the rotation's progress, and the D1, vector and tenant counts
+against their limits.
+
+```bash
+pmail ops status
+```
+
+### `ops switch`
+
+Sets a deployment-wide switch (`PUT /v1/platform/switches`, a platform key with `platform:ops`).
+`read_only` refuses writes from every key but platform keys and holds outbound sends; `free_sending off`
+stops sends from workspaces on the Free plan or still in the send ramp; `emergency_prune` shortens the
+retention of event and delivery logs to 7 days. The automatic containment rules set these switches too
+([Observability › Automatic containment](../project/design/observability.md#56-automatic-containment)).
+
+```text
+pmail ops switch read_only|free_sending|emergency_prune on|off [--reason <text>]
+```
+
+### `ops freeze` and `ops unfreeze`
+
+Freezes the whole deployment for a restore, or ends the freeze. `freeze` sets `PM_FREEZE = "on"` in
+`deploy/wrangler.toml` and redeploys the deployed version; `unfreeze` sets it back to `off`. While frozen,
+inbound mail gets a temporary failure (senders retry), queued work waits, and only platform keys can use the API. Uses your Cloudflare token.
+
+```bash
+pmail ops freeze
+pmail ops unfreeze
+```
+
+### `ops restore`
+
+Runs the restore steps of the
+[restore runbook](../project/design/observability.md#restore-from-pitr). Every subcommand refuses unless
+the deployment is frozen.
+
+```text
+pmail ops restore d1 --at <time> [--exclude <table>[.<column>]]… [--exclude-row <table>:<key>]… [--yes]
+pmail ops restore d1 --replay-only <dir>
+pmail ops restore mailbox <identity> (--at <time> | --bookmark <bookmark>)
+pmail ops restore reconcile --tenant <tenant> --identity <identity>… --after <time>
+pmail ops restore cleanup
+```
+
+- `d1` exports the database, restores it with D1 Time Travel, exports it again, and re-applies every
+  change made after `--at` except the excluded tables, columns and rows. It prints a summary and the
+  bookmark that undoes the restore, and asks before it applies the changes. Uses your Cloudflare token.
+- `mailbox` restores one identity's mailbox to `--at` (or undoes a restore with `--bookmark`) through
+  `POST /v1/platform/identities/{identity_id}/restore`.
+- `reconcile` starts the `restore_reconcile` job for the restored mailboxes and then re-applies every
+  erasure that completed after `--after` (`POST /v1/platform/erasure-requests/{erasure_id}/reapply`),
+  waiting until all of them complete.
+- `cleanup` deletes the working files the restore wrote (they hold every D1 row).
 
 ---
 
@@ -1976,6 +2038,28 @@ pmail erasure get era_01JA9M0R6AW7X2M5N6P8R0T1YW
 pmail erasure list --tenant acme --status completed --json
 ```
 
+### `erasure retry`
+
+Restarts a `failed` erasure: it submits the same scope and target again, and the new request resumes
+the failed job at the step that failed and keeps the original 24-hour deadline, for every scope. A
+counterparty erasure needs the address again, because it is never stored.
+
+```text
+pmail erasure retry <erasure-id> [--address <counterparty-address>] [--wait]
+```
+
+### `erasure reapply`
+
+Platform keys only (`platform:ops`). Runs a completed erasure again from its stored record, after a
+restore brought erased data back. A counterparty erasure is matched by the address's keyed hash, so the
+address is not needed. `pmail ops restore reconcile` calls it for every erasure after the restore point.
+A request that did not complete is refused (`409 erasure_not_completed`, exit 6): resume a failed one with
+`erasure retry`.
+
+```bash
+pmail erasure reapply era_01JA9M0R6AW7X2M5N6P8R0T1YW
+```
+
 ### `export create`
 
 A subject-access export: one `.eml` per message plus `messages.json`, in a ZIP.
@@ -2135,6 +2219,7 @@ pmail audit --tenant acme --action quarantine.release
 ```text
 Deployment   setup · setup ses · deploy · upgrade · doctor · destroy · secrets rotate-master
 Platform     dlq list|redrive · keys rotate thread|link|cursor|web_bot_auth · jobs start|get · waitlist invite
+             ops status|switch|freeze|unfreeze · ops restore d1|mailbox|reconcile|cleanup
 Profiles     login · config show|set · mcp config
 Tenants      tenants create|list|get|update|suspend|resume
 Partners     partners create|list|get|update|delete
@@ -2148,7 +2233,7 @@ Webhooks     webhooks create|list|get|update|delete|rotate|test|deliveries|repla
 Keys         keys create|list|get|revoke|rotate
 Signing      identity-keys list|create|rotate|revoke · assertions create|verify · http-sign
 Lists        suppressions list|add|remove · lists list|add|remove
-Privacy      erasure create|get|list · export create|get
+Privacy      erasure create|get|list|retry|reapply · export create|get
 Members      members list|invite|remove · invitations revoke
 Billing      plans list · billing get|set
 Usage        usage · usage daily · audit

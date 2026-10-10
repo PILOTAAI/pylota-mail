@@ -328,6 +328,13 @@ pub struct Config {
     pub security_contact: Option<String>, pub log_level: LogLevel,
     pub default_policy: serde_json::Value, pub cf_account_id: Option<String>,
     pub daily_send_quota: Option<u32>, pub backup_bucket: Option<String>,
+    pub alert_email: Option<String>,       // PM_ALERT_EMAIL, else the mailto: of PM_SECURITY_CONTACT
+                                           // (observability.md § 5.5)
+    pub heartbeat_key_id: Option<String>,  // PM_HEARTBEAT_KEY_ID (observability.md § 5.5)
+    pub frozen: bool,                      // PM_FREEZE = "on" (observability.md › Restore from PITR)
+    pub frozen_since: Option<String>,      // PM_FREEZE_SINCE, written by pmail ops freeze
+    pub eval_rest: bool,                   // PM_EVAL_REST = "on", honoured only with PM_ENV = local
+                                           // (testing.md § 9.2)
     pub ses_inbound: Option<SesInbound>,   // PM_SES_INBOUND_{BUCKET,TOPIC_ARN,QUEUE_URL}; Some only when all three are set
     pub ses_rule_set: String,              // PM_SES_RULE_SET
     pub cf_subdomain_setup: bool,          // PM_CF_SUBDOMAIN_SETUP = "on"
@@ -342,7 +349,8 @@ pub struct Config {
     pub secrets: Secrets,
 }
 pub struct Secrets {                 // each decoded from base64; 32 bytes for the PM_* keys
-    pub master_key: [u8; 32], pub master_key_next: Option<[u8; 32]>,
+    pub master_key_a: Option<[u8; 32]>, pub master_key_b: Option<[u8; 32]>,   // PM_MASTER_KEY, PM_MASTER_KEY_B
+    pub master_key_active: MasterSlot,   // PM_MASTER_KEY_ACTIVE: A (default) or B; that slot must be Some
     pub key_pepper: [u8; 32], pub hash_key: [u8; 32],
     pub cf_api_token: Option<String>, pub ses: Option<SesCredentials>,
     pub stripe: Option<StripeSecrets>,                   // PM_STRIPE_SECRET_KEY, PM_STRIPE_WEBHOOK_SECRET
@@ -369,12 +377,14 @@ than `closed` without `PM_TERMS_URL`, `PM_PRIVACY_URL`, `PM_DPA_URL` and `PM_TER
 | `PM_BILLING=stripe` without `PM_STRIPE_SECRET_KEY` or `PM_STRIPE_WEBHOOK_SECRET` | The Worker starts with billing not started: every workspace behaves as `disabled` (no plan checks; holds still run), Checkout, Portal and `/billing/stripe/webhook` answer `503 unavailable`, `/health` reports `"status": "degraded"` with `"billing": "stripe_secrets_missing"`, and `pmail doctor` fails `secrets` |
 | `PM_SIGNUP` is not `closed` and a `PM_TERMS_*`, `PM_PRIVACY_URL` or `PM_DPA_URL` value is missing | `config_invalid`, as above |
 | `PM_WEB_BOT_AUTH=on` in a release built without signed HTTP requests (spike S13 failed, so its fallback was taken) | `config_invalid` naming `PM_WEB_BOT_AUTH`: the variable cannot be turned on, and is never silently ignored |
+| The master-key slot named by `PM_MASTER_KEY_ACTIVE` (default `a`) is empty, `PM_MASTER_KEY_ACTIVE` is not `a` or `b`, or both slots hold keys with the same key ID | `config_invalid` naming the secret ([Security §6.2](security.md#62-rotation-procedures)) |
+| `PM_FREEZE=on` | The Worker starts frozen: `/health` adds `"frozen": true` and every handler follows the freeze rules of [Observability › Restore from PITR](observability.md#restore-from-pitr) |
 
 Test: `platform::config::startup_rules` covers each row.
 
 The thread, link, cursor and `web_bot_auth` keys are not secrets of the Worker: they live sealed in D1 `signing_keys`
 ([Data model](data-model.md#1-d1-control-plane)). `worker::keyring` loads and opens them with
-`master_key` (or `master_key_next`, by the envelope's kid), caches the opened ring per isolate for
+the master-key slot whose key ID matches the envelope's kid, caches the opened ring per isolate for
 5 minutes, and creates the first key of a purpose on first use with `Rng` (`web_bot_auth` only while
 `PM_WEB_BOT_AUTH=on`). Identity signing keys live in `identity_keys`, one ring per identity, opened the
 same way when the identity signs ([Agent signing keys](agent-keys.md#2-keys)).
@@ -963,8 +973,9 @@ binding = "METRICS"
 dataset = "pylota_mail_metrics"
 ```
 
-- Secrets (`PM_MASTER_KEY`, `PM_KEY_PEPPER`, `PM_HASH_KEY`, and the optional `PM_MASTER_KEY_NEXT`
-  (during a master-key rotation only), `PM_CF_API_TOKEN`, `PM_SES_ACCESS_KEY_ID`,
+- Secrets (`PM_MASTER_KEY`, `PM_KEY_PEPPER`, `PM_HASH_KEY`, and the optional `PM_MASTER_KEY_B` and
+  `PM_MASTER_KEY_ACTIVE` (the second master-key slot and its selector, Security §6.2),
+  `PM_CF_API_TOKEN`, `PM_SES_ACCESS_KEY_ID`,
   `PM_SES_SECRET_ACCESS_KEY`, `PM_STRIPE_SECRET_KEY`, `PM_STRIPE_WEBHOOK_SECRET`,
   `PM_OAUTH_GOOGLE_CLIENT_SECRET`, `PM_OAUTH_GITHUB_CLIENT_SECRET`) are uploaded with `wrangler secret`,
   never written to the file. Thread, link, cursor and `web_bot_auth` keys are not secrets: the Worker
@@ -997,10 +1008,12 @@ dataset = "pylota_mail_metrics"
 | `cargo xtask fuzz --target <t> --time <s>` | Runs `cargo +nightly fuzz run <t> -- -max_total_time=<s>` in `fuzz/` |
 | `cargo xtask openapi` | Generates `openapi.json` from `api-types` and compares it semantically with `docs/src/reference/openapi.yaml` |
 | `cargo xtask gen-unicode` | Regenerates `crates/core/src/address/confusables_table.rs` from the pinned UTS #39 data files checked into `crates/core/data/` |
-| `cargo xtask eval-search`, `eval-agentic`, `eval-triage` | Quality gates on the golden set (build plan M18) |
+| `cargo xtask eval-setup` | Deletes and recreates the `pm-mail-chunks-eval` index in the evaluation account and waits until it answers ([Testing § 9.2](testing.md#92-running)) |
+| `cargo xtask eval-search`, `eval-agentic`, `eval-triage` | Quality gates on the golden set (build plan M18): three runs each, scored by the median ([Testing § 9.3](testing.md#93-metrics-and-gates)) |
 | `cargo xtask release --check-version <tag>` | Fails unless `<tag>` is `v` followed by the workspace version, `[workspace.package] version` in the root `Cargo.toml`. That is the one place the version is set: every crate uses `version.workspace = true`, `/health` reports `CARGO_PKG_VERSION`, and the bundle's `VERSION` file is written from it. The version is SemVer, optionally with a pre-release part (`1.0.0-rc.1`) |
-| `cargo xtask release --version <v>` | Runs the `--check-version` rule, builds the Worker, then writes `dist/pylota-mail-worker-<v>.tar.gz` containing `build/index.js`, `build/index_bg.wasm`, `build/worker/shim.mjs`, `migrations/d1/*.sql`, `deploy/wrangler.toml.tmpl` and `VERSION`; collects the CLI binaries built by the CI matrix; writes `dist/SHA256SUMS` (`<sha256 hex>␠␠<filename>` per line) and its detached signature `SHA256SUMS.sig`. It signs itself, with the `minisign` crate (pure Rust, MIT; 0.10.0 on crates.io, read 2026-10-10; pinned at build time like `minisign-verify`), using the secret key and password from the `release` environment's `MINISIGN_SECRET_KEY` and `MINISIGN_PASSWORD`, and writes the trusted comment `pylota-mail v{version}`, which `pmail deploy` requires ([CLI and setup §8.2](cli.md#82-signature-and-checksums)). It finally verifies its own output with `minisign-verify` and the compiled-in public key, so a wrong key fails the release, not the first deploy |
-| `cargo xtask release-gate --version <v>` | The security pre-release checklist as a gate ([Security §16](security.md#16-pre-release-checklist)). Fails unless `release-gates/v{version}.md`, committed on the tagged commit, has every checklist item ticked, each with a link to its evidence (for `1.0.0`, the external penetration test report and its retest), and unless the facts it can check itself hold: the `gate`, `staging` and `live` jobs of the same run passed; the SBOMs, `SHA256SUMS`, `SHA256SUMS.sig` and attestations exist in the run's artefacts; no open issue carries the label `fuzz-crash`; CodeQL reports no open alert of high severity or above (read with `gh api`, read-only); the 24-hour fuzz record named in the file covers the tagged commit. A manual `live --manual` run is recorded in the same file with its date and commit |
+| `cargo xtask release --version <v>` | Runs the `--check-version` rule, builds the Worker, then writes `dist/pylota-mail-worker-<v>.tar.gz` containing `build/index.js`, `build/index_bg.wasm`, `build/worker/shim.mjs`, `migrations/d1/*.sql`, `deploy/wrangler.toml.tmpl` and `VERSION`; collects the CLI binaries built by the CI matrix; writes `dist/SHA256SUMS` (`<sha256 hex>␠␠<filename>` per line). It does not sign: the signing key never enters CI ([Security › Supply chain](security.md#11-supply-chain)). Verification by `pmail deploy` is specified in [CLI and setup](cli.md) |
+| `cargo xtask release sign <tag>` | Run by the owner on their own machine with the offline minisign key: downloads `SHA256SUMS` and every listed file from the draft release, checks each checksum and `gh attestation verify` (provenance naming `release.yml` on that tag), then signs `SHA256SUMS` with the `minisign` crate (pure Rust, MIT; 0.10.0 on crates.io, read 2026-10-10; pinned at build time like `minisign-verify`), the secret key read from the removable drive and its password prompted for, with the trusted comment `pylota-mail v{version}` that `pmail deploy` requires ([CLI and setup §8.2](cli.md#82-signature-and-checksums)). It verifies its own output with `minisign-verify` and the compiled-in public keys, so a wrong key fails here and not at the first deploy, then uploads `SHA256SUMS.sig` to the draft release and starts `release-publish.yml` on the tag (`gh workflow run release-publish.yml --ref <tag>`; GitHub CLI manual, read 2026-10-10) |
+| `cargo xtask release-gate --version <v>` | The security pre-release checklist as a gate ([Security §16](security.md#16-pre-release-checklist)). Fails unless `release-gates/v{version}.md`, committed on the tagged commit, has every checklist item ticked, each with a link to its evidence (for `1.0.0`, the external penetration test report and its retest), and unless the facts it can check itself hold: the `gate` job of the tag's `release.yml` run and the `staging` and `live` jobs of the `release-publish.yml` run passed; the SBOMs, `SHA256SUMS`, `SHA256SUMS.sig` and attestations exist on the release; no open issue carries the label `fuzz-crash`; CodeQL reports no open alert of high severity or above (read with `gh api`, read-only); the 24-hour fuzz record named in the file covers the tagged commit. A manual `live --manual` run is recorded in the same file with its date and commit |
 | `cargo xtask stripe-setup [--live] --api-host <h> --out <file> [--catalog <file>] [--vat-from <date>]` | Sets up the Stripe account of a deployment that sells plans and writes the plan catalog with every Stripe ID filled in ([Billing › Stripe account setup](billing.md#stripe-account-setup)). Uses `STRIPE_SETUP_KEY`, never a Worker secret |
 
 Fuzz targets (each a `fuzz_target!` over `&[u8]` calling one `core` entry point):
@@ -1052,22 +1065,40 @@ Nightly (`.github/workflows/nightly.yml`): all fuzz targets for 10 minutes each,
 `eval-agentic` and `eval-triage` against real Workers AI with a CI API token (build plan M18), `cargo
 audit` on `main`, and the `live::` suite against staging when staging credentials are configured.
 
-Release (`.github/workflows/release.yml`, on a `v*` tag). This is the one definition of the release
-pipeline; [Testing › CI workflows](testing.md#12-ci-workflows-and-required-checks) and build plan M19
-refer to it. It **publishes a release** and never changes Pylota Mail Cloud. Its jobs, in order:
+Release (`.github/workflows/release.yml` on a `v*` tag, then `.github/workflows/release-publish.yml`). This is
+the one definition of the release pipeline; [Testing › CI workflows](testing.md#12-ci-workflows-and-required-checks)
+and build plan M19 refer to it. It **publishes a release** and never changes Pylota Mail Cloud. The signing
+key never enters CI ([Security › Supply chain](security.md#11-supply-chain)), so the pipeline is two
+workflows with the owner's offline signature between them.
+
+`release.yml` (on a `v*` tag). Its jobs, in order:
 
 | Job | Environment | Does |
 |---|---|---|
 | `version` | – | `cargo xtask release --check-version "$GITHUB_REF_NAME"` |
 | `gate` | – | The full `ci.yml` gate on the tagged commit (called as a reusable workflow) and `eval-search`, `eval-agentic` and `eval-triage` |
 | `build` | – | CLI binaries for macOS (arm64, x64), Linux (x64, arm64) and Windows (x64), each built `--locked` |
-| `package` | `release` | `cargo xtask release --version <v>` (bundle, `SHA256SUMS` and its minisign signature); the SBOMs of the Worker (wasm32) and the CLI (`cargo cyclonedx --format json`); build provenance for every file (`actions/attest@v4`, [Security › Supply chain](security.md#11-supply-chain)); then a GitHub Release marked **pre-release** with the bundle, the binaries, the SBOMs, `SHA256SUMS` and `SHA256SUMS.sig` |
+| `package` | – | `cargo xtask release --version <v>` (bundle and `SHA256SUMS`, unsigned); the SBOMs of the Worker (wasm32) and the CLI (`cargo cyclonedx --format json`); build provenance for every file (`actions/attest@v4`, [Security › Supply chain](security.md#11-supply-chain)); then a **draft** GitHub Release with the bundle, the binaries, the SBOMs and `SHA256SUMS`. The run ends here |
+
+The owner then runs `cargo xtask release sign v<x.y.z>` on their own machine with the offline key
+([§9](#9-xtask)). It signs only files whose checksums match and whose provenance names `release.yml` on that
+tag, uploads `SHA256SUMS.sig` to the draft and starts the second workflow on the tag.
+
+`release-publish.yml` (`workflow_dispatch` on the tag, so `GITHUB_REF_NAME` is the tag and the `release`
+environment's tag rule applies). Its jobs, in order:
+
+| Job | Environment | Does |
+|---|---|---|
+| `verify` | – | Refuses unless the ref is a `v*` tag whose `release.yml` run passed. Downloads `SHA256SUMS`, `SHA256SUMS.sig` and every listed file from the draft release; verifies the signature and its trusted comment `pylota-mail v{version}` against the public keys compiled into `pmail` (`minisign-verify`) and every checksum; then publishes the draft as a GitHub Release marked **pre-release** |
 | `staging` | `staging` | Deploys that pre-release to staging with the just-built `pmail deploy --version <v>`, which downloads and verifies it like any deployer ([CLI and setup §8](cli.md#8-deploy)) |
 | `live` | `staging` | The `live::` suite against staging (the tests not marked manual) |
 | `publish` | `release` | `cargo xtask release-gate --version <v>`; then, for a version without a pre-release part, marks the GitHub Release as a full release and runs `cargo publish` for `pylota-mail-api-types`, `pylota-mail` and `pylota-mail-cli`, in that order. A pre-release version (`-rc.N`) stays a pre-release: it exists for staging and rehearsals, and is never published to crates.io |
 
-A tag is never moved or reused. A run that fails after `package` leaves a pre-release that is never
-promoted; the fix ships under the next version or release candidate.
+The `release` environment allows only tags matching `v*` ("Selected branches and tags"; GitHub Actions
+"Deployments and environments" reference, read 2026-10-10) and holds only the crates.io token; no workflow
+holds a signing key. A tag is never moved or reused. A run that fails after `package`, or a draft the owner
+does not sign, leaves a release that is never promoted; the fix ships under the next version or release
+candidate.
 
 Cloud rollout (`.github/workflows/cloud-deploy.yml`, `workflow_dispatch` with the input `version`,
 environment `production`) is a separate, later step that only the owner starts: it downloads the
@@ -1199,6 +1230,7 @@ integration tests that call every method against the workerd harness.
 | `sdk::doctest::published_examples` | The Rust examples of `quickstart.md` compile as rustdoc tests; the landing page's example equals `crates/sdk/examples/confirm_booking.rs`, which builds (FR-SDK-1, build plan M16) |
 | `xtask::release_version_matches_tag` | `release --check-version` passes for `v` + the workspace version and fails for any other tag, including a pre-release part that differs; the signed `SHA256SUMS.sig` carries the trusted comment `pylota-mail v{version}` and verifies with the compiled-in key (build plan M19) |
 | `xtask::release_gate_refuses` | `release-gate` fails with a missing or partly ticked `release-gates/v{version}.md`, a missing SBOM or attestation, an open `fuzz-crash` issue, or a failed `live` job, and passes when all hold (build plan M19, [Security §16](security.md#16-pre-release-checklist)) |
+| `xtask::release_sign_refuses` | Against a recorded draft release: `release sign` refuses a file whose checksum does not match `SHA256SUMS`, a file without an attestation, and an attestation whose provenance names another workflow or tag; in each case it uploads nothing and starts no workflow. With matching files it writes a signature that `minisign-verify` accepts with the trusted comment `pylota-mail v{version}` |
 | `xtask::openapi_matches_contract` | `cargo xtask openapi`: the generated `openapi.json` (OpenAPI 3.1; every path under `/v1`, except the root paths `/health`, `/openapi.json`, `/hooks/*` and `/.well-known/*`, whose path items override `servers`) equals `docs/src/reference/openapi.yaml` semantically (FR-API-1) |
 | `xtask::check_layering_rejects_worker_dep` | A fixture crate depending on `worker` fails the check (AGENTS.md rule) |
 | `platform::config::startup_rules` | Each row of the startup rules in §6.1: a malformed optional variable is `config_invalid` naming it; SES without `PM_SES_SNS_TOPIC_ARN` and `PM_BILLING=stripe` without its secrets start with `/health` `degraded` and the feature off; `PM_WEB_BOT_AUTH=on` in a release without signed requests is `config_invalid`; `PM_CONSOLE_HOST`, `PM_SYSTEM_FROM` and `PM_NOTIFICATIONS` are read with `PM_CONSOLE=off` |

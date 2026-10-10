@@ -177,9 +177,10 @@ reused; the others are defined in section 13.
 |---|---|
 | A Cloudflare account member reads D1, R2 or Durable Object data | Out of scope for the software (SECURITY.md). Deployers keep account membership minimal and use Cloudflare's own audit logs. Secrets are Worker secrets and are never written to disk unless `pmail setup --print-secrets` is used |
 | A partner key is misused | A partner key reaches only the tenants its partner's keys created, never another Cloud customer's ([FR-KEY-4](../prd.md#61-tenancy-and-access)). A platform key suspends the partner (`PATCH /v1/partners/{partner_id}` with `status: suspended`), which at once refuses every partner key of it and every API key of its tenants (`403 partner_suspended`) and holds deliveries to its and its tenants' endpoints, while inbound mail is still stored ([J13](../edge-cases.md)); the partner cannot raise limits past the operator's or undo the operator's enforcement (section 4.6, [J17](../edge-cases.md)), and its reach is bounded by `max_tenants` ([J18](../edge-cases.md)); every state-changing partner-key action is audit-logged like a platform key's |
-| A platform key is misused | Platform keys reach every tenant: issue few, set `expires_at`, store them in a secrets manager (`key_command` in the CLI profile). Every state-changing platform-key action on a tenant is audit-logged; sends are not audit rows: each is a stored message, and the request's structured log carries `key_id` ([Observability §2.1](observability.md#21-schema)). A platform key cannot sign as an identity: `identities:sign` is not allowed at that level; it can grant it to a tenant or identity key it mints, and the `key.create` audit row records the grant (section 4.6) |
+| A platform key is misused | Platform keys reach every tenant: issue few, set `expires_at`, store them in a secrets manager (`key_command` in the CLI profile). Every state-changing platform-key action on a tenant is audit-logged, and so is every platform-key or partner-key read of mail content (`mail.read`, one row per request, written before the response by the shared read services, so REST and MCP reads are covered alike; a request whose row cannot be written fails with `503`: [REST API › Audit](../../reference/api.md#get-v1audit-events--auditread)), so access by the operator, or by a partner, to a tenant's mail is recorded break-glass access; sends are not audit rows: each is a stored message, and the request's structured log carries `key_id` ([Observability §2.1](observability.md#21-schema)). A platform key cannot sign as an identity: `identities:sign` is not allowed at that level; it can grant it to a tenant or identity key it mints, and the `key.create` audit row records the grant (section 4.6) |
 | The CLI machine leaks a key | `~/.config/pylota-mail/config.toml` is created `0600` and refused when group- or world-readable ([Configuration](../../reference/configuration.md#cli-configuration)) |
-| The release pipeline is compromised | Section 11: pinned dependencies and actions, signed `SHA256SUMS`, build provenance attestations, protected tags and environments |
+| The release pipeline is compromised | Section 11: pinned dependencies and actions, signed `SHA256SUMS` with a key that never enters CI, build provenance attestations, protected tags and environments |
+| The one operator is unavailable, asleep or wrong | There is no second person ([ADR 0015](../adr/0015-solo-operator.md)). Mechanical controls instead: automatic containment that fails closed ([Observability § 5.6](observability.md#56-automatic-containment)), alert email plus an external heartbeat ([§ 5.5](observability.md#55-alert-email-and-the-external-heartbeat)), CI gates, a fresh-agent deploy rehearsal and an independent adversarial agent review of T2 changes, and a break-glass record of every recovery credential ([§ 5.7](observability.md#57-break-glass-record)) |
 
 ### 3.7 TB7: people → console
 
@@ -496,7 +497,9 @@ only a platform key rotates or revokes one.
 - **Erasing and erased tenants** ([I8](../edge-cases.md)). For every non-platform key, a write to a tenant
   in status `erasing` or `erased`, or to anything in it, gets `404 tenant_not_found` (or the resource's own
   `*_not_found` on a route by resource ID), except a repeated tenant-scope erasure request (`200` with
-  the existing request, or `409 tenant_erased`); in practice this is the partner key, because the tenant's own
+  the running request, `202` with a resumption of a failed one or a continuation of one that ended
+  `completed_with_holds`, or `409 tenant_erased`) and the hold routes on a tenant that is `erasing` with
+  held threads ([Privacy § 6.6](privacy.md#66-tenant-scope)); in practice this is the partner key, because the tenant's own
   tenant and identity keys are revoked by the erasure and get `401 key_revoked` (section 4.2, step 9). `GET /v1/tenants/{tenant_id}` and the tenant's erasure
   requests (`GET /v1/erasure-requests` filtered on it, and by ID) keep answering its partner key, so a
   partner can follow an erasure to its receipt after the tenant is gone
@@ -686,14 +689,21 @@ For each request, before any Durable Object or R2 call:
    - **Erasing and erased tenants.** For a non-platform key, a write (any method but `GET`) whose
      resolved tenant is `erasing` or `erased` gets the same `*_not_found` (`404 tenant_not_found` on a
      tenant path), so nothing is created, changed or sent in a tenant being erased ([I8](../edge-cases.md)).
-     The one exception is a tenant-scope erasure request for that tenant, which returns the existing
-     request (`200`) while it is `erasing` and `409 tenant_erased` once it is `erased`, for every key that
-     may request it.
+     The exceptions are a tenant-scope erasure request for that tenant, which while it is `erasing`
+     returns the running request (`200`) or starts a resumption or continuation (`202`,
+     [Privacy § 6.1](privacy.md#61-request)), and `409 tenant_erased` once it is `erased`, for every key
+     that may request it; and `POST` and `DELETE …/threads/{thread_id}/hold` on a tenant that is
+     `erasing` with held threads, for partner keys with `erasure:manage`
+     ([Privacy § 8](privacy.md#8-legal-holds)).
+   - **Freeze and read-only.** While `PM_FREEZE = "on"`, every request from a key that is not a platform
+     key, and every console request, gets `503 unavailable` (`details.reason = "frozen"`) before this step;
+     while the `read_only` switch is `on`, every request other than a `GET` from a non-platform key gets
+     `503 unavailable` (`read_only`) ([Observability § 5.6](observability.md#56-automatic-containment)).
      Reads still resolve; for a partner key `GET /v1/tenants/{tenant_id}` and its tenant's erasure
      requests are the reads that remain useful, because the erasure deleted the rest. A platform key's
      write to such a tenant follows the route (a `PATCH` with `status` gets `409 tenant_erased`, a new
-     tenant-scope erasure request returns the existing one or `409 tenant_erased`,
-     [Privacy § 6.6](privacy.md#66-tenant-scope)).
+     tenant-scope erasure request returns the running one, starts a resumption or continuation (`202`),
+     or answers `409 tenant_erased`, [Privacy § 6.1](privacy.md#61-request)).
 5. **Body and query parameters naming a tenant or identity** (`tenant_id` in `POST /v1/keys`,
    `POST /v1/erasure-requests`, `POST /v1/exports`, `identity_ids` filters, `tenant_id` filters):
    for non-platform keys, a value outside the key's scope returns `404 tenant_not_found` or
@@ -784,8 +794,9 @@ another ([Threading](threading.md)).
 
 | Secret | Single purpose | Generated by | Leak impact |
 |---|---|---|---|
-| `PM_MASTER_KEY` | AES-256-GCM encryption at rest of webhook secrets, identity signing keys, the `signing_keys` keyring (the `web_bot_auth` seed included), SMTP relay credentials, TOTP secrets, recovery-code hashes and OAuth PKCE verifiers (section 7.2) | `pmail setup`: 32 bytes from the OS CSPRNG, base64 | Decrypts stolen D1 ciphertexts (needs D1 access too) |
-| `PM_MASTER_KEY_NEXT` (rotation only) | The new master key while `pmail secrets rotate-master` runs | `pmail secrets rotate-master` | As `PM_MASTER_KEY` |
+| `PM_MASTER_KEY` | Master-key slot `a` (section 6.2): AES-256-GCM encryption at rest of webhook secrets, identity signing keys, the `signing_keys` keyring (the `web_bot_auth` seed included), SMTP relay credentials, TOTP secrets, recovery-code hashes and OAuth PKCE verifiers (section 7.2) | `pmail setup`: 32 bytes from the OS CSPRNG, base64 | Decrypts stolen D1 ciphertexts (needs D1 access too) |
+| `PM_MASTER_KEY_B` | Master-key slot `b`: after a rotation either the active key or the previous one (section 6.2) | `pmail secrets rotate-master` | As `PM_MASTER_KEY` |
+| `PM_MASTER_KEY_ACTIVE` | Which slot seals new values (`a` or `b`); not a key | `pmail secrets rotate-master` | None on its own |
 | `PM_KEY_PEPPER` | HMAC-SHA256 of API key strings | `pmail setup` (section 4.8) | Offline guessing of stolen hashes is still infeasible (256-bit secrets); rotate as break-glass |
 | Thread keys (`signing_keys`, purpose `thread`) | HMAC of thread tokens | The Worker: 32 bytes from `platform::Rng`, sealed under `PM_MASTER_KEY` | Forged thread tokens (still rate-limited, still no data access) |
 | Link keys (`signing_keys`, purpose `link`) | MACs and keyed hashes on tokens the service issues and later verifies: signed download links, console sign-in, invitation and session tokens, OAuth state hashes, and notification unsubscribe tokens | The Worker, as above | Forged download links; console tokens matched against stolen hashes; forged unsubscribe tokens, which can only turn a notification kind off |
@@ -826,7 +837,7 @@ Rules:
 |---|---|---|
 | API key | `POST /v1/keys/{id}/rotate` with an overlap (section 4.5) | Old secret valid until the overlap ends |
 | Webhook secret | `POST /v1/webhooks/{id}/rotate-secret { "overlap_hours": 0–168 }` | Both signatures sent during the overlap (FR-WH-2) |
-| `PM_MASTER_KEY` | `pmail secrets rotate-master` (below) | No downtime; all ciphertexts re-encrypted |
+| `PM_MASTER_KEY` (two slots, below) | `pmail secrets rotate-master` (below) | No downtime; all ciphertexts re-sealed under the new key; the previous key stays in the other slot for restores |
 | Thread key | `POST /v1/platform/keys/thread/rotate` (`platform:ops`) | New tokens carry the new kid at once; tokens with the old kid keep verifying for 90 days ([Threading](threading.md#24-key-rotation)). With `?revoke_previous=true` they stop verifying at once, and replies to them fall back to header threading. No secret value is ever handled by a person |
 | Link key | `POST /v1/platform/keys/link/rotate` (`platform:ops`) | Download links, console sign-in tokens, invitations, sessions and OAuth flows with the old kid keep verifying for 7 days (the longest link lifetime), then fail; active console sessions are re-hashed under the new key on their next request. Export links are minted on each `GET /v1/exports/{id}`, so callers fetch a new one. With `?revoke_previous=true` everything under the old kid fails at once: open links, sign-in tokens, invitations and OAuth flows fail, and the sessions hashed under it end (normally all of them, because active sessions are re-hashed under the current key). Reading a link key needs both D1 access and `PM_MASTER_KEY`. Without `revoke_previous`, a leaked key keeps verifying for its 7-day window, so after a suspected leak rotate with `revoke_previous=true`, then rotate `PM_MASTER_KEY` |
 | Cursor key | `POST /v1/platform/keys/cursor/rotate` (`platform:ops`) | New cursors carry the new kid; cursors with the old kid keep working for 24 hours (the cursor lifetime). With `?revoke_previous=true` open cursors fail at once with `400 invalid_request` (path `cursor`), and callers repeat the search without a cursor |
@@ -842,26 +853,65 @@ Rules:
 | `PM_STRIPE_SECRET_KEY` | In the Stripe dashboard, **Rotate key** with an expiration (both keys work for up to 7 days), `wrangler secret put PM_STRIPE_SECRET_KEY`, then let the old key expire ([API keys › Rotate an API key](https://docs.stripe.com/keys#rolling-keys), read 2026-10-09) | No downtime |
 | `PM_STRIPE_WEBHOOK_SECRET` | In the Stripe dashboard, **Roll secret** on the endpoint and keep the old secret for up to 24 hours, then `wrangler secret put PM_STRIPE_WEBHOOK_SECRET` inside that window. Stripe signs with every active secret, and the verifier accepts any matching `v1` ([Webhooks › Roll endpoint signing secrets](https://docs.stripe.com/webhooks#roll-endpoint-secrets), read 2026-10-09) | No downtime; no event is rejected |
 
-**`pmail secrets rotate-master`.** Worker secrets are write-only, so the rotation never needs the old
-value:
+**Master-key slots.** The master key has two secret slots and a selector, so a rotation never needs to
+move or read back a key value:
 
-1. Every ciphertext carries the key ID of the key that sealed it (section 7.2).
-2. The CLI generates a new key `K2` and uploads it as the secret `PM_MASTER_KEY_NEXT`.
-3. While `PM_MASTER_KEY_NEXT` is set, the Worker decrypts with whichever of `PM_MASTER_KEY` and
-   `PM_MASTER_KEY_NEXT` matches the ciphertext's key ID, and seals every new value with
-   `PM_MASTER_KEY_NEXT`. The `*/15` cron re-seals up to 500 values per run whose key ID is not `kid(K2)`,
-   in every column of the sealed-column registry (`crates/core/src/sealed.rs`, pure): for v1.0,
+- `PM_MASTER_KEY` is slot `a` (written by `pmail setup`) and `PM_MASTER_KEY_B` is slot `b`;
+- `PM_MASTER_KEY_ACTIVE` (a Worker secret holding `a` or `b`; absent means `a`) names the slot that
+  seals. It is a secret rather than a `[vars]` entry so that the CLI can change it with
+  `wrangler secret put`, which deploys a new version without a build;
+- the Worker opens a ciphertext with whichever slot's key ID matches the envelope's `kid` (section 7.2),
+  and seals every new value with the active slot. A ciphertext whose `kid` matches neither slot does not
+  open (`secret_unavailable`);
+- startup rule ([Rust workspace › Startup rules](rust-workspace.md#61-errors-and-configuration)): the active
+  slot must hold a 32-byte key, and when both slots are set their key IDs must differ; otherwise the
+  configuration is invalid (`config_invalid`).
+
+A rotation writes the new key into the inactive slot and then switches `PM_MASTER_KEY_ACTIVE`, so the
+previous key stays in the other slot until the next rotation overwrites it.
+
+**`pmail secrets rotate-master`** ([CLI and setup §12.1](cli.md#121-secrets-rotate-master)):
+
+1. The CLI reads `master_key` from `GET /v1/platform/status`: the active slot, each slot's presence and
+   key ID, `remaining` (sealed values whose `kid` is not the active key's, counted by the Worker over
+   the sealed-column registry `crates/core/src/sealed.rs`) and `activated_at` (when the Worker first
+   saw the active key ID: the every-minute cron writes the audit row `master_key.activated`, target the
+   key ID, whenever the active key ID differs from the latest such row's) and `resealed_at` (when
+   `remaining` first reached 0 under the active key: the same cron writes `master_key.resealed`, target
+   the key ID, once per key).
+2. `remaining > 0` means the previous rotation's sweep has not finished. The CLI refuses unless
+   `--resume` is given, which skips to step 5: the new key is already in its slot, so nothing needs to
+   be known or generated again.
+3. When the inactive slot holds a key and `resealed_at` is less than 30 days ago, the CLI refuses unless
+   `--discard-previous` is given (the first rotation, into an empty slot, is never refused).
+   The inactive slot holds the key that sealed values in D1 until the previous re-seal finished at
+   `resealed_at`, and a D1 Time Travel restore reaches back 30 days: overwriting that key would leave a
+   restore to any earlier point unable to open the values still sealed with it. `--discard-previous` (after a suspected leak of the
+   previous key) prints that consequence and continues.
+4. The CLI generates `K2` (32 bytes from the OS CSPRNG), writes it to the inactive slot with
+   `wrangler secret put` (value on stdin), drops it from memory, then writes that slot's letter to
+   `PM_MASTER_KEY_ACTIVE`. Each `wrangler secret put` deploys a new version; in this order every version
+   that seals with `K2` also holds the previous key, so every value opens throughout the rollout.
+5. The Worker's every-minute cron re-seals up to 500 values per run whose `kid` is not the active
+   key's (about 720,000 a day), in every column of the registry: for v1.0,
    `webhook_endpoints.secret_enc`, `webhook_endpoints.prev_secret_enc`, `identity_keys.private_enc`,
    `signing_keys.ciphertext`, `domains.smtp_sealed`, `domains.smtp_pending_sealed`, `users.totp_sealed`,
-   `users.recovery_codes_sealed` and `oauth_states.pkce_sealed` (section 7.2). The CLI's count query
-   (step 4) is built from the same registry, so a column added to it is swept and counted with no other
-   change.
-4. The CLI polls D1 through the Cloudflare D1 query API until no value has a different key ID, then
-   uploads `PM_MASTER_KEY = K2` and deletes `PM_MASTER_KEY_NEXT`.
-5. The Worker logs `secrets_reseal_progress` counts; the CLI prints them.
+   `users.recovery_codes_sealed` and `oauth_states.pkce_sealed` (section 7.2). It logs
+   `secrets_reseal_progress` counts. The CLI polls `GET /v1/platform/status` every 60 seconds and prints
+   `remaining` with an estimate (`remaining / 500` minutes) until it is 0. There is no deadline:
+   interrupting the CLI changes nothing, and `--resume` goes back to polling.
+6. The CLI prints the new key ID and the first date a next rotation is allowed without
+   `--discard-previous` (30 days after `resealed_at`).
 
-`PM_MASTER_KEY_NEXT` is listed in [Configuration › Secrets](../../reference/configuration.md#secrets).
-`pmail doctor` warns while it is set, because a rotation is unfinished.
+`PM_MASTER_KEY_B` and `PM_MASTER_KEY_ACTIVE` are listed in
+[Configuration › Secrets](../../reference/configuration.md#secrets). `pmail doctor` warns while
+`remaining > 0` (an unfinished rotation) and fails when the active slot is empty.
+
+**Restores and rotation.** A D1 Time Travel restore to a point before the last rotation brings back
+values sealed under the previous key, which the inactive slot still holds; the sweep then re-seals them
+under the active key. Because a rotation within 30 days of the previous re-seal's end needs `--discard-previous`,
+every restore inside D1's 30-day window can open its sealed values unless the operator chose otherwise
+after a leak ([Observability › Restore from PITR](observability.md#restore-from-pitr)).
 
 **Rotating the signing keys.** `POST /v1/platform/keys/{purpose}/rotate` (`purpose` is `thread`,
 `link`, `cursor` or `web_bot_auth`, permission `platform:ops`, audit-logged as `signing_key.rotate` with
@@ -1192,8 +1242,11 @@ fails. At delivery time a failure is recorded as a failed attempt with error `ss
   a temporary failure, and every identity of the tenant is paused, so the same signing stop applies.
   Suspend a partner (`PATCH /v1/partners/{partner_id} {"status": "suspended"}`): its keys and every API
   key of its tenants get `403 partner_suspended`, and deliveries to its and its tenants' endpoints are
-  held ([J13](../edge-cases.md)). Stop signed HTTP requests for the whole deployment with `PM_WEB_BOT_AUTH=off`. For a platform-wide
-  stop, suspend every tenant or roll back the Worker version with `npx --yes wrangler@4.139.0 rollback`.
+  held ([J13](../edge-cases.md)). Stop signed HTTP requests for the whole deployment with `PM_WEB_BOT_AUTH=off`. Stop
+  writes from every non-platform key with the `read_only` switch, and sends from Free and ramped
+  workspaces with `free_sending off` (`pmail ops switch`; both are also set automatically,
+  [Observability § 5.6](observability.md#56-automatic-containment)). For a platform-wide stop that loses
+  nothing, freeze the deployment (`pmail ops freeze`), or roll back the Worker version with `npx --yes wrangler@4.139.0 rollback`.
 - **Platform domain reputation.** Per-identity caps, complaint and bounce auto-pause, a DMARC policy
   ramped from `p=none` to `p=reject` on the platform domain, and custom domains encouraged (PRD risk
   table).
@@ -1206,7 +1259,7 @@ fails. At delivery time a failure is recorded as a failed attempt with error `ss
 | `cargo deny check` | In CI on every pull request: advisories, licences (allow-list: Apache-2.0, MIT, BSD-2-Clause, BSD-3-Clause, ISC, Zlib, Unicode-3.0, MPL-2.0; everything else needs an ADR), bans (no `openssl-sys`; `tokio` only as a direct dependency of `worker`, which depends on it with no features: `{ crate = "tokio", wrappers = ["worker"] }`; no duplicate versions of `sha2`, `hmac` or `aes-gcm`), sources (crates.io only, no git dependencies). Bans are checked on the Worker's wasm graph (`cargo deny --manifest-path crates/worker/Cargo.toml --target wasm32-unknown-unknown --exclude-dev check bans`), because the native crates use tokio legitimately (`reqwest` in `sdk` and `cli`, `rmcp` as a dev-dependency); licences, advisories and sources over the whole workspace (`cargo deny --workspace check licenses advisories sources`). The flags are checked against the pinned `cargo-deny` at build time. `deny.toml` sets `[graph] targets` to the targets actually built (`wasm32-unknown-unknown` for the Worker; `aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu` and `x86_64-pc-windows-msvc` for the CLI), so dependencies of other targets are ignored: cargo-deny drops a dependency link that none of the listed targets satisfies (cargo-deny configuration, "The `[graph]` field", <https://embarkstudios.github.io/cargo-deny/checks/cfg.html>, read 2026-10-10). `webpki-root-certs` (the Mozilla root certificates as data; CDLA-Permissive-2.0 on crates.io for 1.0.7 to 1.0.9, read 2026-10-10) is allowed for that crate alone with `[[licenses.exceptions]] allow = ["CDLA-Permissive-2.0"] name = "webpki-root-certs"` (cargo-deny licences configuration, <https://embarkstudios.github.io/cargo-deny/checks/licenses/cfg.html>, read 2026-10-10), never through the general allow-list; this sentence is the record the allow-list rule asks for. Which crate pulls it in on wasm32 is not verified here; `cargo deny` reports the path on the first run of M0 `cargo xtask check-layering` also proves that tokio has no feature enabled in that graph ([Rust workspace §2](rust-workspace.md#2-crate-responsibilities-and-allowed-dependencies)) |
 | `cargo audit` | RustSec advisories on every pull request and daily on `main`; a new advisory opens an issue |
 | SBOM | `cargo cyclonedx --format json` for the Worker (`--target wasm32-unknown-unknown`) and for the CLI, attached to every release |
-| Signed releases | `SHA256SUMS` lists the Worker bundle and CLI binaries and has a detached minisign signature `SHA256SUMS.sig`, made by `cargo xtask release` itself with the `minisign` crate and the trusted comment `pylota-mail v{version}` ([Rust workspace](rust-workspace.md#9-xtask)). The verification key is compiled into `pmail`, which checks the signature, the trusted comment and the bundle checksum before deploying (FR-OPS-2; signature format and verification in [CLI and setup](cli.md)). The signing key lives only in the `release` GitHub Environment (`v*` tags only). Releases also carry build provenance from `actions/attest@v4` (permissions `id-token: write`, `attestations: write`, `contents: read`), verifiable with `gh attestation verify <file> -R PILOTAAI/pylota-mail`. A release is promoted from pre-release only by `cargo xtask release-gate` (section 16) |
+| Signed releases | `SHA256SUMS` lists the Worker bundle and CLI binaries and has a detached minisign signature `SHA256SUMS.sig` with the trusted comment `pylota-mail v{version}` ([Rust workspace](rust-workspace.md#9-xtask)). The verification keys are compiled into `pmail`, which checks the signature, the trusted comment and the bundle checksum before deploying (FR-OPS-2; signature format and verification in [CLI and setup](cli.md)). Releases carry build provenance from `actions/attest@v4` (permissions `id-token: write`, `attestations: write`, `contents: read`), verifiable with `gh attestation verify <file> -R PILOTAAI/pylota-mail`. **The signing key never enters CI** or any online system: the minisign secret key lives on an encrypted removable drive, with a second drive at the break-glass record's location and the password in the owner's password manager ([Observability § 5.7](observability.md#57-break-glass-record)). `release.yml` builds and attests the files, uploads them with `SHA256SUMS` to a draft release, and stops. The owner runs `cargo xtask release sign v<x.y.z>` on their own machine with the drive attached: it downloads `SHA256SUMS` and every file it lists, checks each checksum and each file's attestation (`gh attestation verify`, whose provenance must name `release.yml` on that tag), and only then signs, uploads `SHA256SUMS.sig` and starts `release-publish.yml` on the tag. That workflow's `verify` job checks the signature against the public keys compiled into `pmail` before the draft becomes a pre-release, and its `publish` job promotes it only through `cargo xtask release-gate` (section 16) ([Rust workspace › CI pipeline](rust-workspace.md#10-ci-pipeline)). A compromised CI can build and attest a bad release but cannot sign it, and the owner signs only files whose provenance is the tagged workflow. There is no second signer ([ADR 0015](../adr/0015-solo-operator.md)): the attestation check is the mechanical second look |
 | Site deploy (`.github/workflows/site.yml`) | The landing page and docs Worker `pylota-mail-site` is deployed with Wrangler installed from `site/package-lock.json` by `npm ci --ignore-scripts` (exact `wrangler` 4.139.0, every package with its `integrity` hash), never fetched by name at run time. Its token, the `production` environment's `CLOUDFLARE_API_TOKEN`, is an account-owned token scoped to the single Worker `pylota-mail-site` with the per-Worker **Editor** role, plus **Zone (pylotamail.com) › Workers Routes › Edit**, and nothing else: no account-wide Workers Scripts Edit (in Pylota's shared account that would reach every Worker) and no DNS Edit. Custom Domains that already exist need only Editor to redeploy; adding, changing or removing one needs Workers Routes Write on the zone (Cloudflare "Workers roles and permissions" and the changelog "Grant teammates and agents access to specific Workers", 2026-09-15, both read 2026-10-10). Editor cannot create a Worker, so the first deploy of a new site Worker is done once by hand with a wider token |
 | CodeQL | CodeQL for Rust (supported for editions 2021 and 2024, per codeql.github.com, read 2026-10-09) on pull requests and weekly; open high-severity alerts block a release |
 | Renovate | Cargo and GitHub Actions managers; exact pins kept; weekly grouped pull requests; `worker` and `worker-build` upgrades are never grouped and must pass spike S1's smoke checks plus the full integration suite; security updates raised immediately; nothing auto-merges |
@@ -1301,7 +1354,8 @@ address used by the integration suite, captures all Worker output, and fails if 
 | `it::attachments::serving_headers` | Section 8.5 headers on attachments and raw MIME; `text/html` and SVG served as `application/octet-stream` | [B10](../edge-cases.md) |
 | `it::security::response_headers` | Global headers present; no CORS headers; no `Set-Cookie` | section 8.5 |
 | `core::crypto::envelope_round_trip` | Seal/open round trip; wrong AAD, wrong key or flipped bit fails | SEC-3 |
-| `it::secrets::master_key_rotation` | With `PM_MASTER_KEY_NEXT` set, old and new ciphertexts open, new ones use the new kid, and the sweep re-seals every column of the sealed-column registry, with one case per registered column: `signing_keys` (the `web_bot_auth` seed too), the webhook secrets, `identity_keys`, the `domains` SMTP credentials, the `users` second factors and `oauth_states.pkce_sealed`; the registry names exactly the sealed columns of `0001_init.sql` (those ending `_enc` or `_sealed`, and `signing_keys.ciphertext`) | section 6.2 |
+| `it::security::mail_reads_audited` | A platform key and a partner key reading a message, its raw MIME, an attachment, a thread and a search each write one `mail.read` audit row (target and route, no content) before the response; a tenant or identity key's reads write none; with the audit insert failing, the platform key's read gets `503 unavailable` and returns no content | section 3.6, [ADR 0016](../adr/0016-plan-items-changed-for-v1.md) |
+| `it::secrets::master_key_rotation` | With a key in each slot and `PM_MASTER_KEY_ACTIVE` switched to the new one, old and new ciphertexts open, new ones use the new kid; `GET /v1/platform/status` reports `remaining` falling to 0, `activated_at` and then `resealed_at` (a second rotation inside 30 days of `resealed_at` is refused, even when `activated_at` is older); a D1 state from before the rotation (restored from a snapshot) still opens and is re-sealed; with only the active slot set, a ciphertext of the overwritten key reports `secret_unavailable`; and the sweep re-seals every column of the sealed-column registry, with one case per registered column: `signing_keys` (the `web_bot_auth` seed too), the webhook secrets, `identity_keys`, the `domains` SMTP credentials, the `users` second factors and `oauth_states.pkce_sealed`; the registry names exactly the sealed columns of `0001_init.sql` (those ending `_enc` or `_sealed`, and `signing_keys.ciphertext`) | section 6.2 |
 | `it::secrets::rotate_master_reseals_identity_keys` | Assertions signed before and after a master-key rotation verify with the same public key and kid | [O8](../edge-cases.md) |
 | `core::jwk::thumbprint_rfc8037_vector`, `core::jwt::eddsa_rfc8037_vector`, `core::httpsig::signature_base_rfc9421` | The RFC 8037 thumbprint and signing vectors; RFC 9421 signature bases, an IDN host as its A-label, non-ASCII components refused | section 7.1, [O10](../edge-cases.md) |
 | `it::assertions::sdk_verifies` | The SDK verifier accepts a fresh assertion and rejects a wrong audience, an expired token, an unknown kid and `alg: none`; a token whose `sub` is `../../v1/links/{token}?`, or any value not matching `^idn_[0-9A-HJKMNP-TV-Z]{26}$`, is rejected as `Malformed` with no request made (the test's HTTP recorder sees none); a JWKS answer that is a redirect, or whose `Content-Type` is not `application/jwk-set+json`, is rejected and the redirect is not followed | section 3.8, [O27](../edge-cases.md) |
@@ -1348,10 +1402,11 @@ the reporter, and fixes for the latest release only until 1.0. The process behin
 ## 16. Pre-release checklist
 
 Before v1.0 (PRD release criteria 5 and 7) and before every release that is promoted from pre-release,
-this checklist is a gate, not a reminder: `cargo xtask release-gate` in the release workflow's `publish`
-job refuses to promote until `release-gates/v{version}.md`, committed on the tagged commit, ticks every
-item below with a link to its evidence, and until the items it can check itself hold (the gate, staging
-and live jobs of the same run, the SBOMs, signatures and attestations in the run's artefacts, no open
+this checklist is a gate, not a reminder: `cargo xtask release-gate` in the `publish` job of
+`release-publish.yml` refuses to promote until `release-gates/v{version}.md`, committed on the tagged commit, ticks every
+item below with a link to its evidence, and until the items it can check itself hold (the tag's
+`release.yml` gate and this run's staging and live jobs, the SBOMs, signature and attestations on the
+release, no open
 `fuzz-crash` issue, no open CodeQL alert of high severity; [Rust workspace › xtask](rust-workspace.md#9-xtask)).
 The owner ticks the file; there is no second person, so the evidence links are what a later reader, or
 an independent agent verifying the release, checks.

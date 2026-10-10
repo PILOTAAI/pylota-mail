@@ -545,7 +545,15 @@ For `Send`:
    recipients, their suppressions and the tenant's send-block entries (each list bound as one JSON array).
    If the identity is now `paused` or `deleting`, the tenant `suspended`, or its partner `suspended`
    ([J13](../edge-cases.md)), call `Cancel` with actor `system` (status `canceled`, `message.canceled`,
-   audit entry `message.cancel` with the reason, the `sends` hold released) and ack.
+   audit entry `message.cancel` with the reason, the `sends` hold released) and ack. If `Cancel` answers
+   `NotCancelable`: with an active transport claim, ack (the claimed attempt settles the message); with
+   deliveries already `submitted` (an SMTP relay that deferred only some recipients), re-enqueue with the
+   `Paused` back-off, so the remaining recipients go out if the identity and tenant are active again
+   within 24 hours of submit and otherwise end `failed` (`quota_exhausted`), as every back-off does. While
+   the deployment is frozen, or the `read_only` switch is on (except for a send from the system identity,
+   so sign-in, invitation and alert email still leave), or the `free_sending` switch is off for a
+   Free or ramped workspace, the consumer re-enqueues the message with a delay instead (300 s, or the
+   `Paused` back-off for `free_sending`) and cancels nothing ([Observability § 5.6](observability.md#56-automatic-containment)).
 2. **`BeginTransport { message_id, domain_state, fallback, suppressed, breaker }`** in the mailbox. It
    decides everything except the claim:
    - status not `queued` → `NotQueued` → ack (a duplicate, or already handled);
@@ -919,8 +927,8 @@ and sent to `pm-outbound` as `TransportEvent`, then handled by the same consumer
 `QuotaRequest::RecordOutcome { identity_id, domain_id, outcome, at, event_id }`, which in one transaction
 first inserts `event_id` into `outcome_events` and, when it is already there (a retried event), does
 nothing and returns the current decision; otherwise it inserts the outcome with the next `seq`, deletes
-rows beyond 1,000 for that identity, increments the tenant's and the sending domain's per-day counters
-(below), and evaluates:
+rows beyond 1,000 for that identity, increments the tenant's per-day counters and the sending domain's
+hourly counters (below), and evaluates:
 
 ```text
 complaints = complained outcomes among the identity's last 1,000 rows
@@ -950,9 +958,8 @@ They are not per identity and `ForgetIdentity` leaves them, so they count every 
 workspace was created, which the per-identity `outcomes` rows cannot (they keep 1,000 per identity and are
 deleted with the identity). `OutcomeRates { since }` sums them over the UTC days from the day of `since`
 for the new-workspace send ramp ([Cloud sign-up › New-workspace send ramp](cloud-signup.md#101-new-workspace-send-ramp)).
-They are never pruned (three rows a day at most); tenant erasure's `delete_all` removes them. The same
-three counters per sending domain (`outcomes:dom:{domain_id}`, …) are kept for 8 days for the domain
-pause below.
+They are never pruned (three rows a day at most); tenant erasure's `delete_all` removes them. Per sending
+domain the counters are hourly instead ([Per-domain outcome counters](#per-domain-outcome-counters)).
 
 ### Tenant and domain auto-pause (G12)
 
@@ -986,6 +993,31 @@ pause if complained / outcomes ≥ policy.abuse.tenant_complaint_rate_pause   (d
   with `"sending_paused": false` (any other key gets `403 scope_denied` with
   `details.field = "sending_paused"`), audit-logged. The counters keep their history, so a tenant that
   is still above the rates after a resume is paused again by its next outcome.
+
+### Per-domain outcome counters
+
+`RecordOutcome` also increments `outcomes:dom:{domain_id}`, and `bounced:dom:{domain_id}` or
+`complained:dom:{domain_id}`, in the window of the UTC hour of `at` (`domain_id` is the sending domain the
+delivery used: the platform domain for a fallback send; with no domain nothing is counted), and deletes
+that domain's windows older than 8 days. Outcomes of the system identity are not added. From these windows
+it sums the domain's last 7 UTC days for the domain pause above, and its last hour and last 24 hours for
+the rest:
+
+- **Alerts.** `bounce_alert` when bounced/outcomes > 2% with ≥ 50 outcomes in the hour, and
+  `complaint_alert` when complained/outcomes > 0.1% with ≥ 200 outcomes in 24 hours. The delivery-event
+  consumer reports them as the state alerts `bounce_rate:{tenant_id}:{domain_id}` and
+  `complaint_rate:{tenant_id}:{domain_id}` ([Observability § 5.3](observability.md#53-alert-list)).
+- **Burst pause.** The 7-day rates need 500 outcomes, so a burst from a young workspace could harm the
+  shared reputation before they apply. `pause_tenant` is therefore also `Some(AbuseBurst)` when, for one
+  of the tenant's domains, bounced/outcomes > 10% with ≥ 200 outcomes in the hour, or
+  complained/outcomes > 0.6% with ≥ 1,000 outcomes in 24 hours. These are above the alert thresholds and
+  above the identity pause thresholds (5% and 0.3%), so the identities that cause it are normally paused
+  first, and this catches abuse spread over many identities. The consumer applies it as the tenant pause
+  above with `sending_pause_reason = 'abuse_burst'`, writes `tenant.auto_pause` and reports
+  `containment:tenant_paused` instead of `sending_pause`
+  ([Observability § 5.6](observability.md#56-automatic-containment)). It stops sending only: unlike a
+  suspension, inbound mail is still accepted, so nothing senders retry is lost while the operator looks,
+  and the system identity's mail still leaves.
 
 **The system identity is exempt.** For the identity with `is_system = 1` the consumer still records each
 outcome but never runs the pause: pausing it would stop every sign-in, invitation and notification email
@@ -1265,10 +1297,10 @@ pub enum QuotaRequest {
                                                      // tenant_cap None
     RecordOutcome { identity_id: String, domain_id: Option<String>, outcome: Outcome, at: i64,
                     event_id: String },              // idempotent by event_id (outcome_events): the identity's
-                                                     // abuse windows (outcomes rows), the tenant's and the
-                                                     // sending domain's per-day counters, and the tenant and
-                                                     // domain pause evaluation (G12)
-                                                     // → { pause_identity, pause_tenant, pause_domain }
+                                                     // abuse windows (outcomes rows), the tenant's per-day
+                                                     // and the sending domain's hourly counters, the tenant
+                                                     // and domain pauses (G12) and the domain alerts
+                                                     // → OutcomeDecision
     OutcomeRates { since: i64 },                     // the daily ramp evaluation (Cloud sign-up § 10.1): sums
                                                      // the tenant's outcome counters over the UTC days from
                                                      // since's day → { outcomes, bounced, complained }
@@ -1329,6 +1361,13 @@ pub enum ReserveAnswer {
                                                                        //   details.cap = scope; resets_at None
                                                                        //   only for BillingDispute
 }
+pub struct OutcomeDecision {               // RecordOutcome; a retried event_id answers the current state
+    pub pause_identity: bool,              // the identity thresholds (FR-DLV-3)
+    pub pause_tenant: Option<PauseCause>,  // the 7-day rates (G12) or the burst rule
+    pub pause_domain: bool,                // the 7-day rates of a tenant domain (G12)
+    pub bounce_alert: bool, pub complaint_alert: bool,   // bounce_rate / complaint_rate:{tenant}:{domain}
+}
+pub enum PauseCause { AbuseThreshold, AbuseBurst }       // tenants.sending_pause_reason
 pub enum SystemMailAnswer { Ok, Spent { scope: String } }   // scope: the budget spent (recipient, network,
                                                             // asn, tenant, class or day); Cloud sign-up § 10.2
 pub enum HoldAnswer { Held(Held), Denied(Denied) }
@@ -1477,6 +1516,7 @@ Agent        API handler      IdentityMailbox     pm-outbound consumer   Cloudfl
 | `core::ses::sigv4_vectors`, `core::sns::verify_v2_vectors`, `it::ses::sns_tampered_rejected` | S8: SigV4 and SNS verification; `SignatureVersion` 1, a wrong host or topic and a stale timestamp are refused on `/hooks/ses` |
 | `it::send::sends_hold_with_daily_cap` | Step 18 takes the `sends` hold and the daily reserve together; a `402` keeps neither; a lock failure releases both; a back-off extends the hold; the transport outcome settles it (FR-BILL-4, FR-BILL-5) |
 | `core::smtp::state_machine` | Every row of the SMTP outcome table: no `STARTTLS` → refused before `AUTH`, `535` → `sender_domain_unavailable`, `5xx` on one `RCPT` → that delivery `rejected`, `4xx` on some `RCPT`s → `DATA` still sent to the others and `Accepted` with those recipients in `deferred` (the message stays `queued`), `4xx` on every `RCPT` → no `DATA` and a retry ([N14](../edge-cases.md), [N16](../edge-cases.md), [N20](../edge-cases.md)) |
+| `it::smtp::paused_partial_send_backoff` | An SMTP send with one recipient deferred and one `submitted`, whose identity is then paused: the consumer's `Cancel` answers `NotCancelable`, the message is re-enqueued with the `Paused` back-off (not canceled), the deferred recipient is sent once the identity is resumed within 24 hours, and ends `failed` (`quota_exhausted`) otherwise |
 | `it::smtp::uncertain_after_final_dot` | Connection dropped after the final `.` → `uncertain`, never resent ([N15](../edge-cases.md)) |
 | `it::smtp::probe_unaligned_falls_back` | Failing probes → `failing` → the next send uses the platform address; no relay send before the first passing probe ([N18](../edge-cases.md), FR-DOM-6) |
 | `it::smtp::parallel_cap` | A batch of 10 SMTP sends never has more than four sockets open at once |

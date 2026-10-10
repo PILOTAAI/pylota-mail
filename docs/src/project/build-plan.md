@@ -207,10 +207,10 @@ environment named in brackets. Nothing in this table is ever committed.
 
 | Item | Who provides it | Needed by | Secret or config name |
 |---|---|---|---|
-| Production: Pylota's existing Cloudflare account, on the Workers Paid plan ("shared, tightened", [ADR 0010](adr/0010-cloud-in-the-existing-cloudflare-account.md)). Staging and the spikes: a **separate** Cloudflare account on the Workers Paid plan, because setup uses fixed resource names (`pylota-mail`, `pylota-mail-blobs`, `pm-*`) and production's tokens list only production's zones | Owner (TREFT LTD) | M1 (every spike except S10 and S13, in the staging account), M18 nightly evaluations, M20 | `CLOUDFLARE_ACCOUNT_ID` (local); `PM_CF_ACCOUNT_ID` (written by `pmail setup`); Actions: `PM_EVAL_CF_ACCOUNT_ID`, `STAGING_CLOUDFLARE_ACCOUNT_ID` [`staging`] |
+| Production: Pylota's existing Cloudflare account, on the Workers Paid plan ("shared, tightened", [ADR 0010](adr/0010-cloud-in-the-existing-cloudflare-account.md)). Staging and the spikes: a **separate** Cloudflare account on the Workers Paid plan, because setup uses fixed resource names (`pylota-mail`, `pylota-mail-blobs`, `pm-*`) and production's tokens list only production's zones | Owner (TREFT LTD) | M1 (every spike except S10 and S13, in the staging account), M20 | `CLOUDFLARE_ACCOUNT_ID` (local); `PM_CF_ACCOUNT_ID` (written by `pmail setup`); Actions: `STAGING_CLOUDFLARE_ACCOUNT_ID` [`staging`] |
 | The `pylotamail.com` zone in the production account (bought 2026-10-09, [Cloud sign-up §2](design/cloud-signup.md#2-hostnames)); in the staging account, a staging platform zone apex and a **staging tenant zone** (a second apex, listed in the live suite's test tenant's `domains.cloudflare_zones`, for M20 step 4's zone subdomain and zone apex) | Owner | M1 (S2, S7, S9 use a scratch zone or the staging zones), M20 | `PM_PLATFORM_DOMAIN`, `PM_API_HOST`, `PM_CONSOLE_HOST` in `deploy/wrangler.toml`; Actions: `STAGING_TENANT_ZONE` [`staging`] |
 | The setup API tokens, with the permissions and scopes in [Deploy › step 2](../self-hosting.md#2-create-a-cloudflare-api-token): a short-lived first-run token with Workers Admin at product scope (it creates the Worker and its Custom Domain, then is deleted), then a deploy token with per-Worker Editor on `pylota-mail` and specific zones only; and the Worker's token, limited to named zones (on production `pylotamail.com` and `pylota.io`, with `domains.allow_create_zone` off) | Owner | M1, M20 | `CLOUDFLARE_API_TOKEN` (local, used by `pmail` and Wrangler); `PM_CF_API_TOKEN` (Worker secret, a separate token with the "Worker token" permissions of that table, stored by the operator with `wrangler secret put`, [Deploy › Domains on Cloudflare](../self-hosting.md)); Actions: `STAGING_CLOUDFLARE_API_TOKEN` [`staging`] |
-| A Workers AI API token for the nightly evaluations | Owner | M18 | Actions: `PM_EVAL_CF_API_TOKEN` (repository secret, Workers AI read only) |
+| A separate Cloudflare account for the nightly evaluations (Workers Paid), and an API token on it with exactly Workers AI · Read, Workers AI · Edit and Vectorize · Edit ([Testing § 9.2](design/testing.md#92-running)) | Owner | M18 | Actions: `PM_EVAL_CF_ACCOUNT_ID` and `PM_EVAL_CF_API_TOKEN` (repository secrets). Never the production account: Vectorize permissions are account-wide |
 | A Cloudflare Enterprise account (optional) | Owner, through Cloudflare sales | S10 only | `S10_CLOUDFLARE_ACCOUNT_ID`, `S10_CLOUDFLARE_API_TOKEN` in `spikes/.env`. **S10 may be skipped:** without it `delegated_subdomain` stays off (`PM_CF_SUBDOMAIN_SETUP=off`) and the spike result says "skipped, no Enterprise account" |
 | Two AWS accounts with SES production access in `eu-west-2` (London, decided 2026-10-09), on the à la carte plan: one for production and one for staging and the spikes. One region of one account holds one receiving deployment (`pmail setup ses` refuses a second, [Domains on any DNS host §4.2](design/domain-connections.md#42-deployment-set-up-for-ses)) | Owner; production access is requested in the AWS console and approved by AWS, which can take a day | S8, S11, then M23 and M20 step 5 | `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, or `AWS_PROFILE` (local); `PM_SES_ACCESS_KEY_ID` and `PM_SES_SECRET_ACCESS_KEY` (Worker secrets, written by `pmail setup ses`); Actions: `STAGING_AWS_ACCESS_KEY_ID`, `STAGING_AWS_SECRET_ACCESS_KEY` [`staging`] |
 | Two real SMTP submission providers (for example a Google Workspace mailbox and a Microsoft 365 mailbox), each with a sending account on a test domain | Owner | S12 | `S12_SMTP_A_HOST`, `S12_SMTP_A_USERNAME`, `S12_SMTP_A_PASSWORD`, and the same for `S12_SMTP_B_*`, in `spikes/.env` |
@@ -219,13 +219,13 @@ environment named in brackets. Nothing in this table is ever committed.
 | A staging platform key (90-day expiry) | Created by the agent with `pmail keys create` on staging; stored by a person | M20 | Actions: `STAGING_PLATFORM_KEY` [`staging`] |
 | A Stripe account in test mode | Owner | M22 (recorded fixtures), M20 step 11 | `PM_STRIPE_SECRET_KEY` (a restricted key, `rk_test_…`) and `PM_STRIPE_WEBHOOK_SECRET` (Worker secrets on staging); Actions: `STAGING_STRIPE_SECRET_KEY`, `STAGING_STRIPE_WEBHOOK_SECRET` [`staging`]; `STRIPE_SETUP_KEY` (a test-mode restricted key on the owner's machine for `cargo xtask stripe-setup`, [Billing › Stripe account setup](design/billing.md#stripe-account-setup)) |
 | A Google OAuth client and a GitHub OAuth app, with redirect URLs on the staging and production console hosts | Owner | M24 (its gate re-reads both providers' documentation), M20 step 10 | `PM_OAUTH_GOOGLE_CLIENT_ID`, `PM_OAUTH_GITHUB_CLIENT_ID` (variables); `PM_OAUTH_GOOGLE_CLIENT_SECRET`, `PM_OAUTH_GITHUB_CLIENT_SECRET` (Worker secrets) |
-| The minisign release key pair, generated offline by a person (`minisign -G`) | Owner | M19 | Secret key: Actions `MINISIGN_SECRET_KEY` and `MINISIGN_PASSWORD` [`release`]. Public key: compiled into `pmail` as the `current` key ([CLI and setup §8.2](design/cli.md#82-signature-and-checksums)); a second key pair becomes `next` before the first rotation |
+| The minisign release key pair, generated offline by the owner (`minisign -G`) | Owner | M19 | Secret key: never in GitHub or any online store; kept on an encrypted removable drive (two copies) with its password in the owner's password manager, and used only by `cargo xtask release sign` on the owner's machine ([Security § 11](design/security.md#11-supply-chain)). Public key: compiled into `pmail` as the `current` key ([CLI and setup §8.2](design/cli.md#82-signature-and-checksums)); a second key pair becomes `next` before the first rotation |
 | The GitHub environment `production` (deployments from `main` only; the owner is the only person who can start `cloud-deploy.yml`) | Owner | M19 (site deploy); the Cloud rollout after v1.0 | Actions [`production`]: `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` for `site.yml`, a token with the per-Worker Editor role on `pylota-mail-site` and Workers Routes · Edit on the `pylotamail.com` zone, nothing else (the header of `.github/workflows/site.yml`); `PROD_CLOUDFLARE_API_TOKEN` and `PROD_CLOUDFLARE_ACCOUNT_ID` for `cloud-deploy.yml`, a token with the "Your token" permissions of [Deploy › step 2](../self-hosting.md#2-create-a-cloudflare-api-token), except that account-wide Workers Scripts · Edit is replaced by the per-Worker Editor role on the Cloud Worker and the zones are named, never **All zones**. The account is shared with Pylota, so neither token may reach Pylota's Workers or zones |
 | Terms of service, privacy notice and data processing agreement for Pylota Mail Cloud, published by TREFT LTD | Owner (TREFT LTD) | M24 (sign-up does not start without them), M20 step 10 | `PM_TERMS_URL`, `PM_PRIVACY_URL`, `PM_DPA_URL` and `PM_TERMS_VERSION` (variables on staging and production) |
 | Stripe live mode for TREFT LTD: business details, bank account and identity checks done, Stripe Tax on, and the UK VAT registration date | Owner | Cloud launch after M20 (no milestone waits for it) | `STRIPE_SETUP_KEY` (a live restricted key on the owner's machine, for `cargo xtask stripe-setup --live --vat-from <date>`); `PM_STRIPE_SECRET_KEY` and `PM_STRIPE_WEBHOOK_SECRET` (Worker secrets on production) |
 | The Email Sending daily quota that the Cloudflare dashboard shows for the account shared with Pylota | Owner | M24 (system-mail budgets and the shared-domain breaker), M20 | `PM_DAILY_SEND_QUOTA` (variable on staging and production); updated when Cloudflare raises the quota |
 | Optional: registration of the production deployment's Web Bot Auth key directory (`https://{PM_API_HOST}/.well-known/http-message-signatures-directory`) with Cloudflare's verified-bot programme (dashboard, "Bot Submission Form", verification method "Request Signature"; [Deploy › Signed HTTP requests](../self-hosting.md#signed-http-requests-web-bot-auth)) | Owner, after M25 ships with S13 passed and `PM_WEB_BOT_AUTH=on` | No milestone or test: signatures verify for any Web Bot Auth verifier without it, and S13 expects the unregistered `401` | None (a dashboard form; nothing to store) |
-| The GitHub repository `PILOTAAI/pylota-mail` (created 2026-10-09), with Actions enabled, the environments `staging` (one required reviewer, `main` and `v*` tags only) and `release` (`v*` tags only), and branch protection on `main` | Owner | M0 | Actions: `CARGO_REGISTRY_TOKEN` [`release`], for `cargo publish`; every other secret above |
+| The GitHub repository `PILOTAAI/pylota-mail` (created 2026-10-09), with Actions enabled, the environments `staging` (the owner as its one required reviewer, with "Prevent self-review" left off, which is GitHub's default, so the owner approves the runs they start; `main` and `v*` tags only), `release` (`v*` tags only) and `ops` (`main` only; the heartbeat's keys), and branch protection on `main`. GitHub applies environment protection rules on Free, Pro and Team plans only to public repositories ([Managing environments for deployment](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments), read 2026-10-10), so the repository is public or on a plan that has them | Owner | M0 | Actions: `CARGO_REGISTRY_TOKEN` [`release`], for `cargo publish`; `HEARTBEAT_KEY` and `HEARTBEAT_MAIL_TEST_KEY` [`ops`], created on production after M20 ([Observability § 5.5](design/observability.md#55-alert-email-and-the-external-heartbeat)); every other secret above |
 
 A milestone whose prerequisite is missing stops and reports which row is missing. It never substitutes a
 fake for a spike's real provider.
@@ -876,20 +876,28 @@ also needs S11; without it, `smtp_relay` ships with `inbound: forward` only. `cl
 
 **Implements:** FR-PRV-1–6, FR-IDN-4, NFR-PRV-1, and partner deletion after its tenants' erasure (FR-KEY-4).
 
-**Acceptance:** F6, I1–I7, the `reparse` job that J3 starts (J3 itself is accepted with M17 Completion,
+**Acceptance:** F6, I1–I7, I11–I13 (`it::erasure::i11_inflight_copies`,
+`it::erasure::i12_provider_suppressions`, `it::jobs::i13_finalise_on_fail_and_cancel`), the tenant-scope hold behaviour of I2
+(`it::erasure::i2_hold_tenant_scope`, with the global job's `held_erasures` step), the staging lifetime of
+J7 (`it::inbound::j7_staging_outlives_dlq`, with the 15-day lifecycle rule and the daily re-queue of the
+`staging` step), batched D1 deletes (`it::erasure::batched_deletes`), the `reparse` job that J3 starts (J3 itself is accepted with M17 Completion,
 which adds its start through `POST /v1/platform/jobs`), plus every erasure scope with receipt counts and
 empty probes (identity and tenant scope also delete `identity_keys` and write `key_tombstones`; with M25
 this is O7), J12 (a partner whose tenants are all erased can be deleted, softly, and not before:
 `it::partners::j12_delete_with_tenants`), I8 (writes to an `erasing` or `erased` tenant refused for
 non-platform keys, reads kept for its partner key, a second tenant-scope erasure answered `200` or
-`409 tenant_erased`, and the tenant's idempotency records deleted by `tenant_id`:
-`it::erasure::i8_erasing_tenant_frozen`), J18's erased-tenant case (an `erased` tenant frees its place
+`409 tenant_erased`, a failed tenant erasure resumed at its failed step by a new request, and the
+tenant's idempotency records deleted by `tenant_id`: `it::erasure::i8_erasing_tenant_frozen`), a failed
+erasure of any scope resumed by a new request for the same scope and target (`it::erasure::resume_failed_any_scope`), J18's erased-tenant case (an `erased` tenant frees its place
 under `max_tenants`, in `it::partners::j18_partner_limits`), the optional backup copy (`it::retention::backup_copy`), and
 `it::logs::i5_no_content_in_logs`, which greps captured Worker logs for any test-message body string and
 any test address. I10 (`it::erasure::race_with_index_jobs`) and A15
 (`it::security::a15_system_mailbox_unreachable`: the system identity's mail stays out of tenant search,
 agentic tools, exports and tenant endpoints). NFR-PRV-1: in a time-controlled harness every erasure scope completes within 24 hours,
-and a step that keeps failing still produces a receipt (`it::erasure::step_retry_and_fail`). Tenant scope
+and a step that keeps failing is retried until 20 hours after the request, pages `erasure_stalled`
+on its third failure and still produces a receipt (`it::erasure::step_retry_and_fail`); every job runs
+`finalise` when it fails or is canceled; the `CounterpartyHash` target of `ErasurePlan` matches what
+`Counterparty` matches (used by M17's re-applied erasures). Tenant scope
 runs its steps in order, `cancel_billing` second (`it::erasure::tenant_scope_order`). `remove_domains`
 runs M13's `domain_remove` steps inline, including `delete_ses_identity` (the failover SES identity and
 its three DKIM CNAMEs), and a domain removal that M13 queued behind the stub now runs
@@ -900,8 +908,8 @@ name gets a new row and the old monitor is retired: `it::domains::h13_readd_new_
 14-day expiry, which finish through removal: `it::domains::h14_unverified_claims`) and H16 (the hourly
 cleanup of a failed add: `it::domains::h16_failed_add_cleanup`). The global retention job ([Privacy
 §5.3](design/privacy.md#53-global-retention-job)) lands with its framework and the steps whose tables
-have writers by now: `idempotency`, `platform_events`, `jobs`, `usage`, `dlq`, `signing_keys`, `staging`
-and `audit` (`it::retention::global_job_steps`). Its other steps are added by the milestones that write
+have writers by now: `idempotency`, `platform_events`, `jobs`, `usage`, `dlq`, `signing_keys`, `staging`,
+`held_erasures` and `audit` (`it::retention::global_job_steps`, `it::erasure::i2_hold_tenant_scope`). Its other steps are added by the milestones that write
 their tables, each with its own test: `console` in M21, `billing_events` in M22, `ses_ingest` in M23,
 `signup` in M24 and `identity_keys` in M25.
 
@@ -971,11 +979,18 @@ signing tools of M25 (`mail_sign_assertion`, `mail_sign_http_request`). M27 late
 (alert rules, pure), `handlers/platform.rs`
 (the platform API: `GET /v1/platform/dlq`, `POST /v1/platform/dlq/{dlq_id}/redrive`,
 `POST /v1/platform/jobs`, `GET /v1/platform/jobs/{job_id}`, `POST /v1/platform/keys/{purpose}/rotate`, all
-`platform:ops`), `crates/core/src/sealed.rs` (the registry of sealed columns, pure), `ops/reseal.rs` (the
-re-seal sweep that the `*/15` cron runs), CLI `dlq list|redrive` and `secrets rotate-master`. There is no
+`platform:ops`; `GET /v1/platform/status` (`audit:read`), whose `master_key` block lands in M17
+Foundation and the rest in M17 Completion; and in M17 Completion `PUT /v1/platform/switches`, `POST /v1/platform/identities/{identity_id}/restore` and
+`POST /v1/platform/erasure-requests/{erasure_id}/reapply`),
+`ops/{alert_email.rs, containment.rs, switches.rs, freeze.rs, restore.rs, capacity.rs}` (the restore
+tooling: the freeze, mailbox PITR externs on `Storage::as_raw()` and the `restore_reconcile` job),
+`crates/core/src/{sqldump.rs, schema.rs}`, CLI `ops status|switch|freeze|unfreeze|restore` and
+`erasure retry|reapply` ([CLI and setup § 20](design/cli.md#20-ops)),
+`.github/workflows/heartbeat.yml`, `crates/core/src/sealed.rs` (the registry of sealed columns, pure), `ops/reseal.rs` (the
+re-seal sweep that the every-minute cron runs), CLI `dlq list|redrive` and `secrets rotate-master`. There is no
 internal-only handler: the CLI uses the public platform API.
 
-**Implements:** FR-OPS-4, NFR-OPS-2, NFR-COST-1 and [Observability](design/observability.md).
+**Implements:** FR-OPS-4, NFR-OPS-2, NFR-OPS-3, NFR-COST-1 and [Observability](design/observability.md).
 
 M17 is accepted in two halves, without renumbering ([Dependency graph](#dependency-graph)).
 
@@ -989,8 +1004,10 @@ M17 is accepted in two halves, without renumbering ([Dependency graph](#dependen
   and `it::ops::alert_evaluator_transitions`. M9's G3 (`it::ops::provider_quota_80`) and M23's N26
   (`ses_identities_90pct`, checked by `it::ops::ses_alerts`) fire through them and are accepted there.
 - The master-key rotation ([Security §6.2](design/security.md#62-rotation-procedures)):
-  `PM_MASTER_KEY_NEXT`, the re-seal sweep over the registry in `crates/core/src/sealed.rs`, and
-  `pmail secrets rotate-master`, whose count query is built from the same registry:
+  the two master-key slots (`PM_MASTER_KEY`, `PM_MASTER_KEY_B`, `PM_MASTER_KEY_ACTIVE`), the
+  every-minute re-seal sweep over the registry in `crates/core/src/sealed.rs`, the `master_key` block of
+  `GET /v1/platform/status` (whose `remaining` count is built from the same registry) and
+  `pmail secrets rotate-master`:
   `it::secrets::master_key_rotation` and `cli::secrets::rotate_master` for the columns registered so far.
   Each milestone that writes a sealed column registers it and extends the test
   ([Shared files](#dependency-graph)).
@@ -1003,8 +1020,18 @@ M17 is accepted in two halves, without renumbering ([Dependency graph](#dependen
 - Every SLO of [Observability §4](design/observability.md#4-service-level-objectives) is computed from emitted metrics
   (`it::ops::slo_from_metrics`): NFR-REL-1–4, NFR-PERF-1–6 and NFR-PRV-1, including those that need
   later milestones (NFR-PRV-1 needs M14's erasure, NFR-PERF-6 M11's agentic search).
-- NFR-OPS-2: `it::ops::restore_rebuilds_ledger`, and the restore runbook that `live::ops::restore_drill`
-  runs in M20.
+- NFR-OPS-2, I6 and the restore tooling: `it::ops::freeze_holds_everything`,
+  `it::ops::restore_replays_changes`, `it::ops::restore_rebuilds_ledger`, `it::erasure::i6_reapply_by_hash`,
+  `cli::ops::sqldump_parses_export`, `cli::ops::restore_replay_diff`, `cli::ops::freeze_unfreeze`, and the
+  restore runbook that `live::ops::restore_drill` runs in M20.
+- NFR-OPS-3 and the solo-operator controls ([ADR 0015](adr/0015-solo-operator.md)): alert email and the
+  heartbeat (J32: `it::ops::j32_alert_channels`, `it::ops::heartbeat_missing`), automatic containment
+  (J33: `it::ops::j33_auto_containment`), `job_failed:{kind}` (`it::ops::job_failed_alerts`), the
+  per-domain bounce and complaint state alerts (`it::ops::domain_rate_state_alerts`), capacity (J30:
+  `it::ops::j30_d1_capacity`, J31: `it::ops::j31_vector_capacity`), `GET /v1/platform/status`
+  (`it::ops::platform_status`), `cli::erasure::retry`, and the audit of platform- and partner-key mail
+  reads (`it::security::mail_reads_audited`). The heartbeat workflow runs against staging in M20
+  (`live::ops::heartbeat_workflow`).
 - NFR-COST-1: the generated `wrangler.toml` declares no always-on compute (no Containers, no binding
   that bills while idle beyond storage), checked by `xtask::template_no_idle_compute`; the idle-cost
   review runs in M20.
@@ -1014,22 +1041,27 @@ M17 is accepted in two halves, without renumbering ([Dependency graph](#dependen
 ## M18 · Quality gates (after M10–M12)
 
 **Files:** `crates/conformance/golden/` (a generator for about 5,000 synthetic messages plus labelled
-queries), `xtask eval-search`, `xtask eval-agentic`, `xtask eval-triage`.
+queries), `xtask eval-setup`, `xtask eval-search`, `xtask eval-agentic`, `xtask eval-triage`.
 
 **Implements:** NFR-QUAL-1–3.
 
 **Acceptance:** recall@10 ≥ 0.90 (hybrid), citation precision ≥ 0.98, and triage accuracy ≥ 0.85.
-These figures are measured on the golden set using real Workers AI models in a nightly CI job with an
-API token, and recorded in `docs/src/project/quality.md` (created by this milestone). CI fails on a
-regression of more than 1 point.
+These figures are measured on the golden set using real Workers AI models in a nightly CI job, in the
+separate evaluation account with the token and the freshly created `pm-mail-chunks-eval` index of
+[Testing § 9.2](design/testing.md#92-running) (`cargo xtask eval-setup`, then the REST paths with
+`PM_EVAL_REST = "on"`), and recorded in `docs/src/project/quality.md` (created by this milestone). Each
+suite runs three times and is scored by the median (six runs when the spread exceeds 0.02; still above
+it, the job fails as `unstable`); CI fails when the median drops more than 1 point below the baseline,
+itself the median of five runs. `xtask::eval_median_policy` checks the policy on recorded per-run
+results.
 
 ---
 
 ## M19 · Site, docs and release pipeline (Track 4; the release half after M16)
 
 **Files:** `site/` (exists, with Wrangler pinned in `site/package.json` and `site/package-lock.json`),
-`.github/workflows/{site.yml (exists), release.yml, cloud-deploy.yml}`, `release-gates/`, and the xtask
-commands `release` and `release-gate`.
+`.github/workflows/{site.yml (exists), release.yml, release-publish.yml, cloud-deploy.yml}`, `release-gates/`,
+and the xtask commands `release`, `release sign` and `release-gate`.
 
 **Implements:** the release pipeline of [Rust workspace § 10](design/rust-workspace.md#10-ci-pipeline),
 which is its one definition, and PRD release criterion 7.
@@ -1042,12 +1074,16 @@ which is its one definition, and PRD release criterion 7.
   with the per-Worker token of the `production` environment
   ([Security § 11](design/security.md#11-supply-chain)).
 - `xtask::release_version_matches_tag` and `xtask::release_gate_refuses` pass.
-- The first release candidate, `v1.0.0-rc.1`, is tagged once M16 has landed. Its run produces a GitHub
-  pre-release with `pylota-mail-worker-1.0.0-rc.1.tar.gz`, CLI binaries for macOS (arm64, x64), Linux
-  (x64, arm64) and Windows (x64), the SBOMs, `SHA256SUMS` and `SHA256SUMS.sig` with the trusted comment
-  `pylota-mail v1.0.0-rc.1`, and an attestation for every file; its `staging` job deploys it with
+- The first release candidate, `v1.0.0-rc.1`, is tagged once M16 has landed. Its `release.yml` run
+  produces a draft GitHub Release with `pylota-mail-worker-1.0.0-rc.1.tar.gz`, CLI binaries for macOS
+  (arm64, x64), Linux (x64, arm64) and Windows (x64), the SBOMs, `SHA256SUMS` and an attestation for every
+  file, and no signature. `cargo xtask release sign v1.0.0-rc.1` with the offline key adds
+  `SHA256SUMS.sig` with the trusted comment `pylota-mail v1.0.0-rc.1` and starts `release-publish.yml`,
+  whose `verify` job makes it a pre-release and whose `staging` job deploys it with
   `pmail deploy --version 1.0.0-rc.1`. Its `live` job may fail before M20; a failed run is never
   promoted, and a pre-release never reaches crates.io.
+- `xtask::release_sign_refuses`: `cargo xtask release sign` refuses a file whose checksum does not match
+  or whose attestation is missing or names another workflow or tag, and uploads nothing.
 - `cloud-deploy.yml` refuses a pre-release version and a binary whose attestation does not verify.
 
 ---
@@ -1403,9 +1439,16 @@ the ones marked manual there need a person in a browser and run with `cargo xtas
     names and use Stripe test-mode prices but have small allowances (Free 10 sends, Developer 20 sends, a
     sends top-up of 5), so the allowance is spent in a few sends; the production catalog is never used
     for this.
-12. NFR-OPS-1, a fresh-account rehearsal (`live::ops::fresh_deploy_rehearsal`): a person who did not
-    build it deploys from `self-hosting.md` in under 15 minutes of hands-on time, timed and recorded.
-13. Measured on staging: NFR-REL-3 (`live::slo::inbound_to_webhook`), NFR-PERF-4 with the real models
+12. NFR-OPS-1, a fresh-account rehearsal (`live::ops::fresh_deploy_rehearsal`): a fresh agent session,
+    started with no repository checkout, no memory and no context but `self-hosting.md` and a new
+    Cloudflare account's credentials, deploys from that page alone; the hands-on time it reports (the
+    commands and dashboard steps the page asks a person to do, excluding waiting on Cloudflare) is at
+    most 15 minutes. The session is recorded (its transcript and timings go in the release notes), and
+    every question it had to guess is fixed in the page before the release
+    ([ADR 0015](adr/0015-solo-operator.md)). A paid external tester following the same page is an
+    optional extra, not a requirement.
+13. Measured on staging: the heartbeat workflow (`live::ops::heartbeat_workflow`); NFR-REL-3
+    (`live::slo::inbound_to_webhook`), NFR-PERF-4 with the real models
     (the hybrid figure of `it::bench::hybrid_p95` repeated against staging), NFR-OPS-2
     (`live::ops::restore_drill`) and NFR-COST-1 (`live::ops::idle_cost_review` after a week of idling).
     NFR-REL-2 and NFR-REL-4 are read from the SLO dashboard over the live run.

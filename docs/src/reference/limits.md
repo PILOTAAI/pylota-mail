@@ -157,9 +157,9 @@ From [Notifications and usage alerts](../project/design/notifications.md).
 | Limit | Value | Source |
 |---|---|---|
 | Durable Object SQLite per identity | 10 GB | Cloudflare. Alert at 70%. Raw MIME and attachments live in R2, so this is mostly text and index |
-| D1 database | 10 GB | Cloudflare. Control plane only. Event and delivery logs are pruned after the tenant's `retention.events_days` (default 30) |
-| Vectorize vectors per index | 20,000,000 | Cloudflare. About 4,000–10,000 vectors per 1,000 messages |
-| Vectorize namespaces per index | 50,000 | Cloudflare. One per tenant, so at most 50,000 tenants per index |
+| D1 database | 10 GB; it cannot be raised ([D1 limits](https://developers.cloudflare.com/d1/platform/limits/), read 2026-10-10) | Cloudflare. One database for the whole deployment: control plane only. Event and delivery logs are pruned after the tenant's `retention.events_days` (default 30). Alerts at 70% (ticket) and 80% (page); at 90% event and delivery logs are kept 7 days for every tenant. When full, D1 refuses writes ("Exceeded maximum DB size", [Debug D1](https://developers.cloudflare.com/d1/observability/debug-d1/), read 2026-10-10): API writes get `503 unavailable` (`storage_full`), inbound mail is still accepted and outbox events wait in their mailboxes ([J30](../project/edge-cases.md)). 70% is the trigger to write the sharding ADR |
+| Vectorize vectors per index | 20,000,000 ([Vectorize limits](https://developers.cloudflare.com/vectorize/platform/limits/), last updated 2026-08-05, read 2026-10-10) | Cloudflare. About 4,000–10,000 vectors per 1,000 messages, so roughly 2–5 million messages per deployment. Alerts at 70% and 80% of the count the nightly reconciliation reads. When full, new messages stay keyword-searchable and semantic search reports `degraded` ([J31](../project/edge-cases.md)) |
+| Vectorize namespaces per index | 50,000 | Cloudflare. One per tenant, so at most 50,000 tenants per index. Alerts at 70% and 80% of tenants that are not erased ([J31](../project/edge-cases.md)) |
 | Queue message | 128 KB | Cloudflare. Queues carry pointers only |
 | Queue delay per retry | 24 hours | Cloudflare |
 | Queue retention | 14 days | Cloudflare. Dead-letter items are kept at most 14 days |

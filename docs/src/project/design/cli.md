@@ -3,7 +3,7 @@
 Binding design for `pmail`, the command-line client: configuration, output and exit codes, `setup`,
 `setup ses`, `deploy`, `upgrade`, `doctor`, `destroy`, secret and signing-key rotation, dead-letter
 handling and the client-side behaviour of the mail and admin commands. It implements FR-CLI-1, FR-OPS-1
-to FR-OPS-3, FR-CON-7 and FR-BILL-12, build plan milestone M16, the CLI half of M17 (`dlq`, and `secrets rotate-master` in M17 Foundation), the
+to FR-OPS-3, FR-CON-7 and FR-BILL-12, build plan milestone M16, the CLI half of M17 (`dlq`, and `secrets rotate-master` in M17 Foundation; `ops` and `erasure retry|reapply` in M17 Completion), the
 `deploy --version` acceptance of M19, the CLI parts of FR-DOM-7 to FR-DOM-12 (M23: `domains add
 --method`, `domains update`, `domains probe`, `addresses test-forwarding`, `setup ses`), of FR-CON-8
 (M24: `waitlist invite`), of FR-KEY-4 (M5: `partners`, `keys create --level partner`) and of FR-IDN-6 to FR-IDN-8 (M25: `identity-keys`, `assertions`, `http-sign`,
@@ -76,6 +76,7 @@ pub enum CliError {
     DoctorFailed(u32),                                 // exit 12
     Timeout(String),                                   // exit 13
     Aws { step: &'static str, status: Option<u16>, code: Option<String> }, // exit 14
+    Precondition(String),                              // exit 15
     Interrupted,                                       // exit 130
     Internal(String),                                  // exit 1
 }
@@ -308,8 +309,9 @@ JSON mode prints strings exactly as the API returned them (JSON escaping makes t
 | 10 | `cloudflare` | A Cloudflare API call or Wrangler run failed, or a prerequisite is missing (Node.js 22+, Wrangler) or not met (foreign MX records at the mail domain, `existing_mx`), during `setup`, `setup ses`, `deploy`, `upgrade`, `destroy`, `secrets`, `domains add --local-token` or `domains subscribe`. `doctor` never exits 10: a failed Cloudflare call is a failing check (exit 12) |
 | 11 | `verification` | A release signature or checksum did not verify; `webhooks verify` found no valid signature; `assertions verify` found the assertion invalid |
 | 12 | `doctor_failed` | `doctor` reported at least one `fail` |
-| 13 | `timeout` | `wait` returned `timed_out: true`; a polling step (health, re-seal, erasure, SNS subscription confirmation) passed its deadline |
+| 13 | `timeout` | `wait` returned `timed_out: true`; a polling step (health, erasure, SNS subscription confirmation) passed its deadline |
 | 14 | `aws` | During `setup ses` or `destroy --include-ses`: an AWS API call failed (including access denied), the AWS account is not ready (SES production access missing; the console steps are printed), or it holds another deployment's receipt rule or resources ([N31](../edge-cases.md)) |
+| 15 | `precondition` | A deployment state the command needs is not there: `secrets rotate-master` with an unfinished rotation and no `--resume`, or within 30 days of the previous re-seal without `--discard-previous`; `ops restore d1` while the deployment is not frozen |
 | 130 | `interrupted` | SIGINT or Ctrl-C |
 
 Exit codes are part of the CLI contract ([AGENTS.md](https://github.com/PILOTAAI/pylota-mail/blob/main/AGENTS.md):
@@ -427,7 +429,7 @@ Each step prints `created`, `exists`, `updated` or `skipped` with the resource a
 | 1 | Download and verify the release bundle | GitHub release lookup and downloads ([§8.1](#81-bundle-download), [§8.2](#82-signature-and-checksums)) | An extracted, verified `.bundle/<version>/` is reused |
 | 2 | D1 database `pylota-mail` | `GET /accounts/{a}/d1/database?name=pylota-mail` (filter parameter: verify at build time; otherwise list and match `name`); if absent `POST /accounts/{a}/d1/database` `{"name":"pylota-mail","jurisdiction":"eu"}` (no `jurisdiction` for `default`) | Found by name. If the existing database reports a different jurisdiction, stop: it cannot be moved ([Privacy](privacy.md#3-jurisdiction-and-residency)) |
 | 3 | R2 bucket `pylota-mail-blobs`, and the backup bucket with `--backup-bucket` | `GET /accounts/{a}/r2/buckets/pylota-mail-blobs` with header `cf-r2-jurisdiction: eu`; if `404`, `POST /accounts/{a}/r2/buckets` `{"name":"pylota-mail-blobs"}` with the same header (jurisdiction is a header, not a body field). The same two calls for `{PM_BACKUP_BUCKET}` when it is set, in the same jurisdiction | Found by name in the jurisdiction. A bucket of the same name in another jurisdiction is reported, not reused |
-| 4 | R2 lifecycle rule | `GET …/buckets/pylota-mail-blobs/lifecycle`, then `PUT …/lifecycle` with the existing rules plus `{"id":"pm-inbound-staging","enabled":true,"conditions":{"prefix":"inbound-staging/"},"deleteObjectsTransition":{"condition":{"type":"Age","maxAge":86400}}}` | `PUT` replaces the whole rule set, so the CLI merges: other rules are kept, a rule with id `pm-inbound-staging` is replaced. No `PUT` when it is already identical |
+| 4 | R2 lifecycle rules | `GET …/buckets/pylota-mail-blobs/lifecycle`, then `PUT …/lifecycle` with the existing rules plus `{"id":"pm-inbound-staging","enabled":true,"conditions":{"prefix":"inbound-staging/"},"deleteObjectsTransition":{"condition":{"type":"Age","maxAge":1296000}}}` (15 days, longer than the 14-day dead-letter retention, [J7](../edge-cases.md)) and `{"id":"pm-abort-multipart","enabled":true,"conditions":{"prefix":""},"abortMultipartUploadsTransition":{"condition":{"type":"Age","maxAge":86400}}}` (incomplete multipart uploads aborted after 1 day, [Privacy §9.1](privacy.md#91-job-steps)). Field names from the R2 lifecycle API reference (read 2026-10-10) | `PUT` replaces the whole rule set, so the CLI merges: other rules are kept, rules with these two ids are replaced. No `PUT` when they are already identical |
 | 5 | Queues | `GET /accounts/{a}/queues` (all pages); for each missing name `POST /accounts/{a}/queues` `{"queue_name": …}`. Dead-letter queues first: `pm-inbound-dlq`, `pm-outbound-dlq`, `pm-delivery-events-dlq`, `pm-webhooks-dlq`, `pm-index-dlq`, then `pm-inbound`, `pm-outbound`, `pm-delivery-events`, `pm-webhooks`, `pm-index` | Found by name |
 | 6 | Vectorize index `pm-mail-chunks` | `GET /accounts/{a}/vectorize/v2/indexes/pm-mail-chunks`; if absent `POST /accounts/{a}/vectorize/v2/indexes` `{"name":"pm-mail-chunks","description":"pylota-mail generation=1 embed_model=@cf/baai/bge-m3","config":{"dimensions":1024,"metric":"cosine"}}`. Then `GET …/metadata_index/list` and, for each missing, `POST …/metadata_index/create` `{"propertyName": …, "indexType": …}` for `identity_id` string, `thread_id` string, `sent_at` number, `sender_domain` string, `direction` string, `has_attachment` boolean, `verdict` string, `kind` string ([Data model](data-model.md)) | Found by name. An existing index with other dimensions or metric stops setup. Metadata indexes are created before any vector is written, because vectors written earlier are not filterable ([Search §7.3](search.md#73-re-embed-job-embedding-model-change)) |
 | 7 | Email Routing on the mail domain | `GET /zones/{z}/email/routing`; if not enabled, delete foreign MX records when `--replace-mx` was accepted, then `POST /zones/{z}/email/routing/dns` `{"name": "{mail_domain}"}` (adds and locks the MX and SPF records); then `PATCH /zones/{z}/email/routing` `{"support_subaddress": true}` if it is not already `true` | Read first; each call only when the setting differs |
@@ -762,7 +764,7 @@ repository's template with `--from-source`). The output is the file in
 
 **Choice: minisign** (Ed25519 signatures in the minisign format), verified with the `minisign-verify`
 crate (pin at build time; "a small Rust library with no external dependencies", crates.io, read
-2026-10-09). The `SHA256SUMS.sig` file produced by `cargo xtask release`
+2026-10-09). The `SHA256SUMS.sig` file produced offline by the owner with `cargo xtask release sign`
 ([Rust workspace §9](rust-workspace.md#9-xtask)) is a minisign signature of `SHA256SUMS`.
 
 Why minisign rather than cosign:
@@ -990,10 +992,10 @@ Data sources:
 | `sending.domains` | D1 `SELECT name, zone_id FROM domains WHERE sending = 1 AND transport = 'cloudflare' AND state <> 'removed'`, then `GET /zones/{z}/email/sending/subdomains` per zone (`preview_enabled`) |
 | `sending.event_subscriptions` | `GET /accounts/{a}/event_subscriptions/subscriptions` compared with the same domains and each row's `event_subscription_id` |
 | `bindings` | D1, R2 (with the jurisdiction header), queues and their consumers (`GET /accounts/{a}/queues/{queue_id}/consumers`), the Vectorize index and its metadata indexes, as declared in the rendered file; plus the index generation state of [§8.7](#87-index-generation-changes). A bound index's dimensions are compared with those of the model named in its description (1,024 for `@cf/baai/bge-m3`, otherwise a probe embedding as in §8.7), never with a fixed number, because a re-embed may create an index of another dimension |
-| `secrets` | `GET /accounts/{a}/workers/scripts/pylota-mail/secrets` (names only). `warn` only while `PM_MASTER_KEY_NEXT` is present (an unfinished master-key rotation, [§12.1](#121-secrets-rotate-master)) |
+| `secrets` | `GET /accounts/{a}/workers/scripts/pylota-mail/secrets` (names only): `fail` when a required secret is missing, or when the slot named by `PM_MASTER_KEY_ACTIVE` (default `a`) has no secret; `warn` only while `master_key.remaining` in `GET /v1/platform/status` is above 0 (an unfinished master-key rotation, [§12.1](#121-secrets-rotate-master); `skip` for that part without a key holding `audit:read`) |
 | `observability` | The rendered file's `[observability]` table |
 | `worker.version`, `health` | `GET https://{api_host}/health` |
-| `alerts` | `GET /v1/audit-events?action=alert.fired` and `?action=alert.resolved` with the profile's key (needs `audit:read`; `skip` without it) |
+| `alerts` | `GET /v1/platform/status` with the profile's key (a platform key with `audit:read`; `skip` without one): `fail` on a firing page alert, on `alert_email: missing`, or when `frozen_since` is more than 4 hours ago; `warn` on a firing ticket alert |
 | `dlq` | D1 `SELECT queue, COUNT(*) AS n, MIN(first_seen_at) AS oldest FROM dlq_items WHERE redriven_at IS NULL GROUP BY queue` |
 | `quota` | Workers Analytics Engine SQL API (`POST /accounts/{a}/analytics_engine/sql`; verify at build time) over the `provider_quota_errors_total` points of the last 24 hours ([Observability §3](observability.md#3-metrics)). `warn` when `PM_DAILY_SEND_QUOTA` is unset in the rendered file, with the fix `pmail setup --daily-send-quota <n>` (or set it under `[vars]` and `pmail deploy`). The SQL API needs Account Analytics · Read on the token (Cloudflare's SQL API page, read 2026-10-09); when the call is refused for a missing permission, the check is `warn`, not `fail`, with the fix naming that permission ([Deploy to Cloudflare › step 2](../../self-hosting.md#2-create-a-cloudflare-api-token)) |
 | `ses` | Only when `PM_SES_REGION` is set in the rendered file (otherwise `skip`); needs local AWS credentials ([§2.6](#26-aws-credentials); `skip` without them). `fail` when: SES `GetAccount` shows no production access, or sending paused; `PM_SES_INBOUND_TOPIC_ARN` is set and the active receipt rule set is not `PM_SES_RULE_SET` or does not contain `pm-deliver`; `PM_SES_REGION` is not a receiving region. `warn` when the region is outside the EU and the UK under `PM_JURISDICTION = "eu"` (only possible through `setup ses --allow-non-eu` or a hand edit, [N30](../edge-cases.md)). Identity count: the same count the Worker uses ([Domains on any DNS host §4.3](domain-connections.md#43-dns_records)), from D1 (`SELECT COUNT(*) FROM domains WHERE ses_region IS NOT NULL AND state <> 'removed'`, plus the `domain_onboarding` rows whose journal holds an SES identity, plus 1 for the platform identity) and from `ListEmailIdentities` with the local credentials, whichever is larger. `fail` also when a resource that `setup ses` created no longer carries this deployment's `pylota-mail:api-host` tag, or `pm-deliver` writes to another bucket ([N31](../edge-cases.md)). At 9,000 or more, `warn` `ses_identities_90pct` ([N26](../edge-cases.md)); at 10,000, `fail` (new SES domains are refused with `transport_unavailable`, `ses_identity_limit`). SES allows 10,000 identities per region (SES quotas, read 2026-10-09). Field and call names beyond `GetAccount`: verify at build time |
@@ -1085,8 +1087,9 @@ database or bucket.
    (`DELETE /accounts/{a}/vectorize/v2/indexes/{name}`); the ten queues
    (`DELETE /accounts/{a}/queues/{queue_id}`); the R2 bucket (`DELETE /accounts/{a}/r2/buckets/pylota-mail-blobs`
    with the jurisdiction header), and the `BACKUP` bucket when `PM_BACKUP_BUCKET` is set. R2 refuses to
-   delete a bucket that still holds objects; staging objects expire within a day by the lifecycle rule,
-   so the CLI reports the bucket as pending and a re-run the next day finishes. The tenant erasures of
+   delete a bucket that still holds objects; staging objects expire within 15 days by the lifecycle rule
+   (normally none is left: a staged object is deleted once it is routed), so the CLI reports the bucket
+   as pending and a re-run after they expire finishes. The tenant erasures of
    step 2 sweep the backup bucket too ([Privacy §5.4](privacy.md#54-optional-r2-backup-copy)); an object
    left in it is reported the same way. Last, the D1 database (`DELETE /accounts/{a}/d1/database/{id}`).
 7. Remove the profile's key (it no longer works) and rename `<dir>/wrangler.toml` to
@@ -1099,45 +1102,34 @@ Each step is idempotent; a `404` carrying Cloudflare's own "not found" code coun
 
 ### 12.1 `secrets rotate-master`
 
-The procedure is [Security §6.2](security.md#62-rotation-procedures). The CLI's part:
+`pmail secrets rotate-master [--resume] [--discard-previous] [--yes]`
 
-1. Refuse if `PM_MASTER_KEY_NEXT` already exists (a rotation is in progress) unless `--resume`.
-2. Generate `K2` (32 bytes, OS CSPRNG) and compute `kid(K2)` = first 8 bytes of `SHA-256(K2)`, lower-case
-   hex ([Security §7.2](security.md#72-encryption-envelope)). Upload it with
-   `wrangler secret put PM_MASTER_KEY_NEXT` (value on stdin).
-3. Poll every 60 s through the D1 query API until the count is 0. The query is built from the
-   sealed-column registry (`core::sealed`, [Security §7.2](security.md#72-encryption-envelope)), one term per
-   column; for v1.0 it reads:
+The procedure, with its two key slots, is [Security §6.2](security.md#62-rotation-procedures). The
+CLI's part needs the Cloudflare token (Workers Scripts · Edit, to write secrets) and a platform key with
+`audit:read` (to read `GET /v1/platform/status`); it makes no D1 query.
 
-   ```sql
-   SELECT
-     (SELECT COUNT(*) FROM webhook_endpoints WHERE secret_enc NOT LIKE 'pm1.' || ?1 || '.%')
-   + (SELECT COUNT(*) FROM webhook_endpoints WHERE prev_secret_enc IS NOT NULL
-                                               AND prev_secret_enc NOT LIKE 'pm1.' || ?1 || '.%')
-   + (SELECT COUNT(*) FROM identity_keys WHERE private_enc NOT LIKE 'pm1.' || ?1 || '.%')
-   + (SELECT COUNT(*) FROM signing_keys WHERE ciphertext NOT LIKE 'pm1.' || ?1 || '.%')
-   + (SELECT COUNT(*) FROM domains WHERE smtp_sealed IS NOT NULL
-                                     AND smtp_sealed NOT LIKE 'pm1.' || ?1 || '.%')
-   + (SELECT COUNT(*) FROM domains WHERE smtp_pending_sealed IS NOT NULL
-                                     AND smtp_pending_sealed NOT LIKE 'pm1.' || ?1 || '.%')
-   + (SELECT COUNT(*) FROM users WHERE totp_sealed IS NOT NULL
-                                   AND totp_sealed NOT LIKE 'pm1.' || ?1 || '.%')
-   + (SELECT COUNT(*) FROM users WHERE recovery_codes_sealed IS NOT NULL
-                                   AND recovery_codes_sealed NOT LIKE 'pm1.' || ?1 || '.%')
-   + (SELECT COUNT(*) FROM oauth_states WHERE pkce_sealed NOT LIKE 'pm1.' || ?1 || '.%') AS remaining;
-   ```
+1. Read `master_key` from `GET /v1/platform/status`: `active_slot`, the two slots with `present` and
+   `kid`, `remaining`, `activated_at` and `resealed_at`.
+2. `remaining > 0`: a rotation is unfinished. Without `--resume`, exit 15 with the fix
+   `pmail secrets rotate-master --resume`. With `--resume`, go to step 5.
+3. The inactive slot holds a key and `resealed_at` is less than 30 days ago: exit 15, naming the date
+   from which a rotation is allowed, unless `--discard-previous`, which prints that a D1 restore to before `resealed_at` may no longer
+   open sealed values and asks for confirmation (`--yes` in scripts).
+4. Generate `K2` (32 bytes, OS CSPRNG) and compute `kid(K2)` = first 8 bytes of `SHA-256(K2)`,
+   lower-case hex ([Security §7.2](security.md#72-encryption-envelope)). Write it to the inactive slot
+   (`wrangler secret put PM_MASTER_KEY_B --name pylota-mail`, or `PM_MASTER_KEY` when `b` is active;
+   value on stdin), drop it from memory, then `wrangler secret put PM_MASTER_KEY_ACTIVE` with the slot's
+   letter. A failure between the two writes leaves the old slot active and the new key unused: a re-run
+   without `--resume` writes a fresh key into the same inactive slot.
+5. Poll `GET /v1/platform/status` every 60 s, printing `remaining` and the estimate `remaining / 500`
+   minutes (the every-minute re-seal sweep handles 500 values per run), until `remaining` is 0. Ctrl-C
+   stops the polling only; the sweep continues in the Worker, and `--resume` polls again. There is no
+   deadline.
+6. Print the new active slot and `kid`, and the first date a next rotation is allowed without
+   `--discard-previous` (30 days after `resealed_at`).
 
-   The columns are every value sealed under `PM_MASTER_KEY`, the same registry the Worker's re-seal sweep
-   reads.
-
-   printing the count each time. With `--resume`, `K2` is not known; the CLI reads the target `kid`
-   from the most common `kid` among rows already re-sealed and asks for confirmation.
-4. Upload `PM_MASTER_KEY = K2`, then delete `PM_MASTER_KEY_NEXT` (`wrangler secret delete
-   PM_MASTER_KEY_NEXT --name pylota-mail`), then drop `K2` from memory.
-5. Deadline 24 hours (exit 13; `--resume` continues).
-
-`PM_MASTER_KEY_NEXT` is defined by Security §6.2 and listed in
-[Configuration › Secrets](../../reference/configuration.md#secrets). While it is set, `doctor` warns
+`PM_MASTER_KEY_B` and `PM_MASTER_KEY_ACTIVE` are defined by Security §6.2 and listed in
+[Configuration › Secrets](../../reference/configuration.md#secrets). While `remaining > 0`, `doctor` warns
 (`secrets`).
 
 ### 12.2 Signing keys: `keys rotate thread|link|cursor|web_bot_auth`
@@ -1663,6 +1655,8 @@ have no command: they are set only in the console ([Notifications §2](notificat
 | `suppressions list\|add\|remove` | `GET\|POST /v1/tenants/{t}/suppressions`; `DELETE /v1/tenants/{t}/suppressions/{address}` |
 | `lists list\|add\|remove` | `GET /v1/tenants/{t}/lists/{direction}/{kind}`; `PUT …/{entry}`; `DELETE …/{entry}` |
 | `erasure create\|get\|list` | `POST /v1/erasure-requests`; `GET /v1/erasure-requests/{id}`; `GET /v1/erasure-requests` |
+| `erasure retry` | `GET /v1/erasure-requests/{id}`, then `POST /v1/erasure-requests` with the same `tenant_id`, `scope`, `identity_id` and target (`--address` for counterparty scope) and reason `retry:{era_id}`; the API makes it a resumption of the failed request ([Privacy §6.1](privacy.md#61-request)) |
+| `erasure reapply` | `POST /v1/platform/erasure-requests/{id}/reapply` (platform key, `platform:ops`) |
 | `export create\|get` | `POST /v1/exports`; `GET /v1/exports/{id}` |
 | `members list\|invite\|remove` | `GET /v1/tenants/{t}/members` (`members:read`); `POST /v1/tenants/{t}/invitations`; `DELETE /v1/tenants/{t}/members/{user_id}` (`members:manage`, tenant, partner or platform key) |
 | `invitations revoke` | `DELETE /v1/tenants/{t}/invitations/{invitation_id}` (`members:manage`) |
@@ -1674,10 +1668,50 @@ have no command: they are set only in the console ([Notifications §2](notificat
 | `dlq list\|redrive` | `GET /v1/platform/dlq`; `POST /v1/platform/dlq/{dlq_id}/redrive` (platform key, `platform:ops`; [§13](#13-dlq)) |
 | `jobs start\|get` | `POST /v1/platform/jobs`; `GET /v1/platform/jobs/{job_id}` (platform key, `platform:ops`) |
 | `waitlist invite` | `POST /v1/platform/waitlist/invite` (platform key, `platform:ops`) |
+| `ops status\|switch\|freeze\|unfreeze\|restore` | [§20](#20-ops) |
 | `mcp config` | `GET /v1/me` |
 | `login`, `config show\|set` | `GET /v1/me` (`config set`: none) |
-| `setup`, `deploy`, `upgrade`, `doctor`, `destroy`, `secrets rotate-master` | Cloudflare API, Wrangler, GitHub, and the API as described above (`doctor` also reads `/.well-known/*`; `destroy --include-ses` also the AWS APIs) |
+| `setup`, `deploy`, `upgrade`, `doctor`, `destroy`, `secrets rotate-master` | Cloudflare API, Wrangler, GitHub, and the API as described above (`secrets rotate-master` also `GET /v1/platform/status`) (`doctor` also reads `/.well-known/*`; `destroy --include-ses` also the AWS APIs) |
 | `setup ses` | AWS APIs, Wrangler, the Cloudflare API and `/health` ([§6.9](#69-setup-ses)) |
+
+## 20. `ops`
+
+Operator commands for one person running the deployment ([Observability §5.5–5.7 and the restore
+runbook](observability.md#55-alert-email-and-the-external-heartbeat)). Built by M17 Completion.
+
+| Command | Calls | Credentials |
+|---|---|---|
+| `ops status` | `GET /v1/platform/status`; human output groups the freeze flag, switches, `alert_email`, firing alerts, `master_key` and capacity | platform key with `audit:read` |
+| `ops switch <name> on\|off [--reason <text>]` | `PUT /v1/platform/switches` with `{"name", "state", "reason"}` | platform key with `platform:ops` |
+| `ops freeze` / `ops unfreeze` | Sets `PM_FREEZE` to `on` / `off` under `[vars]` in `<dir>/wrangler.toml` (`freeze` also writes `PM_FREEZE_SINCE` with the current time; `unfreeze` removes it), then the code-deploy step of `deploy` with the deployed version's bundle (§8.6; a variable change only, no migration). Then polls `GET /health` until `frozen` matches, at most 120 s | Cloudflare token |
+| `ops restore d1 --at <T> …` | The steps of the restore runbook's step 3, with Wrangler `d1 export`, `d1 time-travel info`, `d1 time-travel restore` and `d1 execute --file` (all through the pinned Wrangler, §5) | Cloudflare token (D1 · Edit) |
+| `ops restore mailbox <identity> (--at <T> \| --bookmark <b>)` | `POST /v1/platform/identities/{identity_id}/restore` | platform key with `platform:ops` |
+| `ops restore reconcile --tenant <t> --identity <i>… --after <T>` | `POST /v1/platform/jobs` (`kind: restore_reconcile`), then `GET /v1/erasure-requests?tenant_id=…` (every page) and, for each request with `completed_at` after `T` whose identity is restored or whose scope is counterparty or tenant, `POST /v1/platform/erasure-requests/{erasure_id}/reapply`; then polls the job and the new requests until they end | platform key with `platform:ops` and `erasure:manage` |
+| `ops restore cleanup` | Deletes `<dir>/restore-*/` | none |
+
+Rules for `ops restore d1`:
+
+- It refuses (exit 15) unless `GET /health` reports `frozen: true`.
+- Working files go to `<dir>/restore-<UTC timestamp>/`, created `0700`, files `0600`: `before.sql`,
+  `after.sql`, `undo-bookmark`, `replay.sql`, `summary.json`. The undo bookmark is printed as soon as the
+  restore returns, before anything else can fail.
+- The comparison is pure Rust: `core::sqldump` parses the `INSERT INTO "<table>" VALUES(…)` statements
+  of each export (SQL literals: integers, reals, `'…'` strings with doubled quotes, `X'…'` blobs, `NULL`)
+  into rows, and keys them by the primary keys in `core::schema`, a table generated at build time from
+  `migrations/d1/`. Every table except `schema_migrations` is compared. `--exclude` and `--exclude-row`
+  names are checked against `core::schema`, and an unknown name is exit 2 before anything is restored.
+  The export format is checked against a recorded export from the pinned Wrangler
+  (`cli::ops::sqldump_parses_export`).
+- Statements are ordered by the foreign keys of `migrations/d1/` (inserts and updates parents first,
+  deletes children first). Values are written as SQL literals with blobs in `X'…'` form; the file is
+  applied with `wrangler d1 execute pylota-mail --remote --file`, which accepts files up to 5 GiB
+  (Import and export data, read 2026-10-10).
+- `--yes` skips the confirmation of the summary. Without it, a non-interactive run is exit 2.
+- `--replay-only <dir>` recomputes and applies the replay from an existing `before.sql` against a fresh
+  export of the current database, for the case where a migration had to be re-applied first.
+
+Exit codes are those of §3.4; a Cloudflare or Wrangler failure in the middle is exit 10 with the step
+reached, and every step can be re-run.
 
 ## Tests
 
@@ -1696,7 +1730,7 @@ have no command: they are set only in the console ([Notifications §2](notificat
 | `cli::setup::order` | The recorded call order matches §6.3; the catch-all `PUT` comes after the first deploy, the secrets and a `200` health | FR-OPS-1 |
 | `cli::setup::h5_existing_mx` | Foreign MX records stop setup without `--replace-mx`; with it they are deleted before routing is enabled | [H5] |
 | `cli::setup::not_apex` | A subdomain or a zone in another account is refused with the zone's name | FR-OPS-1 |
-| `cli::setup::lifecycle_merge` | Existing R2 lifecycle rules are kept; the staging rule is added or replaced | FR-OPS-1 |
+| `cli::setup::lifecycle_merge` | Existing R2 lifecycle rules are kept; the 15-day staging rule and the 1-day multipart-abort rule are added or replaced | FR-OPS-1, [J7](../edge-cases.md), [I13](../edge-cases.md) |
 | `cli::setup::bootstrap_key` | The inserted key authenticates against the workerd harness and holds every permission except `identities:sign`; the decision table of §6.5 holds, including refusal when keys exist, and every pepper upload happens in step 14 | FR-OPS-1, FR-KEY-2 |
 | `cli::setup::owner_email` | The default tenant is created with the owner; `--no-console` writes `PM_CONSOLE = "off"` | FR-CON-7 |
 | `cli::setup::billing_off` | Setup writes no `PM_BILLING`; the default tenant reports `billing: disabled` | FR-BILL-12 |
@@ -1715,13 +1749,17 @@ have no command: they are set only in the console ([Notifications §2](notificat
 | `cli::deploy::noop_redeploy` | `deploy` straight after `setup` calls no Wrangler command and exits 0 | FR-OPS-2 |
 | `cli::deploy::version_flag` | `pmail deploy --version <v>` downloads and deploys that release | M19 |
 | `cli::doctor::every_check_has_fix` | Each failing check prints a fix; exit 12 with a fail, 0 with warnings only | FR-OPS-3 (M16) |
-| `cli::doctor::warn_rules` | `secrets` warns only while `PM_MASTER_KEY_NEXT` exists; `quota` warns when `PM_DAILY_SEND_QUOTA` is unset, and when the token lacks Account Analytics · Read (never `fail` for that); `cloudflare.zones` prints the count and warns above 1,000; a Cloudflare error in any other check is `fail` and exit 12, never 10 | FR-OPS-3 |
+| `cli::doctor::warn_rules` | `secrets` warns only while `master_key.remaining` is above 0 and fails when the active slot is empty; `quota` warns when `PM_DAILY_SEND_QUOTA` is unset, and when the token lacks Account Analytics · Read (never `fail` for that); `cloudflare.zones` prints the count and warns above 1,000; a Cloudflare error in any other check is `fail` and exit 12, never 10 | FR-OPS-3 |
 | `cli::doctor::web_bot_auth` | `skip` with `PM_WEB_BOT_AUTH = "off"`; with `on`, `pass` for a directory signed once per listed key, `fail` for a missing signature, a wrong tag or content type, or more than three keys | FR-OPS-3, FR-IDN-8, [O12] |
 | `cli::doctor::ses_check` | `skip` without `PM_SES_REGION` or AWS credentials; `fail` on no production access, paused sending, an inactive rule set or a missing `pm-deliver`; `warn` `ses_identities_90pct` at 9,000 identities and `fail` at 10,000 | FR-OPS-3, FR-DOM-9, [N26] |
 | `cli::destroy::confirmation` | Without the typed platform domain nothing is deleted; `--dry-run` changes nothing; an erasure ending `completed_with_holds` lists the held threads and exits 6 before any domain, Worker or storage is deleted | FR-OPS-1, FR-PRV-4 |
 | `cli::destroy::include_ses` | Without `--include-ses`, the plan and the final output list the `setup ses` resources as left in place and no AWS call is made; with it and no AWS credentials, exit 3 before anything is deleted; with credentials, every resource of §6.9 is deleted in reverse order against the recorded AWS fake, an operator's own active rule set is kept without `pm-deliver`, and a re-run after a failure continues | FR-OPS-1, FR-DOM-8 |
-| `cli::secrets::rotate_master` | The flow of §12.1 against the harness ends with no ciphertext under the old `kid` and no `PM_MASTER_KEY_NEXT` | [Security §6.2](security.md#62-rotation-procedures) |
+| `cli::secrets::rotate_master` | The flow of §12.1 against the harness writes the new key to the inactive slot, then switches `PM_MASTER_KEY_ACTIVE`, and ends with no ciphertext under the old `kid` while the old key stays in its slot; a second rotation within 30 days of the previous re-seal's end is exit 15 without `--discard-previous`; an interrupted run is finished by `--resume` with no key generated; a failure between the two writes leaves the old slot active | [Security §6.2](security.md#62-rotation-procedures) |
 | `cli::secrets::rotate_signing_key` | `keys rotate thread\|link\|cursor\|web_bot_auth` calls the platform endpoint, `--revoke-previous` adds `revoke_previous=true`, and the output shows the new kid (a 43-character thumbprint for `web_bot_auth`) and the previous kid with `verify_until` or `revoked`, never key material; `422 web_bot_auth_disabled` is exit 7; `keys rotate key_…` still rotates an API key; mixed flags are exit 2 | [Security §6.2](security.md#62-rotation-procedures), FR-IDN-8 |
+| `cli::ops::sqldump_parses_export` | A recorded `wrangler d1 export` file parses into the expected rows (strings with quotes, blobs, nulls, reals) | §20 |
+| `cli::ops::restore_replay_diff` | From two parsed exports, the replay inserts rows created after `T`, deletes rows deleted after `T`, updates changed rows, skips `--exclude` tables, columns and rows, orders statements by foreign key, and refuses an unknown exclude name with exit 2; `ops restore d1` refuses with exit 13 unless `/health` reports `frozen: true` | §20, [I6](../edge-cases.md) |
+| `cli::ops::freeze_unfreeze` | `ops freeze` writes `PM_FREEZE = "on"`, redeploys the deployed bundle with no migration and waits for `/health` to report `frozen`; `ops unfreeze` reverses it; a re-run is a no-op | §20 |
+| `cli::erasure::retry` | `erasure retry` resubmits the stored scope and target with reason `retry:{era_id}`; a counterparty retry without `--address` is exit 2 | §19 |
 | `cli::dlq::j8_list_redrive` | `list` passes `queue`, `status` and `tenant_id` to `GET /v1/platform/dlq`; `redrive` posts once per item and reports partial failures; no Cloudflare, D1 or Queues call is made | FR-OPS-4, [J8] |
 | `cli::jobs::start_get` | `jobs start` builds the job body (repeated `--identity` resolved to `identity_ids`; `--tenant` required) and `jobs get` reads it back | [J3] |
 | `cli::waitlist::invite` | `--count` outside 1–500 is exit 2 before any request; the result prints `invited` and `waiting` | FR-CON-8 |

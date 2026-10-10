@@ -76,3 +76,5 @@
   - [0012 Service sign-up ledger](project/adr/0012-service-sign-up-ledger.md)
   - [0013 Partner keys as a fourth key level](project/adr/0013-partner-keys.md)
   - [0014 Marketing mail only through SES or SMTP](project/adr/0014-marketing-needs-ses.md)
+  - [0015 One person builds and operates Pylota Mail Cloud](project/adr/0015-solo-operator.md)
+  - [0016 Plan items that v1.0 defers or does differently](project/adr/0016-plan-items-changed-for-v1.md)

@@ -13,7 +13,7 @@ There are three layers:
 | Binding | Type | Name created by setup | Notes |
 |---|---|---|---|
 | `DB` | D1 | `pylota-mail` | Created with the chosen jurisdiction. It cannot be moved later |
-| `BLOBS` | R2 | `pylota-mail-blobs` | Same jurisdiction. Lifecycle rule: delete `inbound-staging/` after 1 day |
+| `BLOBS` | R2 | `pylota-mail-blobs` | Same jurisdiction. Lifecycle rules: delete `inbound-staging/` after 15 days (longer than the 14-day dead-letter retention), and abort incomplete multipart uploads after 1 day |
 | `MAILBOX` | Durable Object namespace | class `IdentityMailbox` | SQLite-backed |
 | `DOMAINS` | Durable Object namespace | class `DomainMonitor` | SQLite-backed |
 | `JOBS` | Durable Object namespace | class `JobRunner` | SQLite-backed |
@@ -55,7 +55,8 @@ and email recipients ([Observability › Signals](../project/design/observabilit
 Cron triggers:
 
 - `* * * * *`: address retirement, the platform-event outbox sweep, restarting jobs left `queued`, the
-  state-alert evaluator, the SES inbound backstop (draining `PM_SES_INBOUND_QUEUE_URL`, when set), and
+  state-alert evaluator (with alert email, the automatic containment rules, and every 15th run the
+  capacity checks), the master-key re-seal sweep (500 values per run), the SES inbound backstop (draining `PM_SES_INBOUND_QUEUE_URL`, when set), and
   minting the Durable Object IDs that only the Worker can mint for rows written outside it: the system
   identity's mailbox, the `DomainMonitor` of a domain row with `monitor_do_id = ''` (the platform domain,
   and domains added with `pmail domains add --local-token`), the `Notifier` of a tenant row with
@@ -63,7 +64,7 @@ Cron triggers:
   configured.
   Retrying stuck sends, transport claims and uncertain-send bookkeeping run in each mailbox's own alarms,
   not in the cron.
-- `*/15 * * * *`: domain health scheduling, retention, usage roll-up, the master-key re-seal sweep, the
+- `*/15 * * * *`: domain health scheduling, retention, usage roll-up, the
   nightly backup job once per UTC day when `PM_BACKUP_BUCKET` is set, and the new-workspace send-ramp
   evaluation once per UTC day (`crons/signup_ramp.rs`; it finds ramped Free workspaces with
   `PM_BILLING=stripe`, and ramped tenants of partners on any deployment).
@@ -95,9 +96,13 @@ Cron triggers:
 | `PM_WEB_BOT_AUTH` | `off` | `on` publishes the Web Bot Auth key directory at `/.well-known/http-message-signatures-directory` and allows signed HTTP requests (`POST …/http-signatures`), for tenants whose policy has `web_bot_auth.allowed: true`. Turn it on only once spike S13 has passed; while it is `off`, those requests and the `web_bot_auth` key rotation get `422 web_bot_auth_disabled` and the directory `404` ([Agent signing keys](../project/design/agent-keys.md#5-signed-http-requests-web-bot-auth), [Deploy › Signed HTTP requests](../self-hosting.md#signed-http-requests-web-bot-auth)) |
 | `PM_IDENTITY_KEY_OVERLAP_DAYS` | `7` | Days a rotated identity signing key stays `retiring`: still published in the identity's JWKS, no longer signing ([Agent signing keys › Keys](../project/design/agent-keys.md#2-keys)) |
 | `PM_DAILY_SEND_QUOTA` | unset | The account's Email Sending daily quota, copied from the Cloudflare dashboard. Cloudflare does not expose it to the Worker. When set, an alert fires at 80% of it; when unset, the alert fires on the first quota error ([G3](../project/edge-cases.md)). When set it also turns on the shared-domain breaker (at 60% of the day's quota, Free and ramped workspaces stop sending; at 90%, every tenant does) and sizes the system identity's day for the system-mail budgets ([Cloud sign-up §10.2–10.3](../project/design/cloud-signup.md#102-system-mail-budgets)). Pylota Mail Cloud must set it, because its account's quota is shared with Pylota |
-| `PM_BACKUP_BUCKET` | unset | Name of a second R2 bucket. When set, setup creates it in the same jurisdiction, binds it as `BACKUP`, and a nightly job copies new `t/` objects into it ([Privacy design](../project/design/privacy.md#54-optional-r2-backup-copy)). Off by default |
+| `PM_BACKUP_BUCKET` | unset | Name of a second R2 bucket. When set, setup creates it in the same jurisdiction, binds it as `BACKUP`, and a nightly job copies new `t/` objects into it ([Privacy design](../project/design/privacy.md#54-optional-r2-backup-copy)). Off by default; Pylota Mail Cloud sets `pylota-mail-backup` |
+| `PM_ALERT_EMAIL` | the `mailto:` address of `PM_SECURITY_CONTACT`, if it is one | The operator's address for alert email: each page alert at once and every 6 hours while it fires, and a daily summary of ticket alerts, sent through the system identity ([Observability › Alert email](../project/design/observability.md#55-alert-email-and-the-external-heartbeat)). When neither is set, `GET /v1/platform/status` reports `alert_email: missing` and doctor's `alerts` check fails |
+| `PM_HEARTBEAT_KEY_ID` | unset | The `key_…` ID of the platform key that the external heartbeat workflow uses. When set, the `heartbeat_missing` alert fires once that key has not been used for an hour |
+| `PM_FREEZE` | `off` | `on` freezes the whole deployment for a restore: inbound mail gets a temporary failure, queued work and alarms wait, and only platform keys can use the API. Set only by `pmail ops freeze` and `pmail ops unfreeze` ([Observability › Restore from PITR](../project/design/observability.md#restore-from-pitr)). A variable, so that a D1 restore cannot undo it. `pmail ops freeze` also writes `PM_FREEZE_SINCE` (RFC 3339), which `GET /v1/platform/status` reports as `frozen_since` |
 | `PM_SCANNER_URL` | unset | Optional malware scanner endpoint (see [Inbound](../project/design/inbound.md#attachment-safety)) |
-| `PM_SECURITY_CONTACT` | unset | Served in `/.well-known/security.txt` |
+| `PM_SECURITY_CONTACT` | unset | Served in `/.well-known/security.txt`. When it is a `mailto:` URI and `PM_ALERT_EMAIL` is unset, alert email goes to that address |
+| `PM_EVAL_REST` | `off` | Evaluation runs only: `on` sends every Workers AI and Vectorize call through the REST API with `PM_CF_API_TOKEN`, so `wrangler dev --local` needs no remote binding ([Testing § 9.2](../project/design/testing.md#92-running)). Read only when `PM_ENV = "local"`; ignored otherwise |
 | `PM_LOG_LEVEL` | `info` | `error`, `warn`, `info` or `debug`. Content is never logged at any level |
 | `PM_DEFAULT_POLICY` | `{}` | JSON merged over the built-in tenant policy defaults |
 | `PM_CONSOLE` | `on` | `on` serves the console at `/console`; `off` removes its routes |
@@ -123,8 +128,9 @@ stdout, a file or a log; with it they are printed once to stdout.
 
 | Secret | Required | Used for (one purpose each; no secret is derived from another) |
 |---|---|---|
-| `PM_MASTER_KEY` | yes | AES-256-GCM encryption at rest of webhook secrets, identity signing keys, the Worker-generated thread, link and cursor keys and the Web Bot Auth deployment key, SMTP relay credentials, TOTP secrets and recovery codes, and OAuth PKCE verifiers ([Data model › Notes](../project/design/data-model.md#notes)) |
-| `PM_MASTER_KEY_NEXT` | only during `pmail secrets rotate-master` | The new master key while stored values are re-sealed. `pmail doctor` warns while it is set |
+| `PM_MASTER_KEY` | yes | Master-key slot `a`. AES-256-GCM encryption at rest of webhook secrets, identity signing keys, the Worker-generated thread, link and cursor keys and the Web Bot Auth deployment key, SMTP relay credentials, TOTP secrets and recovery codes, and OAuth PKCE verifiers ([Data model › Notes](../project/design/data-model.md#notes)) |
+| `PM_MASTER_KEY_B` | no (written by the first `pmail secrets rotate-master`) | Master-key slot `b`. `PM_MASTER_KEY` is slot `a`. After a rotation one slot holds the active key and the other the previous one, kept for D1 restores ([Security design](../project/design/security.md#62-rotation-procedures)) |
+| `PM_MASTER_KEY_ACTIVE` | no (absent means `a`) | `a` or `b`: the slot whose key seals new values. A secret, so that the CLI switches it with `wrangler secret put`. The Worker refuses to start when the named slot is empty |
 | `PM_KEY_PEPPER` | yes | HMAC-SHA256 of API key secrets |
 | `PM_HASH_KEY` | yes | Pseudonymisation: address tombstones, suppression hashes, log and query hashes |
 | `PM_CF_API_TOKEN` | for some domain methods (for every deployment if a spike S6 REST fallback is taken) | Runtime automation of tenant domains (zone onboarding and creation, literal routing rules, event subscriptions), and the REST fallbacks for Vectorize and Workers AI if spike S6 fails ([Rust workspace §7](../project/design/rust-workspace.md#7-wasm-bindgen-externs)). Required on the Worker for the `cloudflare_zone`, `nameservers` (a token that can create zones) and `delegated_subdomain` methods; without it they get `422 cf_token_required`. `pmail domains add --local-token` with your own token can then add an apex `cloudflare_zone` domain only (catch-all, no literal rules). `dns_records`, `send_only` and `smtp_relay` need no Cloudflare token. Scope it to named zones (the platform domain's zone and every zone listed in a tenant's `domains.cloudflare_zones`); only a deployment that offers `nameservers` or `delegated_subdomain` needs All zones. Its permissions are in [Deploy › Create a Cloudflare API token](../self-hosting.md#2-create-a-cloudflare-api-token) |
@@ -135,9 +141,11 @@ stdout, a file or a log; with it they are printed once to stdout.
 
 Rotating `PM_KEY_PEPPER` (`pmail setup --rotate-pepper`) invalidates every API key, so it is a
 break-glass action. Rotating
-`PM_MASTER_KEY` uses `pmail secrets rotate-master`, which uploads `PM_MASTER_KEY_NEXT`, waits until the
-Worker has re-sealed every stored value under it, then replaces `PM_MASTER_KEY`. No secret is ever read
-back from the Worker by the CLI ([Security design](../project/design/security.md#62-rotation-procedures)).
+the master key uses `pmail secrets rotate-master`, which writes a new key into the slot that is not
+active, switches `PM_MASTER_KEY_ACTIVE` to it and follows the Worker's re-seal until every stored value
+is sealed with it. The previous key stays in its slot for D1 restores; a rotation within 30 days of the
+previous one needs `--discard-previous`. No secret is ever read back from the Worker by the CLI
+([Security design](../project/design/security.md#62-rotation-procedures)).
 
 ### Thread and link keys
 

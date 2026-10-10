@@ -988,7 +988,8 @@ deletes message rows:
    attachments, any status).
 2. `deleteByIds` in batches of 500 (on both indexes during a re-embed, [§7](#7-index-lifecycle));
    count `vectors_deleted`.
-3. In the mailbox transaction: `DELETE FROM fts WHERE rowid = ?`, `DELETE FROM fts_tri WHERE rowid = ?`,
+3. In the mailbox transaction: `DELETE FROM fts WHERE rowid = ?`, `DELETE FROM fts_tri WHERE rowid = ?`
+   (and from `fts_next` and `fts_tri_next` while a tokenizer-mode reindex has them, [§7.2](#72-reindex-job-analyzer-change)),
    then the message row (cascading to `refs`, `chunks`, `labels`, `attachments`, `deliveries`,
    `verifications`).
    The same transaction inserts each message ID into `erased_ids`, the tombstone that async writers

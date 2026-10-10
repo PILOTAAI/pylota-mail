@@ -23,6 +23,8 @@ ADR supersedes it (AGENTS.md).
 | [0012](0012-service-sign-up-ledger.md) | Service sign-up ledger | Accepted | 2026-10-10 |
 | [0013](0013-partner-keys.md) | Partner keys as a fourth key level | Accepted | 2026-10-10 |
 | [0014](0014-marketing-needs-ses.md) | Marketing mail only through SES or SMTP | Accepted | 2026-10-10 |
+| [0015](0015-solo-operator.md) | One person builds and operates Pylota Mail Cloud | Accepted | 2026-10-10 |
+| [0016](0016-plan-items-changed-for-v1.md) | Plan items that v1.0 defers or does differently | Accepted | 2026-10-10 |
 
 ## When to write one
 
@@ -61,7 +63,7 @@ the decisions marked in the ADR's text are replaced; the rest still holds), `Dep
 |---|---|
 | Status | Proposed |
 | Date | YYYY-MM-DD |
-| Deciders | Pylota engineering |
+| Deciders | The owner (TREFT LTD) |
 | Related | PRD IDs, design documents, spikes, other ADRs |
 
 ## Context

@@ -178,8 +178,10 @@ paths:
       summary: Health check
       description: >-
         No authentication. Reports that the Worker is serving, with its version and commit (compiled into
-        the release bundle) and `env` (`PM_ENV`). `status` is `degraded`, still with `200`, when a feature
-        is off because of the configuration; a field per feature (`ses`, `billing`, `cf_api_token`) says
+        the release bundle) and `env` (`PM_ENV`); also `ses_region` when SES is configured, `frozen: true` while the deployment is frozen
+        for a restore, and `status: degraded` with `ses` or `billing` when a feature is off. `status` is `degraded`, still with `200`, when a feature
+        is off because of the
+        configuration; a field per feature (`ses`, `billing`, `cf_api_token`) says
         why. A missing required variable or secret, or a malformed optional one, returns
         `503 unavailable` with `details.config_invalid` naming the variable.
       security: []
@@ -3302,7 +3304,9 @@ paths:
       summary: Place a legal hold on a thread
       description: >-
         A held thread is skipped by retention and erasure, and erasure receipts list it (FR-PRV-4).
-        Replaces any existing hold on the thread. Audit-logged.
+        Replaces any existing hold on the thread. Audit-logged. On a tenant that is `erasing` with held
+        threads, this and `removeThreadHold` are the one write a partner key (or a platform key) can still
+        make.
       x-required-permission: ['erasure:manage']
       x-key-levels: [platform, partner, tenant, identity]
       x-rate-limit-buckets: [api]
@@ -5744,15 +5748,26 @@ paths:
         | `thread` | `identity_id`, `thread_id` | Every message in the thread |
         | `counterparty` | `counterparty_address` | Every message to or from that address, in every identity of the tenant |
         | `identity` | `identity_id` | The whole mailbox. Its addresses are tombstoned |
-        | `tenant` | none | Everything in the tenant. Then the tenant is marked `erased` |
+        | `tenant` | none | Everything in the tenant. Then the tenant is marked `erased`, once no held thread remains |
+
+        A failing step is retried automatically until `deadline_at` − 4 hours (20 hours after the first
+        request); then the request ends `failed`, and a new request for the same scope and target resumes it
+        at its failed step (`resumes_id` names it, `deadline_at` is copied), for every scope. At most one
+        request resumes a given request; a second one racing it gets `200` with the first.
 
         A `tenant` request also needs `tenants:erase` (`403 permission_denied` with
         `details.required = ["tenants:erase"]` otherwise), which workspace admins and the keys they mint never
-        hold ([W35]). A `tenant` request for a tenant that is already `erasing` returns the existing request
-        with `200` (the same `era_` ID) and starts nothing; for an `erased` tenant it returns
-        `409 tenant_erased`. Any
-        other erasure request naming an `erasing` or `erased` tenant, like every write to such a tenant,
-        gets `404 tenant_not_found` from a non-platform key.
+        hold ([W35]).
+
+        A `tenant` request for a tenant that is already `erasing` depends on the tenant's latest
+        tenant-scope request: `queued` or `running` returns it with `200` (the same `era_` ID) and starts
+        nothing; `failed` returns `202` with a new request that resumes the failed job at its failed step
+        (`resumes_id` names the failed request, `deadline_at` is copied); `completed_with_holds` returns
+        `202` with a continuation request that finishes the erasure once no hold remains. For an `erased`
+        tenant it returns `409 tenant_erased`. A tenant erasure never deletes a held thread: while one
+        remains the request ends `completed_with_holds` and the tenant stays `erasing`. Any other erasure
+        request naming an `erasing` or `erased` tenant, like every write to such a tenant, gets
+        `404 tenant_not_found` from a non-platform key (the hold routes excepted, on a tenant with holds).
       x-required-permission: ['erasure:manage']
       x-key-levels: [platform, partner, tenant, identity]
       x-permission-notes: An identity key can only erase within its own identity (`message`, `thread` and `identity` scopes). `counterparty` needs a tenant, partner or platform key; `tenant` needs a platform key, the partner key of the tenant's own partner, or the tenant's own key, and in every case `tenants:erase` as well as `erasure:manage`.
@@ -5772,7 +5787,10 @@ paths:
               reason: Data subject request DSR-1182
       responses:
         '202':
-          description: The erasure request. It completes asynchronously (within 24 hours, NFR-PRV-1).
+          description: >-
+            The erasure request. It completes asynchronously (within 24 hours, NFR-PRV-1). When the latest request with the
+            same scope and target `failed`, or the tenant's latest tenant-scope request ended
+            `completed_with_holds`, a new request with `resumes_id` set.
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
@@ -5782,7 +5800,9 @@ paths:
               schema: {$ref: '#/components/schemas/ErasureRequest'}
         '200':
           description: >-
-            A `tenant` request for a tenant already being erased: the existing tenant-scope request, unchanged.
+            A `tenant` request for a tenant already being erased whose latest tenant-scope request is still
+            `queued` or `running`: that request, unchanged. Also the resumption of a failed request that a
+            concurrent request created first.
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
@@ -5869,7 +5889,11 @@ paths:
                 tenant_id: ten_01J9Z3K8V4QW7X2M5N6P8R0T1Y
                 scope: counterparty
                 status: completed_with_holds
+                identity_id: null
+                target_id: null
+                resumes_id: null
                 created_at: '2026-10-09T10:00:00Z'
+                deadline_at: '2026-10-10T10:00:00Z'
                 completed_at: '2026-10-09T10:04:12Z'
                 receipt:
                   messages_deleted: 14
@@ -6278,7 +6302,10 @@ paths:
         (`partner.create`, `partner.update`, `partner.delete`), tenants (`tenant.create`, with the
         `partner_id` when a partner key created it), identity status, identity signing keys
         (`identity_key.create`, `identity_key.rotate`, `identity_key.revoke`), quarantine releases, holds,
-        suppression removals, erasure, resolve, members, billing and platform operations. **Sends are not
+        suppression removals, erasure, resolve, members, billing, platform operations (`ops.switch`,
+        `mailbox.restore`, `master_key.activated`, `master_key.resealed`), automatic containment (`partner.auto_suspend`,
+        `tenant.auto_pause`, `domain.auto_pause`), and reads of mail content by platform and partner keys (`mail.read`, one row
+        per request, written before the response). **Sends are not
         audit rows**: each send is recorded by its message, its events (`message.sent` and the delivery
         events) and its per-recipient delivery log. To review what a key sent, list the outbound messages
         of the identities it reaches for the period; request logs also carry the key ID for 7 days. A partner
@@ -6718,6 +6745,7 @@ paths:
         | `reparse` | Re-parses messages from raw MIME with the deployed parser and re-emits their events with `reprocessed: true`. Messages past `raw_days` are skipped and counted |
         | `reembed` | Re-chunks and re-embeds messages into Vectorize, for example after a model change |
         | `reindex` | Rebuilds the keyword index (FTS5 and references) of each mailbox |
+        | `restore_reconcile` | After a mailbox restore: re-queues inbound mail received after `after` whose raw MIME is still in R2, and re-inserts sends made after it as `uncertain` with their idempotency records. Needs `after` and `identity_ids`; runs even while the deployment is frozen |
 
         `tenant_id` is required; `identity_ids` (default: every identity of the tenant), `after` and
         `before` narrow it.
@@ -6775,7 +6803,9 @@ paths:
       summary: Get a maintenance job
       description: >-
         `status` is `queued`, `running`, `completed`, `failed` or `canceled`; `result` holds counts once the
-        job ends. Audit-logged.
+        job ends. Returns any job except erasure and export jobs, which are read through their own
+        requests: the jobs started with `createJob`, and the `retention`, `backup` and `domain_remove`
+        jobs that a `job_failed:{kind}` alert names.
       x-required-permission: ['platform:ops']
       x-key-levels: [platform]
       x-rate-limit-buckets: [api]
@@ -6792,6 +6822,170 @@ paths:
         '401': {$ref: '#/components/responses/Unauthorized'}
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+
+  /platform/status:
+    get:
+      operationId: getPlatformStatus
+      tags: [Platform]
+      summary: Get the deployment's operational state
+      description: |
+        The freeze flag, the switches, whether an alert email address is configured, the firing state
+        alerts, the master-key slots with the re-seal progress, and capacity. Read by `pmail doctor`,
+        `pmail ops status` and the external heartbeat, whose key holds only `audit:read`. Key IDs are not
+        secret (every ciphertext carries one); key material is never returned.
+      x-required-permission: ['audit:read']
+      x-key-levels: [platform]
+      x-rate-limit-buckets: [api]
+      x-idempotency: none
+      responses:
+        '200':
+          description: The operational state.
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PlatformStatus'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+
+  /platform/switches:
+    put:
+      operationId: setSwitch
+      tags: [Platform]
+      summary: Set a deployment-wide switch
+      description: |
+        `read_only` refuses every write from a non-platform key and holds outbound sends;
+        `free_sending` `off` stops sends from workspaces on the Free plan or still in the send ramp;
+        `emergency_prune` `on` shortens the retention of `event_index` and `webhook_deliveries` to 7 days.
+        The automatic containment rules set them too. Readers cache a switch for 60 seconds. Audit action
+        `ops.switch`.
+      x-required-permission: ['platform:ops']
+      x-key-levels: [platform]
+      x-rate-limit-buckets: [api]
+      x-idempotency: optional
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyOptional'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/SwitchUpdate'}
+            example:
+              name: read_only
+              state: 'off'
+              reason: rpc_owner_mismatch fixed in 1.0.3
+      responses:
+        '200':
+          description: The switch as stored.
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
+            Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Switch'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/IdempotencyConflict'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+
+  /platform/identities/{identity_id}/restore:
+    parameters:
+      - $ref: '#/components/parameters/IdentityIdPath'
+    post:
+      operationId: restoreMailbox
+      tags: [Platform]
+      summary: Restore an identity's mailbox to a point in time
+      description: |
+        Durable Object point-in-time recovery of one mailbox, to `at` (within the last 30 days), or back to
+        the state an earlier restore replaced (`bookmark`). Only while the deployment is frozen
+        (`PM_FREEZE = "on"`); otherwise `409 not_frozen`. The response and the audit row
+        `mailbox.restore` carry the undo bookmark. Part of the restore runbook (Observability, Restore
+        from PITR); follow it with a `restore_reconcile` job.
+      x-required-permission: ['platform:ops']
+      x-key-levels: [platform]
+      x-rate-limit-buckets: [api]
+      x-idempotency: none
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/MailboxRestoreRequest'}
+            example:
+              at: '2026-10-09T09:00:00Z'
+      responses:
+        '200':
+          description: The mailbox was restored; the object restarted with the restored state.
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MailboxRestoreResult'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/NotFrozen'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/ServiceUnavailable'}
+
+  /platform/erasure-requests/{erasure_id}/reapply:
+    parameters:
+      - $ref: '#/components/parameters/ErasureIdPath'
+    post:
+      operationId: reapplyErasureRequest
+      tags: [Platform]
+      summary: Re-apply a stored erasure after a restore
+      description: |
+        Creates a new erasure request that repeats the stored one: the same tenant, scope, `identity_id`
+        and `target_id`, reason `reapply_after_restore:{erasure_id}` and its own `deadline_at`. A
+        counterparty erasure matches by the stored keyed hash of the address, which is never needed in
+        clear. No body. Runs even while the deployment is frozen. Only a request that ended `completed` or
+        `completed_with_holds` can be re-applied (`409 erasure_not_completed` otherwise). A tenant-scope
+        request is re-applied although the tenant is `erased`: the job erases the mailboxes of the
+        identities in the source receipt's `identities_affected` and sweeps the tenant's objects and
+        vectors.
+      x-required-permission: ['platform:ops', 'erasure:manage']
+      x-key-levels: [platform]
+      x-rate-limit-buckets: [api]
+      x-idempotency: optional
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyOptional'
+      responses:
+        '202':
+          description: The new erasure request, `queued`.
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+            RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
+            Idempotent-Replayed: {$ref: '#/components/headers/Idempotent-Replayed'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ErasureRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409':
+          description: >-
+            The request did not end `completed` or `completed_with_holds` (`erasure_not_completed`), or the
+            idempotency key is in use.
+          x-error-codes: [erasure_not_completed, idempotency_conflict, request_in_progress]
+          headers:
+            Request-Id: {$ref: '#/components/headers/Request-Id'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
         '429': {$ref: '#/components/responses/TooManyRequests'}
         '500': {$ref: '#/components/responses/InternalError'}
         '503': {$ref: '#/components/responses/ServiceUnavailable'}
@@ -8906,8 +9100,10 @@ components:
     SendForbidden:
       description: >-
         As `Forbidden`, plus `test_mode_recipient` when a test tenant sends to an address that is neither
-        `*@simulator.invalid` nor an identity of its own tenant or of a tenant with the same partner ([L1], [L3]).
-      x-error-codes: [permission_denied, scope_denied, tenant_suspended, partner_suspended, test_mode_recipient]
+        `*@simulator.invalid` nor an identity of its own tenant or of a tenant with the same partner ([L1], [L3]), and `policy_denied` with `details.reason = "free_sending_off"` when the
+        operator's `free_sending` switch is off and the workspace is on the Free plan or still in its send
+        ramp.
+      x-error-codes: [permission_denied, scope_denied, tenant_suspended, partner_suspended, test_mode_recipient, policy_denied]
       headers:
         Request-Id: {$ref: '#/components/headers/Request-Id'}
       content:
@@ -9113,6 +9309,14 @@ components:
       content:
         application/json:
           schema: {$ref: '#/components/schemas/Error'}
+    NotFrozen:
+      description: The call is allowed only while the deployment is frozen for a restore (`pmail ops freeze`).
+      x-error-codes: [not_frozen]
+      headers:
+        Request-Id: {$ref: '#/components/headers/Request-Id'}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
     InternalError:
       description: A bug. It is logged with the `request_id`. Retry with backoff.
       x-error-codes: [internal_error]
@@ -9130,7 +9334,11 @@ components:
         application/json:
           schema: {$ref: '#/components/schemas/Error'}
     ServiceUnavailable:
-      description: A dependency is temporarily unavailable (D1, an overloaded Durable Object). Retry with backoff.
+      description: >-
+        A dependency is temporarily unavailable (D1, an overloaded Durable Object). Retry with backoff.
+        `details.reason` says when the operator caused it: `frozen` (a restore is in progress; `Retry-After`
+        is 300), `read_only` (an automatic containment rule refused writes) or `storage_full` (the D1
+        database is full).
       x-error-codes: [unavailable]
       headers:
         Request-Id: {$ref: '#/components/headers/Request-Id'}
@@ -9572,6 +9780,8 @@ components:
         - raw_expired
         - cursor_expired
         - legal_hold
+        - not_frozen
+        - erasure_not_completed
         # Policy and limits
         - all_recipients_suppressed
         - recipient_blocked
@@ -9773,6 +9983,9 @@ components:
           type: string
           description: '`PM_ENV` of the deployment.'
           enum: [production, staging, local]
+        frozen:
+          type: boolean
+          description: 'Present and `true` while the deployment is frozen for a restore (`PM_FREEZE = "on"`).'
 
     # ── Tenants ──────────────────────────────────────────────────────────────────────────────────
 
@@ -13284,7 +13497,7 @@ components:
       enum: [message, thread, counterparty, identity, tenant]
     ErasureStatus:
       type: string
-      description: '`completed_with_holds`: the erasure finished but skipped held threads, listed in the receipt''s `held`. `canceled`: a tenant erasure superseded it.'
+      description: '`completed_with_holds`: the erasure finished but skipped held threads, listed in the receipt''s `held` (a tenant then stays `erasing` until no hold remains). `failed`: a step still failed 20 hours after the first request. `canceled`: a tenant erasure superseded it.'
       enum: [queued, running, completed, completed_with_holds, failed, canceled]
     ErasureRequestCreate:
       description: An erasure request. `scope` selects which other fields are required.
@@ -13416,15 +13629,32 @@ components:
               minimum: 0
     ErasureRequest:
       type: object
-      required: [id, tenant_id, scope, status, created_at, completed_at, receipt]
+      required: [id, tenant_id, scope, status, identity_id, target_id, resumes_id, created_at, deadline_at, completed_at, receipt]
       properties:
         id: {$ref: '#/components/schemas/ErasureRequestId'}
         tenant_id: {$ref: '#/components/schemas/TenantId'}
         scope: {$ref: '#/components/schemas/ErasureScope'}
         status: {$ref: '#/components/schemas/ErasureStatus'}
+        identity_id:
+          description: Set for message, thread and identity scope.
+          oneOf:
+            - $ref: '#/components/schemas/IdentityId'
+            - type: 'null'
+        target_id:
+          type: [string, 'null']
+          description: The `msg_` or `thr_` ID, for message and thread scope. The counterparty address is never stored or returned.
+        resumes_id:
+          description: The failed request this one resumes, or the `completed_with_holds` request it continues.
+          oneOf:
+            - $ref: '#/components/schemas/ErasureRequestId'
+            - type: 'null'
         created_at:
           type: string
           format: date-time
+        deadline_at:
+          type: string
+          format: date-time
+          description: When the 24 hours of NFR-PRV-1 end, counted from the first request (copied when resuming a failed one).
         completed_at:
           type: [string, 'null']
           format: date-time
@@ -13441,7 +13671,7 @@ components:
       enum: [counterparty, identity]
     ExportStatus:
       type: string
-      description: '`expired` once the download is no longer available (7 days after creation). `canceled`: a tenant erasure superseded it.'
+      description: '`expired` once the download is no longer available (7 days after creation, or earlier when an erasure of the tenant expired it). `canceled`: a tenant erasure superseded it.'
       enum: [queued, running, completed, failed, canceled, expired]
     ExportCreate:
       description: A subject-access export. `scope` selects which other field is required.
@@ -13478,6 +13708,11 @@ components:
         id: {$ref: '#/components/schemas/ExportId'}
         tenant_id: {$ref: '#/components/schemas/TenantId'}
         scope: {$ref: '#/components/schemas/ExportScope'}
+        identity_id:
+          description: The identity, for identity scope.
+          oneOf:
+            - $ref: '#/components/schemas/IdentityId'
+            - type: 'null'
         status: {$ref: '#/components/schemas/ExportStatus'}
         size:
           type: [integer, 'null']
@@ -13904,8 +14139,10 @@ components:
       type: string
       description: >-
         `reparse` (re-parse messages from raw MIME and re-emit their events with `reprocessed: true`),
-        `reembed` (re-chunk and re-embed into Vectorize) or `reindex` (rebuild the keyword index).
-      enum: [reparse, reembed, reindex]
+        `reembed` (re-chunk and re-embed into Vectorize), `reindex` (rebuild the keyword index) or
+        `restore_reconcile` (after a mailbox restore) can be started with `createJob`. `getJob` also
+        returns the jobs the system runs itself: `retention`, `backup` and `domain_remove`.
+      enum: [reparse, reembed, reindex, restore_reconcile, retention, backup, domain_remove]
     JobStatus:
       type: string
       enum: [queued, running, completed, failed, canceled]
@@ -13913,7 +14150,10 @@ components:
       type: object
       required: [kind, tenant_id]
       properties:
-        kind: {$ref: '#/components/schemas/JobKind'}
+        kind:
+          type: string
+          description: '`restore_reconcile` needs `after` and `identity_ids`.'
+          enum: [reparse, reembed, reindex, restore_reconcile]
         tenant_id: {$ref: '#/components/schemas/TenantId'}
         identity_ids:
           type: [array, 'null']
@@ -13934,7 +14174,11 @@ components:
       properties:
         id: {$ref: '#/components/schemas/JobId'}
         kind: {$ref: '#/components/schemas/JobKind'}
-        tenant_id: {$ref: '#/components/schemas/TenantId'}
+        tenant_id:
+          description: The tenant; `null` for a deployment-wide job (`backup`, the global `retention` job).
+          oneOf:
+            - $ref: '#/components/schemas/TenantId'
+            - type: 'null'
         status: {$ref: '#/components/schemas/JobStatus'}
         created_at:
           type: string
@@ -13944,13 +14188,175 @@ components:
           format: date-time
         result:
           type: [object, 'null']
-          description: Counts, once the job ends (for `reparse`, including the messages skipped past `raw_days`).
+          description: >-
+            Counts, once the job ends (for `reparse`, including the messages skipped past `raw_days`); for
+            a `failed` job also `failed_step` and `error` (strings).
           additionalProperties:
-            type: integer
-            minimum: 0
+            type: [integer, string]
         created_by_key_id:
           type: [string, 'null']
           description: The API key that started the job, or `null` for a job the system started itself (for example the `reembed` job that the cron creates during an embedding-model change).
+    SwitchName:
+      type: string
+      enum: [read_only, free_sending, emergency_prune]
+    SwitchUpdate:
+      type: object
+      required: [name, state, reason]
+      properties:
+        name: {$ref: '#/components/schemas/SwitchName'}
+        state:
+          type: string
+          enum: ['on', 'off']
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 200
+    Switch:
+      type: object
+      required: [name, state, set_by, reason, set_at]
+      properties:
+        name: {$ref: '#/components/schemas/SwitchName'}
+        state:
+          type: string
+          enum: ['on', 'off']
+        set_by:
+          type: string
+          description: '`auto` when an automatic containment rule set it, `platform` when a platform key did.'
+          enum: [auto, platform]
+        reason:
+          type: string
+        set_at:
+          type: string
+          format: date-time
+    PlatformStatus:
+      type: object
+      required: [frozen, frozen_since, switches, alert_email, firing, master_key, capacity]
+      properties:
+        frozen:
+          type: boolean
+          description: '`true` while `PM_FREEZE = "on"` (a restore is in progress).'
+        frozen_since:
+          type: [string, 'null']
+          format: date-time
+        switches:
+          type: object
+          required: [read_only, free_sending, emergency_prune]
+          properties:
+            read_only:
+              type: string
+              enum: ['on', 'off']
+            free_sending:
+              type: string
+              enum: ['on', 'off']
+            emergency_prune:
+              type: string
+              enum: ['on', 'off']
+        alert_email:
+          type: string
+          description: '`missing` when neither `PM_ALERT_EMAIL` nor a `mailto:` `PM_SECURITY_CONTACT` is set.'
+          enum: [configured, missing]
+        firing:
+          type: array
+          items:
+            type: object
+            required: [alert, severity, fired_at]
+            properties:
+              alert:
+                type: string
+                description: The alert key, for example `dlq:pm-inbound`.
+              severity:
+                type: string
+                enum: [page, ticket]
+              fired_at:
+                type: string
+                format: date-time
+        master_key:
+          type: object
+          required: [active_slot, slots, remaining, activated_at, resealed_at]
+          properties:
+            active_slot:
+              type: string
+              enum: [a, b]
+            slots:
+              type: array
+              items:
+                type: object
+                required: [slot, present, kid]
+                properties:
+                  slot:
+                    type: string
+                    enum: [a, b]
+                  present:
+                    type: boolean
+                  kid:
+                    type: [string, 'null']
+                    description: First 8 bytes of SHA-256 of the key, lower-case hex.
+            remaining:
+              type: integer
+              minimum: 0
+              description: Sealed values whose key ID is not the active key's; 0 once a rotation's re-seal is done.
+            activated_at:
+              type: [string, 'null']
+              format: date-time
+              description: When the Worker first saw the active key.
+            resealed_at:
+              type: [string, 'null']
+              format: date-time
+              description: When `remaining` first reached 0 under the active key; a next rotation is allowed without `--discard-previous` 30 days later.
+        capacity:
+          type: object
+          required: [d1_bytes, d1_pct, vectors, vectors_pct, tenants, namespaces_pct, measured_at]
+          properties:
+            d1_bytes:
+              type: [integer, 'null']
+              minimum: 0
+            d1_pct:
+              type: [number, 'null']
+            vectors:
+              type: [integer, 'null']
+              minimum: 0
+            vectors_pct:
+              type: [number, 'null']
+            tenants:
+              type: integer
+              minimum: 0
+              description: Tenants that are not erased (one Vectorize namespace each).
+            namespaces_pct:
+              type: number
+            measured_at:
+              type: [string, 'null']
+              format: date-time
+    MailboxRestoreRequest:
+      description: Exactly one of `at` and `bookmark`.
+      oneOf:
+        - type: object
+          required: [at]
+          properties:
+            at:
+              type: string
+              format: date-time
+              description: The point in time, within the last 30 days.
+          additionalProperties: false
+        - type: object
+          required: [bookmark]
+          properties:
+            bookmark:
+              type: string
+              minLength: 1
+              description: An undo bookmark returned by an earlier restore.
+          additionalProperties: false
+    MailboxRestoreResult:
+      type: object
+      required: [identity_id, restored_to, undo_bookmark]
+      properties:
+        identity_id: {$ref: '#/components/schemas/IdentityId'}
+        restored_to:
+          type: [string, 'null']
+          format: date-time
+          description: The `at` asked for, or `null` when a bookmark was restored.
+        undo_bookmark:
+          type: string
+          description: Restores the state this call replaced.
     WaitlistInviteRequest:
       type: object
       required: [count]
@@ -15622,7 +16028,7 @@ components:
         erasure_request_id: {$ref: '#/components/schemas/ErasureRequestId'}
         step:
           type: string
-          description: The job step that failed, for example `delete_vectors`.
+          description: The job step that failed, for example `erase_mailboxes`. The step was retried until 20 hours after the first request.
         error:
           type: string
     ExportCompletedData:

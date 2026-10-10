@@ -4,7 +4,7 @@
 |---|---|
 | Status | Accepted |
 | Date | 2026-10-09 |
-| Deciders | Pylota engineering |
+| Deciders | The owner (TREFT LTD) |
 | Related | FR-DOM-4, FR-DOM-5, FR-ADR-2, FR-PRV-2, FR-PRV-3, NFR-PRV-1; [Privacy](../design/privacy.md); [Identities and domains](../design/identity-domains.md); [ADR 0001](0001-rust-on-workers.md) |
 
 ## Context

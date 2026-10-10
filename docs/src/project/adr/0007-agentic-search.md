@@ -4,7 +4,7 @@
 |---|---|
 | Status | Accepted |
 | Date | 2026-10-09 |
-| Deciders | Pylota engineering |
+| Deciders | The owner (TREFT LTD) |
 | Related | FR-SRCH-8, FR-SRCH-9, FR-SRCH-10, NFR-QUAL-2, NFR-PERF-6; [Search](../design/search.md); [Security](../design/security.md#83-fencing-content-for-models); [F10](../edge-cases.md)–[F13](../edge-cases.md) |
 
 ## Context

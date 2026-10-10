@@ -273,9 +273,9 @@ traits that call it:
   `failing`).
 - **Another value of a deployment variable or secret.** A test that needs one (`PM_CONSOLE=off` for
   `it::console::disabled`, `PM_WEB_BOT_AUTH=off` for `it::http_signatures::disabled_and_policy`,
-  `PM_BILLING=off` for `it::notify::billing_off_no_usage_alerts`, `PM_NOTIFICATIONS=off`, or the secret
-  `PM_MASTER_KEY_NEXT` for the master-key rotation tests) calls `restart_runtime_with(&[(name, value)])`,
-  which restarts wrangler like `restart_runtime()` (section 6.6) with the value overridden in the
+  `PM_BILLING=off` for `it::notify::billing_off_no_usage_alerts`, `PM_NOTIFICATIONS=off`, or the secrets
+  `PM_MASTER_KEY_B` and `PM_MASTER_KEY_ACTIVE` for the master-key rotation tests) calls
+  `restart_runtime_with(&[(name, value)])`, which restarts wrangler like `restart_runtime()` (section 6.6) with the value overridden in the
   rendered `wrangler.itest.toml` or `.dev.vars`, and restores the original on exit.
 
 ### 6.4 Injecting inbound mail
@@ -502,16 +502,33 @@ is synthetic, on reserved domains, under the repository's licence (FSL-1.1-ALv2)
 
 `cargo xtask eval-search`, `eval-agentic` and `eval-triage`:
 
-1. Start `wrangler dev` without `--local`, with the `AI` binding (always remote) and the Vectorize
-   binding set to `remote = true` against a dedicated index `pm-mail-chunks-eval` in the CI Cloudflare
-   account; D1, R2, Durable Objects and queues stay local. If the pinned Wrangler cannot bind Vectorize
-   remotely, the Worker uses the Vectorize REST fallback with `PM_CF_API_TOKEN`
-   ([Rust workspace](rust-workspace.md#7-wasm-bindgen-externs)).
-2. Generate the golden mailbox and inject it through the local email endpoint (section 6.4); wait until
+1. `cargo xtask eval-setup` provisions the index: in the evaluation account (`PM_EVAL_CF_ACCOUNT_ID`,
+   a Cloudflare account of its own, never the production account) it deletes `pm-mail-chunks-eval` if
+   it exists, creates it again (1,024 dimensions, cosine, the eight metadata indexes of
+   [Data model § 5](data-model.md#5-vectorize)) and waits until `GET …/vectorize/v2/indexes/pm-mail-chunks-eval/info`
+   answers. Every nightly run starts from an empty index.
+2. Start the Worker with `wrangler dev --local` and `PM_ENV = "local"`, `PM_EVAL_REST = "on"`,
+   `PM_VECTORS_INDEX = "pm-mail-chunks-eval"`, `PM_CF_ACCOUNT_ID` = the evaluation account and
+   `PM_CF_API_TOKEN` = `PM_EVAL_CF_API_TOKEN`. `PM_EVAL_REST` (read only when `PM_ENV = "local"`) sends
+   every Workers AI and Vectorize call through the REST paths of
+   [Rust workspace § 7](rust-workspace.md#7-wasm-bindgen-externs), so no remote binding is used: the
+   permissions a remote binding needs are not documented (Cloudflare "Local development" page, read
+   2026-10-10). D1, R2, Durable Objects and queues stay local. The binding paths themselves are proven
+   on staging by the `live::` suite.
+3. The token `PM_EVAL_CF_API_TOKEN` holds exactly: Account · Workers AI · Read and Workers AI · Edit
+   (the Workers AI REST page asks a custom token for both to run a model; the "Run model" API reference
+   accepts either), and Account · Vectorize · Edit (index create, insert and `delete_by_ids` accept only
+   Vectorize Write; query and info accept Read or Write), all on the evaluation account only, with no
+   Workers, D1, R2, Queues or zone permission (Cloudflare API reference pages for these calls and
+   "API token permissions", read 2026-10-10). A separate account is required because Vectorize
+   permissions are account-wide: in the production account the same token could delete
+   `pm-mail-chunks`.
+4. Generate the golden mailbox and inject it through the local email endpoint (section 6.4); wait until
    `semantic_coverage = 1.0` for every identity.
-3. Run every query, question or labelled message through the public API (triage through
-   `POST …/messages/{id}/triage`); write `target/eval/<suite>.json` with per-item results and totals.
-4. Compare with the baseline in `quality.md` and fail on a gate.
+5. Run every query, question or labelled message through the public API (triage through
+   `POST …/messages/{id}/triage`) three times (the repeat policy in section 9.3); write
+   `target/eval/<suite>.json` with per-item results per run and the totals.
+6. Compare the median with the baseline in `quality.md` and fail on a gate.
 
 ### 9.3 Metrics and gates
 
@@ -520,6 +537,16 @@ is synthetic, on reserved domains, under the repository's licence (FSL-1.1-ALv2)
 | search (`eval::search`) | Hybrid recall@10 ≥ 0.90 and no drop of more than 0.01 against the baseline (NFR-QUAL-1); keyword zero-result rate 0 on exact-reference queries | [Search §13.2](search.md#132-labelled-queries-and-metrics) |
 | agentic (`eval::agentic`) | Citation precision after verification ≥ 0.98 (NFR-QUAL-2); steering failures 0; no `answered` status on unanswerable questions (FR-SRCH-9) | [Search §13.3](search.md#133-agentic-evaluation) |
 | triage (`eval::triage`) | Category accuracy ≥ 0.85 (NFR-QUAL-3) and no drop of more than 0.01 against the baseline | [Triage §13](triage.md#13-evaluation-set-and-nfr-qual-3) |
+
+**Repeat policy.** Model output varies between runs. Every model call in an evaluation uses the
+production parameters: triage `temperature: 0` with its fixed `seed` ([Triage](triage.md)), the planner's
+`temperature: 0.2` ([Search](search.md)). Workers AI accepts `seed` and `temperature` on its
+text-generation models (model pages, read 2026-10-10), but the documentation does not promise identical
+output for a seed, so each suite runs three times on the same index and its score is the **median** of
+the three. When the spread (highest minus lowest) exceeds 0.02, three more runs follow and the median of
+six is used; a spread still above 0.02 fails the job as `unstable`, and the report lists the items whose
+result changed between runs. A gate's "drop of more than 0.01" compares that median with the baseline.
+The baseline recorded in `quality.md` is the median of five runs on the commit that sets it.
 
 Pull requests run the same pipelines with the scripted fake model, so prompts, fencing, budgets, the
 verifier and schema validation are checked without network access. In addition,
@@ -552,7 +579,7 @@ deployment (its own zone, platform domain, D1, R2, Vectorize and queues, [Archit
 | `live::ops::metrics_reach_analytics_engine`, `live::ops::restore_drill` | [Observability](observability.md#10-tests) |
 | `live::slo::inbound_to_webhook` | M20 step 13, NFR-REL-3: mail from the Gmail and Outlook test mailboxes to a staging webhook endpoint over the live run, p95 ≤ 30 s and p99 ≤ 120 s ([Observability](observability.md#10-tests)) |
 | `live::ops::idle_cost_review` | M20 step 13, NFR-COST-1: after a week of idling on staging, the Cloudflare usage report shows no compute beyond the cron and alarm invocations; the figures are recorded in the release notes ([Observability](observability.md#10-tests)) |
-| `live::ops::fresh_deploy_rehearsal` | NFR-OPS-1: a person who did not build the service deploys a fresh Cloudflare account from `self-hosting.md` alone; the hands-on time is recorded and must be at most 15 minutes ([Build plan › M20](../build-plan.md), step 12) |
+| `live::ops::fresh_deploy_rehearsal` | NFR-OPS-1: a fresh agent session with no checkout, memory or context but `self-hosting.md` and a new Cloudflare account's credentials deploys from that page alone; the hands-on time it reports is at most 15 minutes, and its transcript, timings and every point it had to guess are recorded ([Build plan › M20](../build-plan.md), step 12; [ADR 0015](../adr/0015-solo-operator.md)) |
 | `live::console::magic_link_invite_release` | M20 step 9. Reads the sign-in email from the Gmail test mailbox through its API and posts the console forms with an HTTP client (the console needs no JavaScript); invites the Outlook test mailbox, which accepts; releases a message quarantined as `otp_unsolicited`; the audit log shows `member.invite`, `member.join` and `quarantine.release` |
 | `live::signup::google_to_checkout` | **Manual.** M20 step 10, with `PM_SIGNUP=open`: a person signs up with a dedicated Google test account at `/console/sign-up?plan=developer` and pays on the Checkout page with Stripe's test card; the harness then checks through the API that the account and workspace exist, the Overview shows the first-run checklist, and the plan is `developer` once the webhook arrives |
 | `live::billing::upgrade_spend_topup_retry` | **Manual** for the two Checkout pages, scripted otherwise. M20 step 11 with the staging catalog: a person upgrades Free to Developer and later buys a sends top-up in Stripe Checkout; the harness sends until `402 billing_limit` (Developer's 20 sends), and after the top-up retries the refused send with the same `Idempotency-Key` and gets one `202` and one email |
@@ -574,8 +601,9 @@ through the API exactly as an automated test would, and records the result per t
 price IDs and small allowances (Free 10 sends, Developer 20 sends, a sends top-up of 5 units), so step 11
 reaches `402` and step 15 crosses 80% within a few sends.
 
-**Secrets.** Live tests read credentials only from the GitHub Environment `staging`, which requires a
-reviewer and is limited to `main` and release tags; forks never receive them. The environment holds: a
+**Secrets.** Live tests read credentials only from the GitHub Environment `staging`, which requires the
+owner's approval (the owner may approve their own runs: there is no second person, [ADR 0015](../adr/0015-solo-operator.md))
+and is limited to `main` and release tags; forks never receive them. The environment holds: a
 Cloudflare API token scoped to the staging account, a staging platform key with a 90-day expiry, OAuth
 credentials limited to the two dedicated test mailboxes (Google Workspace and Microsoft 365, holding only
 synthetic mail), AWS credentials for the staging SES resources, and an API token for the external DNS
@@ -665,7 +693,7 @@ It prints the traceability matrix as Markdown into the CI summary, with the mile
 | W24–W26 | Stripe fake and signed webhook payloads; the return page's refresh loop |
 | W27, W28, W30 | Fake clock (TOTP steps, key rotation plus 8 days, the 7-day ramp); the `*/15` cron through the scheduled endpoint at 03:00 UTC for the daily ramp evaluation |
 | W29, W31–W34 | Plain requests; W33 sends two concurrent creates |
-| O1–O13, O27, O28 | Signing keys minted by the harness's platform key with `identities:sign` granted; fake clock for `verify_until` and signature expiry; concurrent first signs from one test (O28); a recording HTTP client under the SDK verifier, to prove no request for a crafted `sub` (O27); the Rust SDK verifier run against the JWKS served by workerd; tenant policy per test; `restart_runtime_with` for `PM_WEB_BOT_AUTH=off` (O9); `restart_runtime_with` setting the secret `PM_MASTER_KEY_NEXT` for O8 |
+| O1–O13, O27, O28 | Signing keys minted by the harness's platform key with `identities:sign` granted; fake clock for `verify_until` and signature expiry; concurrent first signs from one test (O28); a recording HTTP client under the SDK verifier, to prove no request for a crafted `sub` (O27); the Rust SDK verifier run against the JWKS served by workerd; tenant policy per test; `restart_runtime_with` for `PM_WEB_BOT_AUTH=off` (O9); `restart_runtime_with` setting the secrets `PM_MASTER_KEY_B` and `PM_MASTER_KEY_ACTIVE` for O8 |
 | O14–O26 | Fake clock for the 2-minute hold, the 10-minute windows, the hourly and 09:00 runs, time-zone changes and the 24-hour cooldowns; `/__test/alarm` with class `notifier`; notification emails observed like console sign-in mail; `/__test/delivery-event` for a hard bounce on one (O17); the DNS fake for a `failing` platform domain (O25); `restart_runtime_with` for `PM_BILLING=off` (O23) |
 
 ### 11.4 Coverage
@@ -685,8 +713,10 @@ adds the security and traceability jobs:
 |---|---|---|
 | `ci.yml` | `fmt`, `clippy`, `test` (with coverage), `layering`, `wasm`, `itest` (`cargo xtask itest --suite it`; includes the attack suite and the deterministic keyword recall), `browser` (`cargo xtask itest --suite browser`: the console without JavaScript and the axe scan, section 6.8), `fuzz-smoke`, `deny`, `audit` (`cargo audit`), `openapi`, `docs`, `trace` (`cargo xtask trace`) | Every pull request and push to `main` |
 | `codeql.yml` | CodeQL for Rust | Every pull request, weekly |
+| `heartbeat.yml` | `pmail doctor --json --check health --check alerts` against production, and once a day `--mail-test`, with the keys of the `ops` environment ([Observability § 5.5](observability.md#55-alert-email-and-the-external-heartbeat)) | Every 15 minutes, and by hand |
 | `nightly.yml` | All fuzz targets for 10 minutes each; property tests at 65,536 cases; `eval-search`, `eval-agentic`, `eval-triage`; the large benchmarks (`it::bench::*`, section 6.9); `live::` suite; `cargo audit` on `main` | Nightly |
-| `release.yml` | Publishes a release, exactly as defined in [Rust workspace › CI pipeline](rust-workspace.md#10-ci-pipeline): version check; the full `ci.yml` gate and the three evaluations; CLI binaries; `cargo xtask release` (bundle, `SHA256SUMS` signed with minisign, SBOMs, provenance) into a GitHub pre-release; a staging deploy of that release and the `live::` suite; then `cargo xtask release-gate` and, for a version without a pre-release part, promotion to a full release and `cargo publish`. It never deploys Pylota Mail Cloud | Tag `v*` |
+| `release.yml` | Builds a release, exactly as defined in [Rust workspace › CI pipeline](rust-workspace.md#10-ci-pipeline): version check; the full `ci.yml` gate and the three evaluations; CLI binaries; `cargo xtask release` (bundle, unsigned `SHA256SUMS`, SBOMs, provenance) into a draft GitHub Release, then stops for the owner's offline signature (`cargo xtask release sign`, [Security § 11](security.md#11-supply-chain)). It never deploys Pylota Mail Cloud | Tag `v*` |
+| `release-publish.yml` | Verifies `SHA256SUMS.sig` against the public keys compiled into `pmail` and marks the draft a pre-release; a staging deploy of that release and the `live::` suite; then `cargo xtask release-gate` and, for a version without a pre-release part, promotion to a full release and `cargo publish` | Manual (`workflow_dispatch` on the tag, started by `cargo xtask release sign`) |
 | `cloud-deploy.yml` | Rolls a published release out to Pylota Mail Cloud: `pmail deploy --version <v> --gradual` (10% → 50% → 100%, [Architecture](../architecture.md)) with the `production` environment's secrets; refuses a pre-release | Manual (`workflow_dispatch`, input `version`) |
 
 **Required checks to merge into `main`:** `fmt`, `clippy`, `test`, `layering`, `wasm`, `itest`,
@@ -697,7 +727,7 @@ adds the security and traceability jobs:
 (section 9.3); the `live::` suite green on staging with that commit deployed, including a passing manual
 run (`cargo xtask live --manual`, section 10); no open crash from the
 nightly fuzz run; the [security pre-release checklist](security.md#16-pre-release-checklist). They are
-enforced, not only listed: `cargo xtask release-gate` in the `publish` job refuses to promote the release
+enforced, not only listed: `cargo xtask release-gate` in the `publish` job of `release-publish.yml` refuses to promote the release
 until each holds ([Rust workspace › xtask](rust-workspace.md#9-xtask)).
 
 GitHub Actions are pinned to full commit SHAs and each job declares least-privilege `permissions`
@@ -707,6 +737,7 @@ GitHub Actions are pinned to full commit SHAs and each job declares least-privil
 
 | Test | Proves |
 |---|---|
+| `xtask::eval_median_policy` | From recorded per-run results, an evaluation scores the median of three runs, adds three runs when the spread exceeds 0.02, fails as `unstable` when the six still spread more than 0.02, and fails a gate only when the median drops more than 0.01 below the baseline (section 9.3) |
 | `xtask::trace_detects_missing_test` | A fixture register naming a non-existent test fails `cargo xtask trace`; with a `MILESTONES` file that lists only `M5`, a missing test of an `M9` row is `pending` and passes, and the same file with `M9` added fails |
 | `xtask::itest_refuses_release_hooks` | `cargo xtask build-worker` fails when `itest-hooks` is enabled or the bundle contains `/__test/` |
 | `it::harness::hooks_need_token` | Hooks without `x-pm-test-token` return `404` |
