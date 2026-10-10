@@ -6,6 +6,7 @@ The landing page and the docs, served together by one assets-only Cloudflare Wor
 ```
 site/
   wrangler.jsonc     Worker config: name, compatibility date, assets directory
+  package.json       pins Wrangler 4.139.0 for deploys; package-lock.json holds every package's integrity hash
   check-live.sh      after a deploy: both hostnames over HTTPS, and HTTP redirects to HTTPS
   public/            everything that is served
     index.html       landing page
@@ -29,7 +30,7 @@ environment. It needs two secrets on that environment:
 
 | Secret | Value |
 |---|---|
-| `CLOUDFLARE_API_TOKEN` | A token with **Account › Workers Scripts › Edit**, and **Zone (pylotamail.com) › Workers Routes › Edit** and **DNS › Edit** |
+| `CLOUDFLARE_API_TOKEN` | An account-owned token (**Manage Account › Account API Tokens**) with the scope **Specified Workers** = `pylota-mail-site` and the role **Editor**, plus **Zone (pylotamail.com) › Workers Routes › Edit**. Nothing else: no account-wide **Workers Scripts › Edit**, which in Pylota's shared account would reach every Worker, and no **DNS › Edit**. The Custom Domains already exist, and redeploying a Worker without changing them needs only Editor (Cloudflare "Workers roles and permissions", read 2026-10-10). Editor cannot create a Worker: a brand-new site Worker is deployed once by hand with a wider token |
 | `CLOUDFLARE_ACCOUNT_ID` | The Cloudflare account that holds the `pylotamail.com` zone |
 
 Secrets belong to one repository. Secrets that another repository uses for the same Cloudflare
@@ -45,13 +46,17 @@ bash site/check-live.sh pylotamail.com www.pylotamail.com
 **By hand**, from the repository root:
 
 ```bash
-mdbook build docs                                              # writes the docs to site/public/docs
-npx --yes wrangler@4.139.0 deploy --config site/wrangler.jsonc
+mdbook build docs                       # writes the docs to site/public/docs
+cd site
+npm ci --ignore-scripts                 # Wrangler from package-lock.json, integrity-checked
+./node_modules/.bin/wrangler deploy
 ```
 
 `docs/book.toml` sets `build-dir = "../site/public/docs"`, so the docs are served at `/docs/`.
-Paths in `wrangler.jsonc` are relative to that file, so the command works from any directory.
-The workflow pins mdBook 0.5.4 and Wrangler 4.139.0; change both there and here together.
+Paths in `wrangler.jsonc` are relative to that file. The workflow pins mdBook 0.5.4; Wrangler 4.139.0 is
+pinned in `package.json` and `package-lock.json`. To move Wrangler, read its changelog, then run
+`npm install --save-exact --save-dev wrangler@<version>` in `site/` and commit both files; the workflow
+never installs a version that is not in the lockfile.
 
 ### Before the first deploy
 
@@ -94,7 +99,7 @@ block to serve the site on `workers.dev` only.
 ## Preview locally
 
 ```bash
-npx --yes wrangler@4.139.0 dev --config site/wrangler.jsonc
+cd site && npm ci --ignore-scripts && ./node_modules/.bin/wrangler dev
 ```
 
 Wrangler 4.139.0 (2026-09-24) runs the `2026-09-22` compatibility date locally. Older releases

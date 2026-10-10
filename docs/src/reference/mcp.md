@@ -494,8 +494,9 @@ Arguments: `message_id`, `to` and `idempotency_key` (required); `identity`, `tex
 ### `mail_update_labels`
 
 Arguments: `identity`, exactly one of `message_id` and `thread_id`, `labels_add`, `labels_remove`,
-`read`. A call with none of `labels_add`, `labels_remove` and `read` changes nothing and returns
-`invalid_request`, as the REST `PATCH` does.
+`read`. The server checks the "exactly one" rule itself (the input schema is a plain object, with no
+top-level `oneOf`): both or neither returns `invalid_request`. A call with none of `labels_add`,
+`labels_remove` and `read` changes nothing and returns `invalid_request`, as the REST `PATCH` does.
 
 ```json
 { "identity": "bookings@acme.example.com", "thread_id": "thr_01JA5C2H8QW7X2M5N6P8R0T1YB",

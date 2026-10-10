@@ -74,3 +74,5 @@
   - [0010 Cloud in the existing Cloudflare account](project/adr/0010-cloud-in-the-existing-cloudflare-account.md)
   - [0011 Workspace policy self-service](project/adr/0011-workspace-policy-self-service.md)
   - [0012 Service sign-up ledger](project/adr/0012-service-sign-up-ledger.md)
+  - [0013 Partner keys as a fourth key level](project/adr/0013-partner-keys.md)
+  - [0014 Marketing mail only through SES or SMTP](project/adr/0014-marketing-needs-ses.md)

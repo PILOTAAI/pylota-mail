@@ -720,13 +720,21 @@ Title "Label or mark mail". Description:
     "thread_id": { "type": "string", "pattern": "^thr_[0-9A-HJKMNP-TV-Z]{26}$" },
     "labels_add": { "type": "array", "maxItems": 64, "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_:-]{0,63}$" } },
     "labels_remove": { "type": "array", "maxItems": 64, "items": { "type": "string", "pattern": "^[a-z0-9][a-z0-9_:-]{0,63}$" } },
-    "read": { "type": "boolean" } },
-  "oneOf": [ { "required": ["message_id"] }, { "required": ["thread_id"] } ] }
+    "read": { "type": "boolean" } } }
 ```
 
-Output: `{ id, labels, read }` for the message or thread. A call with none of `labels_add`,
-`labels_remove` and `read` changes nothing and returns `invalid_request` (path `labels_add`), as the REST
-`PATCH` does through `minProperties: 1`.
+Output: `{ id, labels, read }` for the message or thread. Exactly one of `message_id` and `thread_id` is
+required, and the handler checks it: both, or neither, returns `invalid_request` with
+`details.errors[0].path` = `thread_id` (both) or `message_id` (neither), and changes nothing. The schema
+does not say it with a top-level `oneOf`, because the Anthropic API is reported to reject a tool whose
+`input_schema` has `oneOf`, `allOf` or `anyOf` at its top level, and to fail the whole request for one
+such tool (anthropics/claude-code issue 27337 and its duplicates, seen 2026-10-10; Anthropic's "Define
+tools" page, read the same day, requires `input_schema` to be a JSON Schema object and does not state
+the restriction). Every tool's `inputSchema` is therefore a plain `"type": "object"` at the top level;
+combinators may appear only inside a property, as in `mail_send`'s recipients
+(`it::mcp::input_schemas_plain_objects`). A call with none of `labels_add`, `labels_remove` and `read`
+changes nothing and returns `invalid_request` (path `labels_add`), as the REST `PATCH` does through
+`minProperties: 1`.
 
 #### `mail_sign_assertion`
 
@@ -988,6 +996,7 @@ v1.1 needs an ADR and updates to [Configuration](../../reference/configuration.m
 | `it::mcp::sse_deep_search_progress` | Progress notifications per step, keep-alive, final response; closing the stream stops the loop | §2.6 |
 | `it::mcp::size_budgets` | Truncation flags and the 96 KB cap; attachment text is cut per page; every cut result still validates against its tool's `outputSchema` and has `truncated: true` | §4.2 |
 | `it::mcp::get_usage` | `mail_get_usage` is listed for tenant and identity keys that do not hold `usage:read` explicitly and never for platform or partner keys; it returns the same body as `GET /v1/usage` for the key's own workspace; any argument gives `invalid_request` | §3, §4.3, FR-BILL-11 |
+| `it::mcp::input_schemas_plain_objects` | Every tool in `tools/list` has an `inputSchema` whose top level is `"type": "object"` with no `oneOf`, `anyOf`, `allOf` or `not`; `mail_update_labels` with both `message_id` and `thread_id`, or with neither, gets `invalid_request` with the path named above and changes nothing | §4.3, FR-MCP-1, M15 |
 | `it::mcp::sign_tools` | `mail_sign_assertion` and `mail_sign_http_request` are listed only for tenant and identity keys holding `identities:sign`; an identity key naming another identity gets `identity_not_found`; the results have the REST shapes and verify (the token against the identity's JWKS); two identical calls return different tokens; an identity of a suspended tenant gets `tenant_suspended` (checked first) and a paused identity `identity_paused`, and `PM_WEB_BOT_AUTH=off` and a tenant not opted in give `web_bot_auth_disabled` and `policy_denied` as `isError` results | §3, §4.3, §5, FR-IDN-7, FR-IDN-8 |
 | `it::mcp::accounts_tools` ([Service sign-up ledger §10](service-accounts.md#10-tests)) | `mail_request_account` and `mail_list_accounts` are listed only for keys with `accounts:request`, map to their REST routes and return the same errors (`account_exists`, `account_limit_reached`, `identity_paused`) | FR-IDN-10, M27 |
 | `it::mcp::rmcp_roundtrip` (native) | Every local protocol type round-trips through `rmcp::model` 3.4.1 | S5 fallback |

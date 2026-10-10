@@ -161,7 +161,7 @@ The **message summary** used in `data.message` is:
 | `member.joined` | `user_id`, `role` |
 | `member.role_changed` | `user_id`, `from`, `to` |
 | `member.removed` | `user_id` |
-| `billing.plan_changed` | `from_plan`, `to_plan`, `reason` (`checkout`, `portal`, `payment_failed_grace_ended`, `payment_recovered` (the plan was restored after a late payment), `canceled`, `operator`) |
+| `billing.plan_changed` | `from_plan`, `to_plan`, `reason` (`checkout`, `portal`, `payment_failed_grace_ended`, `payment_recovered` (the plan was restored after a late payment, or when a dispute closed in the workspace's favour), `canceled`, `operator`, `dispute` (a payment was disputed: the default plan applies and sends stop until the dispute closes)) |
 | `billing.payment_failed` | `grace_until` |
 | `billing.limit_reached` | `feature`, `granted`, `resets_at` (sent once per feature per period, when the first `402` is returned) |
 | `tenant.policy_updated` | `fields` (the dotted paths written), `by` (`platform`, `partner`, `tenant` or `console`), `actor_key_id`, `actor_user_id` (one of them `null`), `policy_version`. Sent for every policy write except a tenant's creation, to the tenant's, its partner's and platform endpoints ([Workspace policy](../project/design/workspace-policy.md#7-audit-and-events)) |

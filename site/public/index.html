@@ -75,7 +75,7 @@
               <div class="menu-col">
                 <p class="menu-label">The mailbox</p>
                 <ul>
-                  <li><a class="menu-link" href="#features"><span class="menu-ico"><svg class="i" aria-hidden="true" focusable="false"><use href="#i-at"/></svg></span><span class="menu-text"><span class="menu-title">Identities</span><span class="menu-desc">Addresses, signed assertions, Web Bot Auth</span></span></a></li>
+                  <li><a class="menu-link" href="#features"><span class="menu-ico"><svg class="i" aria-hidden="true" focusable="false"><use href="#i-at"/></svg></span><span class="menu-text"><span class="menu-title">Identities</span><span class="menu-desc">Addresses and signed agent assertions</span></span></a></li>
                   <li><a class="menu-link" href="#receive"><span class="menu-ico"><svg class="i" aria-hidden="true" focusable="false"><use href="#i-shield"/></svg></span><span class="menu-text"><span class="menu-title">Verified inbound</span><span class="menu-desc">SPF, DKIM and DMARC verdicts, quarantine</span></span></a></li>
                   <li><a class="menu-link" href="#understand"><span class="menu-ico"><svg class="i" aria-hidden="true" focusable="false"><use href="#i-sliders"/></svg></span><span class="menu-text"><span class="menu-title">Triage</span><span class="menu-desc">Category, needs reply, urgency, risk flags</span></span></a></li>
                   <li><a class="menu-link" href="#act"><span class="menu-ico"><svg class="i" aria-hidden="true" focusable="false"><use href="#i-retry"/></svg></span><span class="menu-text"><span class="menu-title">Safe retries</span><span class="menu-desc">Idempotency keys; uncertain sends never resent</span></span></a></li>
@@ -424,7 +424,7 @@
             <p class="usp-num" aria-hidden="true">05</p>
             <h3>Built for untrusted input</h3>
             <p class="usp-text">Every message carries SPF, DKIM and DMARC verdicts and trust flags. Hidden text is stripped, models see fenced content, and risky attachments wait for a person.</p>
-            <p class="usp-proof">trust.flags · quarantine · human release</p>
+            <p class="usp-proof">trust.flags · quarantine · review before release</p>
           </li>
           <li class="usp">
             <p class="usp-num" aria-hidden="true">06</p>
@@ -464,16 +464,16 @@
               <p class="stage-num" aria-hidden="true">01</p>
               <h3>Receive</h3>
               <p>A catch-all route sends mail for every address on your domain to the right identity. Messages up to 25&nbsp;MiB are accepted, parsed and given a sender verdict.</p>
-              <p>Mail that fails authentication, looks like spam or carries an unsafe attachment goes to quarantine. A person releases it. An agent cannot.</p>
+              <p>Mail that fails authentication, looks like spam or carries an unsafe attachment goes to quarantine and waits for review. On Pylota Mail Cloud only a signed-in person can release it, unless the workspace's policy lets an API key with review permission do so; a self-hosted deployment chooses its own rule.</p>
               <ul class="ticks">
                 <li>Catch-all routing to identities</li>
                 <li>Inbound messages up to 25&nbsp;MiB</li>
                 <li>DKIM, ARC and DMARC sender verdicts</li>
-                <li>Quarantine with human release</li>
+                <li>Quarantine with review before release</li>
               </ul>
             </div>
             <div class="stage-visual rise-on-scroll">
-              <div class="card quarantine" role="img" aria-label="Quarantine card for a message with the subject Remittance advice INV-40417. DKIM failed, SPF soft-failed, DMARC failed with a reject policy, ARC is absent, and the attachment invoice.pdf.exe is an executable. The message is held until a person with review permission releases or deletes it.">
+              <div class="card quarantine" role="img" aria-label="Quarantine card for a message with the subject Remittance advice INV-40417. DKIM failed, SPF soft-failed, DMARC failed with a reject policy, ARC is absent, and the attachment invoice.pdf.exe is an executable. The message is held until someone with review permission releases or deletes it.">
                 <div class="q-head">
                   <span class="q-badge"><svg aria-hidden="true"><use href="#i-lock"/></svg>Quarantined</span>
                   <span class="q-time">held 4 min</span>
@@ -686,22 +686,24 @@ pmail ask <span class="t-s">"Did the insurer accept the Golf claim?"</span> --id
               <h3 class="tab-label" data-tab-label>Rust SDK</h3>
               <div class="code">
                 <div class="code-head"><span class="code-file">src/booking.rs</span><button class="copy" type="button" data-copy="code-rust"><svg class="i" aria-hidden="true" focusable="false"><use href="#i-copy"/></svg><span class="copy-label">Copy</span><span class="visually-hidden"> Rust example</span></button></div>
-<pre tabindex="0"><code id="code-rust"><span class="t-kw">use</span> pylota_mail::Client;
+<pre tabindex="0"><code id="code-rust"><span class="t-kw">use</span> pylota_mail::{Client, IdempotencyKey};
+<span class="t-kw">use</span> pylota_mail::types::{Recipient, SendRequest};
 
 <span class="t-kw">async fn</span> <span class="t-f">confirm_booking</span>(key: String) -&gt; Result&lt;(), pylota_mail::Error&gt; {
-    <span class="t-kw">let</span> client = pylota_mail::Client::<span class="t-f">new</span>(<span class="t-s">"https://mail.example.com"</span>, key);
-
-    <span class="t-kw">let</span> sent = client
-        .<span class="t-f">identity</span>(<span class="t-s">"idn_01J9Z3K8V4"</span>)
-        .<span class="t-f">send</span>()
-        .<span class="t-f">to</span>(<span class="t-s">"renter@example.org"</span>)
-        .<span class="t-f">subject</span>(<span class="t-s">"Your booking BK-2291"</span>)
-        .<span class="t-f">text</span>(<span class="t-s">"Your car is ready at 9:00."</span>)
-        .<span class="t-f">idempotency_key</span>(<span class="t-s">"bk-2291-confirm"</span>)
-        .<span class="t-kw">await</span>?;
-
+    <span class="t-kw">let</span> client = Client::<span class="t-f">builder</span>()
+        .<span class="t-f">base_url</span>(<span class="t-s">"https://mail.example.com"</span>)
+        .<span class="t-f">api_key</span>(key)
+        .<span class="t-f">build</span>()?;
+    <span class="t-kw">let</span> request = SendRequest {
+        to: vec![Recipient::<span class="t-f">from</span>(<span class="t-s">"renter@example.org"</span>)],
+        subject: <span class="t-s">"Your booking BK-2291"</span>.<span class="t-f">into</span>(),
+        text: Some(<span class="t-s">"Your car is ready at 9:00."</span>.<span class="t-f">into</span>()),
+        ..Default::<span class="t-f">default</span>()
+    };
+    <span class="t-kw">let</span> key = IdempotencyKey::<span class="t-f">new</span>(<span class="t-s">"bk-2291-confirm"</span>)?;
     <span class="t-c">// a retry with the same key returns this same message</span>
-    println!(<span class="t-s">"{} deduplicated={}"</span>, sent.id, sent.deduplicated);
+    <span class="t-kw">let</span> sent = client.<span class="t-f">send_message</span>(<span class="t-s">"idn_01J9Z3K8V4"</span>, &amp;request, &amp;key).<span class="t-kw">await</span>?;
+    println!(<span class="t-s">"{} deduplicated={}"</span>, sent.message.id, sent.deduplicated);
     Ok(())
 }</code></pre>
               </div>
@@ -801,21 +803,24 @@ pmail ask <span class="t-s">"Did the insurer accept the Golf claim?"</span> --id
             <div class="plan-head"><h3>Free</h3></div>
             <p class="plan-blurb">Try agents with real inboxes. No card required.</p>
             <p class="plan-price"><span class="plan-amount">£0</span><span class="plan-per">a month</span></p>
-            <a class="btn btn-ghost plan-cta" href="/docs/guides/plans.html#pylota-mail-cloud">Get early access</a>
+            <!-- Cloud opens with v1.0. Once it runs with PM_SIGNUP=waitlist, point these three buttons at
+                 https://app.pylotamail.com/console/waitlist?plan={free|developer|team} and label them
+                 "Get early access" (docs: Cloud sign-up §6.1). -->
+            <a class="btn btn-ghost plan-cta" href="/docs/guides/plans.html#pylota-mail-cloud">See how plans work</a>
             <ul class="plan-feats"><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>5 inboxes</li><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>1,000 sends a month</li><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>500 triage analyses a month</li><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>1 GB of storage</li><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>1 seat</li><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>Help on GitHub issues</li></ul>
           </li>
           <li class="plan">
             <div class="plan-head"><h3>Developer</h3></div>
             <p class="plan-blurb">For one person's agents in production.</p>
             <p class="plan-price"><span class="plan-amount">£10</span><span class="plan-per">a month</span></p>
-            <a class="btn btn-ghost plan-cta" href="/docs/guides/plans.html#pylota-mail-cloud">Get early access</a>
+            <a class="btn btn-ghost plan-cta" href="/docs/guides/plans.html#pylota-mail-cloud">See how plans work</a>
             <ul class="plan-feats"><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>10 inboxes</li><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>10,000 sends a month</li><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>10,000 triage analyses a month</li><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>5 custom domains</li><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>10 GB of storage · 2 seats</li><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>Email support · £1 top-ups</li></ul>
           </li>
           <li class="plan plan-featured">
             <div class="plan-head"><h3>Team</h3><span class="plan-badge">Most capacity</span></div>
             <p class="plan-blurb">For a team running a fleet of agents.</p>
             <p class="plan-price"><span class="plan-amount">£49.50</span><span class="plan-per">a month</span></p>
-            <a class="btn btn-primary plan-cta" href="/docs/guides/plans.html#pylota-mail-cloud">Get early access</a>
+            <a class="btn btn-primary plan-cta" href="/docs/guides/plans.html#pylota-mail-cloud">See how plans work</a>
             <ul class="plan-feats"><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>100 inboxes</li><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>100,000 sends a month</li><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>100,000 triage analyses a month</li><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>50 custom domains</li><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>100 GB of storage · 10 seats</li><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>Priority email · £1 top-ups</li></ul>
           </li>
           <li class="plan plan-self">
@@ -826,7 +831,7 @@ pmail ask <span class="t-s">"Did the insurer accept the Golf claim?"</span> --id
             <ul class="plan-feats"><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>API, MCP, CLI and console</li><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>No plan limits, billing off by default</li><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>One Rust Worker, no servers</li><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>EU jurisdiction optional</li><li><svg class="i" aria-hidden="true" focusable="false"><use href="#i-check"/></svg>Support contracts available</li></ul>
           </li>
         </ol>
-        <p class="plans-note">Prices in pounds sterling, excluding VAT. A top-up is £1 a month for one more inbox, 1,000 more sends or 1,000 more triage analyses. Monthly allowances reset on your billing date; inbox, domain and seat counts do not. Pylota Mail Cloud opens with the v1.0 release.</p>
+        <p class="plans-note">Prices in pounds sterling, excluding VAT. A top-up is £1 a month for one more inbox, 1,000 more sends or 1,000 more triage analyses. Monthly allowances reset on your billing date on a paid plan, and on the 1st of each month on Free; inbox, domain and seat counts do not. Pylota Mail Cloud opens with the v1.0 release.</p>
       </div>
     </section>
 
@@ -888,7 +893,7 @@ pmail deploy</code></pre>
           </details>
           <details>
             <summary>Can operators bring their own domain?</summary>
-            <p>Yes, wherever their DNS is hosted. A domain at any DNS host needs a few records (MX, DKIM, a bounce subdomain) and then sends and receives through Amazon SES, on the apex or a subdomain, so existing mail keeps working. Operators can also keep their own mailbox and forward to the agent, or send through their own mail provider: a daily check proves their mail still passes DMARC before the agent sends as them. Domains on Cloudflare work directly. Identities keep their history when they move. The <a href="/docs/guides/custom-domains.html">custom domains guide</a> walks through each option.</p>
+            <p>Yes, wherever their DNS is hosted. A domain at any DNS host needs a few records (MX, DKIM, a bounce subdomain) and then sends and receives through Amazon SES, on the apex or a subdomain, so existing mail keeps working. Operators can also keep their own mailbox and forward to the agent, or send through their own mail provider: a daily check proves their mail still passes DMARC before the agent sends as them. Domains on Cloudflare work directly. Each option that uses Amazon SES or another mail provider ships in v1.0 only if its pre-build test passes; otherwise it follows in a later release. Identities keep their history when they move. The <a href="/docs/guides/custom-domains.html">custom domains guide</a> walks through each option.</p>
           </details>
           <details>
             <summary>Where is data stored?</summary>

@@ -541,9 +541,11 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
   [Console design](design/console.md#roles). Ownership can be transferred to an admin.
 - **FR-CON-3** Sign-in **must** be passwordless: a single-use magic link or a six-digit code sent by email,
   valid for 10 minutes. It **must** be rate-limited: 3 link or code requests per 10 minutes per address;
-  10 attempts per code (the token is burned after 10 failures); and `RL_SIGNIN`, 10 requests per 60 s per
-  client IP on the sign-in, sign-up and waitlist routes. Passkeys (WebAuthn) are P2: they need browser
-  JavaScript, which the console does not use (FR-CON-1).
+  10 attempts per code (the token is burned after 10 failures); 30 failed codes per address per UTC day,
+  after which only the link works until the next UTC day; and `RL_SIGNIN`, 10 requests per 60 s per
+  client network (an IPv6 /64 counts as one) on the sign-in, sign-up, waitlist and pending-step routes
+  and the OAuth start. Passkeys (WebAuthn) are P2: they need browser JavaScript, which the console does
+  not use (FR-CON-1).
 - **FR-CON-4** Members are invited by email. A pending invitation **must** count against the seat limit and
   expire after 7 days. Removing a member **must** end their sessions immediately.
 - **FR-CON-5** Sensitive actions **must** require a sign-in within the last 10 minutes and be written to the
@@ -565,7 +567,8 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
   **must** be created only when the link or code is used.
 - **FR-CON-9** Sign-in with Google and GitHub **must** be available when their client credentials are
   configured (on Pylota Mail Cloud). It **must** accept only a verified email address, use PKCE and a
-  `state` bound to the browser by a cookie, and link to an existing person with the same verified email.
+  `state` bound to the browser by a cookie, and link to an existing person with the same verified email
+  only as FR-CON-17 allows.
 - **FR-CON-10** A person **must** be able to enrol two-step verification with an authenticator app (TOTP,
   RFC 6238) and ten single-use recovery codes. Once enrolled, it is asked for after every first factor and
   at re-authentication. A workspace owner **may** set `require_two_factor`; a member without two-step
@@ -579,9 +582,9 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
 - **FR-CON-13** Returning from Stripe Checkout **must** never change the plan: Stripe webhooks are the only
   source of plan state (FR-BILL-10), and another workspace's Checkout session changes nothing. Pylota Mail
   Cloud **must** apply abuse controls: `RL_SIGNIN`, a new-workspace send ramp (a tenant daily cap of at
-  most 50 for the first 7 days on Free, lifted by a daily evaluation of bounce and complaint rates or at
-  once by a paid plan), refusal of disposable addresses (`PM_SIGNUP_BLOCKED_DOMAINS`), and system mail
-  sent from `PM_SYSTEM_FROM`.
+  most 50 for the first 7 days on Free, lifted by a daily evaluation of bounce and complaint rates or by a
+  paid plan once its invoice is paid), refusal of disposable addresses (`PM_SIGNUP_BLOCKED_DOMAINS`), and
+  system mail sent from `PM_SYSTEM_FROM`.
 - **FR-CON-14** A person **may** opt in, per workspace, to email notifications of new mail in the inboxes
   they choose (`instant`, `hourly` or `daily`). Notifications **must** be coalesced (one email per person
   and inbox per window), **must** count only mail that becomes visible in the inbox, and **must never**
@@ -593,6 +596,21 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
   other notification **must** carry RFC 8058 one-click unsubscribe. Notification email is capped at 50 per
   person and 200 per workspace a day, beyond which items go into one daily digest email (itself
   unsubscribable and not capped).
+- **FR-CON-16** A first factor **must never** create a session while a second step is outstanding: the
+  pending step expires within 10 minutes and can be finished once. Accepting an invitation **must** be an
+  explicit action by the invited person, never automatic at sign-in, and a person enrolled in two-step
+  verification **must** pass it before the membership and the session exist. A workspace's
+  `require_two_factor` **must** be checked on every console request
+  ([Cloud sign-up §5.1](design/cloud-signup.md#51-the-pending-step)).
+- **FR-CON-17** A Google or GitHub identity **must** be linked to an existing person only after a code
+  emailed to that person's address is entered, and a person **must** be able to unlink one. A console
+  sign-in address (an account, an invitation or a workspace owner) **must not** be a mailbox that the
+  deployment itself receives, and an identity address **must not** equal a console sign-in address.
+- **FR-CON-18** Pylota Mail Cloud **must** protect its shared system mail and shared domain: budgets for
+  system mail per recipient, per client network and ASN, and per inviting tenant, with a share of each
+  day kept for sign-in mail; one self-serve Free workspace per person; and, when the account's daily
+  sending quota is configured, a breaker that stops Free and ramped workspaces at 60% of it and every
+  tenant at 90% until 00:00 UTC ([Cloud sign-up §10](design/cloud-signup.md#10-abuse-and-safety-on-cloud)).
 
 ### 6.15 Plans, metering and billing
 
@@ -634,6 +652,12 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
   for allowances that reset, and at most once a day per feature and threshold for counts that do not.
   With billing off, no usage alert is sent. Webhook events (`quota.warning`, `billing.limit_reached`) are
   unchanged.
+- **FR-BILL-14** An allowance **must** rise only after the payment for it succeeded: a plan or top-up
+  increase applies when its invoice is paid, never on a subscription's status alone, and decreases apply
+  at once. A disputed payment **must** stop the workspace's sends and apply the default plan until the
+  dispute closes; a lost dispute cancels the workspace's subscriptions. A workspace **must** have at most
+  one Stripe customer and one subscription per plan or top-up feature; a duplicate is cancelled with its
+  unused time credited ([Billing › Disputes and refunds](design/billing.md#disputes-and-refunds)).
 
 ## 7. Non-functional requirements
 
@@ -680,6 +704,9 @@ v1.1 with a written ADR. `P2` is v1.1 or later.
 4. Search quality gates (NFR-QUAL-1/2) and triage gate (NFR-QUAL-3) pass.
 5. A threat model is written, and the findings rated high are fixed.
 6. A fresh-account deploy rehearsal has been run from the docs.
+7. The release gate passes: `release-gates/v{version}.md` ticks every item of the
+   [pre-release checklist](design/security.md#16-pre-release-checklist) with a link to its evidence, and
+   the release carries SBOMs, signed checksums and build provenance (`cargo xtask release-gate`).
 
 ## 10. Risks
 

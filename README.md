@@ -26,8 +26,9 @@ service, **Pylota Mail Cloud**, on the plans below.
    content fenced for models, risky attachments held for a person.
 6. **Your account, your receipts.** Mail stays in the Cloudflare account that runs it (EU jurisdiction optional);
    erasure returns a receipt with per-store counts and empty probe queries.
-7. **Real team seats.** Workspaces have members with roles, enforced seat counts and an audit log, on Cloud and
-   when self-hosted.
+7. **Real team seats.** Workspaces have members with roles and an audit log, on Cloud and when self-hosted. Seat
+   counts are enforced where billing is on (Pylota Mail Cloud); a self-hosted deployment with billing off, the
+   default, has no seat limit.
 8. **Tested against the edge cases.** A public register of edge cases, each one the service owns mapped to a named
    test, plus a MIME conformance corpus and search-quality gates in CI.
 
@@ -131,8 +132,9 @@ Self-hosting is free under FSL-1.1-ALv2, with no plan limits. Pylota Mail Cloud 
 | Top-ups | none | £1 per unit | £1 per unit |
 | Support | GitHub issues | email | priority email |
 
-A top-up unit is one inbox, 1,000 sends or 1,000 triage analyses for the month. Details:
-[docs/src/guides/plans.md](docs/src/guides/plans.md).
+A top-up unit is one inbox, 1,000 sends or 1,000 triage analyses for the month. Monthly allowances reset on the
+billing date on a paid plan and on the 1st of each month on Free. Pylota Mail Cloud opens with the v1.0 release;
+there is nothing to sign up for yet. Details: [docs/src/guides/plans.md](docs/src/guides/plans.md).
 
 ## License
 

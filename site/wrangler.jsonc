@@ -1,8 +1,9 @@
 // Pylota Mail landing page and docs, deployed as an assets-only Worker:
 // no Worker script ("main") and no bindings.
 //
-// Build the docs first (`mdbook build docs` writes them to site/public/docs), then:
-//   npx --yes wrangler@4.139.0 deploy --config site/wrangler.jsonc
+// Build the docs first (`mdbook build docs` writes them to site/public/docs), then, in site/:
+//   npm ci --ignore-scripts && ./node_modules/.bin/wrangler deploy
+// (Wrangler 4.139.0, pinned with integrity hashes in package-lock.json.)
 {
   "name": "pylota-mail-site",
   "compatibility_date": "2026-09-22",

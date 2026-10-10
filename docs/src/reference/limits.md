@@ -160,7 +160,14 @@ On a deployment with billing on (Pylota Mail Cloud), the plan sets allowances fo
 analyses, custom domains, storage and seats. The table and the rules (holds, `402 billing_limit`, top-ups,
 resets) are in [Plans and billing](../guides/plans.md). Read your workspace's live numbers with
 `GET /v1/usage`. Self-hosted deployments have no plan limits; only the daily caps in tenant policy apply
-(see [API](#api)).
+(see [API](#api)). A workspace can hold at most 100 units of each top-up feature (`topup.max_quantity`).
+A plan or top-up increase counts from the moment its invoice is paid.
+
+| Shared limit (Pylota Mail Cloud, or any deployment with `PM_DAILY_SEND_QUOTA` set) | Value |
+|---|---|
+| Shared-domain breaker, stage 1 | At 60% of the account's daily Email Sending quota, sends from Free and ramped workspaces get `429 daily_cap_reached` (`details.cap: "shared_domain"`) until 00:00 UTC |
+| Shared-domain breaker, stage 2 | At 90%, every tenant's sends get the same refusal until 00:00 UTC; sign-in mail still goes out |
+| A disputed payment | The workspace's sends get `429 daily_cap_reached` (`details.cap: "billing_dispute"`) until the dispute closes |
 
 ## Console
 
@@ -168,13 +175,21 @@ resets) are in [Plans and billing](../guides/plans.md). Read your workspace's li
 |---|---|
 | Sign-in link or code requests | 3 per 10 minutes per address |
 | Code verification attempts | 10 per code; the token is burned after 10 failures |
-| Sign-in requests per client IP (`RL_SIGNIN`) | 10 per minute, keyed by `CF-Connecting-IP`, across sign-in, sign-up and waitlist requests |
+| Failed sign-in codes per address | 30 per UTC day; then sign-in by code is locked for that address until 00:00 UTC (links still work) |
+| Sign-in requests per client network (`RL_SIGNIN`) | 10 per minute, keyed by `CF-Connecting-IP` (an IPv6 address by its /64 prefix), across sign-in, sign-up, waitlist, pending-step and OAuth-start requests |
+| System mail per recipient | 10 a UTC day (sign-in, sign-up, waitlist and invitation mail together) |
+| Sign-in mail per client network | 20 a UTC day per IPv4 address or IPv6 /64, and 200 per ASN |
+| Invitation emails per workspace | 50 a UTC day, new and re-sent; then `429 daily_cap_reached` (`details.cap: "invitations"`) |
+| Self-serve Free workspaces | One per person; `+tag` variants of an address count as the same person |
+| Pending sign-in step (second factor, or the code that confirms a Google or GitHub link) | 5 minutes (10 when it starts with the emailed link code), single use |
+| Two-step enrolment | The secret shown must be confirmed within 10 minutes |
+| Form ticket (sign-in, sign-up and waitlist forms) | Submitted at least 2 seconds and at most 30 minutes after the page was served, from the same network |
 | Link and code lifetime | 10 minutes, single use |
 | Two-step verification codes | 5 attempts a minute per person. 10 failures in a row lock two-step sign-in for 15 minutes |
 | Recovery codes | 10 per person, each single use. Generating new ones invalidates the old |
 | Google or GitHub sign-in | 10 minutes from start to callback, single use |
 | Waitlist | An entry is written only when its confirmation link is used; an unused confirmation link expires after 10 minutes. An invite link (`/console/sign-up?invite=…`) is valid for 7 days, for the waitlisted address only. Entries are deleted 30 days after invitation |
-| New workspace on Free (Pylota Mail Cloud) | At most 50 messages a day (the effective `tenant_daily_send_cap` is the policy value or 50, whichever is lower) for the first 7 days. A daily evaluation lifts the ramp from day 7 if bounce and complaint rates are under the auto-pause thresholds; otherwise it stays and is evaluated again each day. A paid plan lifts it at once. Above it: `429 daily_cap_reached` |
+| New workspace on Free (Pylota Mail Cloud) | At most 50 messages a day (the effective `tenant_daily_send_cap` is the policy value or 50, whichever is lower) for the first 7 days. A daily evaluation lifts the ramp from day 7 if bounce and complaint rates are under the auto-pause thresholds; otherwise it stays and is evaluated again each day. A paid plan lifts it once its first invoice is paid, and a disputed payment restores it. Above it: `429 daily_cap_reached` |
 | Session lifetime | 7 days rolling, 30 days absolute |
 | Re-authentication for sensitive actions | signed in within the last 10 minutes |
 | Workspace policy saves | Owner and admin only; each save needs a sign-in within the last 10 minutes, and a change that deletes mail needs a second, confirmed `POST` ([Workspace policy §6](../project/design/workspace-policy.md#6-the-console-page)) |

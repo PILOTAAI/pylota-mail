@@ -9,7 +9,7 @@ pipeline; this page adds what they must contain.
 
 | | |
 |---|---|
-| Requirements | PRD release criteria 1–6, NFR-QUAL-1, NFR-QUAL-2, NFR-QUAL-3, NFR-SEC-1, NFR-SEC-2, NFR-OPS-1 |
+| Requirements | PRD release criteria 1–7, NFR-QUAL-1, NFR-QUAL-2, NFR-QUAL-3, NFR-SEC-1, NFR-SEC-2, NFR-OPS-1 |
 | Edge cases | Every row marked `S` or `S+I` in the [edge-case register](../edge-cases.md) |
 | Code | `crates/core/src/**` (`#[cfg(test)]` modules), `crates/conformance/`, `crates/worker/tests/it/`, `crates/worker/tests/browser/`, `crates/worker/tests/live/`, `fuzz/`, `xtask/` |
 
@@ -156,8 +156,9 @@ As defined in [Rust workspace](rust-workspace.md#9-xtask), plus the details belo
 
 1. Build the Worker with `worker-build --release` and the `itest-hooks` cargo feature.
 2. Render `deploy/wrangler.itest.toml`: the production bindings, local resources, `PM_ENV = "local"`,
-   `PM_PLATFORM_DOMAIN = "agents.example"`, `PM_API_HOST = "localhost"`,
-   `PM_CONSOLE_HOST = "console.localhost"` (the test client sends that `Host` header on console paths),
+   `PM_PLATFORM_DOMAIN = "agents.example"`, `PM_API_HOST = "localhost:8799"`,
+   `PM_CONSOLE_HOST = "console.localhost:8799"` (hosts with the port, so the console's `Origin` rule and
+   the host split work unchanged: [Console › CSRF](console.md#csrf)),
    `PM_SIGNUP = "open"` with the four values it requires (`PM_TERMS_URL = "https://agents.example/terms"`,
    `PM_PRIVACY_URL = "https://agents.example/privacy"`, `PM_DPA_URL = "https://agents.example/dpa"` and
    `PM_TERMS_VERSION = "itest-1"`; without them the configuration is `config_invalid`,
@@ -172,9 +173,16 @@ As defined in [Rust workspace](rust-workspace.md#9-xtask), plus the details belo
    --persist-to target/itest/state --config deploy/wrangler.itest.toml` (a fresh directory per run). The
    rendered file sets `migrations_dir = "../migrations/d1"`, because Wrangler resolves it against the
    file's own directory, `deploy/`. Until v1.0 there is one file, `0001_init.sql`.
-4. Start `npx --yes wrangler@4.139.0 dev --local --port 8799 --persist-to target/itest/state
-   --test-scheduled --config deploy/wrangler.itest.toml`, write its PID to `target/itest/wrangler.pid`, and
-   capture stdout and stderr to `target/itest/worker.log`. Wait for `GET /health`.
+4. Write a throwaway TLS certificate for the run: `openssl req -x509 -newkey ec -pkeyopt
+   ec_paramgen_curve:P-256 -nodes -days 2 -subj /CN=localhost -addext
+   "subjectAltName=DNS:localhost,DNS:console.localhost,IP:127.0.0.1"` into `target/itest/tls/`. Then start
+   `npx --yes wrangler@4.139.0 dev --local --port 8799 --local-protocol https --https-key-path
+   target/itest/tls/key.pem --https-cert-path target/itest/tls/cert.pem --persist-to target/itest/state
+   --test-scheduled --config deploy/wrangler.itest.toml` (Wrangler's `dev` options `--local-protocol`,
+   `--https-key-path` and `--https-cert-path`, Cloudflare "Wrangler commands", read 2026-10-10), write its
+   PID to `target/itest/wrangler.pid`, and capture stdout and stderr to `target/itest/worker.log`. Wait
+   for `GET https://localhost:8799/health`. The console needs HTTPS locally because its cookies are
+   `__Host-` and `Secure` and its `Origin` must be `https://…` ([Console › CSRF](console.md#csrf)).
 5. Seed exactly what `pmail setup` writes in steps 19–22 ([CLI and setup §6.3](cli.md#63-steps)), in the
    same way:
    - one platform key (step 19, the bootstrap key) with `wrangler d1 execute --local`; the harness knows
@@ -196,9 +204,13 @@ As defined in [Rust workspace](rust-workspace.md#9-xtask), plus the details belo
 
    Every other fixture (tenants, identities, domains, keys) is created through the public API.
 6. Run `cargo test -p pylota-mail-worker --features itest-hooks --test it -- --test-threads=1` with
-   `PM_ITEST_URL=http://127.0.0.1:8799`. The `it` test target declares
+   `PM_ITEST_URL=https://localhost:8799` and `PM_ITEST_CA=target/itest/tls/cert.pem`. The test client
+   (`reqwest`) trusts that certificate as its only extra root and pins `localhost` and
+   `console.localhost` to `127.0.0.1` (`ClientBuilder::resolve`), so console requests go to
+   `https://console.localhost:8799` with no `Host` override. The `it` test target declares
    `required-features = ["itest-hooks"]`, so `cargo test --workspace` never builds it.
-7. Stop wrangler; delete `target/itest/state` unless `--keep` was passed.
+7. From M21, run the browser suite (section 6.8) while wrangler and the fake server are still up.
+8. Stop wrangler and the fake server; delete `target/itest/state` unless `--keep` was passed.
 
 ### 6.2 Test hooks
 
@@ -233,7 +245,7 @@ traits that call it:
 | `Ai::run` (planner) | Scripted tool-call sequences per question from `crates/conformance/golden/questions.toml`, including a hostile script that tries to widen scope ([F10](../edge-cases.md)) |
 | `Ai::to_markdown` | Text from a sidecar fixture, or a scripted failure or timeout ([B12](../edge-cases.md)) |
 | `VectorIndex` | In-memory namespaces with metadata filters (equality and `sent_at` ranges), mutation IDs, a configurable processing lag and `processedUpToDatetime`; `describe()` with the vector count, which tests can offset for the drift check; scriptable failures ([F14](../edge-cases.md)) and a "keep one vector" mode for probe tests ([F6](../edge-cases.md)) |
-| `MailSender` (live tenants) | Records every `StructuredEmail`; scripted outcomes: accepted with a `messageId`, a coded error (`E_RATE_LIMIT_EXCEEDED`, `E_DAILY_LIMIT_EXCEEDED`, `E_HEADER_NOT_ALLOWED`, `E_RECIPIENT_SUPPRESSED`, …), an exception, or a timeout |
+| `MailSender` (live tenants) | Records every `StructuredEmail`; scripted outcomes: accepted with a `messageId`, a coded error (`E_RATE_LIMIT_EXCEEDED`, `E_DAILY_LIMIT_EXCEEDED`, `E_HEADER_NOT_ALLOWED`, `E_RECIPIENT_SUPPRESSED`, …), an exception, or a timeout. The recorded mail is also readable over HTTP, for the browser suite: `GET {PM_ITEST_FAKES_URL}/__fakes/mail?to={address}&last=1` answers the last message to that address (headers, text and HTML parts), from which a Playwright test reads a sign-in code or link. The route exists only in the fake server, never in the Worker |
 | `HttpClient` | Routes requests by host to fake handlers: Cloudflare API (zones, including zone creation with scriptable error `1105` and zone-hold refusals; routing rules with the 200-rule limit; sending subdomains including `preview_enabled`; event subscriptions), SES (`SendEmail`, which checks the SigV4 signature against test credentials; email identities with scriptable DKIM and MAIL FROM status; the account's sending status; receipt rules with the 200-rule and 500-recipient caps), S3 (`GetObject` and `DeleteObject` on the inbound bucket, with SigV4 checks and scriptable `NoSuchKey`), SQS (`ReceiveMessage` and `DeleteMessage` on the backstop queue), SNS certificates, Google and GitHub OAuth (token, user and email endpoints with scriptable claims and unverified addresses), Stripe (creating and retrieving Checkout Sessions, the objects billing reads, and subscription cancellation, with scriptable failures), RDAP, the scanner, and webhook receivers. Any other host gets `HttpError::Connect`: integration tests never reach the internet |
 | SNS push | The fake server signs SES notifications with a test key (`SignatureVersion` 2, or 1 and tampered variants on request) and `POST`s them to the Worker's `/hooks/ses/inbound` and `/hooks/ses`. A test can skip the push and leave the notification only in the SQS fake, for the backstop cron ([N1](../edge-cases.md)–[N3](../edge-cases.md)) |
 | TCP sockets (the `platform` wrapper over `connect()`) | Routes by host name to a scripted SMTP server in the fake process on ports 465 and 587. Scripts can omit `STARTTLS`, answer `535`, refuse some `RCPT TO` with `4xx` or `5xx`, close the connection after the final `.`, or exceed each timeout. Accepted messages can be handed to the platform domain's inbound path, unchanged or with a rewritten `From` or a foreign DKIM `d=`, for alignment probes and DSNs. TLS is simulated; certificate checking is proved by spike S12 and live, not here ([N14](../edge-cases.md)–[N20](../edge-cases.md)) |
@@ -269,7 +281,7 @@ traits that call it:
 ### 6.4 Injecting inbound mail
 
 The default path is the endpoint `wrangler dev` provides for email handlers (Cloudflare docs, read
-2026-10-09): `POST http://127.0.0.1:8799/cdn-cgi/local/email?from=<envelope from>&to=<envelope to>` with
+2026-10-09): `POST https://localhost:8799/cdn-cgi/local/email?from=<envelope from>&to=<envelope to>` with
 the raw RFC 5322 message as the body; the message must have a `Message-ID` header. One call per envelope
 recipient, as Email Routing invokes the handler once per recipient ([A9](../edge-cases.md)). The
 documentation does not say how a `setReject` is reported to the caller, so tests read the outcome from
@@ -330,6 +342,14 @@ From M21 on, `cargo xtask itest` runs the Playwright suite in `crates/worker/tes
 `npx --prefix crates/worker/tests/browser playwright test` (Node.js 22 and the Chromium build of the pinned
 Playwright release, which the CI job installs). `--suite it` and `--suite browser` run one suite alone.
 The test titles carry the `browser::` names, which `cargo xtask trace` collects like the Rust ones.
+
+The suite's base URL is `https://console.localhost:8799`, with `ignoreHTTPSErrors: true` for the
+throwaway certificate; Chromium resolves `*.localhost` to the loopback address. It signs in the way a
+person does: it submits the sign-in form, reads the code from the mail-sender fake
+(`/__fakes/mail?to=…&last=1`, section 6.3) and enters it, and it waits 2 seconds before submitting a form
+that carries a form ticket ([Cloud sign-up §6.2](cloud-signup.md#62-after-launch-open-sign-up)). It
+seeds its owner and viewer through the public API with the bootstrap platform key, like every other
+fixture.
 
 | Test | Proves |
 |---|---|
@@ -666,7 +686,8 @@ adds the security and traceability jobs:
 | `ci.yml` | `fmt`, `clippy`, `test` (with coverage), `layering`, `wasm`, `itest` (`cargo xtask itest --suite it`; includes the attack suite and the deterministic keyword recall), `browser` (`cargo xtask itest --suite browser`: the console without JavaScript and the axe scan, section 6.8), `fuzz-smoke`, `deny`, `audit` (`cargo audit`), `openapi`, `docs`, `trace` (`cargo xtask trace`) | Every pull request and push to `main` |
 | `codeql.yml` | CodeQL for Rust | Every pull request, weekly |
 | `nightly.yml` | All fuzz targets for 10 minutes each; property tests at 65,536 cases; `eval-search`, `eval-agentic`, `eval-triage`; the large benchmarks (`it::bench::*`, section 6.9); `live::` suite; `cargo audit` on `main` | Nightly |
-| `release.yml` | The full `ci.yml` gate; the three evaluations; CLI binaries; `cargo xtask release`; SBOM (`cargo cyclonedx --format json` for the Worker and the CLI); signed `SHA256SUMS`; build provenance (`actions/attest@v4`); deploy to staging; the `live::` suite; then the GitHub Release, `cargo publish`, and the production rollout (10% → 50% → 100%, [Architecture](../architecture.md)) | Tag `v*` |
+| `release.yml` | Publishes a release, exactly as defined in [Rust workspace › CI pipeline](rust-workspace.md#10-ci-pipeline): version check; the full `ci.yml` gate and the three evaluations; CLI binaries; `cargo xtask release` (bundle, `SHA256SUMS` signed with minisign, SBOMs, provenance) into a GitHub pre-release; a staging deploy of that release and the `live::` suite; then `cargo xtask release-gate` and, for a version without a pre-release part, promotion to a full release and `cargo publish`. It never deploys Pylota Mail Cloud | Tag `v*` |
+| `cloud-deploy.yml` | Rolls a published release out to Pylota Mail Cloud: `pmail deploy --version <v> --gradual` (10% → 50% → 100%, [Architecture](../architecture.md)) with the `production` environment's secrets; refuses a pre-release | Manual (`workflow_dispatch`, input `version`) |
 
 **Required checks to merge into `main`:** `fmt`, `clippy`, `test`, `layering`, `wasm`, `itest`,
 `browser`, `fuzz-smoke`, `deny`, `audit`, `openapi`, `docs`, `trace`, `codeql`. The milestone gate's
@@ -675,7 +696,9 @@ adds the security and traceability jobs:
 **Required to publish a release:** all of the above on the tagged commit; the three evaluation gates
 (section 9.3); the `live::` suite green on staging with that commit deployed, including a passing manual
 run (`cargo xtask live --manual`, section 10); no open crash from the
-nightly fuzz run; the [security pre-release checklist](security.md#16-pre-release-checklist).
+nightly fuzz run; the [security pre-release checklist](security.md#16-pre-release-checklist). They are
+enforced, not only listed: `cargo xtask release-gate` in the `publish` job refuses to promote the release
+until each holds ([Rust workspace › xtask](rust-workspace.md#9-xtask)).
 
 GitHub Actions are pinned to full commit SHAs and each job declares least-privilege `permissions`
 ([Security › Supply chain](security.md#11-supply-chain)).

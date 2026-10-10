@@ -3,6 +3,7 @@
 /build
 crates/worker/build/
 site/public/docs/
+site/node_modules/
 deploy/wrangler.toml
 deploy/.secrets*
 .dev.vars

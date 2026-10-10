@@ -97,10 +97,11 @@ an email link or code, or with Google or GitHub where enabled, plus optional two
 ([Cloud sign-up](design/cloud-signup.md)).
 
 With `PM_BILLING=stripe`, plan allowances are enforced by the workspace's `TenantQuota` object (atomic holds,
-settled when an outcome is known). Stripe is called only to create and retrieve Checkout Sessions, to
-create Customer Portal sessions, to read subscriptions, and to cancel them when a workspace is deleted; its
-signed webhooks at `/billing/stripe/webhook` are the only writer of subscription state. No metered request
-waits on Stripe. See [Console design](design/console.md) and [Billing design](design/billing.md).
+settled when an outcome is known). Stripe is called only to create a workspace's Customer, to create and
+retrieve Checkout Sessions, to create Customer Portal sessions, to read subscriptions with their latest
+invoice and a disputed charge, and to cancel subscriptions (a deleted workspace, a duplicate, a lost
+dispute) ([Billing › Stripe integration](design/billing.md#stripe-integration)); its signed webhooks at
+`/billing/stripe/webhook` are the only writer of subscription state. No metered request waits on Stripe. See [Console design](design/console.md) and [Billing design](design/billing.md).
 
 ### Durable Object classes
 

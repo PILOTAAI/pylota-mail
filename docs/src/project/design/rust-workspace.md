@@ -987,14 +987,17 @@ dataset = "pylota_mail_metrics"
 |---|---|
 | `cargo xtask build-worker` | Runs `worker-build --release` (0.8.7) in `crates/worker` with three build-time values in the environment: `PM_BUILD_VERSION` (the workspace version, or the tag without its `v` in a release), `PM_BUILD_COMMIT` (`git rev-parse --short=7 HEAD`) and `PM_BUILD_DATE` (the UTC date of `SOURCE_DATE_EPOCH` when set, which `xtask release` sets to the tagged commit's time, otherwise today). `crates/worker/build.rs` passes them to the compiler with `cargo:rustc-env` and `cargo:rerun-if-env-changed`, defaulting to `CARGO_PKG_VERSION`, `unknown` and `1970-01-01` for native and test builds. `/health` reads `version` and `commit` from them, and `security.txt` computes `Expires` as `PM_BUILD_DATE` plus 365 days. Then measures `build/index.js` + `build/index_bg.wasm`: gzip level 9 total must be ≤ 10,485,760 bytes (NFR-SEC-2) and uncompressed ≤ 64 MiB, else it fails. Prints a size table by crate (from `twiggy`-style name-section data in a non-stripped copy) and warns above 8 MiB compressed |
 | `cargo xtask check-layering` | The checks in section 2: rules 1, 2 and 4 from `cargo metadata`, rule 3 (tokio only under `worker`, with no features; no `gethostname` or `hickory-resolver`) from `cargo tree` on the wasm32 graph without dev-dependencies |
-| `cargo xtask itest` | Builds the Worker with the `itest-hooks` cargo feature, renders `deploy/wrangler.itest.toml` (same bindings, local resources, `PM_ENV = "local"`, test secrets, the fake-server URL and test token), starts the fake server on `127.0.0.1:8798`, applies D1 migrations with `--local --persist-to target/itest/state`, starts `npx --yes wrangler@4.139.0 dev --local --port 8799 --persist-to target/itest/state --test-scheduled --config deploy/wrangler.itest.toml`, waits for `GET /health`, then runs `cargo test -p pylota-mail-worker --features itest-hooks --test it -- --test-threads=1` with `PM_ITEST_URL`. Email events are injected through the local email-event endpoint that `wrangler dev` provides, and cron and alarm time through its scheduled-event endpoint and the `/__test/alarm` hook. Fault injection (R2 failure, D1 failure, transport outcomes) uses `PM_ENV = "local"`-only test hooks compiled behind `itest-hooks`, never in release bundles. The full sequence and the fakes are in [Testing › What cargo xtask itest does](testing.md#61-what-cargo-xtask-itest-does). From M21 on it then runs the Playwright browser suite against the same Worker ([Testing › Browser suite](testing.md#68-browser-suite-browser)); `--suite it` or `--suite browser` runs one of the two |
+| `cargo xtask itest` | Builds the Worker with the `itest-hooks` cargo feature, renders `deploy/wrangler.itest.toml` (same bindings, local resources, `PM_ENV = "local"`, test secrets, the fake-server URL and test token), starts the fake server on `127.0.0.1:8798`, applies D1 migrations with `--local --persist-to target/itest/state`, writes a throwaway TLS certificate, starts `npx --yes wrangler@4.139.0 dev --local --port 8799 --local-protocol https` with that certificate (`--persist-to target/itest/state --test-scheduled --config deploy/wrangler.itest.toml`), waits for `GET https://localhost:8799/health`, then runs `cargo test -p pylota-mail-worker --features itest-hooks --test it -- --test-threads=1` with `PM_ITEST_URL`. Email events are injected through the local email-event endpoint that `wrangler dev` provides, and cron and alarm time through its scheduled-event endpoint and the `/__test/alarm` hook. Fault injection (R2 failure, D1 failure, transport outcomes) uses `PM_ENV = "local"`-only test hooks compiled behind `itest-hooks`, never in release bundles. The full sequence and the fakes are in [Testing › What cargo xtask itest does](testing.md#61-what-cargo-xtask-itest-does). From M21 on it then runs the Playwright browser suite against the same Worker ([Testing › Browser suite](testing.md#68-browser-suite-browser)); `--suite it` or `--suite browser` runs one of the two |
 | `cargo xtask live [--manual]` | Runs `cargo test -p pylota-mail-worker --features live --test live -- --test-threads=1` against staging ([Testing › Live suite](testing.md#10-live-end-to-end-suite-live)). `--manual` runs only the tests marked manual, which pause for a person's browser steps and record the results |
 | `cargo xtask trace` | Checks the edge-case register and the PRD against the test names and `Covers:` lines, and prints the traceability matrix ([Testing](testing.md#112-cargo-xtask-trace)) |
 | `cargo xtask fuzz --target <t> --time <s>` | Runs `cargo +nightly fuzz run <t> -- -max_total_time=<s>` in `fuzz/` |
 | `cargo xtask openapi` | Generates `openapi.json` from `api-types` and compares it semantically with `docs/src/reference/openapi.yaml` |
 | `cargo xtask gen-unicode` | Regenerates `crates/core/src/address/confusables_table.rs` from the pinned UTS #39 data files checked into `crates/core/data/` |
 | `cargo xtask eval-search`, `eval-agentic`, `eval-triage` | Quality gates on the golden set (build plan M18) |
-| `cargo xtask release --version <v>` | Builds the Worker, then writes `dist/pylota-mail-worker-<v>.tar.gz` containing `build/index.js`, `build/index_bg.wasm`, `build/worker/shim.mjs`, `migrations/d1/*.sql`, `deploy/wrangler.toml.tmpl` and `VERSION`; collects the CLI binaries built by the CI matrix; writes `dist/SHA256SUMS` (`<sha256 hex>␠␠<filename>` per line) and its detached signature `SHA256SUMS.sig` made with the release signing key held in CI secrets. Verification by `pmail deploy` is specified in [CLI and setup](cli.md) |
+| `cargo xtask release --check-version <tag>` | Fails unless `<tag>` is `v` followed by the workspace version, `[workspace.package] version` in the root `Cargo.toml`. That is the one place the version is set: every crate uses `version.workspace = true`, `/health` reports `CARGO_PKG_VERSION`, and the bundle's `VERSION` file is written from it. The version is SemVer, optionally with a pre-release part (`1.0.0-rc.1`) |
+| `cargo xtask release --version <v>` | Runs the `--check-version` rule, builds the Worker, then writes `dist/pylota-mail-worker-<v>.tar.gz` containing `build/index.js`, `build/index_bg.wasm`, `build/worker/shim.mjs`, `migrations/d1/*.sql`, `deploy/wrangler.toml.tmpl` and `VERSION`; collects the CLI binaries built by the CI matrix; writes `dist/SHA256SUMS` (`<sha256 hex>␠␠<filename>` per line) and its detached signature `SHA256SUMS.sig`. It signs itself, with the `minisign` crate (pure Rust, MIT; 0.10.0 on crates.io, read 2026-10-10; pinned at build time like `minisign-verify`), using the secret key and password from the `release` environment's `MINISIGN_SECRET_KEY` and `MINISIGN_PASSWORD`, and writes the trusted comment `pylota-mail v{version}`, which `pmail deploy` requires ([CLI and setup §8.2](cli.md#82-signature-and-checksums)). It finally verifies its own output with `minisign-verify` and the compiled-in public key, so a wrong key fails the release, not the first deploy |
+| `cargo xtask release-gate --version <v>` | The security pre-release checklist as a gate ([Security §16](security.md#16-pre-release-checklist)). Fails unless `release-gates/v{version}.md`, committed on the tagged commit, has every checklist item ticked, each with a link to its evidence (for `1.0.0`, the external penetration test report and its retest), and unless the facts it can check itself hold: the `gate`, `staging` and `live` jobs of the same run passed; the SBOMs, `SHA256SUMS`, `SHA256SUMS.sig` and attestations exist in the run's artefacts; no open issue carries the label `fuzz-crash`; CodeQL reports no open alert of high severity or above (read with `gh api`, read-only); the 24-hour fuzz record named in the file covers the tagged commit. A manual `live --manual` run is recorded in the same file with its date and commit |
+| `cargo xtask stripe-setup [--live] --api-host <h> --out <file> [--catalog <file>] [--vat-from <date>]` | Sets up the Stripe account of a deployment that sells plans and writes the plan catalog with every Stripe ID filled in ([Billing › Stripe account setup](billing.md#stripe-account-setup)). Uses `STRIPE_SETUP_KEY`, never a Worker secret |
 
 Fuzz targets (each a `fuzz_target!` over `&[u8]` calling one `core` entry point):
 
@@ -1045,12 +1048,30 @@ Nightly (`.github/workflows/nightly.yml`): all fuzz targets for 10 minutes each,
 `eval-agentic` and `eval-triage` against real Workers AI with a CI API token (build plan M18), `cargo
 audit` on `main`, and the `live::` suite against staging when staging credentials are configured.
 
-Release (`.github/workflows/release.yml`, on a `v*` tag): the full CI gate; CLI binaries for macOS
-(arm64, x64), Linux (x64, arm64) and Windows (x64); `cargo xtask release`; an SBOM for the Worker and
-the CLI (`cargo cyclonedx --format json`); signed `SHA256SUMS` and build provenance (`actions/attest@v4`,
-[Security › Supply chain](security.md#11-supply-chain)); a GitHub Release with the bundle, the binaries,
-the SBOMs, `SHA256SUMS` and `SHA256SUMS.sig`; then `cargo publish` for `pylota-mail` and
-`pylota-mail-cli` (and the crates they depend on).
+Release (`.github/workflows/release.yml`, on a `v*` tag). This is the one definition of the release
+pipeline; [Testing › CI workflows](testing.md#12-ci-workflows-and-required-checks) and build plan M19
+refer to it. It **publishes a release** and never changes Pylota Mail Cloud. Its jobs, in order:
+
+| Job | Environment | Does |
+|---|---|---|
+| `version` | – | `cargo xtask release --check-version "$GITHUB_REF_NAME"` |
+| `gate` | – | The full `ci.yml` gate on the tagged commit (called as a reusable workflow) and `eval-search`, `eval-agentic` and `eval-triage` |
+| `build` | – | CLI binaries for macOS (arm64, x64), Linux (x64, arm64) and Windows (x64), each built `--locked` |
+| `package` | `release` | `cargo xtask release --version <v>` (bundle, `SHA256SUMS` and its minisign signature); the SBOMs of the Worker (wasm32) and the CLI (`cargo cyclonedx --format json`); build provenance for every file (`actions/attest@v4`, [Security › Supply chain](security.md#11-supply-chain)); then a GitHub Release marked **pre-release** with the bundle, the binaries, the SBOMs, `SHA256SUMS` and `SHA256SUMS.sig` |
+| `staging` | `staging` | Deploys that pre-release to staging with the just-built `pmail deploy --version <v>`, which downloads and verifies it like any deployer ([CLI and setup §8](cli.md#8-deploy)) |
+| `live` | `staging` | The `live::` suite against staging (the tests not marked manual) |
+| `publish` | `release` | `cargo xtask release-gate --version <v>`; then, for a version without a pre-release part, marks the GitHub Release as a full release and runs `cargo publish` for `pylota-mail-api-types`, `pylota-mail` and `pylota-mail-cli`, in that order. A pre-release version (`-rc.N`) stays a pre-release: it exists for staging and rehearsals, and is never published to crates.io |
+
+A tag is never moved or reused. A run that fails after `package` leaves a pre-release that is never
+promoted; the fix ships under the next version or release candidate.
+
+Cloud rollout (`.github/workflows/cloud-deploy.yml`, `workflow_dispatch` with the input `version`,
+environment `production`) is a separate, later step that only the owner starts: it downloads the
+released `pmail` for Linux x64, checks it with `gh attestation verify --repo PILOTAAI/pylota-mail`, and
+runs `pmail deploy --version <v> --gradual` (10% → 50% → 100%, [CLI and setup §8.6](cli.md#86-code-deploy-and-the-gradual-flag))
+against Pylota Mail Cloud's configuration with the `production` environment's `PROD_CLOUDFLARE_API_TOKEN`
+and `PROD_CLOUDFLARE_ACCOUNT_ID` (build plan M0, human prerequisites). It refuses a pre-release
+version. No other workflow deploys Pylota Mail Cloud.
 
 ## 11. The Rust SDK (FR-SDK-1)
 
@@ -1059,20 +1080,65 @@ on (build plan M16). It is native only (never compiled to wasm) and depends only
 `reqwest` (rustls), `serde` and `serde_json` (section 2).
 
 - **Coverage.** One async method per REST operation in `openapi.yaml`, named after the operation's
-  `operationId` in snake case (`listIdentities` → `list_identities`, `sendMessage` → `send_message`). Path
-  parameters are arguments; bodies and query parameters are the `api-types` request structs; results
-  are the `api-types` objects. A constant table `OPERATIONS: &[(Method, &str /* path */, &str /* operationId */)]`
-  lists them, and `sdk::coverage::every_operation` compares it with the operations of `openapi.yaml`:
-  a missing or extra operation fails CI. That test is what "covers the whole REST API" means.
-- **Client.** `Client::builder().base_url(url).api_key(key).user_agent(ua).build()`, with timeouts of
+  `operationId` in snake case (`listIdentities` → `list_identities`, `sendMessage` → `send_message`).
+  Arguments come in this order: the path parameters as `&str`, then the body as a reference to its
+  request struct, then the query parameters as one struct, then the idempotency key where the operation
+  takes one. Results are the `api-types` objects. Operations marked `x-sdk: false` in `openapi.yaml` have
+  no method: the provider hooks (`receiveSesNotification`, `receiveSesInboundNotification`), which only
+  Amazon SNS calls, and `getSecurityTxt`, a text file for people. A constant table
+  `OPERATIONS: &[(Method, &str /* path */, &str /* operationId */)]` lists the rest, and
+  `sdk::coverage::every_operation` compares it with the operations of `openapi.yaml` that are not marked
+  `x-sdk: false`: a missing or extra operation fails CI, and so does an `x-sdk: false` operation outside
+  those three. That test is what "covers the whole REST API" means.
+- **Types.** `pylota_mail::types` re-exports `pylota_mail_api_types`, whose type names are the
+  component schema names of `openapi.yaml` (`SendRequest`, `Recipient`, `SendResponse`, `Message`). Every
+  request struct derives `Default`, so a caller sets the fields it needs and ends with
+  `..Default::default()`. A schema built with `allOf` from an object and extra fields is a struct that
+  flattens the object into a named field: `SendResponse { message: Message, deduplicated: bool }`. A
+  `oneOf` is an enum: `Recipient` is `Address(String)` or `Named { address, name }`, with
+  `From<&str>` and `From<String>` for the bare address.
+- **Client.** `Client::builder().base_url(url).api_key(key).user_agent(ua).build()` returns
+  `Result<Client, Error>` (a missing base URL or key, or a URL that is not `https://`, except
+  `http://localhost` and `http://127.0.0.1`, is `Error::Config`), with timeouts of
   10 s to connect and 30 s per request; `wait_for_message` uses its `timeout` plus 15 s, and the agentic
   stream aborts after 30 s without a byte (the server sends a keep-alive every 10 s of silence).
 - **Errors.** `Error::Api { status, code: ErrorCode, message, fix, details, request_id, retryable }`
-  from the error envelope, `Error::Transport` (connect, TLS, timeout) and `Error::Decode`. `retryable`
-  is the envelope's, never decided by the SDK.
+  from the error envelope, `Error::Transport` (connect, TLS, timeout), `Error::Decode`, and
+  `Error::Config(String)` for a value the SDK refuses before sending (builder settings, an invalid
+  idempotency key). `retryable` is the envelope's, never decided by the SDK.
 - **Idempotency.** `send_message`, `reply`, `reply_all` and `forward` take a required
-  `IdempotencyKey` (validated against `^[\x20-\x7E]{1,255}$`). Other `POST` methods take an optional
-  one and generate a ULID-based key when it is absent, so the SDK's own retries are safe.
+  `&IdempotencyKey`, made with `IdempotencyKey::new(&str) -> Result<IdempotencyKey, Error>` (validated
+  against `^[\x20-\x7E]{1,255}$`). Other `POST` methods take an optional one and generate a ULID-based key
+  when it is absent, so the SDK's own retries are safe.
+- **Published examples.** Every Rust example in the docs uses only this surface, and compiles in CI
+  (`sdk::doctest::published_examples`): the Rust blocks of `docs/src/quickstart.md` are rustdoc tests
+  through `#[cfg(doctest)] #[doc = include_str!(…)]` on a private module (`no_run`, so nothing calls a
+  server), and the landing page's example (`site/public/index.html`, the `code-rust` block) must equal
+  `crates/sdk/examples/confirm_booking.rs` byte for byte after its HTML is unescaped and its tags removed,
+  and that example builds with `cargo build -p pylota-mail --examples`.
+
+  ```rust,no_run
+  use pylota_mail::{Client, IdempotencyKey};
+  use pylota_mail::types::{Recipient, SendRequest};
+
+  async fn confirm_booking(key: String) -> Result<(), pylota_mail::Error> {
+      let client = Client::builder()
+          .base_url("https://mail.example.com")
+          .api_key(key)
+          .build()?;
+      let request = SendRequest {
+          to: vec![Recipient::from("renter@example.org")],
+          subject: "Your booking BK-2291".into(),
+          text: Some("Your car is ready at 9:00.".into()),
+          ..Default::default()
+      };
+      let key = IdempotencyKey::new("bk-2291-confirm")?;
+      // a retry with the same key returns this same message
+      let sent = client.send_message("idn_01J9Z3K8V4", &request, &key).await?;
+      println!("{} deduplicated={}", sent.message.id, sent.deduplicated);
+      Ok(())
+  }
+  ```
 - **Retries.** Off by default. `RetryPolicy::standard()` follows
   [Errors › How a client should retry](../../reference/errors.md#how-a-client-should-retry): at most 3
   retries of retryable errors with backoff 0.5 s, 1 s, 2 s plus up to 250 ms jitter, `Retry-After` honoured
@@ -1123,7 +1189,10 @@ integration tests that call every method against the workerd harness.
 
 | Test | Covers |
 |---|---|
-| `sdk::coverage::every_operation` | The SDK has exactly one method per `openapi.yaml` operation (FR-SDK-1) |
+| `sdk::coverage::every_operation` | The SDK has exactly one method per `openapi.yaml` operation not marked `x-sdk: false`, and only the two SES hooks and `getSecurityTxt` carry that mark (FR-SDK-1) |
+| `sdk::doctest::published_examples` | The Rust examples of `quickstart.md` compile as rustdoc tests; the landing page's example equals `crates/sdk/examples/confirm_booking.rs`, which builds (FR-SDK-1, build plan M16) |
+| `xtask::release_version_matches_tag` | `release --check-version` passes for `v` + the workspace version and fails for any other tag, including a pre-release part that differs; the signed `SHA256SUMS.sig` carries the trusted comment `pylota-mail v{version}` and verifies with the compiled-in key (build plan M19) |
+| `xtask::release_gate_refuses` | `release-gate` fails with a missing or partly ticked `release-gates/v{version}.md`, a missing SBOM or attestation, an open `fuzz-crash` issue, or a failed `live` job, and passes when all hold (build plan M19, [Security §16](security.md#16-pre-release-checklist)) |
 | `xtask::openapi_matches_contract` | `cargo xtask openapi`: the generated `openapi.json` (OpenAPI 3.1; every path under `/v1`, except the root paths `/health`, `/openapi.json`, `/hooks/*` and `/.well-known/*`, whose path items override `servers`) equals `docs/src/reference/openapi.yaml` semantically (FR-API-1) |
 | `xtask::check_layering_rejects_worker_dep` | A fixture crate depending on `worker` fails the check (AGENTS.md rule) |
 | `platform::config::startup_rules` | Each row of the startup rules in §6.1: a malformed optional variable is `config_invalid` naming it; SES without `PM_SES_SNS_TOPIC_ARN` and `PM_BILLING=stripe` without its secrets start with `/health` `degraded` and the feature off; `PM_WEB_BOT_AUTH=on` in a release without signed requests is `config_invalid`; `PM_CONSOLE_HOST`, `PM_SYSTEM_FROM` and `PM_NOTIFICATIONS` are read with `PM_CONSOLE=off` |

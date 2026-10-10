@@ -21,6 +21,8 @@ ADR supersedes it (AGENTS.md).
 | [0010](0010-cloud-in-the-existing-cloudflare-account.md) | Cloud runs in the operator's existing Cloudflare account with scoped tokens | Accepted | 2026-10-10 |
 | [0011](0011-workspace-policy-self-service.md) | Workspace policy self-service | Accepted | 2026-10-10 |
 | [0012](0012-service-sign-up-ledger.md) | Service sign-up ledger | Accepted | 2026-10-10 |
+| [0013](0013-partner-keys.md) | Partner keys as a fourth key level | Accepted | 2026-10-10 |
+| [0014](0014-marketing-needs-ses.md) | Marketing mail only through SES or SMTP | Accepted | 2026-10-10 |
 
 ## When to write one
 
