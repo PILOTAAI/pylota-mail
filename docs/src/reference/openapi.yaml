@@ -524,8 +524,11 @@ paths:
         '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
         '409':
-          description: A platform key changed the `status` of a tenant that is `erasing` or `erased`.
-          x-error-codes: [tenant_erased]
+          description: >-
+            A platform key changed the `status` of a tenant that is `erasing` or `erased` (`tenant_erased`),
+            or dropped a zone from `policy.domains.cloudflare_zones` while the tenant still has domains in it
+            (`domain_in_use`, `details.reason = "zone_has_domains"`, `details.domain_ids`; [H13]).
+          x-error-codes: [tenant_erased, domain_in_use]
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
           content:
@@ -1919,8 +1922,20 @@ paths:
           the console host, is refused, as is a `nameservers` or `delegated_subdomain` name inside such a
           zone: `403 scope_denied` with `details.reason = "zone_not_allowed"` ([H8]). Platform keys may use
           any zone.
-        - **`nameservers`** creates the zone. Tenant keys need the policy `domains.allow_create_zone: true`
-          (`422 transport_unavailable`, `zone_creation_not_allowed`). A name with A, AAAA or MX records, or a
+        - **Name taken** ([H10], [H14]): `409 domain_exists`. For a domain of the caller's own tenant,
+          `details.domain_id` names it. Otherwise the body is the same whoever holds the name, in whatever
+          state, and also when a zone or provider object of that name exists that this deployment did not
+          create for this tenant (it is never adopted); `details.claim` is a TXT record to publish before
+          repeating the request with `claim: true`, which evicts a holder that never verified the domain
+          (`409 domain_claim_pending` until its removal finishes). A tenant or partner key's tenant may hold
+          5 domains that were never verified (`422 unverified_domain_limit`); an unverified domain is removed
+          14 days after it was added.
+        - **Mail domains per zone** ([H15]): a Cloudflare zone holds at most 30, routing and sending
+          together; the 31st returns `422 zone_domain_limit` before anything is created.
+        - **`nameservers`** creates the zone, never using one that already exists in the account. Tenant keys
+          need the policy `domains.allow_create_zone: true` (`422 transport_unavailable`,
+          `zone_creation_not_allowed`, also returned when Cloudflare refuses the create for the Worker
+          token's scope); Pylota Mail Cloud does not offer the method. A name with A, AAAA or MX records, or a
           `www` CNAME, A or AAAA record, needs `confirm_dedicated: true` (`409 domain_not_dedicated`, with
           `details.records`) ([N21]). The response's `records` are the zone's `NS` records for the
           registrar. A zone not activated within 28 days is deleted by Cloudflare and the domain becomes
@@ -2041,13 +2056,15 @@ paths:
         '404': {$ref: '#/components/responses/NotFound'}
         '409':
           description: >-
-            The domain is already registered in this deployment; the name already has MX records and
-            `replace_mx` is not `true`; a `nameservers` name is not dedicated to mail and
-            `confirm_dedicated` is not `true` (`details.records`); Cloudflare refused the zone because of a
-            zone hold; or the idempotency key is in use.
-          x-error-codes: [domain_exists, existing_mx, domain_not_dedicated, zone_hold, idempotency_conflict, request_in_progress]
+            The name is not available (`domain_exists`, with `details.claim` unless the domain is the
+            caller's own); a proved claim is evicting the previous holder (`domain_claim_pending`, with
+            `Retry-After`); the name already has MX records and `replace_mx` is not `true`; a `nameservers`
+            name is not dedicated to mail and `confirm_dedicated` is not `true` (`details.records`); Cloudflare
+            refused the zone because of a zone hold; or the idempotency key is in use.
+          x-error-codes: [domain_exists, domain_claim_pending, existing_mx, domain_not_dedicated, zone_hold, idempotency_conflict, request_in_progress]
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
+            Retry-After: {$ref: '#/components/headers/Retry-After'}
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Error'}
@@ -2072,8 +2089,9 @@ paths:
             The deployment or the method cannot add this domain (`transport_unavailable`, with
             `details.reason`); the SMTP relay does not offer TLS (`smtp_tls_required`) or refused the
             credentials (`smtp_auth_failed`); or the method needs `PM_CF_API_TOKEN`, which is not set
-            (`cf_token_required`).
-          x-error-codes: [transport_unavailable, smtp_tls_required, smtp_auth_failed, cf_token_required]
+            (`cf_token_required`); the tenant holds 5 unverified domains (`unverified_domain_limit`); or the
+            Cloudflare zone holds 30 mail domains (`zone_domain_limit`).
+          x-error-codes: [transport_unavailable, smtp_tls_required, smtp_auth_failed, cf_token_required, unverified_domain_limit, zone_domain_limit]
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
           content:
@@ -2181,7 +2199,8 @@ paths:
           `ses_not_configured`) and an SES identity for the domain (`ses_region` set): a `cloudflare_zone`,
           `nameservers` or `delegated_subdomain` domain gets one, with its three DKIM records, during
           onboarding when the SES transport is configured; a domain onboarded without one gets
-          `422 transport_unavailable`. `dns_records` and `send_only`
+          `422 transport_unavailable`. The switch also needs SES to report the identity as verified for
+          sending with DKIM `SUCCESS` at that moment (`ses_identity_not_verified` otherwise). `dns_records` and `send_only`
           domains send only through `ses`, `smtp_relay` domains only through `smtp`, and the platform domain
           only through `cloudflare`; another value returns `422 transport_unavailable`,
           `method_not_supported`. The change applies to sends that reach the transport after it and starts
@@ -2240,8 +2259,10 @@ paths:
         '422':
           description: >-
             The domain cannot use the requested transport or has no SMTP relay (`transport_unavailable`,
-            `method_not_supported`), the transport is not configured (`ses_not_configured`), or the new
-            relay does not offer TLS (`smtp_tls_required`) or refused the credentials (`smtp_auth_failed`).
+            `method_not_supported`), the transport is not configured (`ses_not_configured`), SES does not
+            report the domain's identity as verified for sending with DKIM `SUCCESS`
+            (`ses_identity_not_verified`), or the new relay does not offer TLS (`smtp_tls_required`) or
+            refused the credentials (`smtp_auth_failed`).
           x-error-codes: [transport_unavailable, smtp_tls_required, smtp_auth_failed]
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
@@ -2280,18 +2301,22 @@ paths:
       tags: [Domains]
       summary: Remove a domain
       description: >-
-        Fails with `409 domain_in_use` while any address on the domain is `active` or `retiring`.
-        Otherwise starts removal: routing rules, sending onboarding and the event subscription are deleted,
-        and for a domain with an SES identity, the SES identity and the domain's addresses in the
-        retired-address receipt rules (`pm-retired-{n}`). The domain moves to `removing`, then `removed`,
-        and `domain.removed` is emitted with `reason: requested`.
+        Fails with `409 domain_in_use` while any address on the domain is `active` or `retiring`, and with
+        `403 scope_denied` on the platform domain ([H9]). Otherwise starts removal of the provider objects
+        that onboarding created for this domain, and only those ([H10], [H11]): routing rules, this name's
+        routing records (the zone-wide routing disable only for the zone's last routing domain, at its
+        apex), sending onboarding and the event subscription, and for a domain with an SES identity, the SES
+        identity and the domain's addresses in the retired-address receipt rules (`pm-retired-{n}`). The
+        domain moves to `removing`, then `removed`, and `domain.removed` is emitted with `reason: requested`.
+        On a domain that is already `removing` because its removal job failed after 10 attempts, the call
+        restarts the job from the first step not done and answers `202` ([H12]).
       x-required-permission: ['domains:write']
       x-key-levels: [platform, partner, tenant]
       x-rate-limit-buckets: [api]
       x-idempotency: none
       responses:
         '202':
-          description: Removal started. The domain is returned in state `removing`.
+          description: Removal started, or a failed removal restarted. The domain is returned in state `removing`.
           headers:
             Request-Id: {$ref: '#/components/headers/Request-Id'}
             RateLimit-Limit: {$ref: '#/components/headers/RateLimit-Limit'}
@@ -7358,7 +7383,7 @@ webhooks:
       operationId: onDomainRemoved
       tags: [Events]
       summary: 'domain.removed'
-      description: 'A domain was removed, on request (`reason: requested`) or because Cloudflare deleted a `nameservers` zone that was never activated (`reason: zone_expired`).'
+      description: 'A domain was removed: on request (`reason: requested`), because Cloudflare deleted a `nameservers` zone that was never activated (`reason: zone_expired`), because another tenant proved control of the DNS of a domain this tenant never verified (`reason: evicted`), or because it was never verified within 14 days (`reason: unverified_expired`).'
       security: []
       parameters:
         - $ref: '#/components/parameters/WebhookIdHeader'
@@ -8758,6 +8783,7 @@ components:
         - domain_not_ready
         - domain_in_use
         - domain_exists
+        - domain_claim_pending
         - identity_paused
         - identity_owner_required
         - thread_busy
@@ -8776,6 +8802,8 @@ components:
         - cf_token_required
         - agentic_disabled
         - address_limit_reached
+        - unverified_domain_limit
+        - zone_domain_limit
         - webhook_limit_reached
         - key_limit_reached
         - web_bot_auth_disabled
@@ -8801,10 +8829,11 @@ components:
         | `ses_receiving_not_configured` | `dns_records`, or `smtp_relay` with `inbound: ses`, without `PM_SES_INBOUND_TOPIC_ARN` (and the bucket and queue) |
         | `ses_identity_limit` | The SES region already has 10,000 identities, and the method needs one (`dns_records`, `send_only`, `smtp_relay` with `inbound: ses`) |
         | `subdomain_setup_disabled` | `delegated_subdomain` while `PM_CF_SUBDOMAIN_SETUP` is not `on` |
-        | `zone_creation_not_allowed` | `nameservers` by a tenant or partner key whose tenant's policy lacks `domains.allow_create_zone: true` |
+        | `zone_creation_not_allowed` | `nameservers` by a tenant or partner key whose tenant's policy lacks `domains.allow_create_zone: true`, or a zone create that Cloudflare refused for the Worker token's scope (a token limited to named zones, as on Pylota Mail Cloud) |
+        | `ses_identity_not_verified` | `PATCH` with `transport: ses` while SES does not report the domain's identity as verified for sending with DKIM `SUCCESS` (`details.dkim_status`) |
         | `method_not_supported` | The domain's method does not support the operation: `PATCH` with a transport it cannot use, `probe` on a domain whose transport is not `smtp`, `test-forwarding` on an address whose domain does not use `inbound: forward` |
         | `marketing_needs_ses` | A `kind: marketing` send or reply from a domain whose transport is `cloudflare`, the platform domain included: Cloudflare Email Service is for transactional mail only. Use a domain with the `ses` or `smtp` transport |
-      enum: [ses_not_configured, ses_receiving_not_configured, ses_identity_limit, subdomain_setup_disabled, zone_creation_not_allowed, method_not_supported, marketing_needs_ses]
+      enum: [ses_not_configured, ses_receiving_not_configured, ses_identity_limit, subdomain_setup_disabled, zone_creation_not_allowed, ses_identity_not_verified, method_not_supported, marketing_needs_ses]
 
     # ── Keys and access ──────────────────────────────────────────────────────────────────────────
 
@@ -9347,8 +9376,8 @@ components:
               description: >-
                 Lets the tenant's own keys, and its partner key, use the `nameservers` method, which creates a
                 Cloudflare zone. Without it, they get `422 transport_unavailable` (`zone_creation_not_allowed`).
-                Platform keys may always use it. Pylota Mail Cloud sets it to `true` in `PM_DEFAULT_POLICY`.
-                Platform-only.
+                Platform keys may always use it, when the Worker's Cloudflare token can create zones. Pylota Mail
+                Cloud keeps it `false`. Platform-only.
             cloudflare_zones:
               type: array
               maxItems: 50
@@ -9363,7 +9392,9 @@ components:
                 deployment created for the tenant (`nameservers`, `delegated_subdomain`). A zone created for
                 another tenant, or under the zones of the deployment's platform domain, API host or console
                 host, is refused even when listed (`403 scope_denied`, `details.reason = "zone_not_allowed"`).
-                Platform keys may use any zone. Platform-only.
+                Platform keys may use any zone. The zone must also be among the zones of the Worker's
+                Cloudflare token. Dropping a zone while the tenant still has domains in it is refused
+                (`409 domain_in_use`, `zone_has_domains`). Platform-only.
           default:
             allow_create_zone: false
             cloudflare_zones: []
@@ -10196,7 +10227,7 @@ components:
         state: {$ref: '#/components/schemas/DomainState'}
         state_reason:
           type: [string, 'null']
-          description: Machine code for the state, for example `dkim_missing`, or `zone_expired` on a `nameservers` domain whose zone Cloudflare deleted.
+          description: Machine code for the state, for example `dkim_missing`; `zone_expired` on a `nameservers` domain whose zone Cloudflare deleted; `evicted` or `unverified_expired` on a never-verified domain that is being or was removed.
         state_changed_at:
           type: string
           format: date-time
@@ -10205,8 +10236,9 @@ components:
           enum: [active, manual, none]
           description: >-
             `active`: provider delivery events reach the service. `manual`: a Cloudflare-transport domain was
-            created without an Email Sending event subscription (spike S9 fallback); delivery statuses stop at
-            `submitted` until `pmail domains subscribe <domain>` has run. `none`: `sending` is false.
+            created without an Email Sending event subscription (spike S9 fallback); until
+            `pmail domains subscribe <domain>` has run, its sends go out from each identity's platform address
+            (`sent_via_fallback`), whose delivery events are seen ([H17]). `none`: `sending` is false.
         details:
           description: '`null`, or the operator step that remains while `delivery_events` is `manual`.'
           oneOf:
@@ -10308,6 +10340,15 @@ components:
           description: >-
             `nameservers` only. Confirms that a website or mail on the name may stop. Without it, a name with
             A, AAAA or MX records, or a `www` CNAME, A or AAAA record, returns `409 domain_not_dedicated` ([N21]).
+        claim:
+          type: boolean
+          default: false
+          description: >-
+            Claims a name that another tenant holds but never verified ([H14]). Publish the TXT record from
+            `details.claim` of the earlier `409 domain_exists` answer, then repeat the request with this set to
+            `true`. When both resolvers show it and the holder never verified the domain, the holder is evicted
+            and the answer is `409 domain_claim_pending` until its removal finishes; then the same request
+            succeeds. Otherwise the answer is the same `409 domain_exists`.
         inbound:
           type: string
           description: '`smtp_relay` only, and required there: `forward` (the customer''s mailbox forwards) or `ses` (they also publish the SES MX and DKIM records).'
@@ -13803,7 +13844,7 @@ components:
             data: {$ref: '#/components/schemas/DomainReminderData'}
 
     DomainRemovedEvent:
-      description: '`domain.removed`: A domain was removed (`reason`: `requested` or `zone_expired`).'
+      description: '`domain.removed`: A domain was removed (`reason`: `requested`, `zone_expired`, `evicted` or `unverified_expired`).'
       allOf:
         - $ref: '#/components/schemas/EventBase'
         - type: object
@@ -14325,8 +14366,8 @@ components:
         state: {$ref: '#/components/schemas/DomainState'}
         hours_in_state:
           type: integer
-          description: 24, 72 and 168 (7 days); `504` (21 days) is the final reminder for a `nameservers` domain still `pending` before Cloudflare deletes its zone at 28 days.
-          enum: [24, 72, 168, 504]
+          description: 24, 72 and 168 (7 days); `288` (12 days) for a domain never verified, two days before its unverified expiry; `504` (21 days) is the final reminder for a `nameservers` domain still `pending` before Cloudflare deletes its zone at 28 days.
+          enum: [24, 72, 168, 288, 504]
     DomainRemovedData:
       type: object
       required: [domain_id, reason]
@@ -14336,8 +14377,11 @@ components:
           type: string
           description: >-
             `requested`: removed through `DELETE /v1/domains/{domain_id}`. `zone_expired`: a `nameservers`
-            zone was never activated and Cloudflare deleted it; the domain can be added again.
-          enum: [requested, zone_expired]
+            zone was never activated and Cloudflare deleted it; the domain can be added again. `evicted`: the
+            domain was never verified, and another tenant proved control of its DNS with a claim record.
+            `unverified_expired`: the domain was never verified within 14 days of being added (or of its
+            zone's activation).
+          enum: [requested, zone_expired, evicted, unverified_expired]
 
     ErasureCompletedData:
       type: object

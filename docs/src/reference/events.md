@@ -138,8 +138,8 @@ The **message summary** used in `data.message` is:
 | `domain.failing` | `domain_id`, `issues[]`, `fallback_active` |
 | `domain.suspended` | `domain_id`, `reason` (`failing_14_days`, `nameservers_changed`, `ownership_record_missing` or `registration_changed`) |
 | `domain.recovered` | `domain_id`, `from_state` |
-| `domain.reminder` | `domain_id`, `state`, `hours_in_state` (sent at 24 h, 72 h and 7 days; a `nameservers` domain still `pending` also gets a final one at 21 days, 504 h, before Cloudflare deletes the zone at 28 days) |
-| `domain.removed` | `domain_id`, `reason`: `requested` (removed through `DELETE /v1/domains/{id}`) or `zone_expired` (a `nameservers` zone was never activated and Cloudflare deleted it; the domain can be added again) |
+| `domain.reminder` | `domain_id`, `state`, `hours_in_state` (sent at 24 h, 72 h and 7 days; a domain never verified also gets one at 12 days, 288 h, two days before its unverified expiry; a `nameservers` domain still `pending` also gets a final one at 21 days, 504 h, before Cloudflare deletes the zone at 28 days) |
+| `domain.removed` | `domain_id`, `reason`: `requested` (removed through `DELETE /v1/domains/{id}`), `zone_expired` (a `nameservers` zone was never activated and Cloudflare deleted it; the domain can be added again), `evicted` (the domain was never verified, and another tenant proved control of its DNS with a claim record) or `unverified_expired` (the domain was never verified within 14 days of being added, or of its zone's activation) |
 
 ### Privacy, platform and webhooks
 

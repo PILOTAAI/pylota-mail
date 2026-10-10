@@ -106,6 +106,9 @@ other pages link here.
   `account_id` (which `setup` stores), else `PM_CF_ACCOUNT_ID` in `deploy/wrangler.toml`.
 - The permissions the token needs, and those of the Worker's own `PM_CF_API_TOKEN`, are in one table:
   [Deploy to Cloudflare › Create a Cloudflare API token](../self-hosting.md#2-create-a-cloudflare-api-token).
+  The first `setup` creates the Worker and its Custom Domains, so it needs a short-lived first-run token
+  (Workers Admin at product scope); every later command works with a deploy token that holds Workers
+  Editor on the Worker `pylota-mail` only, and `destroy` needs Workers Admin on that Worker.
 - Every other command needs only an API key, including the platform operations (`dlq`,
   `keys rotate thread|link|cursor|web_bot_auth`, `jobs`, `waitlist invite`). `assertions verify` and
   `webhooks verify` need neither a key nor a token.
@@ -276,16 +279,19 @@ pmail setup ses --region <aws-region> [--allow-non-eu] [--prefix <prefix>] [--di
 |---|---|---|
 | `--region` | required | The SES region (`PM_SES_REGION`). It must be a region where SES receives mail |
 | `--allow-non-eu` | off | Accept a region outside the EU and the UK on a deployment with `PM_JURISDICTION = "eu"`. Without it such a region is refused. For the SES region, `eu` means "EU or UK" (the UK has an EU GDPR adequacy decision), so `eu-west-2` (London) needs no flag; Cloudflare's own `eu` jurisdiction for D1, R2 and Durable Objects means the EU only |
-| `--prefix` | `pylota-mail-` + your AWS account ID | Prefix of the S3 bucket that holds incoming mail until it is ingested (`{prefix}-inbound`) |
+| `--prefix` | `pylota-mail-{aws-account-id}-{dep}`, where `{dep}` is 8 hex characters derived from the API host | Prefix of the S3 bucket that holds incoming mail until it is ingested (`{prefix}-inbound`) |
 | `--yes` | off | Apply the IAM policy without asking. Without it, the policy is printed and you are asked first |
 
 What it does, reading each resource first and changing only what is missing or different: checks the
 region and that your SES account has production access (if it does not, it prints the AWS console steps
-to request it and stops, having created nothing); warns if the account is on the Essentials plan; creates
+to request it and stops, having created nothing); warns if the account is on the Essentials plan; stops,
+having created nothing, if the account and region already serve another deployment (a `pm-deliver` rule
+writing to another bucket, or a resource of its names tagged for another API host); creates
 the inbound S3 bucket, the SNS topic, the SQS backstop queue, the receipt rule `pm-deliver` (in your
 active rule set if you already have one), the configuration set and its event topic, and the SES
-identity of the platform domain; sets `SignatureVersion = 2` on both SNS topics; prints the IAM policy of
-the user `pylota-mail-worker` for review and applies it; creates that user's access key and uploads it
+identity of the platform domain, each tagged `pylota-mail:api-host` with your API host where AWS accepts
+tags; sets `SignatureVersion = 2` on both SNS topics; prints the IAM policy of
+the user `pylota-mail-worker-{dep}` for review and applies it; creates that user's access key and uploads it
 with `wrangler secret put` as `PM_SES_ACCESS_KEY_ID` and `PM_SES_SECRET_ACCESS_KEY` (never written to
 disk or printed); writes `PM_SES_REGION`, `PM_SES_INBOUND_BUCKET`, `PM_SES_INBOUND_TOPIC_ARN`,
 `PM_SES_INBOUND_QUEUE_URL`, `PM_SES_RULE_SET` and `PM_SES_SNS_TOPIC_ARN` into `deploy/wrangler.toml`;
@@ -297,7 +303,8 @@ Exit codes: 2 for a region that cannot receive mail, a region outside the EU and
 review you declined or (without `--yes`) could not be asked; 3 without AWS or Cloudflare credentials, or
 without `deploy/wrangler.toml` (run `pmail setup` first); 9 when the Worker's `/health` does not answer;
 10 when Wrangler or the Cloudflare API fails; 13 when the subscriptions are not confirmed within 5
-minutes; 14 when an AWS call fails or the account has no production access.
+minutes; 14 when an AWS call fails, the account has no production access, or the account and region hold
+another deployment's rule or resources (use a separate AWS account).
 
 ```bash
 pmail setup ses --region eu-west-2
@@ -425,7 +432,7 @@ pmail destroy [--dry-run] [--confirm <platform-domain>] [--skip-erasure] [--keep
 | `--include-ses` | Also delete the AWS resources that [`setup ses`](#setup-ses) created, with your local AWS credentials, in the reverse order of setup |
 
 If you ran `setup ses`, the plan lists its AWS resources (the S3 bucket, SNS topic, SQS queue, receipt
-rule, configuration set, the platform domain's SES identity, and the IAM user `pylota-mail-worker` with
+rule, configuration set, the platform domain's SES identity, and the IAM user `pylota-mail-worker-{dep}` with
 its access key). Without `--include-ses` they are left in place and listed again at the end: delete them
 in the AWS console, because the IAM user's access key stays valid until you do. With `--include-ses`,
 `destroy` deletes them itself; an active receipt rule set that was yours before `setup ses` is kept,
@@ -960,7 +967,7 @@ has the full table.
 
 ```text
 pmail domains add <name> --method <method> [--tenant <tenant>] [--no-receiving] [--no-sending]
-                  [--replace-mx] [--confirm-dedicated]
+                  [--replace-mx] [--confirm-dedicated] [--claim]
                   [--inbound forward|ses] [--smtp-host <host>] [--smtp-port 465|587]
                   [--smtp-username <name>] [--smtp-password-stdin] [--probe-from <address>]
                   [--local-token]
@@ -969,7 +976,7 @@ pmail domains add <name> --method <method> [--tenant <tenant>] [--no-receiving] 
 | `--method` | Use it for | You change at your DNS host | Needs on the deployment |
 |---|---|---|---|
 | `cloudflare_zone` | A domain already on Cloudflare in the deployment's account | Nothing | `PM_CF_API_TOKEN` (an apex works without it with `--local-token`, see below) |
-| `nameservers` | A new domain used only for mail | Two NS records at your registrar | `PM_CF_API_TOKEN`; a platform key, or a tenant whose policy allows zone creation |
+| `nameservers` | A new domain used only for mail | Two NS records at your registrar | `PM_CF_API_TOKEN` that can create zones; a platform key, or a tenant whose policy allows zone creation. Not offered on Pylota Mail Cloud |
 | `dns_records` | A subdomain (or domain) whose DNS stays where it is, both directions | One MX, three DKIM CNAMEs, a MAIL FROM MX and TXT, an ownership TXT | [`setup ses`](#setup-ses) |
 | `send_only` | Sending as your existing addresses; your mailbox forwards to the agent | Three DKIM CNAMEs, a MAIL FROM MX and TXT, an ownership TXT | [`setup ses`](#setup-ses) |
 | `smtp_relay` | Sending through your own mail provider's SMTP server | An ownership TXT | Your relay's credentials; a passing alignment probe |
@@ -984,6 +991,7 @@ pmail domains add <name> --method <method> [--tenant <tenant>] [--no-receiving] 
 | `--smtp-password-stdin` | `smtp_relay` (required) | Read the SMTP password from stdin. **The password is never accepted on the command line.** On a terminal, `pmail` asks for it with hidden input |
 | `--probe-from` | `smtp_relay` | The sender address of the alignment probe. Defaults to `postmaster@{domain}` |
 | `--no-receiving`, `--no-sending` | all | Onboard only one direction |
+| `--claim` | all | Claim a name another workspace holds but never verified, after publishing the TXT record printed by the earlier `409 domain_exists` (`details.claim`). The CLI prints that record and this flag as the fix of every `domain_exists` that carries `details.claim` |
 | `--local-token` | `cloudflare_zone` (apex) | If the deployment has no `PM_CF_API_TOKEN`, onboard the zone apex with your own `CLOUDFLARE_API_TOKEN` (below) |
 
 A flag that the method does not use is refused (exit 2). Needs `domains:write`.

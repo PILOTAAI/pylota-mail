@@ -194,12 +194,12 @@ environment named in brackets. Nothing in this table is ever committed.
 
 | Item | Who provides it | Needed by | Secret or config name |
 |---|---|---|---|
-| A Cloudflare account on the Workers Paid plan | Owner (TREFT LTD) | M1 (every spike except S10 and S13), M18 nightly evaluations, M20 | `CLOUDFLARE_ACCOUNT_ID` (local); `PM_CF_ACCOUNT_ID` (written by `pmail setup`); Actions: `PM_EVAL_CF_ACCOUNT_ID`, `STAGING_CLOUDFLARE_ACCOUNT_ID` [`staging`] |
-| The `pylotamail.com` zone in that account (bought 2026-10-09, [Cloud sign-up §2](design/cloud-signup.md#2-hostnames)), plus a separate staging zone apex | Owner | M1 (S2, S7, S9 use a scratch zone or the staging zone), M20 | `PM_PLATFORM_DOMAIN`, `PM_API_HOST`, `PM_CONSOLE_HOST` in `deploy/wrangler.toml` |
-| The setup API token, with the permissions in [Deploy › step 2](../self-hosting.md#2-create-a-cloudflare-api-token) | Owner | M1, M20 | `CLOUDFLARE_API_TOKEN` (local, used by `pmail` and Wrangler); `PM_CF_API_TOKEN` (Worker secret, a separate token with the "Worker token" permissions of that table, stored by the operator with `wrangler secret put`, [Deploy › Domains on Cloudflare](../self-hosting.md)); Actions: `STAGING_CLOUDFLARE_API_TOKEN` [`staging`] |
+| Production: Pylota's existing Cloudflare account, on the Workers Paid plan ("shared, tightened", [ADR 0010](adr/0010-cloud-in-the-existing-cloudflare-account.md)). Staging and the spikes: a **separate** Cloudflare account on the Workers Paid plan, because setup uses fixed resource names (`pylota-mail`, `pylota-mail-blobs`, `pm-*`) and production's tokens list only production's zones | Owner (TREFT LTD) | M1 (every spike except S10 and S13, in the staging account), M18 nightly evaluations, M20 | `CLOUDFLARE_ACCOUNT_ID` (local); `PM_CF_ACCOUNT_ID` (written by `pmail setup`); Actions: `PM_EVAL_CF_ACCOUNT_ID`, `STAGING_CLOUDFLARE_ACCOUNT_ID` [`staging`] |
+| The `pylotamail.com` zone in the production account (bought 2026-10-09, [Cloud sign-up §2](design/cloud-signup.md#2-hostnames)); in the staging account, a staging platform zone apex and a **staging tenant zone** (a second apex, listed in the live suite's test tenant's `domains.cloudflare_zones`, for M20 step 4's zone subdomain and zone apex) | Owner | M1 (S2, S7, S9 use a scratch zone or the staging zones), M20 | `PM_PLATFORM_DOMAIN`, `PM_API_HOST`, `PM_CONSOLE_HOST` in `deploy/wrangler.toml`; Actions: `STAGING_TENANT_ZONE` [`staging`] |
+| The setup API tokens, with the permissions and scopes in [Deploy › step 2](../self-hosting.md#2-create-a-cloudflare-api-token): a short-lived first-run token with Workers Admin at product scope (it creates the Worker and its Custom Domain, then is deleted), then a deploy token with per-Worker Editor on `pylota-mail` and specific zones only; and the Worker's token, limited to named zones (on production `pylotamail.com` and `pylota.io`, with `domains.allow_create_zone` off) | Owner | M1, M20 | `CLOUDFLARE_API_TOKEN` (local, used by `pmail` and Wrangler); `PM_CF_API_TOKEN` (Worker secret, a separate token with the "Worker token" permissions of that table, stored by the operator with `wrangler secret put`, [Deploy › Domains on Cloudflare](../self-hosting.md)); Actions: `STAGING_CLOUDFLARE_API_TOKEN` [`staging`] |
 | A Workers AI API token for the nightly evaluations | Owner | M18 | Actions: `PM_EVAL_CF_API_TOKEN` (repository secret, Workers AI read only) |
 | A Cloudflare Enterprise account (optional) | Owner, through Cloudflare sales | S10 only | `S10_CLOUDFLARE_ACCOUNT_ID`, `S10_CLOUDFLARE_API_TOKEN` in `spikes/.env`. **S10 may be skipped:** without it `delegated_subdomain` stays off (`PM_CF_SUBDOMAIN_SETUP=off`) and the spike result says "skipped, no Enterprise account" |
-| An AWS account with SES production access in `eu-west-2` (London, decided 2026-10-09), on the à la carte plan | Owner; production access is requested in the AWS console and approved by AWS, which can take a day | S8, S11, then M23 and M20 step 5 | `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, or `AWS_PROFILE` (local); `PM_SES_ACCESS_KEY_ID` and `PM_SES_SECRET_ACCESS_KEY` (Worker secrets, written by `pmail setup ses`); Actions: `STAGING_AWS_ACCESS_KEY_ID`, `STAGING_AWS_SECRET_ACCESS_KEY` [`staging`] |
+| Two AWS accounts with SES production access in `eu-west-2` (London, decided 2026-10-09), on the à la carte plan: one for production and one for staging and the spikes. One region of one account holds one receiving deployment (`pmail setup ses` refuses a second, [Domains on any DNS host §4.2](design/domain-connections.md#42-deployment-set-up-for-ses)) | Owner; production access is requested in the AWS console and approved by AWS, which can take a day | S8, S11, then M23 and M20 step 5 | `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, or `AWS_PROFILE` (local); `PM_SES_ACCESS_KEY_ID` and `PM_SES_SECRET_ACCESS_KEY` (Worker secrets, written by `pmail setup ses`); Actions: `STAGING_AWS_ACCESS_KEY_ID`, `STAGING_AWS_SECRET_ACCESS_KEY` [`staging`] |
 | Two real SMTP submission providers (for example a Google Workspace mailbox and a Microsoft 365 mailbox), each with a sending account on a test domain | Owner | S12 | `S12_SMTP_A_HOST`, `S12_SMTP_A_USERNAME`, `S12_SMTP_A_PASSWORD`, and the same for `S12_SMTP_B_*`, in `spikes/.env` |
 | Gmail (Google Workspace) and Microsoft 365 test mailboxes holding only synthetic mail, with API access for the harness | Owner | M20 (the live suite) | Actions: `STAGING_GMAIL_CLIENT_ID`, `STAGING_GMAIL_CLIENT_SECRET`, `STAGING_GMAIL_REFRESH_TOKEN`, `STAGING_M365_TENANT_ID`, `STAGING_M365_CLIENT_ID`, `STAGING_M365_CLIENT_SECRET` [`staging`] |
 | A domain at an external DNS provider (not Cloudflare) and that provider's API token | Owner | M20 step 5 (`live::domains::dns_records_external_host`) | Actions: `STAGING_EXTERNAL_DNS_TOKEN`, `STAGING_EXTERNAL_DOMAIN` [`staging`] |
@@ -246,7 +246,7 @@ shipped), plus a written result.
 | S6 Externs and jurisdiction | Vectorize `upsert`, `query` (namespace and metadata filter), `deleteByIds`, `getByIds` and `describe()` (the vector count); `AI.run` with the `gateway` option, including the `bge-m3` output shape, the reranker's score form and the agent model's chat-completions schema ([Search](design/search.md)); `AI.toMarkdown` (including whether PDF output marks page boundaries) — all through `wasm-bindgen` externs; DO IDs from `unique_id_with_jurisdiction("eu")` stored as strings and re-addressed with `id_from_string` | Every call works and each recorded shape matches the design, or the design is updated with the observed one. An EU object reports the EU jurisdiction (`ctx.id.jurisdiction`) | REST fallbacks (`/vectorize/v2/…`, `/ai/run`, `/ai/tomarkdown`) using `PM_CF_API_TOKEN`, which then becomes required ([Rust workspace §7](design/rust-workspace.md#7-wasm-bindgen-externs)); one page per document when `toMarkdown` does not mark pages. If an EU object does not report the EU jurisdiction, the build stops for an owner decision, because FR-PRV-1 depends on it |
 | S7 Outbound Message-ID | The relationship between the `messageId` that `send()` returns and the `Message-ID` header recipients see | Either a deterministic mapping (strategy A), or the header learned from a journal copy (strategy B) | Strategy B: a hidden journal BCC to `journal+{message ulid}.{identity ulid}@{PM_PLATFORM_DOMAIN}`; the email handler records the header and drops the copy ([Outbound](design/outbound.md#message-id-of-outbound-mail-spike-s7)). If a journal copy never arrives, that message matches replies by thread token and provider ID only |
 | S8 SES in wasm | SigV4 signing for SES v2 `SendEmail` with raw content, and SNS message signature verification (`SignatureVersion` 2; version 1 is refused), from Rust in wasm | A real send through SES in `eu-west-2`; a real SNS notification verified, and a tampered one rejected | SES leaves v1.0: an ADR moves `send_only`, `dns_records`, `smtp_relay` with `inbound: ses` and the SES failover to v1.1 |
-| S9 Event subscriptions and onboarding APIs | Create an Email Sending event subscription to `pm-delivery-events` through the API for one domain (source type `email.sending` with `zone_id` and `domain`; this source shape appears in Wrangler's source, not yet in the API reference), receive all six event types, delete it. Onboard a zone **apex** and a subdomain through `POST /zones/{zone_id}/email/sending/subdomains`, and enable routing on a subdomain through `POST /zones/{zone_id}/email/routing/dns` with `name`. A literal routing rule whose `worker` action value is the script name `pylota-mail` delivers to the Worker | Payload fields match [Outbound › Delivery events](design/outbound.md#delivery-events); subscriptions can be created per domain at runtime with `PM_CF_API_TOKEN`; apex and subdomain onboarding both work through the API | For `cloudflare_zone` and `nameservers`, the API creates the domain without a subscription, marks it `delivery_events: "manual"`, and returns its records with `details.action = "run pmail domains subscribe <domain>"`; delivery events start once that command has run ([Identities and domains › Kind `zone`](design/identity-domains.md#kind-zone), tests `it::domains::s9_manual_delivery_events` and, for `nameservers`, `it::domains::s9_manual_delivery_events_nameservers`). Any onboarding step the API cannot do is listed by `pmail domains add` as a dashboard step and checked by `pmail doctor` |
+| S9 Event subscriptions and onboarding APIs | Create an Email Sending event subscription to `pm-delivery-events` through the API for one domain (source type `email.sending` with `zone_id` and `domain`; this source shape appears in Wrangler's source, not yet in the API reference), receive all six event types, delete it. Onboard a zone **apex** and a subdomain through `POST /zones/{zone_id}/email/sending/subdomains`, and enable routing on a subdomain through `POST /zones/{zone_id}/email/routing/dns` with `name`. A literal routing rule whose `worker` action value is the script name `pylota-mail` delivers to the Worker. **Subdomain enable and disable** in a zone whose apex already routes, and in one whose apex has a foreign MX: enabling a subdomain leaves the apex's MX records and catch-all unchanged; `PATCH /zones/{zone_id}/email/routing/dns` with the subdomain's `name` unlocks its records, deleting them by ID stops mail to that subdomain only, the apex and another subdomain keep receiving, and the zone's mail-domain count drops; `DELETE /zones/{zone_id}/email/routing/dns` disables the whole zone (recorded, never used for one name). Record the error codes Cloudflare returns for a zone deleted out of band, for a 31st mail domain in a zone, and for a zone that already exists on `POST /zones` | Payload fields match [Outbound › Delivery events](design/outbound.md#delivery-events); subscriptions can be created per domain at runtime with `PM_CF_API_TOKEN`; apex and subdomain onboarding both work through the API; a subdomain's routing can be removed without touching the zone's other mail domains | For `cloudflare_zone` and `nameservers`, the API creates the domain without a subscription, marks it `delivery_events: "manual"`, and returns its records with `details.action = "run pmail domains subscribe <domain>"`; delivery events start once that command has run ([Identities and domains › Kind `zone`](design/identity-domains.md#kind-zone), tests `it::domains::s9_manual_delivery_events` and, for `nameservers`, `it::domains::s9_manual_delivery_events_nameservers`). Any onboarding step the API cannot do is listed by `pmail domains add` as a dashboard step and checked by `pmail doctor`. If a subdomain's routing cannot be removed on its own, removal leaves it with no rules and `pmail doctor` lists it under `routing.leftover_subdomains` with the dashboard step ([Identities and domains › Domain removal](design/identity-domains.md#domain-removal)) |
 | S10 Child zones | On an Enterprise account, a subdomain-setup child zone accepts Email Routing catch-all to the Worker and Email Sending onboarding, and both work end to end. Optional: skipped when no Enterprise account is available ([Build plan › Human prerequisites](#human-prerequisites)) | Mail to any address at the child apex reaches `email()`; a send is DKIM-aligned | `delegated_subdomain` stays off; `dns_records` covers the case |
 | S11 SES receiving | Rule set, S3 action and topic as specified; the notification shape, including the `objectKey` form; S3 `GetObject` with SigV4 from a Worker; a 39 MB message ([N5](edge-cases.md)); `user+tag@` routing; the retired-address bounce; the backstop picks up a message whose push failed | All pass in `eu-west-2` | `dns_records` and `smtp_relay` with `inbound: ses` do not ship in v1.0; `send_only` still does |
 | S12 SMTP from a Worker | Ports 465 and 587 with `StartTls` against two real providers; the certificate host name is checked (a wrong-name certificate is refused); timeouts and the uncertain window behave as designed | All pass | `smtp_relay` does not ship in v1.0 |
@@ -672,14 +672,14 @@ The `triage` hold of consumer step 2 ([Triage § 1.1](design/triage.md#11-consum
 ## M13 · Domains (after M7 and M9; SES depends on S8)
 
 **Files:** `domains/{mod.rs, cloudflare_api.rs, ses_api.rs, ses_control.rs (SesControl DO, the SES
-token bucket), records.rs, monitor.rs (DomainMonitor DO), fallback.rs}` (the two classes replace M5's
-stubs; their bindings exist since M5),
+token bucket), records.rs, monitor.rs (DomainMonitor DO), fallback.rs, provider_objects.rs (the onboarding
+journal and `provider_objects_json`)}` (the two classes replace M5's stubs; their bindings exist since M5), `crons/domain_cleanup.rs` (the hourly cleanup of failed adds),
 `handlers/domains.rs` (full for `cloudflare_zone`, including `PATCH /v1/domains/{domain_id}` for the
 transport), `handlers/addresses.rs` (aliases on tenant domains, promote, retire and rollback),
 `crons/retire.rs`, `transport/ses.rs`, `consumers/ses_events.rs` (the `POST /hooks/ses` SNS endpoint), and
 CLI `pmail domains subscribe`. The other connection methods, `nameservers` included, are M23's.
 
-**Implements:** FR-DOM-2–6 for `cloudflare_zone`, FR-ADR-1–4.
+**Implements:** FR-DOM-2–6, FR-DOM-13 and FR-DOM-14 for `cloudflare_zone`, FR-ADR-1–4.
 
 **Acceptance:**
 
@@ -696,8 +696,17 @@ CLI `pmail domains subscribe`. The other connection methods, `nameservers` inclu
   for the failover when SES is configured). J5's live part, `live::transport::j5_ses_failover`, runs in
   M20.
 - The spike S9 fallback path for `cloudflare_zone`, whatever S9's result
-  (`it::domains::s9_manual_delivery_events`, `cli::domains::subscribe_manual`), and the SES control-plane
-  budget (`it::ses::control_plane_rate`).
+  (`it::domains::s9_manual_delivery_events`, `cli::domains::subscribe_manual`), with its sends from the
+  platform address until the subscription exists (H17, `it::domains::h17_manual_events_fallback`), and the
+  SES control-plane budget (`it::ses::control_plane_rate`).
+- H7's two-resolver failure (`it::domains::h7_dns_unresolvable`), the platform domain's health (H9,
+  `it::domains::h9_platform_domain_failing`, with the `platform_domain_failing` page), no adoption for
+  `cloudflare_zone` and SES identities (H10, `it::domains::h10_no_adoption`: existing sending domain,
+  routing, catch-all and foreign-tagged SES identity; the zone parts are added in M23), the mail-domain
+  limit per zone (H15, `it::domains::h15_zone_domain_limit`), the onboarding journal and
+  `provider_objects_json` written by every create step, the uniform `409 domain_exists`, the claim record,
+  the unverified cap and expiry (the add paths of H14; eviction and expiry finish through removal in M14),
+  and the alerts `domain_remove_failed` and `delivery_events_manual` through M17 Foundation's evaluator.
 - With a DNS fake that can remove a record, add a conflicting record, or move the NS, and the
   `cloudflare_zone` method only: `it::domains::{h1_failing_fallback, h4_ownership_change, h5_existing_mx,
   h6_rule_failure, onboarding_idempotent, records_from_api, cron_mints_missing_monitor,
@@ -709,8 +718,11 @@ CLI `pmail domains subscribe`. The other connection methods, `nameservers` inclu
 - The `domain_remove` job's steps for `cloudflare_zone`
   ([Identities and domains › Domain removal](design/identity-domains.md#domain-removal)), including
   `delete_ses_identity`, which deletes the failover SES identity that onboarding created and its three
-  DKIM CNAMEs. `DELETE /v1/domains/{domain_id}` queues the job behind M6's `JobRunner` stub; M14 runs it,
-  inline in tenant erasure's `remove_domains` too, and accepts `it::domains::remove_deletes_ses_identity`.
+  DKIM CNAMEs. Every step acts on the recorded provider IDs only, `disable_routing` removes one name's
+  routing unless it is the zone's last routing domain at its apex, and absence is read back rather than
+  inferred from a `404` code. `DELETE /v1/domains/{domain_id}` queues the job behind M6's `JobRunner` stub;
+  M14 runs it, inline in tenant erasure's `remove_domains` too, and accepts
+  `it::domains::remove_deletes_ses_identity` and the other removal tests.
 
 ---
 
@@ -720,7 +732,8 @@ CLI `pmail domains subscribe`. The other connection methods, `nameservers` inclu
 `handlers/domains.rs` (methods, `PATCH` with `smtp`, `probe`), `handlers/addresses.rs`
 (`test-forwarding`), `handlers/hooks_ses.rs` (`POST /hooks/ses/inbound`), `transport/smtp.rs`,
 `inbound/sources/{routing.rs, ses.rs}`, `consumers/inbound.rs` (the SES source), `crons/ses_backstop.rs`,
-`domains/monitor.rs` (method health rows, retired-address rules, probe and forwarding tokens); no
+`domains/monitor.rs` (method health rows, probe and forwarding tokens), `domains/ses_control.rs` (the
+retired-address rule sync, its single writer); no
 migration (the `domains` method columns, `ses_ingest`, `addresses.ses_bounce_rule` and
 `addresses.forwarding` are already in `0001_init.sql`); CLI `pmail setup ses`, `pmail domains add --method`, `pmail domains update
 --smtp-…`, `pmail domains probe` and `pmail addresses test-forwarding`.
@@ -737,12 +750,22 @@ migration (the `domains` method columns, `ses_ingest`, `addresses.ses_bounce_rul
 - `core::connect::method_matrix`, which no register row names: every `method` maps to the documented
   `kind`, `inbound` and `transport`, and invalid combinations are refused.
 - The `nameservers` and `delegated_subdomain` parts of M13's domain tests:
-  `it::domains::onboarding_idempotent_created_zones`, `it::domains::s9_manual_delivery_events_nameservers`
-  and `it::domains::cf_token_required_other_methods`, and the claimed-zone part of H8
+  `it::domains::onboarding_idempotent_created_zones` (with the monitor's failed and refused onboarding
+  steps), `it::domains::s9_manual_delivery_events_nameservers`
+  and `it::domains::cf_token_required_other_methods`, the zone part of H10 (an existing zone is never
+  adopted; the pending claim; `it::domains::h10_no_adoption`), the DS check of H7, and the claimed-zone
+  part of H8
   (`it::domains::h8_zone_permission`: `zone_claims` written with the domain row, deleted by `delete_zone`
   and on `zone_expired`, and the refusal of a name under a deployment or another tenant's zone).
 - `pmail setup ses` is idempotent: it runs twice against a recorded AWS API fake with no duplicate
   resources, never deactivates an existing active rule set, and prints the IAM policy before applying it.
+  It tags every taggable resource with the API host and refuses another deployment's resources (N31,
+  `cli::setup::ses_foreign_resources`).
+- The retired-address rules have one writer, `SesControl`, which verifies each write by reading back (N32,
+  `it::ses::retired_rule_single_writer`); SES-sourced mail for a domain without `inbound = ses` is dropped
+  (N33, `it::ses::non_ses_recipient_dropped`); a probe timeout after a pass is fail-level from the second
+  (N34, `it::smtp::probe_timeout_after_pass`). The alert `ses_rule_sync_failed` fires through M17
+  Foundation's evaluator.
 - Every new error code and `transport_unavailable` reason in the design is returned by at least one test.
 - The SES parts of rows that M7 and M13 accept: A6's suspended-tenant hold (`it::ses::suspended_tenant_held`)
   and H2's MAIL FROM preflight (`it::ses::h2_mail_from_spf_preflight`).
@@ -788,7 +811,12 @@ and a step that keeps failing still produces a receipt (`it::erasure::step_retry
 runs its steps in order, `cancel_billing` second (`it::erasure::tenant_scope_order`). `remove_domains`
 runs M13's `domain_remove` steps inline, including `delete_ses_identity` (the failover SES identity and
 its three DKIM CNAMEs), and a domain removal that M13 queued behind the stub now runs
-(`it::domains::remove_deletes_ses_identity`). The global retention job ([Privacy
+(`it::domains::remove_deletes_ses_identity`), with the removal rows of the edge-case register: H11 (one
+name's routing removed, the zone's others kept; a gone zone: `it::domains::h11_remove_keeps_zone_routing`),
+H12 (a failed job restarted daily and by `DELETE`: `it::domains::h12_remove_failed_restart`), H13 (a re-added
+name gets a new row and the old monitor is retired: `it::domains::h13_readd_new_row`), H14 (eviction and the
+14-day expiry, which finish through removal: `it::domains::h14_unverified_claims`) and H16 (the hourly
+cleanup of a failed add: `it::domains::h16_failed_add_cleanup`). The global retention job ([Privacy
 §5.3](design/privacy.md#53-global-retention-job)) lands with its framework and the steps whose tables
 have writers by now: `idempotency`, `platform_events`, `jobs`, `usage`, `dlq`, `signing_keys`, `staging`
 and `audit` (`it::retention::global_job_steps`). Its other steps are added by the milestones that write
@@ -1184,11 +1212,16 @@ the ones marked manual there need a person in a browser and run with `cargo xtas
    into the same thread.
 3. Bounce: a non-existent mailbox at a domain you control. Complaint: through the provider's simulator
    if available, otherwise a manual test.
-4. A domain change: platform address, then zone subdomain, then zone apex, then rollback.
+4. A domain change: platform address, then a subdomain of the staging tenant zone, then that zone's apex
+   (with the staging platform key), then rollback.
 5. A domain on an external DNS host with `dns_records`: publish the records at a DNS provider other than
    Cloudflare, wait for `healthy`, receive from Gmail through SES, and send with aligned DKIM and SPF.
-6. A domain failure: delete the DKIM record. After two checks the domain is `failing`, sends fall back,
-   the operator is told. Restore the record and the domain recovers.
+6. A domain failure: delete one of the three SES DKIM CNAMEs of step 5's domain through the external DNS
+   provider's API (`dkim_missing`, fail). After two checks the domain is `failing`, sends fall back, the
+   operator is told. Restore the record and the domain recovers. A Cloudflare zone's sending DKIM record
+   cannot be used: Email Sending records stay locked for as long as the sending domain exists (Email Service
+   [locked DNS records](https://developers.cloudflare.com/email-service/configuration/domains/), read
+   2026-10-10).
 7. Erasure of a counterparty with a held thread. The receipt is correct and the probes are empty.
 8. An MCP client (Claude Code) connects, searches and sends with an idempotency key.
 9. Console: sign in with a magic link, invite a second member, release a quarantined message, and see it

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Accepted |
+| Status | Superseded in part by [0008](0008-domains-on-any-dns-host.md) (decision 4 and the consequence on tenant domain kinds) |
 | Date | 2026-10-09 |
 | Deciders | Pylota engineering |
 | Related | FR-DOM-1, FR-DOM-2, FR-ADR-1…7, FR-IN-2, FR-OUT-6; [Identities and domains](../design/identity-domains.md); [Threading](../design/threading.md) |
@@ -40,7 +40,9 @@ used, so `bookings@a.example` and `bookings@b.example` reach the same agent.
 4. **Tenant domains.** Kind `zone` (same Cloudflare account): an apex uses a catch-all; a subdomain uses
    one literal routing rule per address (at most 200), and an address stays `pending` until its rule
    exists. Kind `external` (DNS elsewhere): the tenant's mail system forwards to the identity's platform
-   alias; outbound uses the optional SES transport.
+   alias; outbound uses the optional SES transport. *Superseded by [0008](0008-domains-on-any-dns-host.md):
+   the kind now follows from one of six connection methods, and `external` also covers SES inbound
+   (`dns_records`) and the customer's own SMTP relay (`smtp_relay`).*
 5. **Sub-addresses carry thread tokens only.** The `Reply-To` of every outbound message is
    `local+t<kid><seq>.<mac>@domain`; a tag never selects an identity.
 6. **Addresses are global and permanent.** A retired address keeps its row; a deleted or erased address
@@ -53,7 +55,8 @@ used, so `bookings@a.example` and `bookings@b.example` reach the same agent.
   the directory lookup and reject happen before any R2 write, and the reject-spike alert watches them.
 - Subdomain mail domains are capped at 200 addresses each by the rule limit; apex domains are not.
 - Each tenant domain kind has its own onboarding, health checks and failure modes
-  ([Identities and domains](../design/identity-domains.md)).
+  ([Identities and domains](../design/identity-domains.md)). *Superseded by
+  [0008](0008-domains-on-any-dns-host.md): onboarding and health checks follow the connection method.*
 - Tenants share the platform domain's sending reputation; per-identity caps, abuse auto-pause, a DMARC
   ramp and custom domains mitigate that (PRD risks).
 - Role names (RFC 2142) and confusables are reserved, and SMTPUTF8 local parts are refused, because

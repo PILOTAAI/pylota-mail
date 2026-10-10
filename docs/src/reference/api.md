@@ -309,6 +309,9 @@ key cannot call this route (`403 permission_denied`: it can never hold `tenants:
 - **Erasing and erased tenants.** Once a tenant is `erasing` or `erased`, only the erasure job changes its
   status: a platform key gets `409 tenant_erased`, and any other key gets `404 tenant_not_found` here and
   on every other write to the tenant ([I8](../project/edge-cases.md)).
+- **Listed zones.** Dropping a zone from `policy.domains.cloudflare_zones` while the tenant still has
+  domains in it returns `409 domain_in_use` with `details.reason: "zone_has_domains"` and
+  `details.domain_ids`; remove those domains first ([H13](../project/edge-cases.md)).
 
 #### Tenant object
 
@@ -857,6 +860,7 @@ The **connection method** says what the customer changes at their DNS host. It f
 | `receiving`, `sending` | all | Default `true` |
 | `replace_mx` | `cloudflare_zone` (apex), `dns_records` | Default `false`. A name that already has MX records, none of them the expected host, is refused with `409 existing_mx` unless this is `true` ([H5](../project/edge-cases.md)). On a zone apex, enabling routing replaces the existing mail provider. On `dns_records` it means "I will replace these": health reports `mx_unexpected` until the old records are gone |
 | `confirm_dedicated` | `nameservers` | Default `false`. Confirms that a website or mail on the name may stop (below) |
+| `claim` | all | Default `false`. Claims a name that another tenant holds but never verified, after you published the TXT record from `details.claim` of an earlier `409 domain_exists` (below) |
 | `inbound` | `smtp_relay` (required) | `forward` (the customer's mailbox forwards) or `ses` (they also publish the SES MX and DKIM records) |
 | `smtp` | `smtp_relay` (required) | `host` (a DNS name, not an IP literal), `port` (`465` or `587`), `username`, `password` and `probe_from` (an address the relay accepts as sender; default `postmaster@{name}`). The credentials are sealed under `PM_MASTER_KEY` and never returned, logged or exported |
 
@@ -874,9 +878,12 @@ What each method checks before the domain is created:
   refused, for `nameservers` and `delegated_subdomain` too: `403 scope_denied` with
   `details.reason: "zone_not_allowed"`, before anything is changed ([H8](../project/edge-cases.md)).
   Platform keys may use any zone.
-- **`nameservers`** creates the zone in this account. Platform keys may always use it; tenant and partner
-  keys only when the tenant's policy has `domains.allow_create_zone: true` (otherwise `422 transport_unavailable`,
-  `details.reason: "zone_creation_not_allowed"`). Moving the nameservers hands the whole domain to this
+- **`nameservers`** creates the zone in this account, and never uses a zone that already exists there
+  (`409 domain_exists`, [H10](../project/edge-cases.md)). Platform keys may use it when the Worker's
+  Cloudflare token can create zones; tenant and partner keys only when the tenant's policy also has
+  `domains.allow_create_zone: true` (otherwise `422 transport_unavailable`,
+  `details.reason: "zone_creation_not_allowed"`). Pylota Mail Cloud does not offer it. Moving the
+  nameservers hands the whole domain to this
   deployment, so when the name has A, AAAA or MX records, or `www` has a CNAME, A or AAAA record, the request
   needs `"confirm_dedicated": true`; otherwise it fails with `409 domain_not_dedicated` and
   `details.records` lists what was found ([N21](../project/edge-cases.md)). The response's `records` are
@@ -906,7 +913,19 @@ What each method checks before the domain is created:
 
 Also:
 
-- A name already registered in this deployment returns `409 domain_exists`.
+- A name your own tenant already has returns `409 domain_exists` with `details.domain_id`. A name held by
+  another tenant (in any state), or one for which the deployment's Cloudflare or AWS account already holds a
+  zone, sending domain, routing setup or SES identity it did not create for you, returns `409 domain_exists`
+  with one body for all of these cases, so the answer reveals nothing about others. Its `details.claim` is a
+  TXT record, `_pylota-mail.{name}` = `pm-claim=…`. If you control the name's DNS, publish it and repeat
+  the request with `"claim": true`: a holder that never verified the domain is evicted, the answer is
+  `409 domain_claim_pending` with `Retry-After` until its removal finishes, and then the same request
+  succeeds. A verified holder is never evicted ([H14](../project/edge-cases.md)).
+- A tenant may hold 5 domains that were never verified: the 6th returns `422 unverified_domain_limit`
+  (platform keys are not limited). A domain still unverified 14 days after it was added is removed, with
+  `domain.removed` and `reason: "unverified_expired"`.
+- A Cloudflare zone holds at most 30 mail domains, routing and sending together: the 31st returns
+  `422 zone_domain_limit` ([H15](../project/edge-cases.md)).
 - When the plan's `custom_domains` allowance is spent, the request fails with `402 billing_limit`
   (`details.feature: "custom_domains"`).
 - An apex whose merged SPF record would need more than 10 DNS lookups (or more than 2 void lookups) is
@@ -958,7 +977,10 @@ Sending failover of [J5](../project/edge-cases.md). `ses` needs the SES transpor
 (`422 transport_unavailable`, `details.reason: "ses_not_configured"`) and an SES identity for the domain
 (`ses_region` set). A `cloudflare_zone`, `nameservers` or `delegated_subdomain` domain gets one, with its
 three DKIM records, during onboarding when the SES transport is configured; without one the switch gets
-`422 transport_unavailable`. A transport the domain's method cannot use returns
+`422 transport_unavailable`. The switch also needs SES to report the identity as verified for sending with
+DKIM `SUCCESS` at that moment; otherwise `422 transport_unavailable` with
+`details.reason: "ses_identity_not_verified"` and `details.dkim_status`. A transport the domain's method
+cannot use returns
 `422 transport_unavailable` with `details.reason: "method_not_supported"`: `dns_records` and `send_only`
 domains send only through `ses`, `smtp_relay` domains only through `smtp`, and the platform domain only
 through `cloudflare`. The change applies to sends that reach the transport after it and starts a health
@@ -1022,10 +1044,14 @@ Issues a new ownership TXT value for a `suspended` domain. Returns the domain wi
 
 ### `DELETE /v1/domains/{domain_id}` — `domains:write`
 
-Fails with `409 domain_in_use` while any address on it is `active` or `retiring`. Otherwise it starts
-removal: routing rules, sending onboarding and the event subscription are deleted, and for a domain with
-an SES identity, the SES identity and the domain's addresses in the retired-address receipt rules
-(`pm-retired-{n}`). Returns `202`. `domain.removed` follows with `reason: "requested"`. A removal that
+Fails with `409 domain_in_use` while any address on it is `active` or `retiring`, and with
+`403 scope_denied` on the platform domain. Otherwise it starts removal of what onboarding created for
+this domain, and nothing else: its routing rules, its own routing records (Email Routing stays on for the
+zone's other mail domains), sending onboarding and the event subscription, and for a domain with an SES
+identity, the SES identity and the domain's addresses in the retired-address receipt rules
+(`pm-retired-{n}`). Returns `202`. `domain.removed` follows with `reason: "requested"`. If the removal
+fails after 10 attempts on one step, the domain stays `removing` and the removal restarts once a day;
+calling `DELETE` again restarts it at once ([H12](../project/edge-cases.md)). A removal that
 must call SES first waits up to 5 seconds for the deployment's SES control-plane budget, then fails with
 `429 upstream_rate_limited` and `Retry-After`, as `PATCH` does.
 
@@ -1056,8 +1082,8 @@ must call SES first waits up to 5 seconds for the deployment's SES control-plane
 | `mail_from_domain` | `pm-bounce.{name}` on a `dns_records` or `send_only` domain, whose mail SES sends; the local part `pm-bounce` is reserved on such domains. Otherwise `null`, including a Cloudflare-method domain sending through its J5 failover identity after a `PATCH` to `ses`: that identity has no custom MAIL FROM |
 | `smtp` | `smtp_relay` only, otherwise `null`: `{ "host", "port", "username", "probe_from" }`. Never the password |
 | `probe` | `smtp` transport only, otherwise `null`: `{ "last_at", "result" }`. `result` is `pass` or the issue code of the failure (`smtp_unaligned`, `smtp_from_rewritten`, `smtp_probe_timeout`, `smtp_auth_failed`, `smtp_tls_required`); both are `null` before the first probe |
-| `state_reason` | The first issue code, or `zone_expired` on a `nameservers` domain whose zone Cloudflare deleted |
-| `delivery_events` | `active` (provider delivery events reach the service), `manual` (a Cloudflare-transport domain created without an event subscription: run `pmail domains subscribe <domain>`; until then statuses stop at `submitted`), or `none` (`sending: false`). See [Identities and domains › Kind `zone`](../project/design/identity-domains.md#kind-zone) |
+| `state_reason` | The first issue code; `zone_expired` on a `nameservers` domain whose zone Cloudflare deleted; `evicted` or `unverified_expired` on a never-verified domain being or already removed |
+| `delivery_events` | `active` (provider delivery events reach the service), `manual` (a Cloudflare-transport domain created without an event subscription: run `pmail domains subscribe <domain>`; until then its sends go out from each identity's platform address, marked `sent_via_fallback`), or `none` (`sending: false`). See [Identities and domains › Kind `zone`](../project/design/identity-domains.md#kind-zone) |
 | `details` | `null`, or `{ "action": "run pmail domains subscribe <domain>" }` while `delivery_events` is `manual`: the operator step that remains |
 
 ---

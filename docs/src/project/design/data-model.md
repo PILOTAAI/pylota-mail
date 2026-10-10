@@ -109,7 +109,9 @@ CREATE INDEX tenants_partner ON tenants(partner_id) WHERE partner_id IS NOT NULL
 CREATE TABLE domains (
   id                    TEXT PRIMARY KEY,                  -- dom_
   tenant_id             TEXT REFERENCES tenants(id),       -- NULL only for the platform domain
-  name                  TEXT NOT NULL UNIQUE,              -- A-label, lower case
+  name                  TEXT NOT NULL,                     -- A-label, lower case; unique among rows not
+                                                           -- 'removed' (domains_name_live): a re-added
+                                                           -- name gets a new row, the removed row stays
   kind                  TEXT NOT NULL CHECK (kind IN ('platform','zone','delegated','external')),
   method                TEXT NOT NULL                      -- connection method; fixes kind, inbound, transport
                         CHECK (method IN ('platform','cloudflare_zone','nameservers','dns_records',
@@ -128,9 +130,15 @@ CREATE TABLE domains (
   state_reason          TEXT,                              -- machine code, e.g. dkim_missing
   state_changed_at      INTEGER NOT NULL,
   ownership_token       TEXT,                              -- value for _pylota-mail TXT challenge
-  ownership_verified_at INTEGER,
-  expected_ns_json      TEXT,                              -- nameservers seen at verification
-  rdap_fingerprint      TEXT,                              -- hash of registrar + registrant handle + created
+  ownership_verified_at INTEGER,                           -- NULL until first verified: such a domain counts
+                                                           -- toward the unverified cap, expires after 14 days
+                                                           -- and can be evicted (identity-domains.md)
+  expected_ns_json      TEXT,                              -- zone name servers, written with the row
+  rdap_fingerprint      TEXT,                              -- hash of registrar + registrant handle + created;
+                                                           -- written by the first RDAP query after verification
+  provider_objects_json TEXT NOT NULL DEFAULT '{}',        -- provider objects onboarding created or adopted,
+                                                           -- by provider ID (identity-domains.md › Provider
+                                                           -- objects); removal acts on these only
   event_subscription_id TEXT,                              -- Email Sending → pm-delivery-events; NULL on a
                                                            -- cloudflare-transport domain = delivery_events
                                                            -- "manual" (S9 fallback, identity-domains.md)
@@ -157,15 +165,36 @@ CREATE TABLE domains (
   updated_at            INTEGER NOT NULL
 );
 CREATE INDEX domains_tenant ON domains(tenant_id, state);
+CREATE UNIQUE INDEX domains_name_live ON domains(name) WHERE state <> 'removed';
+CREATE INDEX domains_zone ON domains(zone_id, inbound) WHERE zone_id IS NOT NULL AND state <> 'removed';
+
+-- A domain add in progress: written before the first provider call, deleted by the batch that inserts
+-- the domain row, or by the hourly cleanup after undoing its objects (identity-domains.md › Adding a
+-- domain, Cleanup after a failed add).
+CREATE TABLE domain_onboarding (
+  name         TEXT PRIMARY KEY,                           -- A-label, lower case; one add per name at a time
+  domain_id    TEXT NOT NULL,                              -- the ID the domain row will get
+  tenant_id    TEXT NOT NULL REFERENCES tenants(id),
+  method       TEXT NOT NULL,
+  zone_id      TEXT,                                       -- the zone, once known
+  objects_json TEXT NOT NULL DEFAULT '{}',                 -- provider objects created so far (same shape as
+                                                           -- domains.provider_objects_json)
+  created_at   INTEGER NOT NULL,
+  updated_at   INTEGER NOT NULL
+);
+CREATE INDEX domain_onboarding_stale ON domain_onboarding(updated_at);
 
 -- Cloudflare zones this deployment created for a tenant (nameservers, delegated_subdomain), so no other
--- tenant's key can use them through cloudflare_zone (Identities and domains › Zone permission).
+-- tenant's key can use them through cloudflare_zone, and only these zones are ever deleted
+-- (Identities and domains › Zone permission, Creating a zone).
 CREATE TABLE zone_claims (
-  zone_id    TEXT PRIMARY KEY,                             -- Cloudflare zone ID
-  zone_name  TEXT NOT NULL UNIQUE,                         -- A-label apex of the zone
+  zone_name  TEXT PRIMARY KEY,                             -- A-label apex of the zone
+  zone_id    TEXT UNIQUE,                                  -- Cloudflare zone ID; NULL while pending
   tenant_id  TEXT NOT NULL REFERENCES tenants(id),         -- the tenant it was created for
   domain_id  TEXT NOT NULL,                                -- the domain whose onboarding created it
-  created_at INTEGER NOT NULL
+  state      TEXT NOT NULL CHECK (state IN ('pending','active')),  -- pending: written before POST /zones
+  created_at INTEGER NOT NULL,
+  CHECK ((state = 'active') = (zone_id IS NOT NULL))
 );
 
 CREATE TABLE identities (
@@ -857,9 +886,18 @@ CREATE TABLE platform_objects (
   `api_keys.partner_id` is written by `POST /v1/keys` for `level: "partner"` and read by authentication
   (step 9). `webhook_endpoints.partner_id` is written by `POST /v1/webhooks` with a partner key and read
   by the fan-out, the replay selection and the owner check. `zone_claims` rows are written by the
-  `nameservers` and `delegated_subdomain` onboarding in the batch that records the new zone, read by the
-  zone-permission check of `cloudflare_zone` ([Identities and domains › Zone permission](identity-domains.md#zone-permission)),
-  and deleted by the `delete_zone` step of domain removal or when the zone expires.
+  `nameservers` and `delegated_subdomain` onboarding, `pending` before `POST /zones` and `active` in the
+  batch that inserts the domain row, read by the zone-permission check of every method and by the
+  `delete_zone` step ([Identities and domains › Zone permission](identity-domains.md#zone-permission)), and
+  deleted by `delete_zone`, when the zone expires, or by the cleanup of a failed add.
+  `domain_onboarding` rows are written by `POST /v1/tenants/{tenant_id}/domains` (and by the monitor's
+  onboarding of a created zone, through `domains.provider_objects_json` directly), read by the name-taken
+  check, the unverified cap, the SES identity count and the hourly cleanup (`crons/domain_cleanup.rs`), and
+  deleted by the domain insert batch or the cleanup. `domains.provider_objects_json` is written by that
+  batch and by the monitor's onboarding steps, and read by every `domain_remove` step and by the J5
+  failover step. `domains.ownership_verified_at` is also read by the unverified cap, the 14-day expiry and
+  eviction. A policy write that drops a zone from `domains.cloudflare_zones` reads `domains` (`name`,
+  `method`) to refuse while the tenant still has domains under it.
   `DELETE /v1/partners/{partner_id}` runs one D1 batch: it deletes the partner's `webhook_endpoints`
   (their deliveries cascade), revokes and deletes its `api_keys` and deletes its `idempotency_records`
   (`scope` = the partner ID), then sets `status = 'deleted'`, `name = ''` and `deleted_at`. Every statement
@@ -1174,6 +1212,12 @@ CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 --   candidate, candidate_count  agreed outcome that would change the state, and how many cycles in a row
 --                    (Identities and domains › Outcome per resolver and agreement)
 --   failing_since    when the domain entered failing (suspension after 14 days)
+--   both_error_since the first cycle in a row in which both resolvers returned error; after 6 hours the
+--                    cd=1 re-query decides dnssec_bogus or dns_unresolvable (Identities and domains ›
+--                    Outcome per resolver and agreement)
+--   retired          written by DomainRequest::Retire (the domain_remove finish step) right after
+--                    deleteAlarm and deleteAll, so it is the only key left besides schema_version; the
+--                    object then answers every request with Retired, before any owner check
 --   reminders_sent_json  reminders already sent for the current state; reset on every state change
 --   event_seq        outbox sequence (Webhooks › Outbox)
 --   outbox_backoff   consecutive failed outbox dispatches, for the retry delay (Webhooks › Dispatching)
@@ -1278,7 +1322,18 @@ CREATE TABLE IF NOT EXISTS outcomes (                      -- sliding windows fo
 
 -- SesControl (one per deployment, only with SES; Domains on any DNS host § 4.8)
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
--- keys: schema_version; next_free_ms (the earliest time the next SES control-plane call may start)
+-- keys: schema_version; next_free_ms (the earliest time the next SES control-plane call may start);
+--   alarm:rule_sync (the next attempt at the oldest change set); identities_total, identities_read_at
+--   (the region's ListEmailIdentities total, read once a UTC day by the platform check)
+-- The single writer of the pm-retired-{n} receipt rules (Domains on any DNS host § 4.6): queued
+-- SyncRetired change sets, worked oldest first and deleted once a read-back matches.
+CREATE TABLE IF NOT EXISTS rule_sync (
+  seq        INTEGER PRIMARY KEY,
+  add_json   TEXT NOT NULL,                                -- address IDs to add to a pm-retired-{n} rule
+  remove_json TEXT NOT NULL,                               -- address IDs to remove
+  attempts   INTEGER NOT NULL DEFAULT 0,
+  queued_at  INTEGER NOT NULL
+);
 
 -- Notifier (one per tenant; Notifications § 8). Holds user, identity and message IDs and counts, never mail content.
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);
