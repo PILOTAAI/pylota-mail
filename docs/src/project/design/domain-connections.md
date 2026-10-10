@@ -67,7 +67,7 @@ This table is in the [Custom domains guide](../../guides/custom-domains.md) in t
 the deployment's own Cloudflare account, which also holds other tenants' zones and the zones of the
 deployment's hosts, so a tenant or partner key may use only a zone created for its tenant by `nameservers`
 or `delegated_subdomain` (`zone_claims`) or one listed in its platform-only policy
-`domains.cloudflare_zones`. A name under the zone of `PM_PLATFORM_DOMAIN`, `PM_API_HOST` or
+`domains.cloudflare_zones`, which allows names strictly under the listed zone, never its apex. A name under the zone of `PM_PLATFORM_DOMAIN`, `PM_API_HOST` or
 `PM_CONSOLE_HOST` is refused, and so is `replace_mx` on any zone the tenant may not use:
 `403 scope_denied`, `details.reason = "zone_not_allowed"`
 ([Zone permission](identity-domains.md#zone-permission), [H8](../edge-cases.md)). Platform keys may use

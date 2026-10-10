@@ -113,7 +113,7 @@ of the API host and the console host, and the zone of every tenant domain you ad
 `cloudflare_zone`, and a zone it creates for `nameservers` or `delegated_subdomain` exists in no list of
 specific zones. A tenant or partner key can use a zone through `cloudflare_zone` only when this
 deployment created it for that tenant or a platform key listed it in the tenant's policy
-`domains.cloudflare_zones`; the zones of your mail domain, API host and console host are refused to every
+`domains.cloudflare_zones` (then only for names under it, never its apex); the zones of your mail domain, API host and console host are refused to every
 key but a platform key ([Identities and domains › Zone permission](project/design/identity-domains.md#zone-permission)).
 For least privilege, give your own token **specific zones** instead: the mail domain's
 zone, the API host's zone, the console host's zone, and each tenant zone you will add with

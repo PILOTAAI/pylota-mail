@@ -1842,7 +1842,8 @@ paths:
           operator's own Cloudflare token works instead (catch-all, no literal rules).
         - **Zone permission** (tenant and partner keys, before any Cloudflare call): `cloudflare_zone` and
           `replace_mx` work only on a zone this deployment created for the tenant (`nameservers`,
-          `delegated_subdomain`) or one listed in its platform-only policy `domains.cloudflare_zones`. A zone
+          `delegated_subdomain`) or one listed in its platform-only policy `domains.cloudflare_zones` (names
+          strictly under a listed zone: its apex, and `replace_mx` there, stay platform-only). A zone
           created for another tenant, and any name under the zones of the platform domain, the API host or
           the console host, is refused, as is a `nameservers` or `delegated_subdomain` name inside such a
           zone: `403 scope_denied` with `details.reason = "zone_not_allowed"` ([H8]). Platform keys may use
@@ -9356,6 +9357,10 @@ components:
               type: [boolean, 'null']
             cloudflare_zones:
               type: [array, 'null']
+              description: >-
+                Platform-only. Zones a tenant or partner key may use with `cloudflare_zone`, beyond the zones
+                created for the tenant. A listed zone grants names strictly under it: its apex, and
+                `replace_mx` there, stay platform-only.
               maxItems: 50
               uniqueItems: true
               items:

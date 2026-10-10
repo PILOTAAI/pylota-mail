@@ -60,7 +60,9 @@ A Cloudflare zone can have at most 30 mail domains (routing and sending together
   `dns_records`, `send_only` and `smtp_relay` need no Cloudflare token.
 - With a tenant or partner key, `cloudflare_zone` (and `replace_mx` with it) works only on a zone that
   this deployment created for your workspace with `nameservers` or `delegated_subdomain`, or one the
-  operator assigned to it (tenant policy `domains.cloudflare_zones`, which only a platform key sets).
+  operator assigned to it (tenant policy `domains.cloudflare_zones`, which only a platform key sets). An
+  assigned zone allows names under it, such as `mail.example.com` under `example.com`, but not the
+  zone's apex itself, so the apex's own mail (its MX records) stays as it is.
   Another workspace's zone and the zone of the deployment's own hosts are refused with
   `403 scope_denied` and `details.reason: "zone_not_allowed"`, for `nameservers` and
   `delegated_subdomain` too ([Identities and domains › Zone permission](../project/design/identity-domains.md#zone-permission)).

@@ -800,7 +800,8 @@ What each method checks before the domain is created:
   rules).
 - **Zone permission** (tenant and partner keys): `cloudflare_zone`, and `replace_mx` with it, work only on
   a zone this deployment created for the tenant (with `nameservers` or `delegated_subdomain`) or one
-  listed in the tenant's platform-only policy `domains.cloudflare_zones`. A zone created for another
+  listed in the tenant's platform-only policy `domains.cloudflare_zones` (names strictly under a listed
+  zone: its apex, and `replace_mx` there, stay platform-only). A zone created for another
   tenant, and any name under the zone of the platform domain, the API host or the console host, is
   refused, for `nameservers` and `delegated_subdomain` too: `403 scope_denied` with
   `details.reason: "zone_not_allowed"`, before anything is changed ([H8](../project/edge-cases.md)).
